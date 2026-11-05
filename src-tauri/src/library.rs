@@ -129,8 +129,41 @@ fn str_field(fm: &serde_yaml::Value, key: &str) -> Option<String> {
     }
 }
 
+/// Enough of a meeting file for the library list: frontmatter plus the start of the body.
+/// Summary and notes come before the transcript, which is usually most of the file.
+fn read_head(path: &Path) -> Option<String> {
+    use std::io::Read;
+    const HEAD: usize = 16 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; HEAD];
+    let mut n = 0;
+    while n < HEAD {
+        match file.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(n);
+    let text = match String::from_utf8(buf) {
+        Ok(t) => t,
+        // Cut inside a multi-byte character: drop the partial tail.
+        Err(e) => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut b = e.into_bytes();
+            b.truncate(valid);
+            String::from_utf8(b).ok()?
+        }
+    };
+    // Frontmatter longer than the head (unusual): read it all.
+    if n == HEAD && text.starts_with("---") && !text[3..].contains("\n---") {
+        return std::fs::read_to_string(path).ok();
+    }
+    Some(text)
+}
+
 fn summarize_file(path: &Path) -> Option<MeetingSummary> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = read_head(path)?;
     let (fm, body) = frontmatter(&content);
     if fm.is_null() {
         return None;

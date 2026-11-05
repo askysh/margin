@@ -33,3 +33,30 @@ each one locally.
   Add `summarization.ollama_timeout_secs`, defaulting to the current 120.
 - **Workaround:** Margin's error message names the cause and suggests a non-thinking model
   or Claude.
+
+## 4. Rename a speaker in the Markdown itself
+- **Where:** `crates/core/src/overlays.rs` (`write_speaker_confirmation`) and the CLI's
+  `confirm`.
+- **Why:** a confirmation is an overlay row bound to the file's sha256.
+  - Any later edit (notes, a re-summary) silently drops it for readers that check the
+    hash.
+  - The Markdown keeps `SPEAKER_1`, so Obsidian never sees the name.
+  - The CLI also refuses labels that aren't already in `speaker_map`.
+- **Patch:** `markdown::rename_speaker(path, label, name) -> Result<()>`. It would rewrite
+  transcript labels and `@label` / whole-word mentions outside `## Notes`, and update
+  `speaker_map`, `attendees`, `action_items[].assignee`, `intents[].who` and `people`.
+  Then it writes the overlay row against the new bytes.
+- **Workaround:** Margin does exactly this in `src-tauri/src/speakers.rs`.
+
+## 5. Tag live-transcript lines with their capture source
+- **Where:** `crates/core/src/live_transcript.rs`, the recording sidecar. In dual-source
+  call capture, the live whisper thread hears the mixed signal and writes
+  `speaker: null`.
+- **Why:** core already has the separate voice and system streams. With them, a live UI
+  could show "You" and "Them" from facts instead of guesses.
+- **Patch:** in dual-source mode, compare per-source energy over each utterance's window
+  inside the sidecar and set `speaker` to `"MICROPHONE"` or `"SYSTEM"` (the labels
+  `source_transcript.rs` already uses), or `null` when unclear.
+- **Workaround:** Margin reads the growing `.voice.wav` / `.system.wav` stems and compares
+  loudness for each line (`recorder.rs::guess_speaker`). It works, but has to infer
+  timing from the line's write time.
