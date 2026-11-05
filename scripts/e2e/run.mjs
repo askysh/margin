@@ -284,6 +284,37 @@ await check("a silent recording explains itself", async () => {
   await page.getByText("No speech was detected in this recording.").waitFor({ timeout: 5000 });
 });
 
+await check("switching meetings right after typing still saves the notes", async () => {
+  await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
+  await page.getByLabel("Your notes").click();
+  await page.keyboard.press("Meta+ArrowDown");
+  await page.keyboard.type("\nquick switch note");
+  await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
+  await page.waitForTimeout(1500);
+  const f = meetingFiles().find((x) => x.includes("qa-follow-up"));
+  assert(fs.readFileSync(path.join(meetingsDir, f), "utf8").includes("quick switch note"), "edit lost on quick switch");
+});
+if (simulate) {
+  await check("leaving and returning to a recording keeps its notes", async () => {
+    await page.getByRole("button", { name: "More recording options" }).click();
+    await page.getByRole("menuitem", { name: /In person/ }).click();
+    await page.locator(".page-live").waitFor({ timeout: 10000 });
+    await page.getByLabel("Your notes").click();
+    await page.keyboard.type("- kept across navigation");
+    await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
+    await page.waitForTimeout(800);
+    await page.locator(".row-live").click();
+    assert((await page.getByLabel("Your notes").inputValue()).includes("kept across navigation"), "live notes wiped on return");
+    assert((await page.locator(".live-speaker").count()) === 0, "in-person recording shows You/Them");
+    await page.getByLabel("Meeting title").fill("QA in person");
+    await page.waitForTimeout(8000); // a first sentence of speech
+    await page.getByRole("button", { name: "Stop" }).click();
+    await page.locator(".turn").first().waitFor({ timeout: 180000 });
+    const f = meetingFiles().find((x) => x.includes("qa-in-person"));
+    assert(f && fs.readFileSync(path.join(meetingsDir, f), "utf8").includes("- kept across navigation"), "notes missing in saved file");
+  });
+}
+
 // ---------------------------------------------------------------- search
 await check("search finds a meeting by transcript text", async () => {
   await page.getByLabel("Search meetings").fill("legal review");

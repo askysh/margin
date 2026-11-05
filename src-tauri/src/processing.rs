@@ -149,11 +149,23 @@ fn finish(job: &JobView, announce: bool) {
         return;
     }
     if let Ok(notes) = std::fs::read_to_string(&draft) {
-        match library::replace_notes(std::path::Path::new(output), &notes) {
+        let out = std::path::Path::new(output);
+        // Core wrote the notes as cleaned bullets. If the section differs from that, someone
+        // (Obsidian, say, while Margin was closed) edited it since: theirs wins.
+        let written = library::notes_section(out).unwrap_or_default();
+        let expected = crate::recorder::notes_for_summarizer(&notes)
+            .map(|n| n.lines().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        if written.trim() != expected.trim() && !written.trim().is_empty() {
+            tracing::info!(output, "notes changed since processing; keeping them");
+            let _ = std::fs::remove_file(&draft);
+        } else {
+        match library::replace_notes(out, &notes) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&draft);
             }
             Err(error) => tracing::warn!(%error, output, "could not restore notes"),
+        }
         }
     }
     if announce {

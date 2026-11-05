@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, errorText, type Backends, type Boot, type Permissions, type ResetPreview, type Settings, type Voice } from "../api";
 import { bytes, copyText, tildify } from "../util";
@@ -24,30 +24,49 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
   const [nameDraft, setNameDraft] = useState(boot.settings.user_name);
 
   const refreshPerms = () => api.permissions().then(setPerms).catch(() => {});
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const resetOpenRef = useRef(resetOpen);
+  resetOpenRef.current = resetOpen;
   useEffect(() => {
     api.summaryBackends().then(setBackends).catch(() => {});
     refreshPerms();
     api.listVoices().then(setVoices).catch(() => {});
     api.mcpSnippet().then(setMcp).catch(() => {});
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && !resetOpen && onClose();
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && !resetOpenRef.current && onCloseRef.current();
     window.addEventListener("keydown", esc);
     window.addEventListener("focus", refreshPerms);
     return () => { window.removeEventListener("keydown", esc); window.removeEventListener("focus", refreshPerms); };
-  }, [onClose, resetOpen]);
+  }, []);
 
-  const save = async (patch: Partial<Settings>) => {
-    try {
-      const saved = await api.saveSettings({ ...s, ...patch });
-      setS(saved);
-      onSaved(saved);
-      if (patch.model) {
-        const files = await api.modelsStatus();
-        if (files.some((f) => !f.installed)) await api.downloadModels();
+  // Each change applies on top of the latest settings, and saves go one at a time, so a
+  // name edit and a model click in quick succession can't undo each other.
+  const latest = useRef<Settings>(boot.settings);
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const pendingSaves = useRef(0);
+  const save = (patch: Partial<Settings>) => {
+    latest.current = { ...latest.current, ...patch };
+    setS(latest.current);
+    pendingSaves.current++;
+    queue.current = queue.current.then(async () => {
+      try {
+        const saved = await api.saveSettings(latest.current);
+        pendingSaves.current--;
+        if (pendingSaves.current === 0) {
+          latest.current = saved;
+          setS(saved);
+          onSaved(saved);
+        }
+        if (patch.model) {
+          const files = await api.modelsStatus();
+          if (files.some((f) => !f.installed)) await api.downloadModels();
+        }
+        if (patch.output_dir) api.mcpSnippet().then(setMcp);
+      } catch (e) {
+        pendingSaves.current--;
+        notify(errorText(e), "error");
       }
-      if (patch.output_dir) api.mcpSnippet().then(setMcp);
-    } catch (e) {
-      notify(errorText(e), "error");
-    }
+    });
   };
 
   const changeFolder = async () => {

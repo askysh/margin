@@ -346,6 +346,10 @@ pub fn ensure_inside_output(path: &Path) -> Result<(), String> {
 /// Replace the body of `## Notes` (or insert the section before `## Transcript`). Every
 /// other byte of the file is kept, including the frontmatter.
 pub fn replace_notes(path: &Path, notes: &str) -> Result<(), String> {
+    crate::fsutil::with_file_lock(path, || replace_notes_locked(path, notes))
+}
+
+fn replace_notes_locked(path: &Path, notes: &str) -> Result<(), String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let updated = splice_notes(&content, notes);
     if updated == content {
@@ -355,6 +359,13 @@ pub fn replace_notes(path: &Path, notes: &str) -> Result<(), String> {
     let cfg = corecfg::load();
     let _ = minutes_core::derived::refresh_derived_views(path, &cfg, &Default::default());
     Ok(())
+}
+
+/// The body of the `## Notes` section as it is on disk now.
+pub fn notes_section(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let (_, body) = split_frontmatter(&content);
+    Some(sections(body).into_iter().find(|s| s.heading == "Notes").map(|s| s.body).unwrap_or_default())
 }
 
 pub fn splice_notes(content: &str, notes: &str) -> String {
@@ -408,7 +419,7 @@ pub fn set_title(path: &Path, title: &str) -> Result<(), String> {
     if title.is_empty() {
         return Err("A meeting needs a title.".into());
     }
-    minutes_core::markdown::update_frontmatter(path, |fm| fm.title = title.to_string())
+    crate::fsutil::with_file_lock(path, || minutes_core::markdown::update_frontmatter(path, |fm| fm.title = title.to_string()))
         .map_err(|e| format!("Couldn't rename the meeting: {e}"))?;
     let cfg = corecfg::load();
     let _ = minutes_core::derived::refresh_derived_views(path, &cfg, &Default::default());

@@ -23,10 +23,17 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
       setHits(null);
       return;
     }
+    let cancelled = false;
     const t = setTimeout(() => {
-      api.search(q).then((r) => setHits(new Map(r.map((h) => [h.path, h.excerpt])))).catch(() => setHits(new Map()));
+      api
+        .search(q)
+        .then((r) => !cancelled && setHits(new Map(r.map((h) => [h.path, h.excerpt]))))
+        .catch(() => !cancelled && setHits(new Map()));
     }, 180);
-    return () => clearTimeout(t);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
   }, [query]);
 
   const groups = useMemo(() => {

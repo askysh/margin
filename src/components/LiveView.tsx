@@ -11,13 +11,17 @@ interface Props {
 
 /** The latest notes and title typed, newer than the last debounced save. Stop sends them,
  * so the last few words before Stop are never lost. */
-export const liveDraft: { notes: string | null; title: string | null } = { notes: null, title: null };
+export const liveDraft: { session: string | null; notes: string | null; title: string | null } = { session: null, notes: null, title: null };
 
 /** The notepad during a meeting: your notes on the left and the live transcript on the
  * right. The rule between them is the recording light and level meter. */
 export function LiveView({ recorder, lines, level }: Props) {
-  const [notes, setNotes] = useState(recorder.notes);
-  const [title, setTitle] = useState(recorder.title ?? "");
+  // Coming back to the live view mid-recording: what you typed lives in liveDraft, which is
+  // newer than the recorder snapshot App holds.
+  const same = liveDraft.session === recorder.started_at;
+  const [notes, setNotes] = useState(same && liveDraft.notes !== null ? liveDraft.notes : recorder.notes);
+  const [title, setTitle] = useState(same && liveDraft.title !== null ? liveDraft.title : recorder.title ?? "");
+  liveDraft.session = recorder.started_at;
   useDebounced(notes, 350, (v) => api.setDraftNotes(v));
   useDebounced(title, 350, (v) => api.setRecordingTitle(v));
   liveDraft.notes = notes;

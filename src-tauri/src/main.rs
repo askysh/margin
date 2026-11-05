@@ -116,9 +116,17 @@ fn main() {
 
     app.run(|app, event| match event {
         RunEvent::Reopen { .. } => tray::show_main(app),
-        RunEvent::ExitRequested { .. } => {
-            // Cmd-Q while recording (or while a stop is finishing): save the meeting first.
-            recorder::recorder().finish_before_exit(std::time::Duration::from_secs(120));
+        RunEvent::ExitRequested { api, .. } => {
+            // Cmd-Q while recording (or while a stop is finishing): save the meeting first,
+            // off the main thread, then quit for real.
+            if recorder::recorder().is_recording() {
+                api.prevent_exit();
+                let app = app.clone();
+                std::thread::spawn(move || {
+                    recorder::recorder().finish_before_exit(std::time::Duration::from_secs(120));
+                    app.exit(0);
+                });
+            }
         }
         _ => {}
     });

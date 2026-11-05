@@ -34,6 +34,8 @@ pub mod ops {
     }
 
     pub fn save_settings(settings: corecfg::AppSettings) -> Res<corecfg::AppSettings> {
+        static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one_at_a_time = SAVING.lock().unwrap_or_else(|e| e.into_inner());
         let first_save = !corecfg::exists();
         let mut cfg = corecfg::load();
         corecfg::apply(&mut cfg, &settings)?;

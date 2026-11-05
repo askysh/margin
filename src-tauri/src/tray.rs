@@ -87,9 +87,12 @@ fn handle(app: &AppHandle, id: &str) {
         }
         "open" => show_main(app),
         "quit" => {
-            // Never lose a recording to Quit: finish saving it first.
-            recorder().finish_before_exit(Duration::from_secs(120));
-            app.exit(0);
+            // Never lose a recording to Quit: finish saving it first, off the main thread.
+            let app = app.clone();
+            std::thread::spawn(move || {
+                recorder().finish_before_exit(Duration::from_secs(120));
+                app.exit(0);
+            });
         }
         _ => {}
     }

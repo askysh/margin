@@ -75,18 +75,35 @@ export function isRawSpeaker(label: string | null): boolean {
   return !!label && /^(SPEAKER_\d+|MICROPHONE|SYSTEM)$/.test(label);
 }
 
+/** Run `fn(value)` once `value` has been stable for `ms`. A change still pending when the
+ * component unmounts is flushed, not dropped (switching meetings mid-sentence keeps it). */
 export function useDebounced<T>(value: T, ms: number, fn: (v: T) => void) {
   const first = useRef(true);
   const fnRef = useRef(fn);
   fnRef.current = fn;
+  const pending = useRef<{ value: T } | null>(null);
   useEffect(() => {
     if (first.current) {
       first.current = false;
       return;
     }
-    const t = setTimeout(() => fnRef.current(value), ms);
+    pending.current = { value };
+    const t = setTimeout(() => {
+      pending.current = null;
+      fnRef.current(value);
+    }, ms);
     return () => clearTimeout(t);
   }, [value, ms]);
+  useEffect(
+    () => () => {
+      if (pending.current) {
+        const { value: v } = pending.current;
+        pending.current = null;
+        fnRef.current(v);
+      }
+    },
+    [],
+  );
 }
 
 /** Copy text. The async clipboard API isn't available in every WebView context, so fall

@@ -78,6 +78,12 @@ export default function App() {
       on<string>("error-toast", (t) => notify(t, "error")),
       on<string>("recording-ended", (t) => notify(t)),
       on<string | null>("call-detected", (a) => setCallApp(a)),
+      // However a recording ended (Stop here, the menu bar, auto-stop), follow it to its
+      // processing view if you were looking at it.
+      on<{ job_id: string; title: string | null; notes: string }>("recording-stopped", ({ job_id, title, notes }) => {
+        liveDraft.session = liveDraft.notes = liveDraft.title = null;
+        if (selectionRef.current.type === "live") setSelection({ type: "processing", jobId: job_id, notes, title });
+      }),
     ];
     const onFocus = () => refreshMeetings();
     window.addEventListener("focus", onFocus);
@@ -86,17 +92,6 @@ export default function App() {
       window.removeEventListener("focus", onFocus);
     };
   }, [reboot, refreshMeetings, notify]);
-
-  // When a recording ends from the menu bar, follow it to its processing view.
-  const lastRecording = useRef<RecorderView | null>(null);
-  useEffect(() => {
-    const prev = lastRecording.current;
-    if (prev?.recording && recorder && !recorder.recording && selectionRef.current.type === "live") {
-      const job = jobs.find((j) => !["complete", "failed", "needs-review"].includes(j.state));
-      setSelection(job ? { type: "processing", jobId: job.id, notes: prev.notes, title: prev.title } : { type: "home" });
-    }
-    lastRecording.current = recorder;
-  }, [recorder, jobs]);
 
   const start = async (kind: Kind) => {
     setBusy(true);
@@ -117,15 +112,14 @@ export default function App() {
 
   const stop = async () => {
     setBusy(true);
-    const notes = liveDraft.notes ?? recorder?.notes ?? "";
+    // Only this recording's draft: liveDraft could be from a view that never mounted.
+    const mine = liveDraft.session === recorder?.started_at;
     try {
-      const { job_id, title } = await api.stopRecording(liveDraft.notes, liveDraft.title);
-      lastRecording.current = null;
-      liveDraft.notes = liveDraft.title = null;
-      setRecorder((r) => (r ? { ...r, recording: false, stopping: false } : r));
-      setSelection({ type: "processing", jobId: job_id, notes, title });
+      // Navigation happens on the "recording-stopped" event.
+      await api.stopRecording(mine ? liveDraft.notes : null, mine ? liveDraft.title : null);
     } catch (e) {
-      notify(errorText(e), "error");
+      // Auto-stop got there first; its event takes over.
+      if (errorText(e) !== "Already stopping.") notify(errorText(e), "error");
     } finally {
       setBusy(false);
     }
@@ -196,6 +190,7 @@ export default function App() {
               notify={notify}
               onChanged={refreshMeetings}
               onDeleted={() => { setSelection({ type: "home" }); refreshMeetings(); }}
+              processing={active.some((j) => j.output_path === selection.path)}
             />
           )}
           {(selection.type === "home" || (selection.type === "live" && !recorder?.recording)) && (

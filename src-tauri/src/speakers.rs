@@ -20,6 +20,10 @@ pub struct RenameResult {
 
 pub fn rename(path: &Path, label: &str, new_name: &str, remember_voice: bool) -> Result<RenameResult, String> {
     library::ensure_inside_output(path)?;
+    crate::fsutil::with_file_lock(path, || rename_locked(path, label, new_name, remember_voice))
+}
+
+fn rename_locked(path: &Path, label: &str, new_name: &str, remember_voice: bool) -> Result<RenameResult, String> {
     let new_name = new_name.trim();
     if new_name.is_empty() {
         return Err("Enter a name.".into());

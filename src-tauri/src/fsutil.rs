@@ -24,3 +24,15 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Re
         let _ = std::fs::remove_file(&tmp);
     })
 }
+
+/// One lock per meeting file, held for a whole read-modify-write, so the notes autosave,
+/// a title edit, a speaker rename and the processing watcher can't undo each other.
+pub fn with_file_lock<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let lock = LOCKS.get_or_init(Default::default).lock().unwrap().entry(key).or_default().clone();
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}

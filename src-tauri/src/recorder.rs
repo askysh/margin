@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 /// A WAV smaller than this (header plus about a second of audio) holds nothing worth
 /// processing.
 const MIN_USEFUL_WAV_BYTES: u64 = 44 + 16_000 * 2;
+pub const ALREADY_STOPPING: &str = "Already stopping.";
+const ENDED: &str = "That recording already ended.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -120,7 +122,8 @@ impl Recorder {
 
     pub fn set_notes(&self, text: String) {
         let mut guard = self.active.lock().unwrap();
-        if let Some(a) = guard.as_mut() {
+        // After Stop, the notes sent with Stop are final; a late autosave must not win.
+        if let Some(a) = guard.as_mut().filter(|a| !a.stopping) {
             a.notes = text.clone();
             drop(guard);
             // Crash safety: keep the draft on disk while recording.
@@ -129,7 +132,7 @@ impl Recorder {
     }
 
     pub fn set_title(&self, title: Option<String>) {
-        let changed = match self.active.lock().unwrap().as_mut() {
+        let changed = match self.active.lock().unwrap().as_mut().filter(|a| !a.stopping) {
             Some(a) => {
                 a.title = title.filter(|t| !t.trim().is_empty());
                 true
@@ -263,10 +266,10 @@ impl Recorder {
             let mut guard = self.active.lock().unwrap();
             let a = guard.as_mut().ok_or("Not recording.")?;
             if session.is_some_and(|s| s != a.session) {
-                return Err("That recording already ended.".into());
+                return Err(ENDED.into());
             }
             if a.stopping {
-                return Err("Already stopping.".into());
+                return Err(ALREADY_STOPPING.into());
             }
             a.stopping = true;
             if let Some(n) = notes {
@@ -291,15 +294,17 @@ impl Recorder {
 
         let result = (|| {
             let size = std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0);
+            // Under a second there's nothing to keep, so don't leave files in the meetings
+            // folder (which may be an Obsidian vault) for an accidental Start/Stop.
+            if size < MIN_USEFUL_WAV_BYTES {
+                discard_current_capture();
+                return Err(match &capture_result {
+                    Err(error) => format!("Recording failed: {error}"),
+                    Ok(()) => "The recording was too short to save.".into(),
+                });
+            }
             if let Err(error) = &capture_result {
-                tracing::warn!(%error, size, "capture ended with an error");
-                if size < MIN_USEFUL_WAV_BYTES {
-                    recover_leftover_capture(&corecfg::load());
-                    return Err(format!("Recording failed: {error}"));
-                }
-            } else if size < MIN_USEFUL_WAV_BYTES {
-                recover_leftover_capture(&corecfg::load());
-                return Err("The recording was too short to save.".into());
+                tracing::warn!(%error, size, "capture ended with an error; processing what was recorded");
             }
             let job = jobs::queue_live_capture_with_recording_health(
                 CaptureMode::Meeting,
@@ -338,6 +343,13 @@ impl Recorder {
             processing::spawn_worker();
         }
         *self.active.lock().unwrap() = None;
+        if let Ok(stopped) = &result {
+            // The UI follows this, wherever Stop came from (window, menu bar, auto-stop).
+            events::emit(
+                "recording-stopped",
+                serde_json::json!({ "job_id": stopped.job_id, "title": stopped.title, "notes": draft }),
+            );
+        }
         events::emit("recorder", self.view());
         events::refresh_tray();
         result
@@ -394,6 +406,15 @@ pub fn session_config(kind: Kind) -> Config {
     cfg
 }
 
+fn discard_current_capture() {
+    let wav = pid::current_wav_path();
+    if let Some(stems) = capture::stem_paths_for(&wav) {
+        let _ = std::fs::remove_file(stems.voice);
+        let _ = std::fs::remove_file(stems.system);
+    }
+    let _ = std::fs::remove_file(wav);
+}
+
 /// Move `current.wav` and its stems to `<meetings>/failed-captures/`, if any exist.
 pub fn recover_leftover_capture(cfg: &Config) -> Option<PathBuf> {
     let wav = pid::current_wav_path();
@@ -425,7 +446,7 @@ pub fn recover_leftover_capture(cfg: &Config) -> Option<PathBuf> {
 
 /// The pipeline turns each notes line into a bullet, so strip the user's own list markers
 /// to avoid "- - item". The exact text is spliced back after processing.
-fn notes_for_summarizer(notes: &str) -> Option<String> {
+pub fn notes_for_summarizer(notes: &str) -> Option<String> {
     let cleaned: Vec<String> = notes
         .lines()
         .map(|l| l.trim().trim_start_matches(['-', '*', '•']).trim_start().to_string())
@@ -455,6 +476,8 @@ fn spawn_ticker(session: u64) {
                     // Silence auto-stop, max duration, low disk space, or a capture error.
                     match r.stop_session(Some(session), None, None) {
                         Ok(_) => events::emit("recording-ended", "The recording stopped on its own and is being processed."),
+                        // A Stop click got there first; that path reports its own result.
+                        Err(e) if e == ALREADY_STOPPING || e == ENDED => {}
                         Err(e) => events::emit("error-toast", e),
                     }
                     return;

@@ -11,25 +11,32 @@ interface Props {
   notify: (t: string, tone?: "info" | "error") => void;
   onChanged: () => void;
   onDeleted: () => void;
+  /** Core is still writing this file (diarizing or summarizing); edits would make it fail. */
+  processing: boolean;
 }
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
-export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
+export function MeetingView({ path, notify, onChanged, onDeleted, processing }: Props) {
   const [m, setM] = useState<MeetingDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [save, setSave] = useState<SaveState>("idle");
   const [showTranscript, setShowTranscript] = useState(true);
   const [summarizing, setSummarizing] = useState(false);
-  const dirty = useRef(false);
+  // Every edit bumps `edits`; a save records the count it wrote. Unsaved = they differ.
+  // Saves run one at a time, so an older save can never land after a newer one.
+  const edits = useRef(0);
+  const saved = useRef(0);
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const unsaved = () => edits.current !== saved.current;
 
   const load = useCallback(() => {
     api
       .readMeeting(path)
       .then((d) => {
         setM(d);
-        if (!dirty.current) setNotes(d.notes);
+        if (edits.current === saved.current) setNotes(d.notes);
       })
       .catch((e) => setError(errorText(e)));
   }, [path]);
@@ -37,25 +44,32 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
   useEffect(load, [load]);
   useEffect(() => {
     // Pick up edits made in Obsidian or another editor, unless there are unsaved changes here.
-    const f = () => !dirty.current && load();
+    const f = () => !unsaved() && load();
     window.addEventListener("focus", f);
     return () => window.removeEventListener("focus", f);
   }, [load]);
+  useEffect(() => {
+    // Processing just finished: show the enriched file.
+    if (!processing) load();
+  }, [processing, load]);
 
   useDebounced(notes, 600, (v) => {
-    if (!dirty.current) return;
+    if (!unsaved()) return;
+    const upTo = edits.current;
     setSave("saving");
-    api
-      .saveNotes(path, v)
-      .then(() => {
-        dirty.current = false;
-        setSave("saved");
-        onChanged();
-      })
-      .catch((e) => {
-        setSave("error");
-        notify(`Notes not saved: ${errorText(e)}`, "error");
-      });
+    queue.current = queue.current.then(() =>
+      api
+        .saveNotes(path, v)
+        .then(() => {
+          saved.current = Math.max(saved.current, upTo);
+          if (!unsaved()) setSave("saved");
+          onChanged();
+        })
+        .catch((e) => {
+          setSave("error");
+          notify(`Notes not saved: ${errorText(e)}`, "error");
+        }),
+    );
   });
 
   // One display name per label, used by chips and transcript rows alike: a name from
@@ -108,6 +122,7 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
       <div className="notes-col">
         <TitleField
           value={m.title}
+          disabled={processing}
           onSave={async (t) => {
             try {
               await api.setMeetingTitle(path, t);
@@ -135,6 +150,13 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
           <button className="link-btn danger" onClick={trash}>Move to Trash</button>
         </div>
 
+        {processing && (
+          <div className="callout">
+            <p><strong>Still processing.</strong> Margin is separating speakers and finishing this meeting. You can
+              read it now; editing unlocks when it's done.</p>
+          </div>
+        )}
+
         {m.status === "no-speech" && (
           <div className="callout">
             <p><strong>No speech was detected in this recording.</strong> Check that the right microphone is selected in
@@ -156,7 +178,8 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
           </h2>
           <NotesEditor
             value={notes}
-            onChange={(v) => { dirty.current = true; setSave("idle"); setNotes(v); }}
+            onChange={(v) => { edits.current++; setSave("idle"); setNotes(v); }}
+            readOnly={processing}
             placeholder="Add notes. They're saved into the meeting file."
           />
         </section>
@@ -164,7 +187,7 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
       {showTranscript && m.transcript.length > 0 && (
         <>
           <Rule level={0} live={false} />
-          <Transcript meeting={m} names={names} onRenamed={() => { load(); onChanged(); }} notify={notify} />
+          <Transcript meeting={m} names={names} locked={processing} onRenamed={() => { load(); onChanged(); }} notify={notify} />
         </>
       )}
     </div>
@@ -172,7 +195,7 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
 }
 
 /** The meeting title, editable in place. Enter or leaving the field saves; Escape undoes. */
-function TitleField({ value, onSave }: { value: string; onSave: (t: string) => void }) {
+function TitleField({ value, onSave, disabled }: { value: string; onSave: (t: string) => void; disabled?: boolean }) {
   const [draft, setDraft] = useState(value);
   useEffect(() => setDraft(value), [value]);
   const commit = () => {
@@ -188,17 +211,23 @@ function TitleField({ value, onSave }: { value: string; onSave: (t: string) => v
       onBlur={commit}
       onKeyDown={(e) => {
         if (e.key === "Enter") e.currentTarget.blur();
-        if (e.key === "Escape") { setDraft(value); requestAnimationFrame(() => e.currentTarget?.blur()); }
+        if (e.key === "Escape") {
+          const el = e.currentTarget;
+          setDraft(value);
+          requestAnimationFrame(() => el.blur());
+        }
       }}
       aria-label="Meeting title"
       title="Click to rename this meeting"
+      disabled={disabled}
     />
   );
 }
 
-function Transcript({ meeting, names, onRenamed, notify }: {
+function Transcript({ meeting, names, locked, onRenamed, notify }: {
   meeting: MeetingDetail;
   names: Map<string, string>;
+  locked: boolean;
   onRenamed: () => void;
   notify: Props["notify"];
 }) {
@@ -209,7 +238,7 @@ function Transcript({ meeting, names, onRenamed, notify }: {
   return (
     <aside className="transcript-col" aria-label="Transcript">
       <div className="col-label">Transcript</div>
-      {hasSpeakers && (
+      {hasSpeakers && !locked && (
         <div className="speakers">
           {meeting.speakers.map((s) => (
             <SpeakerChip
@@ -233,7 +262,7 @@ function Transcript({ meeting, names, onRenamed, notify }: {
           turn={t}
           showSpeaker={!!t.speaker && t.speaker !== turns[i - 1]?.speaker}
           display={t.speaker ? names.get(t.speaker) ?? t.speaker : ""}
-          onSpeaker={() => t.speaker && setRenaming(t.speaker)}
+          onSpeaker={() => !locked && t.speaker && setRenaming(t.speaker)}
         />
       ))}
     </aside>
