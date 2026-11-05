@@ -1,17 +1,20 @@
 //! Menu-bar item: start and stop recordings without opening the window.
 
-use crate::recorder::{Kind, Recorder};
+use crate::commands::ops;
+use crate::events;
+use crate::recorder::{recorder, Kind};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, Wry};
+use std::time::Duration;
+use tauri::{AppHandle, Manager, Wry};
 
 const TRAY_ID: &str = "main";
 const ICON_IDLE: &[u8] = include_bytes!("../icons/tray-template.png");
 const ICON_REC: &[u8] = include_bytes!("../icons/tray-recording.png");
 
 fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
-    let recording = app.state::<Recorder>().is_recording();
+    let recording = recorder().is_recording();
     let onboarded = crate::prefs::load().onboarding_complete;
     let can_start = onboarded && !recording;
     Menu::with_items(
@@ -44,7 +47,7 @@ pub fn refresh(app: &AppHandle) {
     // Menu objects must be touched on the main thread.
     let _ = app.run_on_main_thread(move || {
         let Some(tray) = app2.tray_by_id(TRAY_ID) else { return };
-        let recording = app2.state::<Recorder>().is_recording();
+        let recording = recorder().is_recording();
         if let Ok(m) = menu(&app2) {
             let _ = tray.set_menu(Some(m));
         }
@@ -68,35 +71,24 @@ fn handle(app: &AppHandle, id: &str) {
     match id {
         "start-call" | "start-in-person" => {
             let kind = if id == "start-call" { Kind::Call } else { Kind::InPerson };
-            let app = app.clone();
+            show_main(app);
             std::thread::spawn(move || {
-                let result = app.state::<Recorder>().start(&app, kind, None);
-                show_main(&app);
-                match result {
-                    Ok(view) => {
-                        let _ = app.emit("recorder", view);
-                    }
-                    Err(error) => {
-                        let _ = app.emit("error-toast", error);
-                    }
+                if let Err(error) = ops::start_recording(kind, None) {
+                    events::emit("error-toast", error);
                 }
             });
         }
         "stop" => {
-            let app = app.clone();
-            std::thread::spawn(move || {
-                if let Err(error) = app.state::<Recorder>().stop(&app) {
-                    let _ = app.emit("error-toast", error);
+            std::thread::spawn(|| {
+                if let Err(error) = recorder().stop(None, None) {
+                    events::emit("error-toast", error);
                 }
             });
         }
         "open" => show_main(app),
         "quit" => {
-            let recording = app.state::<Recorder>().is_recording();
-            if recording {
-                // Never lose a recording to Quit: stop and queue it first.
-                let _ = app.state::<Recorder>().stop(app);
-            }
+            // Never lose a recording to Quit: finish saving it first.
+            recorder().finish_before_exit(Duration::from_secs(120));
             app.exit(0);
         }
         _ => {}

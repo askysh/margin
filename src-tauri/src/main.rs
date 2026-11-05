@@ -4,6 +4,8 @@ mod calldetect;
 mod commands;
 mod corecfg;
 mod devcli;
+mod devserve;
+mod events;
 mod fsutil;
 mod library;
 mod models;
@@ -17,8 +19,7 @@ mod speakers;
 mod summaries;
 mod tray;
 
-use recorder::Recorder;
-use tauri::{Manager, RunEvent, WindowEvent};
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
 fn main() {
     // Isolate minutes-core from any other Minutes install before anything reads its env.
@@ -45,9 +46,16 @@ fn main() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(Recorder::default())
         .setup(|app| {
             let handle = app.handle().clone();
+            let sink = handle.clone();
+            events::set_sink(Box::new(move |name, payload| {
+                if name == events::TRAY_REFRESH {
+                    tray::refresh(&sink);
+                } else {
+                    let _ = sink.emit(name, payload);
+                }
+            }));
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "macos")]
                 {
@@ -57,8 +65,8 @@ fn main() {
                 let _ = window.show();
             }
             tray::init(&handle)?;
-            processing::spawn_watcher(handle.clone());
-            calldetect::spawn(handle);
+            processing::spawn_watcher();
+            calldetect::spawn();
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -69,38 +77,38 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::boot,
-            commands::save_settings,
-            commands::folder_choices,
-            commands::complete_onboarding,
-            commands::models_status,
-            commands::download_models,
-            commands::permissions_state,
-            commands::request_permission,
-            commands::open_privacy_settings,
-            commands::summary_backends,
-            commands::start_recording,
-            commands::stop_recording,
-            commands::recorder_view,
-            commands::set_draft_notes,
-            commands::set_recording_title,
-            commands::discard_orphaned_draft,
-            commands::list_jobs,
-            commands::retry_job,
-            commands::list_meetings,
-            commands::read_meeting,
-            commands::save_notes,
-            commands::search_meetings,
-            commands::trash_meeting,
-            commands::reveal_in_finder,
-            commands::open_in_obsidian,
-            commands::rename_speaker,
-            commands::summarize_meeting,
-            commands::list_voices,
-            commands::forget_voice,
-            commands::reset_preview,
-            commands::reset_app,
-            commands::mcp_snippet,
+            commands::tauri_cmds::boot,
+            commands::tauri_cmds::save_settings,
+            commands::tauri_cmds::folder_choices,
+            commands::tauri_cmds::complete_onboarding,
+            commands::tauri_cmds::models_status,
+            commands::tauri_cmds::download_models,
+            commands::tauri_cmds::permissions_state,
+            commands::tauri_cmds::request_permission,
+            commands::tauri_cmds::open_privacy_settings,
+            commands::tauri_cmds::summary_backends,
+            commands::tauri_cmds::start_recording,
+            commands::tauri_cmds::stop_recording,
+            commands::tauri_cmds::recorder_view,
+            commands::tauri_cmds::set_draft_notes,
+            commands::tauri_cmds::set_recording_title,
+            commands::tauri_cmds::discard_orphaned_draft,
+            commands::tauri_cmds::list_jobs,
+            commands::tauri_cmds::retry_job,
+            commands::tauri_cmds::list_meetings,
+            commands::tauri_cmds::read_meeting,
+            commands::tauri_cmds::save_notes,
+            commands::tauri_cmds::search_meetings,
+            commands::tauri_cmds::trash_meeting,
+            commands::tauri_cmds::reveal_in_finder,
+            commands::tauri_cmds::open_in_obsidian,
+            commands::tauri_cmds::rename_speaker,
+            commands::tauri_cmds::summarize_meeting,
+            commands::tauri_cmds::list_voices,
+            commands::tauri_cmds::forget_voice,
+            commands::tauri_cmds::reset_preview,
+            commands::tauri_cmds::reset_app,
+            commands::tauri_cmds::mcp_snippet,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Margin");
@@ -108,11 +116,8 @@ fn main() {
     app.run(|app, event| match event {
         RunEvent::Reopen { .. } => tray::show_main(app),
         RunEvent::ExitRequested { .. } => {
-            // Cmd-Q while recording: stop and queue the meeting rather than lose it.
-            let recorder = app.state::<Recorder>();
-            if recorder.is_recording() {
-                let _ = recorder.stop(app);
-            }
+            // Cmd-Q while recording (or while a stop is finishing): save the meeting first.
+            recorder::recorder().finish_before_exit(std::time::Duration::from_secs(120));
         }
         _ => {}
     });

@@ -33,8 +33,12 @@ regex = "1"
 trash = "5"
 libc = "0.2"
 block2 = "0.6"
+tiny_http = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+hound = "3.5"
 
 [profile.release]
 strip = true

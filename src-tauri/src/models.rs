@@ -2,14 +2,13 @@
 //! #2), so we use the same URLs core and its CLI use and write to the directories our config
 //! points at.
 
-use crate::{corecfg, paths};
+use crate::{corecfg, events, paths};
 use minutes_core::config::Config;
 use minutes_core::diarize;
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{AppHandle, Emitter};
 
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
@@ -89,7 +88,7 @@ pub fn all_installed(cfg: &Config) -> bool {
 }
 
 /// Download every missing model in the background. Emits `model-progress`.
-pub fn download_missing(app: AppHandle) -> Result<(), String> {
+pub fn download_missing() -> Result<(), String> {
     if DOWNLOADING.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
@@ -99,10 +98,8 @@ pub fn download_missing(app: AppHandle) -> Result<(), String> {
         .spawn(move || {
             let mut failed = None;
             for f in &files {
-                if let Err(error) = fetch(f, &mut |p| {
-                    let _ = app.emit("model-progress", p);
-                }) {
-                    let _ = app.emit(
+                if let Err(error) = fetch(f, &mut |p| events::emit("model-progress", p)) {
+                    events::emit(
                         "model-progress",
                         Progress { id: f.id.clone(), downloaded: 0, total: 0, finished: false, all_done: true, error: Some(error.clone()) },
                     );
@@ -111,7 +108,7 @@ pub fn download_missing(app: AppHandle) -> Result<(), String> {
                 }
             }
             if failed.is_none() {
-                let _ = app.emit(
+                events::emit(
                     "model-progress",
                     Progress { id: "all".into(), downloaded: 0, total: 0, finished: true, all_done: true, error: None },
                 );

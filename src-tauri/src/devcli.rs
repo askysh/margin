@@ -92,9 +92,13 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 delete_models: args.iter().any(|a| a == "--models"),
                 forget_voices: args.iter().any(|a| a == "--voices"),
             };
-            let report = crate::reset::run(&crate::recorder::Recorder::default(), &opts)?;
+            let report = crate::reset::run(crate::recorder::recorder(), &opts)?;
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
             Ok(())
+        }
+        Some("serve") => {
+            let port = args.get(1).and_then(|p| p.parse().ok()).unwrap_or(4545);
+            crate::devserve::serve(port)
         }
         Some("permissions") => {
             println!("{}", serde_json::to_string_pretty(&permissions::state()).unwrap());

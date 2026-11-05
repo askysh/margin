@@ -47,29 +47,50 @@ pub fn run(recorder: &Recorder, opts: &ResetOptions) -> Result<ResetReport, Stri
     if recorder.is_recording() {
         return Err("Stop the recording before resetting.".into());
     }
-    if minutes_core::jobs::worker_active() {
+    if minutes_core::jobs::worker_active() || !minutes_core::jobs::active_jobs().is_empty() {
         return Err("A meeting is still being processed. Try again when it finishes.".into());
     }
     let mut report = ResetReport { meetings_trashed: 0, models_deleted: false, voices_forgotten: 0 };
+    let cfg = crate::corecfg::load();
+    let root = cfg.output_dir.clone();
 
-    // Meetings first: this needs the current config to know where they are.
-    if opts.delete_meetings {
-        let root = library::output_dir();
-        let mut items: Vec<PathBuf> = Vec::new();
-        for meeting in library::list() {
-            let md = PathBuf::from(&meeting.path);
-            items.extend(minutes_core::capture::meeting_audio_artifact_paths(&md).into_iter().filter(|p| p.exists()));
-            items.push(md);
-            report.meetings_trashed += 1;
-        }
-        for dir in ["archive", "failed-captures"] {
-            let p = root.join(dir);
-            if p.exists() {
-                items.push(p);
+    // Audio of failed jobs, or a capture left by a crash, lives in state/. It is meeting
+    // audio, so it follows the "keep my meetings" choice instead of being wiped with state.
+    crate::recorder::recover_leftover_capture(&cfg);
+    let orphaned_audio = job_audio();
+    if !opts.delete_meetings && !orphaned_audio.is_empty() {
+        let dir = root.join("failed-captures");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't save unprocessed audio: {e}"))?;
+        for src in &orphaned_audio {
+            let dest = dir.join(src.file_name().unwrap_or_default());
+            if std::fs::rename(src, &dest).is_err() {
+                std::fs::copy(src, &dest).map_err(|e| format!("Couldn't save unprocessed audio: {e}"))?;
             }
         }
+    }
+
+    if opts.delete_meetings {
+        let mut items: Vec<PathBuf> = Vec::new();
+        let add_meeting = |md: PathBuf, items: &mut Vec<PathBuf>| {
+            items.extend(minutes_core::capture::meeting_audio_artifact_paths(&md).into_iter().filter(|p| p.exists()));
+            items.push(md);
+        };
+        for meeting in library::list() {
+            add_meeting(PathBuf::from(&meeting.path), &mut items);
+            report.meetings_trashed += 1;
+        }
+        // archive/ may be the user's own folder (a vault root): only take meeting files.
+        for md in library::meeting_files_in(&root.join("archive")) {
+            add_meeting(md, &mut items);
+        }
+        for f in files_with_ext(&root.join("failed-captures"), "wav") {
+            items.push(f);
+        }
+        items.extend(orphaned_audio.iter().cloned());
+        items.sort();
+        items.dedup();
         if !items.is_empty() {
-            trash::delete_all(&items).map_err(|e| format!("Could not move meetings to the Trash: {e}"))?;
+            trash::delete_all(&items).map_err(|e| format!("Couldn't move meetings to the Trash: {e}"))?;
         }
     }
 
@@ -98,8 +119,33 @@ pub fn run(recorder: &Recorder, opts: &ResetOptions) -> Result<ResetReport, Stri
         let _ = std::fs::remove_file(file);
     }
     let _ = std::fs::remove_dir_all(paths::drafts_dir());
-    paths::install_env();
+    paths::ensure_dirs();
+    crate::events::refresh_tray();
     Ok(report)
+}
+
+/// Audio files under state/jobs (recursively): captures whose processing failed.
+fn job_audio() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![minutes_core::jobs::jobs_dir()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "wav") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn files_with_ext(dir: &std::path::Path, ext: &str) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|it| it.flatten().map(|e| e.path()).filter(|p| p.is_file() && p.extension().is_some_and(|x| x == ext)).collect())
+        .unwrap_or_default()
 }
 
 fn dir_size(dir: &std::path::Path) -> u64 {

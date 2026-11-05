@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, errorText, on, type Boot, type Job, type Kind, type LiveLine, type MeetingSummary, type RecorderView } from "./api";
 import { Onboarding } from "./components/Onboarding";
 import { Sidebar } from "./components/Sidebar";
-import { LiveView } from "./components/LiveView";
+import { LiveView, liveDraft } from "./components/LiveView";
 import { MeetingView } from "./components/MeetingView";
 import { ProcessingView } from "./components/ProcessingView";
 import { Home } from "./components/Home";
@@ -111,12 +111,13 @@ export default function App() {
 
   const stop = async () => {
     setBusy(true);
-    const snapshot = recorder;
+    const notes = liveDraft.notes ?? recorder?.notes ?? "";
     try {
-      const { job_id, title } = await api.stopRecording();
+      const { job_id, title } = await api.stopRecording(liveDraft.notes, liveDraft.title);
       lastRecording.current = null;
-      setRecorder((r) => (r ? { ...r, recording: false } : r));
-      setSelection({ type: "processing", jobId: job_id, notes: snapshot?.notes ?? "", title });
+      liveDraft.notes = liveDraft.title = null;
+      setRecorder((r) => (r ? { ...r, recording: false, stopping: false } : r));
+      setSelection({ type: "processing", jobId: job_id, notes, title });
     } catch (e) {
       notify(errorText(e), "error");
     } finally {
@@ -158,7 +159,9 @@ export default function App() {
             <div className="rec-control">
               <span className="rec-dot" aria-hidden />
               <span className="rec-time mono">{clock(tick.elapsed_secs)}</span>
-              <button className="btn btn-stop" onClick={stop} disabled={busy}>Stop</button>
+              <button className="btn btn-stop" onClick={stop} disabled={busy || recorder?.stopping}>
+                {busy || recorder?.stopping ? "Saving…" : "Stop"}
+              </button>
             </div>
           ) : (
             <RecordButton busy={busy} onStart={start} />

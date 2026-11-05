@@ -1,293 +1,341 @@
-//! Tauri commands. Anything that blocks runs on the blocking pool, so the UI thread stays
-//! free.
+//! The operations the UI can ask for. Each is a plain function (`ops::*`). The Tauri
+//! commands below run them on the blocking pool so the UI thread stays free, and the
+//! `--dev serve` QA bridge calls the same functions over HTTP.
 
-use crate::recorder::{Kind, RecorderView, Recorder, Stopped};
+use crate::recorder::{recorder, Kind, RecorderView, Stopped};
 use crate::{corecfg, library, models, paths, permissions, prefs, processing, reset, speakers, summaries};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager, State};
 
-type Res<T> = Result<T, String>;
+pub type Res<T> = Result<T, String>;
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Res<T> + Send + 'static) -> Res<T> {
-    tauri::async_runtime::spawn_blocking(f).await.map_err(|e| e.to_string())?
-}
+pub mod ops {
+    use super::*;
 
-#[derive(Serialize)]
-pub struct Boot {
-    onboarded: bool,
-    settings: corecfg::AppSettings,
-    recorder: RecorderView,
-    orphaned_draft: Option<String>,
-    upstream_tag: &'static str,
-    version: &'static str,
-}
-
-#[tauri::command]
-pub fn boot(recorder: State<Recorder>) -> Boot {
-    Boot {
-        onboarded: prefs::load().onboarding_complete && corecfg::exists(),
-        settings: corecfg::settings(&corecfg::load()),
-        recorder: recorder.view(),
-        orphaned_draft: crate::recorder::orphaned_draft(),
-        upstream_tag: "v0.32.1",
-        version: env!("CARGO_PKG_VERSION"),
+    #[derive(Serialize)]
+    pub struct Boot {
+        onboarded: bool,
+        settings: corecfg::AppSettings,
+        recorder: RecorderView,
+        orphaned_draft: Option<String>,
+        upstream_tag: &'static str,
+        version: &'static str,
     }
-}
 
-// ---- settings & onboarding -------------------------------------------------------------
+    pub fn boot() -> Res<Boot> {
+        Ok(Boot {
+            onboarded: prefs::load().onboarding_complete && corecfg::exists(),
+            settings: corecfg::settings(&corecfg::load()),
+            recorder: recorder().view(),
+            orphaned_draft: crate::recorder::orphaned_draft(),
+            upstream_tag: "v0.32.1",
+            version: env!("CARGO_PKG_VERSION"),
+        })
+    }
 
-#[tauri::command]
-pub async fn save_settings(settings: corecfg::AppSettings) -> Res<corecfg::AppSettings> {
-    blocking(move || {
+    pub fn save_settings(settings: corecfg::AppSettings) -> Res<corecfg::AppSettings> {
         let mut cfg = corecfg::load();
         corecfg::apply(&mut cfg, &settings)?;
-        std::fs::create_dir_all(&cfg.output_dir)
-            .map_err(|e| format!("Can't use that folder: {e}"))?;
+        std::fs::create_dir_all(&cfg.output_dir).map_err(|e| format!("Can't use that folder: {e}"))?;
         corecfg::save(&mut cfg)?;
         Ok(corecfg::settings(&corecfg::load()))
-    })
-    .await
-}
+    }
 
-#[derive(Serialize)]
-pub struct FolderChoices {
-    default_dir: String,
-    obsidian_vaults: Vec<Vault>,
-}
+    #[derive(Serialize)]
+    pub struct FolderChoices {
+        default_dir: String,
+        obsidian_vaults: Vec<Vault>,
+    }
 
-#[derive(Serialize)]
-pub struct Vault {
-    name: String,
-    path: String,
-}
+    #[derive(Serialize)]
+    pub struct Vault {
+        name: String,
+        path: String,
+    }
 
-#[tauri::command]
-pub fn folder_choices() -> FolderChoices {
-    let registry = paths::home().join("Library/Application Support/obsidian/obsidian.json");
-    let vaults = std::fs::read(registry)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v["vaults"].as_object().cloned())
-        .map(|m| {
-            m.values()
-                .filter_map(|v| v["path"].as_str())
-                .filter(|p| std::path::Path::new(p).is_dir())
-                .map(|p| Vault {
-                    name: std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-                    path: p.to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    FolderChoices { default_dir: paths::default_output_dir().display().to_string(), obsidian_vaults: vaults }
-}
+    pub fn folder_choices() -> Res<FolderChoices> {
+        let registry = paths::home().join("Library/Application Support/obsidian/obsidian.json");
+        let vaults = std::fs::read(registry)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["vaults"].as_object().cloned())
+            .map(|m| {
+                m.values()
+                    .filter_map(|v| v["path"].as_str())
+                    .filter(|p| std::path::Path::new(p).is_dir())
+                    .map(|p| Vault {
+                        name: std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                        path: p.to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(FolderChoices { default_dir: paths::default_output_dir().display().to_string(), obsidian_vaults: vaults })
+    }
 
-#[tauri::command]
-pub fn complete_onboarding(app: AppHandle) -> Res<()> {
-    let mut p = prefs::load();
-    p.onboarding_complete = true;
-    prefs::save(&p)?;
-    crate::tray::refresh(&app);
-    Ok(())
-}
+    pub fn complete_onboarding() -> Res<()> {
+        let mut p = prefs::load();
+        p.onboarding_complete = true;
+        prefs::save(&p)?;
+        crate::events::refresh_tray();
+        Ok(())
+    }
 
-#[tauri::command]
-pub fn models_status() -> Vec<models::ModelFile> {
-    models::required(&corecfg::load())
-}
+    pub fn models_status() -> Res<Vec<models::ModelFile>> {
+        Ok(models::required(&corecfg::load()))
+    }
 
-#[tauri::command]
-pub fn download_models(app: AppHandle) -> Res<()> {
-    models::download_missing(app)
-}
+    pub fn download_models() -> Res<()> {
+        models::download_missing()
+    }
 
-#[tauri::command]
-pub fn permissions_state() -> permissions::PermissionState {
-    permissions::state()
-}
+    pub fn permissions_state() -> Res<permissions::PermissionState> {
+        Ok(permissions::state())
+    }
 
-#[tauri::command]
-pub async fn request_permission(which: String) -> Res<&'static str> {
-    blocking(move || {
+    pub fn request_permission(which: String) -> Res<&'static str> {
         Ok(match which.as_str() {
             "microphone" => permissions::request_microphone(),
             _ => permissions::request_system_audio(),
         })
-    })
-    .await
-}
-
-#[tauri::command]
-pub fn open_privacy_settings(pane: String) {
-    permissions::open_settings(&pane);
-}
-
-#[tauri::command]
-pub async fn summary_backends() -> Res<summaries::SummaryBackends> {
-    blocking(|| Ok(summaries::detect(&corecfg::load().summarization.ollama_url))).await
-}
-
-// ---- recording -------------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn start_recording(app: AppHandle, kind: Kind, title: Option<String>) -> Res<RecorderView> {
-    if !models::all_installed(&corecfg::load()) {
-        return Err("The transcription models aren't downloaded yet. Open Settings → Transcription.".into());
     }
-    blocking(move || app.state::<Recorder>().start(&app, kind, title)).await
-}
 
-#[tauri::command]
-pub async fn stop_recording(app: AppHandle) -> Res<Stopped> {
-    blocking(move || app.state::<Recorder>().stop(&app)).await
-}
+    pub fn open_privacy_settings(pane: String) -> Res<()> {
+        permissions::open_settings(&pane);
+        Ok(())
+    }
 
-#[tauri::command]
-pub fn recorder_view(recorder: State<Recorder>) -> RecorderView {
-    recorder.view()
-}
+    pub fn summary_backends() -> Res<summaries::SummaryBackends> {
+        Ok(summaries::detect(&corecfg::load().summarization.ollama_url))
+    }
 
-#[tauri::command]
-pub fn set_draft_notes(recorder: State<Recorder>, text: String) {
-    recorder.set_notes(text);
-}
+    pub fn start_recording(kind: Kind, title: Option<String>) -> Res<RecorderView> {
+        if !models::all_installed(&corecfg::load()) {
+            return Err("The speech models aren't downloaded yet. Open Settings → Transcription.".into());
+        }
+        recorder().start(kind, title)
+    }
 
-#[tauri::command]
-pub fn set_recording_title(recorder: State<Recorder>, title: Option<String>) {
-    recorder.set_title(title);
-}
+    pub fn stop_recording(notes: Option<String>, title: Option<String>) -> Res<Stopped> {
+        recorder().stop(notes, title)
+    }
 
-#[tauri::command]
-pub fn discard_orphaned_draft() {
-    let _ = std::fs::remove_file(paths::drafts_dir().join("current.md"));
-}
+    pub fn recorder_view() -> Res<RecorderView> {
+        Ok(recorder().view())
+    }
 
-#[tauri::command]
-pub fn list_jobs() -> Vec<processing::JobView> {
-    processing::job_views()
-}
+    pub fn set_draft_notes(text: String) -> Res<()> {
+        recorder().set_notes(text);
+        Ok(())
+    }
 
-#[tauri::command]
-pub fn retry_job(id: String) -> Res<()> {
-    minutes_core::jobs::requeue_job(&id).map_err(|e| e.to_string())?;
-    processing::spawn_worker();
-    Ok(())
-}
+    pub fn set_recording_title(title: Option<String>) -> Res<()> {
+        recorder().set_title(title);
+        Ok(())
+    }
 
-// ---- library ---------------------------------------------------------------------------
+    pub fn discard_orphaned_draft() -> Res<()> {
+        let _ = std::fs::remove_file(paths::drafts_dir().join("current.md"));
+        Ok(())
+    }
 
-#[tauri::command]
-pub async fn list_meetings() -> Res<Vec<library::MeetingSummary>> {
-    blocking(|| Ok(library::list())).await
-}
+    pub fn list_jobs() -> Res<Vec<processing::JobView>> {
+        Ok(processing::job_views())
+    }
 
-#[tauri::command]
-pub async fn read_meeting(path: String) -> Res<library::MeetingDetail> {
-    blocking(move || library::read(&PathBuf::from(path))).await
-}
+    pub fn retry_job(id: String) -> Res<()> {
+        minutes_core::jobs::requeue_job(&id).map_err(|e| e.to_string())?;
+        processing::spawn_worker();
+        Ok(())
+    }
 
-#[tauri::command]
-pub async fn save_notes(path: String, notes: String) -> Res<()> {
-    blocking(move || {
+    pub fn list_meetings() -> Res<Vec<library::MeetingSummary>> {
+        Ok(library::list())
+    }
+
+    pub fn read_meeting(path: String) -> Res<library::MeetingDetail> {
+        library::read(&PathBuf::from(path))
+    }
+
+    pub fn save_notes(path: String, notes: String) -> Res<()> {
         let p = PathBuf::from(path);
         library::ensure_inside_output(&p)?;
         library::replace_notes(&p, &notes)
-    })
-    .await
-}
+    }
 
-#[tauri::command]
-pub async fn search_meetings(query: String) -> Res<Vec<library::SearchHit>> {
-    blocking(move || Ok(library::search(&query))).await
-}
+    pub fn search_meetings(query: String) -> Res<Vec<library::SearchHit>> {
+        Ok(library::search(&query))
+    }
 
-#[tauri::command]
-pub async fn trash_meeting(path: String) -> Res<()> {
-    blocking(move || library::trash(&PathBuf::from(path))).await
-}
+    pub fn trash_meeting(path: String) -> Res<()> {
+        library::trash(&PathBuf::from(path))
+    }
 
-#[tauri::command]
-pub fn reveal_in_finder(path: String) {
-    let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
-}
+    pub fn reveal_in_finder(path: String) -> Res<()> {
+        let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
+        Ok(())
+    }
 
-#[tauri::command]
-pub fn open_in_obsidian(path: String) -> Res<()> {
-    let p = PathBuf::from(&path);
-    library::obsidian_vault_for(&p).ok_or("This meeting isn't inside an Obsidian vault.")?;
-    let url = format!("obsidian://open?path={}", percent_encode(&path));
-    std::process::Command::new("/usr/bin/open").arg(url).spawn().map_err(|e| e.to_string())?;
-    Ok(())
-}
+    pub fn open_in_obsidian(path: String) -> Res<()> {
+        let p = PathBuf::from(&path);
+        library::obsidian_vault_for(&p).ok_or("This meeting isn't inside an Obsidian vault.")?;
+        let url = format!("obsidian://open?path={}", percent_encode(&path));
+        std::process::Command::new("/usr/bin/open").arg(url).spawn().map_err(|e| e.to_string())?;
+        Ok(())
+    }
 
-fn percent_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
+    pub fn rename_speaker(path: String, label: String, name: String, remember_voice: bool) -> Res<speakers::RenameResult> {
+        speakers::rename(&PathBuf::from(path), &label, &name, remember_voice)
+    }
 
-#[tauri::command]
-pub async fn rename_speaker(path: String, label: String, name: String, remember_voice: bool) -> Res<speakers::RenameResult> {
-    blocking(move || speakers::rename(&PathBuf::from(path), &label, &name, remember_voice)).await
-}
-
-#[tauri::command]
-pub async fn summarize_meeting(path: String) -> Res<()> {
-    blocking(move || {
+    pub fn summarize_meeting(path: String) -> Res<()> {
         let p = PathBuf::from(path);
         library::ensure_inside_output(&p)?;
         let cfg = corecfg::load();
         if cfg.summarization.engine == "none" {
             return Err("Summaries are off. Turn on Claude or Ollama in Settings → Summaries.".into());
         }
-        minutes_core::resummarize::resummarize_meeting(
+        let report = minutes_core::resummarize::resummarize_meeting(
             &p,
             &cfg,
             &minutes_core::resummarize::ResummarizeOptions { apply: true, template_override: None, refresh: Default::default() },
         )
-        .map(|_| ())
-        .map_err(|e| format!("Summary failed: {e}"))
-    })
-    .await
+        .map_err(|e| format!("Summary failed: {e}"))?;
+        if !report.applied {
+            return Err("The summary engine returned nothing. Check that it's running, then try again.".into());
+        }
+        Ok(())
+    }
+
+    pub fn list_voices() -> Res<Vec<speakers::VoiceProfileView>> {
+        Ok(speakers::list_voices())
+    }
+
+    pub fn forget_voice(slug: String) -> Res<()> {
+        speakers::forget_voice(&slug)
+    }
+
+    pub fn reset_preview() -> Res<reset::ResetPreview> {
+        Ok(reset::preview())
+    }
+
+    pub fn reset_app(options: reset::ResetOptions) -> Res<reset::ResetReport> {
+        reset::run(recorder(), &options)
+    }
+
+    pub fn mcp_snippet() -> Res<String> {
+        let dir = corecfg::load().output_dir.display().to_string();
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": { "minutes": { "command": "npx", "args": ["-y", "minutes-mcp"], "env": { "MEETINGS_DIR": dir } } }
+        }))
+        .unwrap_or_default())
+    }
+
+    fn percent_encode(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
 }
 
-#[tauri::command]
-pub fn list_voices() -> Vec<speakers::VoiceProfileView> {
-    speakers::list_voices()
+/// Dispatch by name with JSON arguments: the `--dev serve` bridge and its UI tests use
+/// this. Argument names match what the frontend sends (camelCase, as Tauri expects).
+pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
+    fn arg<T: for<'de> Deserialize<'de>>(args: &serde_json::Value, key: &str) -> Res<T> {
+        serde_json::from_value(args.get(key).cloned().unwrap_or(serde_json::Value::Null))
+            .map_err(|e| format!("bad argument {key}: {e}"))
+    }
+    fn out<T: Serialize>(r: Res<T>) -> Res<serde_json::Value> {
+        r.and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+    }
+    let a = &args;
+    match cmd {
+        "boot" => out(ops::boot()),
+        "save_settings" => out(ops::save_settings(arg(a, "settings")?)),
+        "folder_choices" => out(ops::folder_choices()),
+        "complete_onboarding" => out(ops::complete_onboarding()),
+        "models_status" => out(ops::models_status()),
+        "download_models" => out(ops::download_models()),
+        "permissions_state" => out(ops::permissions_state()),
+        // The QA bridge must never raise a macOS permission prompt.
+        "request_permission" => Err("Permission prompts are disabled in the QA bridge.".into()),
+        "open_privacy_settings" => Ok(serde_json::Value::Null),
+        "summary_backends" => out(ops::summary_backends()),
+        "start_recording" => out(ops::start_recording(arg(a, "kind")?, arg(a, "title")?)),
+        "stop_recording" => out(ops::stop_recording(arg(a, "notes")?, arg(a, "title")?)),
+        "recorder_view" => out(ops::recorder_view()),
+        "set_draft_notes" => out(ops::set_draft_notes(arg(a, "text")?)),
+        "set_recording_title" => out(ops::set_recording_title(arg(a, "title")?)),
+        "discard_orphaned_draft" => out(ops::discard_orphaned_draft()),
+        "list_jobs" => out(ops::list_jobs()),
+        "retry_job" => out(ops::retry_job(arg(a, "id")?)),
+        "list_meetings" => out(ops::list_meetings()),
+        "read_meeting" => out(ops::read_meeting(arg(a, "path")?)),
+        "save_notes" => out(ops::save_notes(arg(a, "path")?, arg(a, "notes")?)),
+        "search_meetings" => out(ops::search_meetings(arg(a, "query")?)),
+        "trash_meeting" => out(ops::trash_meeting(arg(a, "path")?)),
+        "reveal_in_finder" | "open_in_obsidian" => Ok(serde_json::Value::Null),
+        "rename_speaker" => out(ops::rename_speaker(arg(a, "path")?, arg(a, "label")?, arg(a, "name")?, arg(a, "rememberVoice")?)),
+        "summarize_meeting" => out(ops::summarize_meeting(arg(a, "path")?)),
+        "list_voices" => out(ops::list_voices()),
+        "forget_voice" => out(ops::forget_voice(arg(a, "slug")?)),
+        "reset_preview" => out(ops::reset_preview()),
+        "reset_app" => out(ops::reset_app(arg(a, "options")?)),
+        "mcp_snippet" => out(ops::mcp_snippet()),
+        other => Err(format!("unknown command {other}")),
+    }
 }
 
-#[tauri::command]
-pub fn forget_voice(slug: String) -> Res<()> {
-    speakers::forget_voice(&slug)
-}
+/// Tauri wrappers: same names and arguments as `ops`, run off the main thread.
+pub mod tauri_cmds {
+    use super::*;
 
-// ---- reset -----------------------------------------------------------------------------
+    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Res<T> + Send + 'static) -> Res<T> {
+        tauri::async_runtime::spawn_blocking(f).await.map_err(|e| e.to_string())?
+    }
 
-#[tauri::command]
-pub async fn reset_preview() -> Res<reset::ResetPreview> {
-    blocking(|| Ok(reset::preview())).await
-}
+    macro_rules! cmd {
+        ($name:ident ( $($arg:ident : $ty:ty),* ) -> $ret:ty) => {
+            #[tauri::command]
+            pub async fn $name($($arg: $ty),*) -> Res<$ret> {
+                blocking(move || ops::$name($($arg),*)).await
+            }
+        };
+    }
 
-#[tauri::command]
-pub async fn reset_app(app: AppHandle, options: reset::ResetOptions) -> Res<reset::ResetReport> {
-    let report = blocking({
-        let app = app.clone();
-        move || reset::run(&app.state::<Recorder>(), &options)
-    })
-    .await?;
-    crate::tray::refresh(&app);
-    Ok(report)
-}
-
-#[tauri::command]
-pub fn mcp_snippet() -> String {
-    let dir = corecfg::load().output_dir.display().to_string();
-    serde_json::to_string_pretty(&serde_json::json!({
-        "mcpServers": { "minutes": { "command": "npx", "args": ["-y", "minutes-mcp"], "env": { "MEETINGS_DIR": dir } } }
-    }))
-    .unwrap_or_default()
+    cmd!(boot() -> ops::Boot);
+    cmd!(save_settings(settings: corecfg::AppSettings) -> corecfg::AppSettings);
+    cmd!(folder_choices() -> ops::FolderChoices);
+    cmd!(complete_onboarding() -> ());
+    cmd!(models_status() -> Vec<models::ModelFile>);
+    cmd!(download_models() -> ());
+    cmd!(permissions_state() -> permissions::PermissionState);
+    cmd!(request_permission(which: String) -> &'static str);
+    cmd!(open_privacy_settings(pane: String) -> ());
+    cmd!(summary_backends() -> summaries::SummaryBackends);
+    cmd!(start_recording(kind: Kind, title: Option<String>) -> RecorderView);
+    cmd!(stop_recording(notes: Option<String>, title: Option<String>) -> Stopped);
+    cmd!(recorder_view() -> RecorderView);
+    cmd!(set_draft_notes(text: String) -> ());
+    cmd!(set_recording_title(title: Option<String>) -> ());
+    cmd!(discard_orphaned_draft() -> ());
+    cmd!(list_jobs() -> Vec<processing::JobView>);
+    cmd!(retry_job(id: String) -> ());
+    cmd!(list_meetings() -> Vec<library::MeetingSummary>);
+    cmd!(read_meeting(path: String) -> library::MeetingDetail);
+    cmd!(save_notes(path: String, notes: String) -> ());
+    cmd!(search_meetings(query: String) -> Vec<library::SearchHit>);
+    cmd!(trash_meeting(path: String) -> ());
+    cmd!(reveal_in_finder(path: String) -> ());
+    cmd!(open_in_obsidian(path: String) -> ());
+    cmd!(rename_speaker(path: String, label: String, name: String, remember_voice: bool) -> speakers::RenameResult);
+    cmd!(summarize_meeting(path: String) -> ());
+    cmd!(list_voices() -> Vec<speakers::VoiceProfileView>);
+    cmd!(forget_voice(slug: String) -> ());
+    cmd!(reset_preview() -> reset::ResetPreview);
+    cmd!(reset_app(options: reset::ResetOptions) -> reset::ResetReport);
+    cmd!(mcp_snippet() -> String);
 }

@@ -98,6 +98,21 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `.md` files directly in `dir` that carry meeting frontmatter (`type:` present).
+pub fn meeting_files_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .map(|c| frontmatter(&c).0.get("type").is_some())
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 fn frontmatter(content: &str) -> (serde_yaml::Value, &str) {
     let (fm, body) = split_frontmatter(content);
     let value = serde_yaml::from_str(fm).unwrap_or(serde_yaml::Value::Null);

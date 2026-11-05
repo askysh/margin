@@ -2,12 +2,11 @@
 //! a child process, as in both upstream frontends: whisper and ONNX get their own address
 //! space, and processing keeps going if the window is closed.
 
-use crate::{corecfg, library, paths};
+use crate::{corecfg, events, library, paths};
 use minutes_core::jobs::{self, JobState};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
 
 pub const WORKER_FLAG: &str = "--process-queue-worker";
 
@@ -94,7 +93,7 @@ pub fn job_views() -> Vec<JobView> {
 
 /// Polls job files, pushes changes to the UI, and puts the user's exact notes into the
 /// finished meeting file.
-pub fn spawn_watcher(app: AppHandle) {
+pub fn spawn_watcher() {
     // Resume anything left from a previous run (crash, quit mid-processing).
     if !jobs::active_jobs().is_empty() {
         spawn_worker();
@@ -104,6 +103,7 @@ pub fn spawn_watcher(app: AppHandle) {
         .spawn(move || {
             let mut last: HashMap<String, JobView> = HashMap::new();
             let mut first = true;
+            let mut idle_polls = 0u32;
             loop {
                 let views = job_views();
                 let mut changed = false;
@@ -111,13 +111,20 @@ pub fn spawn_watcher(app: AppHandle) {
                     if last.get(&view.id) != Some(view) {
                         changed = true;
                         if view.state.is_terminal() {
-                            finish(&app, view, !first);
+                            finish(view, !first);
                         }
                     }
                 }
                 first = false;
+                // A job queued just as the worker finished its loop would wait forever.
+                let pending = views.iter().any(|v| v.state == JobState::Queued);
+                idle_polls = if pending && !jobs::worker_active() { idle_polls + 1 } else { 0 };
+                if idle_polls >= 5 {
+                    idle_polls = 0;
+                    spawn_worker();
+                }
                 if changed || views.len() != last.len() {
-                    let _ = app.emit("jobs", &views);
+                    events::emit("jobs", &views);
                     last = views.into_iter().map(|v| (v.id.clone(), v)).collect();
                 }
                 std::thread::sleep(Duration::from_millis(1000));
@@ -128,11 +135,16 @@ pub fn spawn_watcher(app: AppHandle) {
 
 /// `announce` is false on the first poll, so old jobs from the archive don't each fire
 /// "meeting-ready". Their leftover drafts are still restored.
-fn finish(app: &AppHandle, job: &JobView, announce: bool) {
+fn finish(job: &JobView, announce: bool) {
     let draft = paths::drafts_dir().join(format!("{}.md", job.id));
     let Some(output) = job.output_path.as_deref() else {
         return;
     };
+    // A failed job may be retried, and a retry rewrites the file. Keep the draft until a
+    // run succeeds.
+    if !matches!(job.state, JobState::Complete | JobState::NeedsReview) {
+        return;
+    }
     if let Ok(notes) = std::fs::read_to_string(&draft) {
         match library::replace_notes(std::path::Path::new(output), &notes) {
             Ok(()) => {
@@ -142,6 +154,6 @@ fn finish(app: &AppHandle, job: &JobView, announce: bool) {
         }
     }
     if announce {
-        let _ = app.emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
+        events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
     }
 }

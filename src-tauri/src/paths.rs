@@ -56,9 +56,13 @@ pub fn default_output_dir() -> PathBuf {
 /// before minutes-core is touched; child processes inherit it.
 pub fn install_env() {
     let state = state_dir();
-    let _ = std::fs::create_dir_all(&state);
-    let _ = std::fs::create_dir_all(drafts_dir());
+    ensure_dirs();
     std::env::set_var("MINUTES_CONFIG_PATH", config_path());
     std::env::set_var("MINUTES_DATA_DIR", &state);
     std::env::set_var("MINUTES_HOME", &state);
+}
+
+pub fn ensure_dirs() {
+    let _ = std::fs::create_dir_all(state_dir());
+    let _ = std::fs::create_dir_all(drafts_dir());
 }

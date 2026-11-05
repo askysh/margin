@@ -21,6 +21,7 @@ export interface LiveLine {
 
 export interface RecorderView {
   recording: boolean;
+  stopping: boolean;
   kind: Kind | null;
   title: string | null;
   started_at: string | null;
@@ -141,7 +142,8 @@ export const api = {
   openPrivacySettings: (pane: "microphone" | "system-audio") => invoke<void>("open_privacy_settings", { pane }),
   summaryBackends: () => invoke<Backends>("summary_backends"),
   startRecording: (kind: Kind, title?: string) => invoke<RecorderView>("start_recording", { kind, title: title ?? null }),
-  stopRecording: () => invoke<{ job_id: string; title: string | null }>("stop_recording"),
+  stopRecording: (notes: string | null, title: string | null) =>
+    invoke<{ job_id: string; title: string | null }>("stop_recording", { notes, title }),
   recorderView: () => invoke<RecorderView>("recorder_view"),
   setDraftNotes: (text: string) => invoke<void>("set_draft_notes", { text }),
   setRecordingTitle: (title: string) => invoke<void>("set_recording_title", { title }),
