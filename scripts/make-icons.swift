@@ -15,17 +15,17 @@ func png(_ size: CGFloat, _ path: String, _ draw: (CGRect) -> Void) {
     try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
 }
 
-// App icon: warm paper squircle, a terracotta margin rule, three ink lines.
+// App icon: steno-pad paper, the green margin rule, three ink lines.
 png(1024, "\(out)/app-icon.png") { r in
     let inset = r.insetBy(dx: 100, dy: 100)
     let shape = NSBezierPath(roundedRect: inset, xRadius: 185, yRadius: 185)
-    NSGradient(starting: NSColor(calibratedRed: 0.99, green: 0.97, blue: 0.93, alpha: 1),
-               ending: NSColor(calibratedRed: 0.95, green: 0.91, blue: 0.84, alpha: 1))!
+    NSGradient(starting: NSColor(calibratedRed: 0.95, green: 0.96, blue: 0.94, alpha: 1),
+               ending: NSColor(calibratedRed: 0.87, green: 0.91, blue: 0.86, alpha: 1))!
         .draw(in: shape, angle: -90)
     NSColor(calibratedWhite: 0, alpha: 0.08).setStroke(); shape.lineWidth = 4; shape.stroke()
     let rule = NSBezierPath(roundedRect: CGRect(x: 330, y: 230, width: 26, height: 564), xRadius: 13, yRadius: 13)
-    NSColor(calibratedRed: 0.82, green: 0.38, blue: 0.27, alpha: 1).setFill(); rule.fill()
-    NSColor(calibratedRed: 0.17, green: 0.16, blue: 0.15, alpha: 1).setFill()
+    NSColor(calibratedRed: 0.37, green: 0.58, blue: 0.50, alpha: 1).setFill(); rule.fill()
+    NSColor(calibratedRed: 0.11, green: 0.14, blue: 0.19, alpha: 1).setFill()
     for (i, w) in [300.0, 250.0, 180.0].enumerated() {
         NSBezierPath(roundedRect: CGRect(x: 410, y: 640 - Double(i) * 130, width: w, height: 44),
                      xRadius: 22, yRadius: 22).fill()

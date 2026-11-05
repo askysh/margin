@@ -65,7 +65,15 @@ pub fn list() -> Vec<MeetingSummary> {
     let mut files = Vec::new();
     collect(&root, &root, &mut files);
     let mut out: Vec<MeetingSummary> = files.iter().filter_map(|p| summarize_file(p)).collect();
-    out.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.path.cmp(&a.path)));
+    // Dates carry different UTC offsets, so compare instants, not strings.
+    let instant = |m: &MeetingSummary| {
+        m.date
+            .as_deref()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| d.timestamp_millis())
+            .unwrap_or(0)
+    };
+    out.sort_by(|a, b| instant(b).cmp(&instant(a)).then_with(|| b.path.cmp(&a.path)));
     out
 }
 
