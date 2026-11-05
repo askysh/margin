@@ -54,6 +54,7 @@ export interface Turn {
   speaker: string | null;
   ts: string;
   text: string;
+  source: "MICROPHONE" | "SYSTEM" | null;
 }
 
 export interface Speaker {

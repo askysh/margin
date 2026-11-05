@@ -24,6 +24,9 @@ const flag = (k) => argv.includes(k);
 const audio = opt("--audio");
 const seed = opt("--seed-models");
 const summaries = opt("--summaries", "none");
+// --simulate <wav>: debug builds play this file instead of the mic (MARGIN_SIMULATE_CAPTURE),
+// with <wav>.voice.wav / .system.wav stems and <wav>.live.jsonl as the live transcript.
+const simulate = opt("--simulate");
 if (!audio) throw new Error("--audio <wav> is required");
 
 const base = process.env.E2E_DIR || "/tmp/margin-e2e";
@@ -39,7 +42,7 @@ if (seed) {
   fs.cpSync(seed, dest, { recursive: true });
 }
 const meetingsDir = path.join(home, "Documents/Meetings");
-const env = { ...process.env, HOME: home, MARGIN_HOME: marginHome };
+const env = { ...process.env, HOME: home, MARGIN_HOME: marginHome, ...(simulate ? { MARGIN_SIMULATE_CAPTURE: path.resolve(simulate) } : {}) };
 const bin = path.join(root, "src-tauri/target/debug/margin");
 
 const procs = [];
@@ -126,6 +129,52 @@ await check("summaries step: finish setup", async () => {
   await page.getByText(/Your first meeting starts here/).waitFor({ timeout: 8000 });
   assert(JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8")).onboarding_complete, "prefs not saved");
 });
+
+// ---------------------------------------------------------------- record a call (simulated mic)
+if (simulate) {
+  await check("record a call: live notepad opens", async () => {
+    await page.getByRole("button", { name: "Record call", exact: true }).click();
+    await page.getByLabel("Meeting title").waitFor({ timeout: 10000 });
+    await page.locator(".rule-live").waitFor();
+    await page.locator(".row-live").waitFor();
+  });
+  await check("live transcript streams with You / Them", async () => {
+    await page.getByLabel("Meeting title").fill("QA live call");
+    await page.locator(".row-live", { hasText: "QA live call" }).waitFor({ timeout: 3000 });
+    await page.getByLabel("Your notes").click();
+    await page.keyboard.type("- risk: download size");
+    await page.locator(".live-line").nth(3).waitFor({ timeout: 45000 });
+    const who = await page.locator(".live-speaker").allInnerTexts();
+    assert(who.includes("You") && who.includes("Them"), `speakers seen: ${who.join(",")}`);
+    const first = await page.locator(".live-line").first().innerText();
+    assert(first.includes("launch plan"), `first line: ${first}`);
+  });
+  await check("typing right up to Stop keeps every word", async () => {
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("last words before stop");
+    await page.getByRole("button", { name: "Stop" }).click();
+    await page.getByText(/Transcribing|Queued|Telling speakers apart|Saving/).first().waitFor({ timeout: 15000 });
+  });
+  let liveMd = null;
+  await check("after processing, the meeting opens with the notes", async () => {
+    await page.locator("h1.title", { hasText: "QA live call" }).waitFor({ timeout: 180000 });
+    await page.locator(".turn").first().waitFor({ timeout: 10000 });
+    const f = meetingFiles().find((x) => x.includes("qa-live-call"));
+    assert(f, "no qa-live-call file");
+    liveMd = fs.readFileSync(path.join(meetingsDir, f), "utf8");
+    assert(liveMd.includes("## Notes\n\n- risk: download size\n- last words before stop\n"), "notes not exact:\n" + liveMd.slice(liveMd.indexOf("## Notes"), liveMd.indexOf("## Transcript")));
+  });
+  await check("transcript rows use the same names as the speaker chips", async () => {
+    const chips = new Set(await page.locator(".chip").allInnerTexts());
+    const rows = new Set(await page.locator(".turn-speaker").allInnerTexts());
+    for (const r of rows) assert(chips.has(r), `row label "${r}" has no chip (${[...chips].join(", ")})`);
+  });
+  await check("call stems give speaker separation", async () => {
+    const labels = [...new Set([...liveMd.matchAll(/^\[([^\]]+?) \d+:\d\d\]/gm)].map((m) => m[1]))];
+    assert(labels.length >= 2, `labels: ${labels.join(", ")}`);
+    fs.writeFileSync(path.join(out, "live-call.md"), liveMd);
+  });
+}
 
 // ---------------------------------------------------------------- a meeting arrives
 const notesFile = path.join(base, "notes.md");

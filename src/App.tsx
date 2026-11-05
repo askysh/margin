@@ -30,6 +30,7 @@ export default function App() {
   const [callApp, setCallApp] = useState<string | null>(null);
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
+  const recorderRef = useRef<RecorderView | null>(null);
 
   const notify = useCallback((text: string, tone: "info" | "error" = "info") => {
     setToast({ text, tone });
@@ -43,6 +44,7 @@ export default function App() {
       .boot()
       .then((b) => {
         setBoot(b);
+        recorderRef.current = b.recorder;
         setRecorder(b.recorder);
         setLines(b.recorder.lines);
         if (b.recorder.recording) setSelection({ type: "live" });
@@ -56,11 +58,14 @@ export default function App() {
     api.listJobs().then(setJobs).catch(() => {});
     const subs = [
       on<RecorderView>("recorder", (v) => {
-        setRecorder(v);
-        if (v.recording) {
+        // A new recording (or one started from the menu bar) takes over the window. Later
+        // updates, such as a title change, must not pull you back from another meeting.
+        if (v.recording && !recorderRef.current?.recording) {
           setLines(v.lines);
           setSelection({ type: "live" });
         }
+        recorderRef.current = v;
+        setRecorder(v);
       }),
       on<LiveLine[]>("live-lines", (l) => setLines((prev) => [...prev, ...l.filter((x) => !prev.some((p) => p.line === x.line))])),
       on<{ elapsed_secs: number; level: number }>("recorder-tick", setTick),
@@ -98,6 +103,7 @@ export default function App() {
     setCallApp(null);
     try {
       const v = await api.startRecording(kind);
+      recorderRef.current = v;
       setRecorder(v);
       setLines([]);
       setTick({ elapsed_secs: 0, level: 0 });

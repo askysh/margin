@@ -57,7 +57,13 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
       });
   });
 
-  const names = useMemo(() => speakerNames((m?.transcript ?? []).map((t) => t.speaker ?? "").filter(Boolean)), [m]);
+  // One display name per label, used by chips and transcript rows alike: a name from
+  // speaker_map wins, then "You" / "Them" / "Speaker n".
+  const names = useMemo(() => {
+    const base = speakerNames((m?.transcript ?? []).map((t) => t.speaker ?? "").filter(Boolean));
+    for (const s of m?.speakers ?? []) if (s.name) base.set(s.label, s.name);
+    return base;
+  }, [m]);
 
   if (error) return <div className="page page-empty"><p className="empty-title">Couldn't open this meeting</p><p className="empty-body">{error}</p></div>;
   if (!m) return <div className="page" />;
@@ -238,7 +244,9 @@ function SpeakerChip(props: {
       </button>
       {props.open && (
         <form className="popover" onSubmit={submit} onKeyDown={(e) => e.key === "Escape" && props.onClose()}>
-          <label className="field-label" htmlFor={`rn-${props.label}`}>Who is {props.display}?</label>
+          <label className="field-label" htmlFor={`rn-${props.label}`}>
+            {props.label === "SYSTEM" ? "Who was on the other end of the call?" : props.label === "MICROPHONE" ? "Who was speaking on your mic?" : `Who is ${props.display}?`}
+          </label>
           <input id={`rn-${props.label}`} autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" />
           <label className="check">
             <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />

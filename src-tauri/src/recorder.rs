@@ -129,8 +129,16 @@ impl Recorder {
     }
 
     pub fn set_title(&self, title: Option<String>) {
-        if let Some(a) = self.active.lock().unwrap().as_mut() {
-            a.title = title.filter(|t| !t.trim().is_empty());
+        let changed = match self.active.lock().unwrap().as_mut() {
+            Some(a) => {
+                a.title = title.filter(|t| !t.trim().is_empty());
+                true
+            }
+            None => false,
+        };
+        if changed {
+            // The sidebar and menu bar show the title.
+            events::emit("recorder", self.view());
         }
     }
 
@@ -140,19 +148,24 @@ impl Recorder {
         }
         // Slow checks (device listing, process scan) run without holding the lock, so the
         // UI can keep asking for the recorder state meanwhile.
-        ensure_permissions(kind)?;
+        let simulate = simulated_source();
+        if simulate.is_none() {
+            ensure_permissions(kind)?;
+        }
         let cfg = session_config(kind);
         cfg.ensure_dirs().map_err(|e| format!("Couldn't create the meetings folder: {e}"))?;
         let intent = match kind {
             Kind::Call => RecordingIntent::Call,
             Kind::InPerson => RecordingIntent::Room,
         };
-        let preflight = capture::preflight_recording(CaptureMode::Meeting, Some(intent), false, &cfg)?;
-        if let Some(reason) = preflight.blocking_reason {
-            return Err(reason);
-        }
-        for warning in &preflight.warnings {
-            tracing::info!(%warning, "recording preflight");
+        if simulate.is_none() {
+            let preflight = capture::preflight_recording(CaptureMode::Meeting, Some(intent), false, &cfg)?;
+            if let Some(reason) = preflight.blocking_reason {
+                return Err(reason);
+            }
+            for warning in &preflight.warnings {
+                tracing::info!(%warning, "recording preflight");
+            }
         }
         if pid::inspect_pid_file(&pid::live_transcript_pid_path()).is_active() {
             return Err("A live transcript session is already running.".into());
@@ -193,6 +206,9 @@ impl Recorder {
             std::thread::Builder::new()
                 .name("margin-capture".into())
                 .spawn(move || {
+                    if let Some(source) = simulate {
+                        return simulate_capture(&source, &wav, &stop);
+                    }
                     capture::record_to_wav_with_lifecycle(
                         &wav,
                         stop,
@@ -520,6 +536,85 @@ fn window_rms_from_end(path: &Path, lag_ms: u64, duration_ms: u64) -> Option<f32
     let samples = buf[..read - read % 2].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0);
     let (sum, count) = samples.fold((0f64, 0usize), |(s, c), x| (s + (x * x) as f64, c + 1));
     (count > 0).then(|| (sum / count as f64).sqrt() as f32)
+}
+
+/// Debug builds only: `MARGIN_SIMULATE_CAPTURE=<wav>` replaces the microphone with a file,
+/// so the whole record → live transcript → stop → process flow can be tested without
+/// permissions (scripts/e2e). Release builds ignore it.
+fn simulated_source() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var_os("MARGIN_SIMULATE_CAPTURE").map(PathBuf::from).filter(|p| p.exists())
+}
+
+/// Plays `source` (16 kHz mono 16-bit) into `dest` in real time, copying its
+/// `.voice.wav` and `.system.wav` stems alongside when present. Lines from
+/// `<source>.live.jsonl` (`{"offset_ms","duration_ms","text"}`) are written to the live
+/// transcript once their time has passed, as core's sidecar would write them.
+fn simulate_capture(source: &Path, dest: &Path, stop: &AtomicBool) -> Result<(), String> {
+    let spec = hound::WavSpec { channels: 1, sample_rate: 16_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let read = |p: &Path| -> Option<Vec<i16>> { hound::WavReader::open(p).ok()?.samples::<i16>().collect::<Result<_, _>>().ok() };
+    let main = read(source).ok_or("simulated source unreadable")?;
+    let src_stems = capture::stem_paths_for(source);
+    let dst_stems = capture::stem_paths_for(dest).ok_or("bad dest")?;
+    let mut tracks: Vec<(Vec<i16>, hound::WavWriter<std::io::BufWriter<std::fs::File>>)> =
+        vec![(main, hound::WavWriter::create(dest, spec).map_err(|e| e.to_string())?)];
+    if let Some(stems) = src_stems {
+        for (src, dst) in [(stems.voice, dst_stems.voice), (stems.system, dst_stems.system)] {
+            if let Some(samples) = read(&src) {
+                tracks.push((samples, hound::WavWriter::create(&dst, spec).map_err(|e| e.to_string())?));
+            }
+        }
+    }
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(source.with_extension("live.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let started = Instant::now();
+    let start_wall = Local::now();
+    let mut written = 0usize;
+    let mut next_line = 0usize;
+    let total = tracks[0].0.len();
+    while written < total && !stop.load(Ordering::SeqCst) {
+        let chunk = 1600.min(total - written); // 100 ms
+        for (samples, writer) in tracks.iter_mut() {
+            for &s in samples.iter().skip(written).take(chunk) {
+                writer.write_sample(s).map_err(|e| e.to_string())?;
+            }
+            writer.flush().map_err(|e| e.to_string())?;
+        }
+        written += chunk;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        while let Some(l) = lines.get(next_line) {
+            let end = l["offset_ms"].as_u64().unwrap_or(0) + l["duration_ms"].as_u64().unwrap_or(0);
+            if end + 1200 > elapsed_ms {
+                break;
+            }
+            next_line += 1;
+            let line = serde_json::json!({
+                "line": next_line,
+                "ts": (start_wall + chrono::Duration::milliseconds(elapsed_ms as i64)).to_rfc3339(),
+                "offset_ms": end,
+                "duration_ms": l["duration_ms"],
+                "text": l["text"],
+                "speaker": null,
+            });
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(pid::live_transcript_jsonl_path()).map_err(|e| e.to_string())?;
+            writeln!(f, "{line}").map_err(|e| e.to_string())?;
+        }
+        let target = Duration::from_millis((written as u64) / 16);
+        if let Some(wait) = target.checked_sub(started.elapsed()) {
+            std::thread::sleep(wait);
+        }
+    }
+    for (_, writer) in tracks {
+        writer.finalize().map_err(|e| e.to_string())?;
+    }
+    // Like core's silence auto-stop: the source ran out before Stop was pressed.
+    Ok(())
 }
 
 /// A draft left by a crash mid-recording (shown once in the UI).

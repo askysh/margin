@@ -64,13 +64,15 @@ export function speakerNames(order: string[]): Map<string, string> {
   for (const label of order) {
     if (out.has(label)) continue;
     n++;
-    out.set(label, isRawSpeaker(label) ? `Speaker ${n}` : label);
+    out.set(label, label === "MICROPHONE" ? "You" : label === "SYSTEM" ? "Them" : isRawSpeaker(label) ? `Speaker ${n}` : label);
   }
   return out;
 }
 
+/** Labels core writes before anyone is named: diarized `SPEAKER_n`, or the capture source
+ * (`MICROPHONE` = your mic, `SYSTEM` = the call) on call recordings. */
 export function isRawSpeaker(label: string | null): boolean {
-  return !!label && /^SPEAKER_\d+$/.test(label);
+  return !!label && /^(SPEAKER_\d+|MICROPHONE|SYSTEM)$/.test(label);
 }
 
 export function useDebounced<T>(value: T, ms: number, fn: (v: T) => void) {

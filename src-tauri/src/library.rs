@@ -33,6 +33,8 @@ pub struct Turn {
     pub speaker: Option<String>,
     pub ts: String,
     pub text: String,
+    /// "MICROPHONE" | "SYSTEM" when core tagged a diarized line with its capture source.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,10 +214,19 @@ fn parse_transcript(body: &str) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     for line in body.lines() {
         if let Some(c) = re.captures(line.trim()) {
+            // Call recordings: `[SPEAKER_0 0:22] [MICROPHONE] text` carries the source too.
+            let (source, text) = match c[3].strip_prefix("[MICROPHONE] ") {
+                Some(t) => (Some("MICROPHONE"), t),
+                None => match c[3].strip_prefix("[SYSTEM] ") {
+                    Some(t) => (Some("SYSTEM"), t),
+                    None => (None, &c[3]),
+                },
+            };
             turns.push(Turn {
                 speaker: c.get(1).map(|m| m.as_str().to_string()),
                 ts: c[2].to_string(),
-                text: c[3].to_string(),
+                text: text.to_string(),
+                source: source.map(String::from),
             });
         } else if let Some(last) = turns.last_mut() {
             if !line.trim().is_empty() {
@@ -450,6 +461,10 @@ mod tests {
         assert_eq!(turns[0].speaker.as_deref(), Some("SPEAKER_0"));
         assert_eq!(turns[1].speaker.as_deref(), Some("Alice Smith"));
         assert_eq!(turns[1].ts, "1:02");
+        let call = parse_transcript("[MICROPHONE 0:00] hi\n[SPEAKER_0 0:22] [SYSTEM] yo");
+        assert_eq!(call[0].speaker.as_deref(), Some("MICROPHONE"));
+        assert_eq!(call[1].text, "yo");
+        assert_eq!(call[1].source.as_deref(), Some("SYSTEM"));
         let bare = parse_transcript("[0:09] So let's add that.");
         assert_eq!(bare[0].speaker, None);
         assert_eq!(bare[0].text, "So let's add that.");
