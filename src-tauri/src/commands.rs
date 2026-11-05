@@ -23,6 +23,7 @@ pub mod ops {
     }
 
     pub fn boot() -> Res<Boot> {
+        tracing::info!("ui connected (boot)");
         Ok(Boot {
             onboarded: prefs::load().onboarding_complete && corecfg::exists(),
             settings: corecfg::settings(&corecfg::load()),
@@ -89,6 +90,7 @@ pub mod ops {
     }
 
     pub fn models_status() -> Res<Vec<models::ModelFile>> {
+        tracing::debug!("models_status");
         Ok(models::required(&corecfg::load()))
     }
 

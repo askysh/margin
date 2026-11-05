@@ -1,5 +1,33 @@
 # Progress
 
+## Start here (morning of 2026-11-06)
+
+What I could not do overnight is the one thing that needs you: real microphone and
+system-audio capture, because macOS asks a person for permission. Everything else was
+tested end to end (31/31). Suggested first run, about 10 minutes:
+
+1. `scripts/build-app.sh && open src-tauri/target/release/bundle/macos/Margin.app`
+2. Onboarding:
+   - Your name.
+   - Pick the **Obsidian: Workspace 42** option, or Documents.
+   - **Balanced** model: a 523 MB download.
+   - **Allow** both permissions.
+   - Summaries: **Claude** (it found `~/.local/bin/claude`).
+3. **Record in person** (⌘⇧I) for 30 s while talking. Type a couple of notes, then Stop.
+   You should see:
+   - live lines on the right
+   - the red rule moving with your voice
+   - processing, then the finished meeting with your notes.
+4. **Record call** (⌘⇧R) with a YouTube video playing. Live lines should alternate
+   You / Them.
+5. Rename a speaker. Edit notes, then open the file in Obsidian. Settings → **Reset
+   Margin…**.
+
+If capture fails, the error toast says why, and `~/Library/Application
+Support/Margin/state/logs/margin.log` has the details. Margin doesn't touch the upstream
+Minutes app's settings, and the two can be installed side by side. Quit Minutes.app while
+testing, so the two don't record at once.
+
 ## 2026-11-06
 
 ### M0: Phase 1 research (done)
