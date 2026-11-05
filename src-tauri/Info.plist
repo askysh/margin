@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Margin records your voice so it can transcribe your meetings on this Mac. Audio never leaves your computer.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Margin records the other people on your calls (Zoom, Meet, Teams) by capturing system audio. It is transcribed on this Mac and never uploaded.</string>
+  <key>LSUIElement</key>
+  <false/>
+</dict>
+</plist>
