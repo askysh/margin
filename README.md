@@ -80,7 +80,7 @@ $M --dev serve [port]                    # QA bridge for scripts/e2e
 
 ## What works
 
-Everything below was checked by the end-to-end pass, 29 of 29 (see PROGRESS.md), unless
+Everything below was checked by the end-to-end pass, 31 of 31 (see PROGRESS.md), unless
 it says otherwise.
 
 - **Onboarding.** It runs in this order:
@@ -105,6 +105,7 @@ it says otherwise.
     The frontmatter and the other sections stay byte-for-byte.
   - Titles can be edited. The file name stays, so Obsidian links keep working.
   - Recordings with no speech say what to check.
+  - While core is still finishing a meeting (speakers, summary), it's shown read-only.
 - **Renaming a speaker.** Click a speaker chip or a transcript label, then *Rename
   everywhere*.
   - This updates the transcript labels, mentions in the summary, action-item assignees,

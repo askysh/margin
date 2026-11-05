@@ -38,7 +38,7 @@
   - draft handling on retry
   - temp-file collisions
 - The end-to-end QA harness (`scripts/e2e/run.mjs`) runs the real UI in headless WebKit
-  against the real backend in a sandbox. **29/29 checks pass**:
+  against the real backend in a sandbox. **29/29 checks pass** (31/31 after M3):
   - Onboarding writes explicit config: summaries none, calendar off, your name.
   - A simulated call recording shows live You/Them lines from the real stem heuristic.
     Notes typed right up to Stop are kept. Processing runs in the worker child. The UI
@@ -64,3 +64,26 @@
   mic plus the Core Audio process tap, with system audio ready.
 - **Still not verified:** real microphone and system-audio capture. It needs a person to
   answer the macOS permission prompts, and is the first thing to try in the morning.
+
+### M3: second review and hardening (done, overnight 2026-11-06)
+- A second independent review of the frontend state logic and the newer backend found
+  3 high, 4 medium and 6 low issues. All are fixed. In short:
+  - Notes can no longer be lost:
+    - Live notes survive leaving and coming back to a recording.
+    - Debounced saves are flushed on unmount.
+    - Note saves run in order behind an edit counter.
+  - Meetings that core is still enriching are read-only. Editing them made core's
+    enrichment step fail.
+  - Every way a recording can stop (window, menu bar, auto-stop) navigates through a
+    `recording-stopped` event that carries the job ID.
+  - Writes are safer:
+    - A per-file lock covers notes, title and speaker rename.
+    - Settings saves run one at a time.
+    - Restoring a draft at launch never overwrites notes edited in Obsidian meanwhile.
+  - Quit never blocks the main thread while a recording finishes saving.
+  - Recordings under a second are discarded instead of leaving files in the vault.
+- e2e now has 31 checks, including two that reproduce the review's scenarios: a quick
+  switch right after typing, and leaving and returning to a live recording. An in-person
+  recording shows no You/Them labels.
+- Load test: 600 one-hour meetings (40 MB). The library list takes 0.1 s, and a full-text
+  search 0.1–0.2 s (debug build).
