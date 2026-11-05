@@ -22,7 +22,9 @@ pub fn run(args: &[String]) -> i32 {
 
 fn run_inner(args: &[String]) -> Result<(), String> {
     let mut cfg = corecfg::load();
-    if !corecfg::exists() {
+    // `serve` must look like a first launch to the UI, so only the other commands get a
+    // config written up front.
+    if !corecfg::exists() && args.first().map(String::as_str) != Some("serve") {
         corecfg::save(&mut cfg)?;
     }
     match args.first().map(String::as_str) {
