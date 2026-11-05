@@ -19,6 +19,8 @@ pub struct JobView {
     pub output_path: Option<String>,
     pub created_at: String,
     pub error: Option<String>,
+    /// Notes typed during the recording, until they're added to the meeting file.
+    pub draft: Option<String>,
 }
 
 pub fn run_worker_mode() -> i32 {
@@ -80,6 +82,7 @@ pub fn job_views() -> Vec<JobView> {
     jobs::display_jobs(Some(30), true)
         .into_iter()
         .map(|j| JobView {
+            draft: std::fs::read_to_string(paths::drafts_dir().join(format!("{}.md", j.id))).ok(),
             id: j.id,
             title: j.title,
             state: j.state,

@@ -183,7 +183,7 @@ export default function App() {
           {selection.type === "processing" && (
             <ProcessingView
               job={jobs.find((j) => j.id === selection.jobId) ?? null}
-              notes={selection.notes}
+              notes={selection.notes || jobs.find((j) => j.id === selection.jobId)?.draft || ""}
               title={selection.title}
               onOpen={(path) => setSelection({ type: "meeting", path })}
               onRetry={(id) => api.retryJob(id).catch((e) => notify(errorText(e), "error"))}

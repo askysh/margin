@@ -85,6 +85,7 @@ export interface Job {
   output_path: string | null;
   created_at: string;
   error: string | null;
+  draft: string | null;
 }
 
 export interface ModelFile {
@@ -154,6 +155,7 @@ export const api = {
   listMeetings: () => invoke<MeetingSummary[]>("list_meetings"),
   readMeeting: (path: string) => invoke<MeetingDetail>("read_meeting", { path }),
   saveNotes: (path: string, notes: string) => invoke<void>("save_notes", { path, notes }),
+  setMeetingTitle: (path: string, title: string) => invoke<void>("set_meeting_title", { path, title }),
   search: (query: string) => invoke<{ path: string; excerpt: string }[]>("search_meetings", { query }),
   trashMeeting: (path: string) => invoke<void>("trash_meeting", { path }),
   reveal: (path: string) => invoke<void>("reveal_in_finder", { path }),

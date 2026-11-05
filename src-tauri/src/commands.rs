@@ -163,6 +163,10 @@ pub mod ops {
         library::replace_notes(&p, &notes)
     }
 
+    pub fn set_meeting_title(path: String, title: String) -> Res<()> {
+        library::set_title(&PathBuf::from(path), &title)
+    }
+
     pub fn search_meetings(query: String) -> Res<Vec<library::SearchHit>> {
         Ok(library::search(&query))
     }
@@ -294,6 +298,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "read_meeting" => out(ops::read_meeting(arg(a, "path")?)),
         "save_notes" => out(ops::save_notes(arg(a, "path")?, arg(a, "notes")?)),
         "search_meetings" => out(ops::search_meetings(arg(a, "query")?)),
+        "set_meeting_title" => out(ops::set_meeting_title(arg(a, "path")?, arg(a, "title")?)),
         "trash_meeting" => out(ops::trash_meeting(arg(a, "path")?)),
         "reveal_in_finder" | "open_in_obsidian" => Ok(serde_json::Value::Null),
         "rename_speaker" => out(ops::rename_speaker(arg(a, "path")?, arg(a, "label")?, arg(a, "name")?, arg(a, "rememberVoice")?)),
@@ -346,6 +351,7 @@ pub mod tauri_cmds {
     cmd!(read_meeting(path: String) -> library::MeetingDetail);
     cmd!(save_notes(path: String, notes: String) -> ());
     cmd!(search_meetings(query: String) -> Vec<library::SearchHit>);
+    cmd!(set_meeting_title(path: String, title: String) -> ());
     cmd!(trash_meeting(path: String) -> ());
     cmd!(reveal_in_finder(path: String) -> ());
     cmd!(open_in_obsidian(path: String) -> ());

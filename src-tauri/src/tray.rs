@@ -20,7 +20,7 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     Menu::with_items(
         app,
         &[
-            &MenuItem::with_id(app, "start-call", "Record call (mic + system audio)", can_start, Some("CmdOrCtrl+Shift+R"))?,
+            &MenuItem::with_id(app, "start-call", "Record call (mic + system audio)", can_start, None::<&str>)?,
             &MenuItem::with_id(app, "start-in-person", "Record in-person meeting", can_start, None::<&str>)?,
             &MenuItem::with_id(app, "stop", "Stop recording", recording, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,

@@ -99,6 +99,7 @@ fn main() {
             commands::tauri_cmds::read_meeting,
             commands::tauri_cmds::save_notes,
             commands::tauri_cmds::search_meetings,
+            commands::tauri_cmds::set_meeting_title,
             commands::tauri_cmds::trash_meeting,
             commands::tauri_cmds::reveal_in_finder,
             commands::tauri_cmds::open_in_obsidian,

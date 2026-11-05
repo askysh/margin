@@ -367,6 +367,21 @@ pub fn splice_notes(content: &str, notes: &str) -> String {
     out
 }
 
+/// Change the title in the frontmatter. The file name stays, so links from Obsidian notes
+/// keep working.
+pub fn set_title(path: &Path, title: &str) -> Result<(), String> {
+    ensure_inside_output(path)?;
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("A meeting needs a title.".into());
+    }
+    minutes_core::markdown::update_frontmatter(path, |fm| fm.title = title.to_string())
+        .map_err(|e| format!("Couldn't rename the meeting: {e}"))?;
+    let cfg = corecfg::load();
+    let _ = minutes_core::derived::refresh_derived_views(path, &cfg, &Default::default());
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 pub struct SearchHit {
     pub path: String,

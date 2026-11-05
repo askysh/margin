@@ -99,7 +99,18 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
   return (
     <div className={`page page-meeting ${showTranscript && m.transcript.length ? "" : "no-transcript"}`}>
       <div className="notes-col">
-        <h1 className="title">{m.title}</h1>
+        <TitleField
+          value={m.title}
+          onSave={async (t) => {
+            try {
+              await api.setMeetingTitle(path, t);
+              load();
+              onChanged();
+            } catch (e) {
+              notify(errorText(e), "error");
+            }
+          }}
+        />
         <div className="meta-line">
           <span>{meetingDate(m.date)}</span>
           {m.duration && (<><span className="dot-sep" /><span className="mono">{m.duration}</span></>)}
@@ -116,6 +127,13 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
           )}
           <button className="link-btn danger" onClick={trash}>Move to Trash</button>
         </div>
+
+        {m.status === "no-speech" && (
+          <div className="callout">
+            <p><strong>No speech was detected in this recording.</strong> Check that the right microphone is selected in
+              System Settings → Sound, and for calls, that Margin is allowed to record system audio.</p>
+          </div>
+        )}
 
         {summary.map((s) => (
           <section key={s.heading} className="summary-block">
@@ -143,6 +161,31 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
         </>
       )}
     </div>
+  );
+}
+
+/** The meeting title, editable in place. Enter or leaving the field saves; Escape undoes. */
+function TitleField({ value, onSave }: { value: string; onSave: (t: string) => void }) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const commit = () => {
+    const t = draft.trim();
+    if (!t) setDraft(value);
+    else if (t !== value) onSave(t);
+  };
+  return (
+    <input
+      className="title-input"
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        if (e.key === "Escape") { setDraft(value); requestAnimationFrame(() => e.currentTarget?.blur()); }
+      }}
+      aria-label="Meeting title"
+      title="Click to rename this meeting"
+    />
   );
 }
 

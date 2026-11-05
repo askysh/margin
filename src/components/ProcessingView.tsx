@@ -32,7 +32,7 @@ export function ProcessingView({ job, notes, title, onOpen, onRetry }: Props) {
           </div>
         ) : done && job?.output_path ? (
           <div className="callout">
-            <p>Your meeting is ready.</p>
+            <p>{job.state === "needs-review" ? "Saved, but something needs a look. Open the meeting to see what happened." : "Your meeting is ready."}</p>
             <button className="btn btn-primary" onClick={() => onOpen(job.output_path!)}>Open meeting</button>
           </div>
         ) : (

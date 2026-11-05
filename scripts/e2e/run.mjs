@@ -157,8 +157,8 @@ if (simulate) {
   });
   let liveMd = null;
   await check("after processing, the meeting opens with the notes", async () => {
-    await page.locator("h1.title", { hasText: "QA live call" }).waitFor({ timeout: 180000 });
-    await page.locator(".turn").first().waitFor({ timeout: 10000 });
+    await page.locator(".turn").first().waitFor({ timeout: 180000 });
+    assert((await page.getByLabel("Meeting title").inputValue()) === "QA live call", "did not land on the processed meeting");
     const f = meetingFiles().find((x) => x.includes("qa-live-call"));
     assert(f, "no qa-live-call file");
     liveMd = fs.readFileSync(path.join(meetingsDir, f), "utf8");
@@ -197,8 +197,8 @@ await check("meeting file has the exact notes and a transcript", async () => {
 });
 await check("open the meeting from the sidebar", async () => {
   await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
-  await page.locator("h1.title", { hasText: "QA launch sync" }).waitFor();
   await page.locator(".turn").first().waitFor();
+  assert((await page.getByLabel("Meeting title").inputValue()) === "QA launch sync", "wrong meeting opened");
   assert((await page.locator(".chip").count()) >= 2, "expected at least 2 speaker chips");
 });
 
@@ -255,6 +255,30 @@ await check("a second meeting with the same voice is labelled automatically", as
   assert(/\[Priya \d+:\d\d\]/.test(md), "Priya not recognised in the second meeting");
   await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
   await page.locator(".chip", { hasText: "Priya" }).waitFor();
+});
+
+await check("rename the meeting from its title", async () => {
+  await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
+  const title = page.getByLabel("Meeting title");
+  await title.click();
+  await page.keyboard.press("Meta+A");
+  await page.keyboard.type("QA launch sync, renamed");
+  await page.keyboard.press("Enter");
+  await page.locator(".row-title", { hasText: "QA launch sync, renamed" }).waitFor({ timeout: 5000 });
+  assert(/^title: QA launch sync, renamed$/m.test(fs.readFileSync(mdPath, "utf8")), "frontmatter title not updated");
+});
+await check("a silent recording explains itself", async () => {
+  const silent = path.join(base, "silence.wav");
+  const wav = Buffer.alloc(44 + 16000 * 2 * 6);
+  wav.write("RIFF", 0); wav.writeUInt32LE(36 + 16000 * 12, 4); wav.write("WAVEfmt ", 8); wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22); wav.writeUInt32LE(16000, 24); wav.writeUInt32LE(32000, 28);
+  wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write("data", 36); wav.writeUInt32LE(16000 * 12, 40);
+  fs.writeFileSync(silent, wav);
+  dev("queue", silent, "QA silent");
+  await page.locator(".row").filter({ hasText: "QA silent" }).first().waitFor({ timeout: 60000 });
+  await page.locator(".row-job").waitFor({ state: "detached", timeout: 60000 });
+  await page.locator(".row").filter({ hasText: "QA silent" }).first().click();
+  await page.getByText("No speech was detected in this recording.").waitFor({ timeout: 5000 });
 });
 
 // ---------------------------------------------------------------- search
