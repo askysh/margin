@@ -27,6 +27,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [toast, setToast] = useState<{ text: string; tone: "info" | "error" } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [callApp, setCallApp] = useState<string | null>(null);
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
 
@@ -71,6 +72,7 @@ export default function App() {
       }),
       on<string>("error-toast", (t) => notify(t, "error")),
       on<string>("recording-ended", (t) => notify(t)),
+      on<string | null>("call-detected", (a) => setCallApp(a)),
     ];
     const onFocus = () => refreshMeetings();
     window.addEventListener("focus", onFocus);
@@ -93,6 +95,7 @@ export default function App() {
 
   const start = async (kind: Kind) => {
     setBusy(true);
+    setCallApp(null);
     try {
       const v = await api.startRecording(kind);
       setRecorder(v);
@@ -144,6 +147,13 @@ export default function App() {
       <main className="pane">
         <header className="toolbar" data-tauri-drag-region>
           <div className="toolbar-spacer" data-tauri-drag-region />
+          {callApp && !recording && (
+            <div className="call-banner" role="status">
+              <span>{callApp} looks active.</span>
+              <button className="link-btn" onClick={() => start("call")}>Record this call</button>
+              <button className="icon-btn small" aria-label="Dismiss" onClick={() => setCallApp(null)}>×</button>
+            </div>
+          )}
           {recording ? (
             <div className="rec-control">
               <span className="rec-dot" aria-hidden />

@@ -51,6 +51,9 @@ pub fn fresh() -> Config {
     cfg.summarization.engine = "none".into();
     cfg.diarization.engine = "auto".into();
     cfg.identity.name = full_user_name();
+    // Off in v1: core would query EventKit from the background worker, which raises a
+    // Calendars prompt nobody asked for (DECISIONS.md D9).
+    cfg.calendar.enabled = false;
     pin_owned_keys(&mut cfg);
     cfg
 }

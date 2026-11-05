@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod calldetect;
 mod commands;
 mod corecfg;
 mod devcli;
@@ -32,6 +33,7 @@ fn main() {
     }
     minutes_core::install_whisper_logging_hooks();
     init_logging();
+    extend_path();
 
     if std::env::args().any(|a| a == processing::WORKER_FLAG) {
         minutes_core::exit_without_cxx_teardown(processing::run_worker_mode());
@@ -40,8 +42,6 @@ fn main() {
     if args.first().map(String::as_str) == Some("--dev") {
         minutes_core::exit_without_cxx_teardown(devcli::run(&args[1..]));
     }
-
-    extend_path();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -57,7 +57,8 @@ fn main() {
                 let _ = window.show();
             }
             tray::init(&handle)?;
-            processing::spawn_watcher(handle);
+            processing::spawn_watcher(handle.clone());
+            calldetect::spawn(handle);
             Ok(())
         })
         .on_window_event(|window, event| {

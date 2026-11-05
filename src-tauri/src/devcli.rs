@@ -85,6 +85,17 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             println!("{}", serde_json::to_string_pretty(&r).unwrap());
             Ok(())
         }
+        Some("reset") => {
+            println!("{}", serde_json::to_string_pretty(&crate::reset::preview()).unwrap());
+            let opts = crate::reset::ResetOptions {
+                delete_meetings: args.iter().any(|a| a == "--meetings"),
+                delete_models: args.iter().any(|a| a == "--models"),
+                forget_voices: args.iter().any(|a| a == "--voices"),
+            };
+            let report = crate::reset::run(&crate::recorder::Recorder::default(), &opts)?;
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            Ok(())
+        }
         Some("permissions") => {
             println!("{}", serde_json::to_string_pretty(&permissions::state()).unwrap());
             Ok(())

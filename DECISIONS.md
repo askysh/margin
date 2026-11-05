@@ -55,3 +55,18 @@ Product and technical decisions made without asking. Each one lists the options 
 - In call mode we compare the RMS of the `.voice.wav` and `.system.wav` windows for each
   line. The UI shows these labels as approximate. Proper diarized labels replace them
   after processing.
+
+## D9. Calendar lookup is off in v1
+- minutes-core matches a recording to the calendar event at the same time, through an
+  EventKit helper. It runs inside the background processing worker, so it would raise a
+  Calendars permission prompt in the middle of processing, with no explanation in the UI.
+- Pick: `calendar.enabled = false` in new configs. Info.plist still carries
+  `NSCalendarsFullAccessUsageDescription`, so a later opt-in (a Settings toggle with its
+  own permission step) only needs UI.
+- Call-app detection (a "Zoom looks active" banner) ships, since it needs no permission.
+
+## D10. Delete means "move to the Trash"
+- Deleting a meeting and resetting with "delete meetings" both move files to the Trash.
+  Reset moves only files Margin recognises as meetings (plus `archive/` and
+  `failed-captures/`), never the whole folder, because the folder may be inside an
+  Obsidian vault.
