@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { api, errorText, type MeetingDetail, type Turn } from "../api";
 import { isRawSpeaker, meetingDate, speakerNames, useDebounced } from "../util";
 import { Markdown } from "./Markdown";
@@ -86,7 +87,13 @@ export function MeetingView({ path, notify, onChanged, onDeleted }: Props) {
   };
 
   const trash = async () => {
-    if (!window.confirm(`Move “${m.title}” and its audio to the Trash?`)) return;
+    const sure = await ask(`“${m.title}” and its audio will be moved to the Trash. You can restore them from there.`, {
+      title: "Move this meeting to the Trash?",
+      kind: "warning",
+      okLabel: "Move to Trash",
+      cancelLabel: "Cancel",
+    });
+    if (!sure) return;
     try {
       await api.trashMeeting(path);
       notify("Moved to the Trash.");

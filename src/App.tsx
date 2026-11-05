@@ -222,7 +222,7 @@ export default function App() {
       {toast && (
         <div className={`toast toast-${toast.tone}`} role="status" onClick={() => setToast(null)}>{toast.text}</div>
       )}
-      <KeyboardShortcuts onSettings={() => setSettingsOpen(true)} />
+      <KeyboardShortcuts onSettings={() => setSettingsOpen(true)} onStart={start} canStart={!recording && !busy && !settingsOpen} />
     </div>
   );
 }
@@ -237,7 +237,7 @@ function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => 
   }, [open]);
   return (
     <div className="split">
-      <button className="btn btn-primary split-main" disabled={busy} onClick={() => onStart("call")} title="Records your mic and the other people on the call">
+      <button className="btn btn-primary split-main" disabled={busy} onClick={() => onStart("call")} title="Records your mic and the other people on the call (⌘⇧R)">
         Record call
       </button>
       <button
@@ -265,16 +265,25 @@ function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => 
   );
 }
 
-function KeyboardShortcuts({ onSettings }: { onSettings: () => void }) {
+/** In-window shortcuts: ⌘, settings, ⌘F search, ⌘⇧R record a call, ⌘⇧I record in person. */
+function KeyboardShortcuts({ onSettings, onStart, canStart }: { onSettings: () => void; onStart: (k: Kind) => void; canStart: boolean }) {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (e.metaKey && e.key === ",") {
+      if (!e.metaKey) return;
+      const key = e.key.toLowerCase();
+      if (key === ",") {
         e.preventDefault();
         onSettings();
+      } else if (key === "f" && !e.shiftKey) {
+        e.preventDefault();
+        document.querySelector<HTMLInputElement>(".search input")?.focus();
+      } else if (e.shiftKey && (key === "r" || key === "i") && canStart) {
+        e.preventDefault();
+        onStart(key === "r" ? "call" : "in-person");
       }
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [onSettings]);
+  }, [onSettings, onStart, canStart]);
   return null;
 }

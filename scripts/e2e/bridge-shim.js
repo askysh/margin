@@ -63,6 +63,7 @@
         return null;
       }
       if (cmd === "plugin:dialog|open") return e2e.pickFolder;
+      if (cmd === "plugin:dialog|ask" || cmd === "plugin:dialog|confirm") return e2e.answer ?? true;
       if (cmd.startsWith("plugin:")) return null;
       return call(cmd, args);
     },

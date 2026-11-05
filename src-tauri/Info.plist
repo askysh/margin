@@ -6,6 +6,10 @@
   <string>Margin records your voice so it can transcribe your meetings on this Mac. Audio never leaves your computer.</string>
   <key>NSAudioCaptureUsageDescription</key>
   <string>Margin records the other people on your calls (Zoom, Meet, Teams) by capturing system audio. It is transcribed on this Mac and never uploaded.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Margin saves each meeting as a Markdown file in the folder you chose.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Margin saves each meeting as a Markdown file in the folder you chose.</string>
   <key>NSCalendarsFullAccessUsageDescription</key>
   <string>Margin can name meetings and list attendees from the calendar event happening while you record.</string>
   <key>LSUIElement</key>

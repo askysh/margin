@@ -34,9 +34,14 @@ pub mod ops {
     }
 
     pub fn save_settings(settings: corecfg::AppSettings) -> Res<corecfg::AppSettings> {
+        let first_save = !corecfg::exists();
         let mut cfg = corecfg::load();
         corecfg::apply(&mut cfg, &settings)?;
-        std::fs::create_dir_all(&cfg.output_dir).map_err(|e| format!("Can't use that folder: {e}"))?;
+        // Onboarding saves your name before you choose a folder. Don't create the default
+        // folder until it has actually been chosen.
+        if !(first_save && cfg.output_dir == paths::default_output_dir()) {
+            std::fs::create_dir_all(&cfg.output_dir).map_err(|e| format!("Can't use that folder: {e}"))?;
+        }
         corecfg::save(&mut cfg)?;
         Ok(corecfg::settings(&corecfg::load()))
     }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, errorText, type Backends, type Boot, type Permissions, type ResetPreview, type Settings, type Voice } from "../api";
-import { bytes, tildify } from "../util";
+import { bytes, copyText, tildify } from "../util";
 import { DownloadProgress, MODEL_CHOICES } from "./Onboarding";
 import { PermissionRow } from "./PermissionRow";
 import { SummaryChoice } from "./SummaryChoice";
@@ -137,7 +137,7 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
             <h2 className="eyebrow">Use your meetings in Claude</h2>
             <p className="set-help">Add this to your Claude Desktop or Claude Code MCP config to search and read your meetings from Claude. It uses the open-source Minutes MCP server.</p>
             <pre className="code">{mcp}</pre>
-            <button className="btn btn-quiet" onClick={() => { navigator.clipboard.writeText(mcp); notify("Copied."); }}>Copy</button>
+            <button className="btn btn-quiet" onClick={async () => notify((await copyText(mcp)) ? "Copied." : "Couldn't copy. Select the text and press ⌘C.")}>Copy</button>
           </section>
 
           <section className="set set-danger">

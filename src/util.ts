@@ -88,3 +88,22 @@ export function useDebounced<T>(value: T, ms: number, fn: (v: T) => void) {
     return () => clearTimeout(t);
   }, [value, ms]);
 }
+
+/** Copy text. The async clipboard API isn't available in every WebView context, so fall
+ * back to a hidden textarea and execCommand. */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }
+}

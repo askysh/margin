@@ -1,5 +1,5 @@
 import type { Kind } from "../api";
-import { tildify } from "../util";
+import { copyText, tildify } from "../util";
 
 interface Props {
   count: number;
@@ -19,7 +19,7 @@ export function Home({ count, outputDir, orphanedDraft, onDismissDraft, onStart,
             <p><strong>Notes from an interrupted recording.</strong> Margin closed before the meeting was saved. Here's what you typed:</p>
             <pre className="notes notes-static">{orphanedDraft}</pre>
             <div className="row-actions">
-              <button className="btn btn-quiet" onClick={() => navigator.clipboard.writeText(orphanedDraft)}>Copy</button>
+              <button className="btn btn-quiet" onClick={() => copyText(orphanedDraft)}>Copy</button>
               <button className="btn btn-quiet" onClick={onDismissDraft}>Discard</button>
             </div>
           </div>

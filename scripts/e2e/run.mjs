@@ -9,6 +9,7 @@
 // --summaries fake-ollama runs a stand-in Ollama (scripts/e2e/fake-ollama.py) so the whole
 // summary flow is tested without a real model. "claude" needs your real HOME, so it is not
 // offered here; use `margin --dev summarize` for that.
+// --dark runs the whole pass in dark mode (for screenshots).
 // --download also tests a real model switch + download (Fast model, ~148 MB).
 // Screenshots and report.json go to $E2E_OUT (default /tmp/margin-e2e/out).
 import { webkit } from "playwright";
@@ -82,7 +83,7 @@ const dev = (...a) => execFileSync(bin, ["--dev", ...a], { env, encoding: "utf8"
 const meetingFiles = () => (fs.existsSync(meetingsDir) ? fs.readdirSync(meetingsDir).filter((f) => f.endsWith(".md")) : []);
 
 const browser = await webkit.launch();
-const ctx = await browser.newContext({ viewport: { width: 1180, height: 760 }, deviceScaleFactor: 2 });
+const ctx = await browser.newContext({ viewport: { width: 1180, height: 760 }, deviceScaleFactor: 2, colorScheme: flag("--dark") ? "dark" : "light" });
 const page = await ctx.newPage();
 const consoleErrors = [];
 page.on("pageerror", (e) => consoleErrors.push(e.message));
@@ -104,6 +105,7 @@ await check("name step saves your name", async () => {
   assert(cfg.includes('name = "Akash QA"'), "identity.name not written");
   assert(/\[summarization\][^[]*engine = "none"/s.test(cfg), "summarization.engine not explicit none");
   assert(/\[calendar\][^[]*enabled = false/s.test(cfg), "calendar not disabled");
+  assert(!fs.existsSync(meetingsDir), "default folder created before it was chosen");
 });
 await check("folder step defaults to Documents/Meetings", async () => {
   await page.getByRole("radio", { name: /Documents/ }).click();
