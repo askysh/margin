@@ -208,9 +208,10 @@ export function DownloadProgress({ compact }: { compact?: boolean }) {
     api.modelsStatus().then(setFiles).catch(() => {});
     const sub = on<ModelProgress>("model-progress", (p) => {
       if (p.error) setError(p.error);
-      if (p.all_done && !p.error) api.modelsStatus().then(setFiles);
       setProgress((prev) => ({ ...prev, [p.id]: p }));
-      if (p.finished) api.modelsStatus().then(setFiles);
+      // Also catches a download for a model this view didn't know about yet.
+      if (p.finished || p.all_done) api.modelsStatus().then(setFiles);
+      else setFiles((f) => (f.some((x) => x.id === p.id) ? f : (api.modelsStatus().then(setFiles), f)));
     });
     return () => { sub.then((u) => u()); };
   }, []);

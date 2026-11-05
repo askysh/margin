@@ -195,12 +195,30 @@ pub mod ops {
         if cfg.summarization.engine == "none" {
             return Err("Summaries are off. Turn on Claude or Ollama in Settings → Summaries.".into());
         }
+        if cfg.summarization.engine == "ollama" {
+            let model = &cfg.summarization.ollama_model;
+            match summaries::ollama_models(&cfg.summarization.ollama_url) {
+                None => return Err("Ollama isn't running. Start the Ollama app, then try again.".into()),
+                Some(installed) if !installed.iter().any(|m| m == model || m.trim_end_matches(":latest") == model) => {
+                    return Err(format!("Ollama doesn't have the model “{model}”. Pick another in Settings → Summaries."));
+                }
+                _ => {}
+            }
+        }
         let report = minutes_core::resummarize::resummarize_meeting(
             &p,
             &cfg,
             &minutes_core::resummarize::ResummarizeOptions { apply: true, template_override: None, refresh: Default::default() },
         )
-        .map_err(|e| format!("Summary failed: {e}"))?;
+        .map_err(|e| {
+            if cfg.summarization.engine == "ollama" {
+                format!(
+                    "Ollama didn't finish the summary. Summaries must finish within 2 minutes, and local models that think before answering (such as qwen3) are often slower than that. Try llama3.2 or gemma3, or Claude. ({e})"
+                )
+            } else {
+                format!("Summary failed: {e}")
+            }
+        })?;
         if !report.applied {
             return Err("The summary engine returned nothing. Check that it's running, then try again.".into());
         }

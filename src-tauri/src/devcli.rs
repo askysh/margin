@@ -69,6 +69,53 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             println!("{}", serde_json::to_string_pretty(&done.map(|j| (j.state, j.output_path, j.error))).unwrap());
             Ok(())
         }
+        Some("queue") => {
+            // What Stop does after capture: queue the audio with the notes draft and start
+            // the worker child. A running app (or QA bridge) then finishes the job.
+            let wav = PathBuf::from(args.get(1).ok_or("usage: queue <wav> [title] [notes-file]")?);
+            cfg.ensure_dirs().map_err(|e| e.to_string())?;
+            let current = minutes_core::pid::current_wav_path();
+            std::fs::copy(&wav, &current).map_err(|e| e.to_string())?;
+            let notes = match args.get(3) {
+                Some(f) => std::fs::read_to_string(f).map_err(|e| e.to_string())?,
+                None => String::new(),
+            };
+            let summary_notes: Vec<&str> =
+                notes.lines().map(|l| l.trim().trim_start_matches(['-', '*']).trim()).filter(|l| !l.is_empty()).collect();
+            let job = minutes_core::jobs::queue_live_capture_with_recording_health(
+                minutes_core::pid::CaptureMode::Meeting,
+                args.get(2).cloned(),
+                &current,
+                (!summary_notes.is_empty()).then(|| summary_notes.join("\n")),
+                None,
+                Some(chrono::Local::now() - chrono::Duration::seconds(40)),
+                Some(chrono::Local::now()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+            crate::processing::save_draft(&job.id, &notes);
+            crate::processing::spawn_worker();
+            println!("{}", job.id);
+            Ok(())
+        }
+        Some("summarize") => {
+            let md = args.get(1).ok_or("usage: summarize <md> [claude|ollama]")?.clone();
+            if let Some(engine) = args.get(2) {
+                let mut s = corecfg::settings(&cfg);
+                s.summary_engine = engine.clone();
+                corecfg::apply(&mut cfg, &s)?;
+                corecfg::save(&mut cfg)?;
+            }
+            let t = std::time::Instant::now();
+            crate::commands::ops::summarize_meeting(md)?;
+            eprintln!("summarized in {:.1}s", t.elapsed().as_secs_f32());
+            Ok(())
+        }
         Some("list") => {
             println!("{}", serde_json::to_string_pretty(&library::list()).unwrap());
             Ok(())

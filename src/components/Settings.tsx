@@ -91,7 +91,7 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
                 </button>
               ))}
             </div>
-            <DownloadProgress compact />
+            <DownloadProgress compact key={s.model} />
           </section>
 
           <section className="set">

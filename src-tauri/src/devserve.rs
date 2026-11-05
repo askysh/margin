@@ -4,6 +4,7 @@
 //! Permission prompts are refused, so tests can never raise a macOS dialog.
 //!
 //!   POST /invoke        {"cmd": "...", "args": {...}} → {"ok": true, "value": ...} | {"ok": false, "error": "..."}
+//!   GET  /latest                                      → newest event number
 //!   GET  /events?since=N                              → [{"seq": n, "event": "...", "payload": ...}]
 
 use crate::{calldetect, commands, events, processing};
@@ -70,6 +71,10 @@ fn handle(mut request: tiny_http::Request) {
             Err(error) => serde_json::json!({ "ok": false, "error": error }),
         };
         return respond(request, result.to_string());
+    }
+    if url.starts_with("/latest") {
+        let latest = queue().items.lock().unwrap().last().map(|i| i.0).unwrap_or(0);
+        return respond(request, latest.to_string());
     }
     if url.starts_with("/events") {
         let since: u64 = url.split("since=").nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);

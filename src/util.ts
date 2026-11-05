@@ -55,14 +55,16 @@ export function groupLabel(iso: string | null, now = new Date()): string {
   return new Intl.DateTimeFormat(undefined, sameYear ? { month: "long" } : { month: "long", year: "numeric" }).format(d);
 }
 
-/** Display names for a meeting's labels: raw `SPEAKER_n` become "Speaker 1…n" in order of
- * first appearance (core numbers from 0 or 1 depending on the path); names pass through. */
+/** Display names for a meeting's labels. Raw `SPEAKER_n` become "Speaker k", where k is
+ * the speaker's order of first appearance among all speakers, named or not. Renaming one
+ * speaker never renumbers the others. Names pass through. */
 export function speakerNames(order: string[]): Map<string, string> {
   const out = new Map<string, string>();
   let n = 0;
   for (const label of order) {
     if (out.has(label)) continue;
-    out.set(label, isRawSpeaker(label) ? `Speaker ${++n}` : label);
+    n++;
+    out.set(label, isRawSpeaker(label) ? `Speaker ${n}` : label);
   }
   return out;
 }

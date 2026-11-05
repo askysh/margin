@@ -71,6 +71,22 @@ pub fn rename(path: &Path, label: &str, new_name: &str, remember_voice: bool) ->
         if !fm.attendees.iter().any(|a| a == new_name) {
             fm.attendees.push(new_name.to_string());
         }
+        // Summaries assign action items and commitments to labels too.
+        let is_label = |s: &str| s.trim_start_matches('@') == label;
+        for item in fm.action_items.iter_mut().filter(|i| is_label(&i.assignee)) {
+            item.assignee = new_name.to_string();
+        }
+        for intent in fm.intents.iter_mut() {
+            if intent.who.as_deref().is_some_and(is_label) {
+                intent.who = Some(new_name.to_string());
+            }
+        }
+        if fm.people.iter().any(|p| p == label) {
+            fm.people.retain(|p| p != label);
+            if !fm.people.iter().any(|p| p == new_name) {
+                fm.people.push(new_name.to_string());
+            }
+        }
     })
     .map_err(|e| format!("Could not update the meeting header: {e}"))?;
 

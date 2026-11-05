@@ -140,6 +140,7 @@ impl Recorder {
         }
         // Slow checks (device listing, process scan) run without holding the lock, so the
         // UI can keep asking for the recorder state meanwhile.
+        ensure_permissions(kind)?;
         let cfg = session_config(kind);
         cfg.ensure_dirs().map_err(|e| format!("Couldn't create the meetings folder: {e}"))?;
         let intent = match kind {
@@ -336,6 +337,33 @@ impl Recorder {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Ask macOS before opening any device. Opening an input while the decision is still
+/// pending can block forever if the prompt never shows (see core's macos_permissions), and
+/// a denied system-audio permission makes the tap record silence.
+fn ensure_permissions(kind: Kind) -> Result<(), String> {
+    let state = crate::permissions::state();
+    let mic = match state.microphone {
+        "not-determined" => crate::permissions::request_microphone(),
+        other => other,
+    };
+    if mic == "denied" {
+        return Err("Margin can't use the microphone. Allow it in System Settings → Privacy & Security → Microphone, then try again.".into());
+    }
+    if mic != "granted" {
+        return Err("macOS didn't answer the microphone request. Check for a permission prompt, or allow Margin in System Settings → Privacy & Security → Microphone.".into());
+    }
+    if kind == Kind::Call {
+        let sys = match state.system_audio {
+            "not-determined" => crate::permissions::request_system_audio(),
+            other => other,
+        };
+        if sys == "denied" {
+            return Err("Margin can't hear the other people on the call. Allow it in System Settings → Privacy & Security → Screen & System Audio Recording (under System Audio Recording Only), or record in person instead.".into());
+        }
+    }
+    Ok(())
 }
 
 fn session_config(kind: Kind) -> Config {

@@ -32,13 +32,21 @@ export function SummaryChoice({ backends, value, onChange }: Props) {
       <button
         role="radio"
         aria-checked={engine === "ollama"}
-        disabled={!ollama}
+        disabled={!ollama || !backends?.ollama_models.length}
         className={`option ${engine === "ollama" ? "on" : ""}`}
-        onClick={() => onChange({ ...value, summary_engine: "ollama", ollama_model: value.ollama_model || backends?.ollama_models[0] || "" })}
+        onClick={() => {
+          const installed = backends?.ollama_models ?? [];
+          const model = value.ollama_model && installed.includes(value.ollama_model) ? value.ollama_model : installed[0] ?? "";
+          onChange({ ...value, summary_engine: "ollama", ollama_model: model });
+        }}
       >
         <span className="option-title">Ollama, on this Mac</span>
         <span className="option-body">
-          {ollama ? "Fully local. Pick a model you've pulled." : "Ollama isn't running. Start it to use this."}
+          {!ollama
+            ? "Ollama isn't running. Start it to use this."
+            : backends?.ollama_models.length
+              ? "Fully local. Nothing leaves this Mac."
+              : "Ollama has no models yet. Run `ollama pull llama3.2` first."}
         </span>
       </button>
       {ollama && engine === "ollama" && (
