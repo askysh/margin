@@ -40,118 +40,142 @@ bunx tauri dev                    # hot-reloading UI, debug Rust
 (cd src-tauri && cargo test)      # unit tests
 ```
 
-### Headless checks (`--dev`)
+### Testing
 
-The binary has a small developer CLI that runs the core integration without the UI. Point
-`MARGIN_HOME` (and `HOME`, because voices.db ignores the other variables) at a temporary
-directory so your real data stays untouched:
+```bash
+(cd src-tauri && cargo test)                       # unit tests
+bun run build && (cd src-tauri && cargo build)     # build what the e2e run uses
+node scripts/e2e/run.mjs --audio meeting.wav \
+  --seed-models ~/Library/Application\ Support/Margin/state/models \
+  --summaries fake-ollama --simulate call.wav [--download]
+```
+
+`scripts/e2e/run.mjs` is a QA pass run as a user.
+- It runs the built UI in headless WebKit. Every click goes to the real backend through
+  `margin --dev serve`, a localhost bridge in front of the same functions the app calls.
+- It uses a sandbox `HOME` and `MARGIN_HOME`, so your settings, meetings and voices are
+  never touched.
+- The bridge refuses permission requests, so no macOS prompt can appear.
+- In debug builds, `--simulate` plays a WAV instead of the microphone, including
+  `<wav>.voice.wav`, `<wav>.system.wav` and `<wav>.live.jsonl` when present. So the whole
+  record → live transcript → stop → process flow runs without permissions.
+- It writes screenshots and `report.json` to `$E2E_OUT`.
+
+The binary also has a small developer CLI for the core integration. Point `MARGIN_HOME`
+(and `HOME`, because voices.db ignores the other variables) at a temporary directory:
 
 ```bash
 export MARGIN_HOME=/tmp/margin-test HOME=/tmp/margin-test/home
 M=src-tauri/target/debug/margin
 $M --dev models                          # download speech models (~520 MB)
-$M --dev process meeting.wav "Title"     # queue and process a WAV as a meeting
-$M --dev list                            # meetings as JSON
+$M --dev preflight call                  # the device checks Start runs, without recording
+$M --dev process meeting.wav "Title"     # process a WAV as a meeting, in-process
+$M --dev queue meeting.wav "Title" notes.md   # what Stop does: queue + worker child
+$M --dev list | read <file.md>
 $M --dev rename <file.md> SPEAKER_2 Priya
+$M --dev summarize <file.md> claude|ollama
 $M --dev reset [--meetings] [--models] [--voices]
-$M --dev permissions
+$M --dev serve [port]                    # QA bridge for scripts/e2e
 ```
 
 ## What works
 
-All of the items below were checked with the `--dev` harness and with UI screenshots in
-headless WebKit, using a mocked bridge and real meeting data.
+Everything below was checked by the end-to-end pass, 29 of 29 (see PROGRESS.md), unless
+it says otherwise.
 
 - **Onboarding.** It runs in this order:
   1. Your name.
-  2. The output folder: `~/Documents/Meetings`, your Obsidian vaults (found through
+  2. The meetings folder: `~/Documents/Meetings`, your Obsidian vaults (found through
      Obsidian's own vault list) or any folder you pick.
   3. Model choice: Fast / Balanced / Best. The download starts in the background with a
      progress bar.
-  4. Microphone and System Audio permissions, each with a short explanation.
+  4. Microphone and System Audio permissions, each with a one-line reason.
   5. Optional summaries.
-- **Processing.** Transcription, diarization and saving run in a background worker process,
-  so they continue if you close the window. A 39-second, two-speaker recording processed in
-  10 seconds.
-- **Library.**
-  - The sidebar groups meetings into Today, Yesterday, This week, then by month.
-  - Search covers titles, notes and transcripts.
-  - Each meeting can be opened, shown in Finder, opened in Obsidian (when it's in a vault)
-    or moved to the Trash.
+- **Recording (simulated mic).**
+  - *Record call* opens the notepad with a live transcript beside it. In calls, lines are
+    marked You / Them by comparing your mic and the call audio.
+  - Notes typed right up to *Stop* are kept.
+  - Processing (transcribe, tell speakers apart, save) runs in a background worker, and
+    the window then opens the finished meeting.
+  - Closing the window keeps Margin in the menu bar. Quitting mid-recording saves the
+    meeting first.
 - **Meeting view.**
   - The summary sections are rendered.
-  - **Your notes** can be edited and are saved into the file's `## Notes` section. The
-    frontmatter and all other sections are kept byte-for-byte.
-  - The transcript shows speakers.
-- **Renaming a speaker.** Click a speaker chip or label and choose *Rename everywhere*.
-  - This rewrites the transcript labels and the summary mentions, and updates
-    `speaker_map` and `attendees`. Your notes are left as you typed them.
-  - It also records the confirmation in minutes-core's overlay database.
-  - With "Recognise this voice" checked, it saves a voice sample. In testing, the next
-    meeting with that voice was labelled automatically (`source: enrollment`).
-- **Summaries are optional.** You can choose:
+  - **Your notes** can be edited and are saved into the file's `## Notes` section.
+    The frontmatter and the other sections stay byte-for-byte.
+  - Titles can be edited. The file name stays, so Obsidian links keep working.
+  - Recordings with no speech say what to check.
+- **Renaming a speaker.** Click a speaker chip or a transcript label, then *Rename
+  everywhere*.
+  - This updates the transcript labels, mentions in the summary, action-item assignees,
+    commitments, `attendees` and `speaker_map`. Your notes are left as you typed them.
+  - It also records the confirmation in minutes-core's overlay database, which the CLI
+    and MCP read.
+  - With "Recognise this voice" checked, it saves a voice sample, and the next meeting
+    labels that person automatically.
+- **Library.** Meetings are grouped Today / Yesterday / This week / by month. Search covers
+  titles, notes and transcripts. Each meeting can be shown in Finder, opened in Obsidian
+  (when it's in a vault) or moved to the Trash.
+- **Summaries** are optional:
   - **None** (the default): nothing leaves the Mac.
-  - **Claude**, through your own `claude` CLI (found even when the app is launched from
-    Finder).
-  - **Ollama**.
-
-  Meetings without a summary have a *Summarize* button.
+  - **Claude**, through your own `claude` CLI. Checked headlessly with a real login: 10 s.
+  - **Ollama**. The flow is checked against a stand-in server. See the limits below.
 - **Settings.**
-  - Name, folder, model (switching downloads the new model if needed), summaries,
-    permission status, and the voices Margin recognises (each can be forgotten).
-  - A copy-paste MCP snippet, so Claude can read your meetings through the
-    `minutes-mcp` server.
-- **Reset.** Choose **Reset Margin…** under *Start over*. The dialog says what will happen:
-  - It always clears settings, the processing queue, logs and app state. Setup then runs
+  - Name, folder, model (switching downloads it with progress), summaries, permission
+    status, and recognised voices (each can be forgotten).
+  - An MCP snippet, so Claude can read your meetings.
+- **Reset.** Choose **Reset Margin…** under *Start over*.
+  - It always clears settings, the processing queue, logs and state, then runs setup
     again.
   - "Keep my meetings", "Keep downloaded speech models" and "Keep recognised voices" are
     each on by default.
+  - Unprocessed audio is saved to `failed-captures/` and never wiped.
   - If you choose to delete meetings, you must type `delete`. The files go to the
     **Trash**, and only files Margin recognises as meetings are moved, so a vault folder
     keeps its other notes.
-  - It refuses to run while you're recording or a meeting is still processing.
-- **Menu bar.** Record a call, record in person, stop, open, quit. Quitting during a
-  recording stops it and saves it first. Closing the window keeps Margin running in the
-  menu bar.
-- **Call detection.** A small "Zoom looks active — Record this call" banner appears when a
-  call app starts.
-- **Crash safety.** Notes typed during a recording are saved to disk as you type. If Margin
-  dies mid-meeting, the next launch shows them. Unfinished processing resumes on the next
-  launch.
+  - It refuses to run while recording or processing.
+- **Call detection.** A "Zoom looks active — Record this call" banner appears when a call
+  app starts.
+- **Crash safety.** Notes typed during a recording are saved to disk as you type, and
+  shown on the next launch if Margin dies. Unfinished processing resumes on the next
+  launch. Audio left over from a crash is moved aside instead of blocking the next
+  recording.
 
 ## What isn't verified, or doesn't work yet
 
-- **Live recording has not been run end to end.** The recorder uses the same minutes-core
-  sequence as upstream's `minutes record`: lock, capture thread, queue the job, spawn the
-  worker. The headless harness processed real audio through the same queue. But the
-  processes I could launch had not been granted the microphone, and starting a recording
-  would have raised a macOS prompt that needs you. Things to try first:
-  1. Record in person for 30 seconds.
-  2. Then record a call while something is playing.
-  3. Watch the live transcript and the red rule (it is the level meter).
-- **"You / Them" live labels are a heuristic.** They compare the loudness of the mic stem
-  and the system-audio stem for each line, and are labelled approximate in the UI. Upstream
-  has no live speaker labels. Real speaker names come after processing. In-person meetings
-  show no live labels.
+- **Real microphone and system-audio capture has not been run.** Everything after the
+  capture thread is tested: the simulated mic runs the same code from the live tail
+  onwards. Recording preflight passes on this Mac for both modes, and the call route is
+  the built-in mic plus the Core Audio process tap. But actually capturing needs you to
+  answer the macOS permission prompts. To try:
+  1. Open the app, allow both permissions in onboarding.
+  2. Record in person for 30 seconds.
+  3. Record a call while a video plays.
+- **The heuristic "You / Them" live labels** compare mic and call loudness for each line.
+  They're labelled approximate in the UI. Upstream has no live speaker labels; real
+  speaker names come after processing. In-person meetings show no live labels.
+- **Ollama models that think first, such as qwen3, time out.** minutes-core gives LLM
+  calls a fixed 2 minutes and doesn't turn thinking off (UPSTREAM-PATCHES.md #3). Use a
+  non-thinking model (llama3.2, gemma3) or Claude. Margin's error message says this.
 - **Permissions reset on every rebuild.** The app is ad-hoc signed, so macOS treats each
   build as a new app. Sign it with a stable identity (even a self-signed one) to keep them.
 - **The system-audio permission check uses private TCC calls.** minutes-core has no check
   for it. `TCCAccessPreflight` and `TCCAccessRequest` are loaded with dlopen, as in Apple's
   AudioCap sample. If Apple changes them, Margin shows "Open System Settings" instead of
   "Allow".
+- **On call recordings core labels lines by source,** `MICROPHONE` (you) and `SYSTEM` (the
+  call). Margin shows them as You / Them, and you can rename them. All voices on the call
+  side share one label unless diarization separates them.
 - **Diarization quality is minutes-core's.** On synthetic TTS voices it found 3 speakers
-  for 2, and shifted one boundary.
-- **Some features are not in v1:**
-  - Calendar-based titles and attendees (deliberately off; see DECISIONS.md D9).
-  - Editing a meeting's title in the app.
+  for 2.
+- **Not in v1:**
+  - Calendar-based titles and attendees (deliberately off; DECISIONS.md D9).
   - Watching the folder for changes made by other apps. The meeting view reloads when
     the window regains focus instead.
   - Live partial transcripts. You see finished lines only, a few seconds behind.
   - Signing, notarization, auto-update.
 - **Voices are shared with the upstream Minutes app.** minutes-core hardcodes
-  `~/.minutes/voices.db`. Everything else Margin stores lives in
-  `~/Library/Application Support/Margin`, apart from the Minutes app's files
-  (UPSTREAM-PATCHES.md #1).
+  `~/.minutes/voices.db` (UPSTREAM-PATCHES.md #1).
 
 ## Where things live
 

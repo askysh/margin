@@ -147,6 +147,22 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             let port = args.get(1).and_then(|p| p.parse().ok()).unwrap_or(4545);
             crate::devserve::serve(port)
         }
+        Some("preflight") => {
+            // The device and capture-plan checks Start runs, without recording.
+            let kind = if args.get(1).map(String::as_str) == Some("call") {
+                crate::recorder::Kind::Call
+            } else {
+                crate::recorder::Kind::InPerson
+            };
+            let cfg = crate::recorder::session_config(kind);
+            let intent = match kind {
+                crate::recorder::Kind::Call => minutes_core::capture::RecordingIntent::Call,
+                crate::recorder::Kind::InPerson => minutes_core::capture::RecordingIntent::Room,
+            };
+            let p = minutes_core::capture::preflight_recording(minutes_core::pid::CaptureMode::Meeting, Some(intent), false, &cfg)?;
+            println!("{}", serde_json::to_string_pretty(&p).unwrap());
+            Ok(())
+        }
         Some("permissions") => {
             println!("{}", serde_json::to_string_pretty(&permissions::state()).unwrap());
             Ok(())

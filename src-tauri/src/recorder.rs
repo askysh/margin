@@ -382,7 +382,7 @@ fn ensure_permissions(kind: Kind) -> Result<(), String> {
     Ok(())
 }
 
-fn session_config(kind: Kind) -> Config {
+pub fn session_config(kind: Kind) -> Config {
     let mut cfg = corecfg::load();
     match kind {
         Kind::Call => {

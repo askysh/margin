@@ -70,3 +70,17 @@ Product and technical decisions made without asking. Each one lists the options 
   Reset moves only files Margin recognises as meetings (plus `archive/` and
   `failed-captures/`), never the whole folder, because the folder may be inside an
   Obsidian vault.
+
+## D11. QA runs the real UI against the real backend, never against your data
+- Tauri has no WebDriver on macOS. So `margin --dev serve` exposes the same command
+  functions over a localhost HTTP bridge, and `scripts/e2e/run.mjs` drives the built UI
+  in headless WebKit through a small IPC shim.
+- The bridge refuses permission prompts. Tests run with a sandbox `HOME` and
+  `MARGIN_HOME`, so test voices never reach `~/.minutes/voices.db`.
+
+## D12. Capture simulation exists only in debug builds
+- `MARGIN_SIMULATE_CAPTURE=<wav>` replaces the microphone with a file, plus optional
+  stems and a live-transcript script. That lets record → live transcript → stop →
+  process be tested without TCC.
+- It is compiled into debug builds only (`cfg!(debug_assertions)`). Release builds
+  ignore the variable.

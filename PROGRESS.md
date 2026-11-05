@@ -24,3 +24,43 @@
 - Unit tests pass (6): notes splice, transcript parsing, rename and speech stats.
 - Not yet run live: mic and system-audio recording, which needs the app bundle for TCC
   prompts. Also not yet run: the UI.
+
+### M2: UI and real-backend QA (done, overnight 2026-11-06)
+- The steno-pad UI covers onboarding, the live notepad, library and search, the meeting
+  view with editable notes and title, speaker rename, settings, Reset, and the call-app
+  banner.
+- An independent review of the untested paths found 9 problems; all 9 are fixed:
+  - You/Them window anchoring
+  - stop/quit and reset races
+  - stale live lines
+  - leftover captures
+  - main-thread stalls
+  - draft handling on retry
+  - temp-file collisions
+- The end-to-end QA harness (`scripts/e2e/run.mjs`) runs the real UI in headless WebKit
+  against the real backend in a sandbox. **29/29 checks pass**:
+  - Onboarding writes explicit config: summaries none, calendar off, your name.
+  - A simulated call recording shows live You/Them lines from the real stem heuristic.
+    Notes typed right up to Stop are kept. Processing runs in the worker child. The UI
+    lands in the finished meeting with the notes exact.
+  - A recording queued while the app is open is processed. Notes are spliced in
+    verbatim, including a `## ` heading demoted to `###`.
+  - Notes editing saves with the frontmatter byte-identical. List continuation works.
+  - Renaming a speaker updates transcript labels, summary mentions, action-item
+    assignees, commitments, attendees and `speaker_map`, and saves a voice. The next
+    meeting is auto-labelled.
+  - Renaming a meeting title works. Silent recordings explain themselves.
+  - Search, and the no-results message.
+  - The full summary flow through Settings → Summarize, using a stand-in Ollama.
+  - A real model switch downloads 148 MB with progress.
+  - Reset keeps meetings and models, onboarding runs again and the meetings are back.
+    Delete requires typing "delete".
+  - No UI errors or failed commands.
+- Summaries through the real Claude CLI were checked headlessly with Akash's login: 10 s
+  for a 39 s meeting.
+- Real Ollama (qwen3.5:4b) times out: it is a thinking model, and core has a fixed 2-minute
+  limit (UPSTREAM-PATCHES.md #3). The plumbing itself works against a stand-in server.
+- Recording preflight on this Mac passes for both modes. The call route is the built-in
+  mic plus the Core Audio process tap, with system audio ready.
+- **Still not verified:** real microphone and system-audio capture. It needs a person to
+  answer the macOS permission prompts, and is the first thing to try in the morning.

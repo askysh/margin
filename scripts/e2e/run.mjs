@@ -35,6 +35,7 @@ const home = path.join(base, "home");
 const marginHome = path.join(base, "margin");
 fs.rmSync(home, { recursive: true, force: true });
 fs.rmSync(marginHome, { recursive: true, force: true });
+fs.rmSync(out, { recursive: true, force: true });
 fs.mkdirSync(out, { recursive: true });
 fs.mkdirSync(home, { recursive: true });
 if (seed) {
