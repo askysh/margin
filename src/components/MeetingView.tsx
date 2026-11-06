@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { api, errorText, type MeetingDetail, type Turn } from "../api";
 import { isRawSpeaker, meetingDate, speakerNames, useDebounced } from "../util";
@@ -25,7 +25,8 @@ interface Props {
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
-export function MeetingView({ path, notify, onChanged, onDeleted, processing, onPerson, onAsk }: Props) {
+// Memoised so a recording's clock, ticking in App, doesn't re-render a long transcript.
+export const MeetingView = memo(function MeetingView({ path, notify, onChanged, onDeleted, processing, onPerson, onAsk }: Props) {
   const [m, setM] = useState<MeetingDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
@@ -41,10 +42,15 @@ export function MeetingView({ path, notify, onChanged, onDeleted, processing, on
   const queue = useRef<Promise<void>>(Promise.resolve());
   const unsaved = () => edits.current !== saved.current;
 
+  // Focus and save refreshes usually read back the same file: keep the rendered one then.
+  const lastRead = useRef("");
   const load = useCallback(() => {
     api
       .readMeeting(path)
       .then((d) => {
+        const json = JSON.stringify(d);
+        if (json === lastRead.current) return;
+        lastRead.current = json;
         setM(d);
         if (edits.current === saved.current) setNotes(d.notes);
       })
@@ -265,7 +271,7 @@ export function MeetingView({ path, notify, onChanged, onDeleted, processing, on
       )}
     </div>
   );
-}
+});
 
 /** The meeting title, editable in place. Enter or leaving the field saves; Escape undoes. */
 function TitleField({ value, onSave, disabled }: { value: string; onSave: (t: string) => void; disabled?: boolean }) {

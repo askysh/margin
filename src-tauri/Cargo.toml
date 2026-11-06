@@ -42,4 +42,7 @@ tauri-plugin-notification = "2"
 
 [profile.release]
 strip = true
-lto = "thin"
+# Whole-program LTO in one unit: an 11% smaller app, the same speed, and about 75 s
+# more per release build (docs/perf.md).
+lto = "fat"
+codegen-units = 1

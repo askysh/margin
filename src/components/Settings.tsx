@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, errorText, type Backends, type Boot, type Permissions, type ResetPreview, type Settings, type SettingsOptions, type Voice } from "../api";
 import { bytes, copyText, tildify } from "../util";
-import { DownloadProgress, MODEL_CHOICES } from "./Onboarding";
+import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { PermissionRow } from "./PermissionRow";
 import { SummaryChoice } from "./SummaryChoice";
 import { SelectRow, TextRow, ToggleRow, type Choice } from "./SettingsRows";

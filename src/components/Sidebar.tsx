@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { api, type Job, type MeetingSummary } from "../api";
 import type { Selection } from "../App";
 import { clock, groupLabel, shortTime } from "../util";
@@ -44,7 +44,7 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
   const groups = useMemo(() => {
     const who = person?.toLowerCase();
     const shown = meetings.filter((m) => (!hits || hits.has(m.path)) && (!who || m.people.some((p) => p.toLowerCase() === who)));
-    const out: { label: string; items: MeetingSummary[] }[] = [];
+    const out: Group[] = [];
     for (const m of shown) {
       const label = groupLabel(m.date);
       const last = out[out.length - 1];
@@ -101,29 +101,46 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
           </button>
         ))}
 
-        {groups.map((g) => (
-          <div key={g.label} className="group">
-            <div className="group-label">{g.label}</div>
-            {g.items.map((m) => (
-              <button
-                key={m.path}
-                className={`row ${selectedPath === m.path ? "selected" : ""}`}
-                onClick={() => onSelect({ type: "meeting", path: m.path })}
-              >
-                <span className="row-title">{m.title}</span>
-                <span className="row-meta">
-                  <span className="mono">{shortTime(m.date)}</span>
-                  {m.duration && <span className="mono"> · {m.duration}</span>}
-                  {m.kind === "memo" && <span> · memo</span>}
-                </span>
-                {hits?.get(m.path) && <span className="row-hit">{hits.get(m.path)}</span>}
-              </button>
-            ))}
-          </div>
-        ))}
+        <MeetingRows groups={groups} hits={hits} selectedPath={selectedPath} onSelect={onSelect} />
         {hits && groups.length === 0 && <p className="list-empty">No meetings mention “{query.trim()}”.</p>}
         {!hits && person && groups.length === 0 && <p className="list-empty">No meetings with {person}.</p>}
       </nav>
     </aside>
   );
 }
+
+type Group = { label: string; items: MeetingSummary[] };
+
+/** The library rows. Memoised: a recording's clock ticks twice a second, and the rows
+ * don't need to re-render for it. */
+const MeetingRows = memo(function MeetingRows({ groups, hits, selectedPath, onSelect }: {
+  groups: Group[];
+  hits: Map<string, string> | null;
+  selectedPath: string | null;
+  onSelect: (s: Selection) => void;
+}) {
+  return (
+    <>
+      {groups.map((g) => (
+        <div key={g.label} className="group">
+          <div className="group-label">{g.label}</div>
+          {g.items.map((m) => (
+            <button
+              key={m.path}
+              className={`row ${selectedPath === m.path ? "selected" : ""}`}
+              onClick={() => onSelect({ type: "meeting", path: m.path })}
+            >
+              <span className="row-title">{m.title}</span>
+              <span className="row-meta">
+                <span className="mono">{shortTime(m.date)}</span>
+                {m.duration && <span className="mono"> · {m.duration}</span>}
+                {m.kind === "memo" && <span> · memo</span>}
+              </span>
+              {hits?.get(m.path) && <span className="row-hit">{hits.get(m.path)}</span>}
+            </button>
+          ))}
+        </div>
+      ))}
+    </>
+  );
+});

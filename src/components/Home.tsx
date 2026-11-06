@@ -1,5 +1,6 @@
 import type { Kind } from "../api";
 import { copyText, tildify } from "../util";
+import { DownloadProgress } from "./Models";
 
 interface Props {
   count: number;
@@ -29,6 +30,7 @@ export function Home({ count, outputDir, orphanedDraft, onDismissDraft, onStart,
           Start recording when the meeting begins and type notes in your own words. Margin writes the transcript,
           tells speakers apart and saves everything to <span className="path">{tildify(outputDir)}</span>.
         </p>
+        <DownloadProgress compact hideWhenReady pendingNote="Recording starts working when the speech models are downloaded." />
         <div className="home-choices">
           <button className="choice" onClick={() => onStart("call")} disabled={busy}>
             <span className="choice-title">Record a call</span>

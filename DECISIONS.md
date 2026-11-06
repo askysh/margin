@@ -261,3 +261,64 @@ The full comparison is in `docs/parity/app.md`.
 - After 10 s the panel shows the time. After 60 s it suggests a narrower question.
   After 5 minutes Margin stops the turn.
 - Stop keeps the partial answer, marked "Stopped.".
+
+## Perf and onboarding (to renumber)
+
+### P1. Measure first, keep only what the numbers support
+- The numbers are in `docs/perf.md`, with the scripts that produced them.
+- Kept: the jobs-watcher change, the library cache, faster search, lazy views and
+  fewer re-renders. Each one has a before and after figure.
+
+### P2. The jobs watcher reads the archive only when something changed
+- Context: minutes-core never prunes `jobs/archive/`, so it has one file per processed
+  meeting. The watcher read and parsed all of them every second. With 600 meetings the
+  idle app used 2.1% CPU.
+- Options:
+  - (a) Poll less often. The UI then notices a finished meeting later.
+  - (b) Prune the archive. That changes core's data, which the CLI also reads.
+  - (c) Each second, read only the active job files and the timestamps of the archive and
+    drafts folders. Do the full listing only when one of them changes.
+- Pick: **(c)**. Core writes job files by rename, so every change moves a folder
+  timestamp. `list_jobs` still runs every second, so a job whose worker died is still
+  re-queued.
+
+### P3. The library list is cached by file size and modification time
+- The cache lives in memory and is rebuilt on each list. Entries for files that are gone
+  drop out. A change that keeps both the size and the modification time is missed. That
+  needs a same-size write in the same nanosecond, and Margin and core write by rename.
+
+### P4. Onboarding: five short steps, every one with a default
+- Steps: You → Setup (folder and model together) → Permissions → Summaries → Ready.
+- Return continues on every step. A user can finish with Return alone.
+- Folder and model share a page. Both have good defaults (Documents, Balanced), and the
+  download starts one step earlier.
+- The download runs in the background. Nothing waits for it. The Ready step and Home show
+  its progress, and recording starts working when it finishes. Before, the last step
+  blocked until the download finished.
+- The Ready step shows the three ways to start a recording: the window button, the menu
+  bar and the shortcuts.
+- Summaries still default to None (D6).
+
+### P5. No microphone level check during onboarding
+- A level meter must open the microphone. That shows the macOS prompt if access is not
+  decided yet. If access is already granted, it records real audio in a test run, which
+  the QA rules forbid.
+- Pick: **no meter**. The live view's rule already shows the level during the first
+  recording. Add a meter later, shown only after `microphone == granted`.
+
+### P6. Release profile: fat LTO in one codegen unit
+- Options: keep `lto = "thin"`, or use `lto = "fat"` with `codegen-units = 1`.
+- Measured (`docs/perf.md`): the app is 11% smaller (39.3 MiB → 35.0 MiB). Command
+  latency and processing time are the same within noise. A release build after a small
+  change takes 175 s instead of 99 s.
+- Pick: **fat LTO, one codegen unit**. Release builds are only for shipping; day-to-day
+  work uses debug builds, which this does not change.
+- Not picked: `panic = "abort"`. A panic in one command would then end the whole app
+  instead of failing that command.
+
+### P7. Measured and dropped
+- **Preloading the notepad font.** The font was loaded about 100 ms after navigation with
+  and without the preload, so the change was removed.
+- **Code-splitting Settings and Onboarding** is kept, but only for size: the startup
+  chunk is 8% smaller (194 → 179 KB). Time to the first `boot` call did not change
+  measurably (about 55 ms either way under the same load).

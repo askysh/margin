@@ -6,8 +6,10 @@ use crate::corecfg;
 use minutes_core::markdown::split_frontmatter;
 use regex::Regex;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 const SKIP_DIRS: &[&str] = &["archive", "failed-captures", "processed", "failed", "daily", "dictations"];
 
@@ -77,7 +79,7 @@ pub fn list() -> Vec<MeetingSummary> {
     let root = output_dir();
     let mut files = Vec::new();
     collect(&root, &root, &mut files);
-    let mut out: Vec<MeetingSummary> = files.iter().filter_map(|p| summarize_file(p)).collect();
+    let mut out = cached_summaries(files);
     // Dates carry different UTC offsets, so compare instants, not strings.
     let instant = |m: &MeetingSummary| {
         m.date
@@ -87,6 +89,29 @@ pub fn list() -> Vec<MeetingSummary> {
             .unwrap_or(0)
     };
     out.sort_by(|a, b| instant(b).cmp(&instant(a)).then_with(|| b.path.cmp(&a.path)));
+    out
+}
+
+/// List entries by file, kept while the file's size and modification time stay the same.
+/// Files without meeting frontmatter are cached too (as `None`), so they aren't re-read.
+type SummaryCache = HashMap<PathBuf, (Option<SystemTime>, u64, Option<MeetingSummary>)>;
+
+fn cached_summaries(files: Vec<PathBuf>) -> Vec<MeetingSummary> {
+    static CACHE: OnceLock<Mutex<SummaryCache>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let mut fresh = SummaryCache::with_capacity(files.len());
+    for path in files {
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let (modified, len) = (meta.modified().ok(), meta.len());
+        let summary = match cache.remove(&path) {
+            Some((m, l, summary)) if m == modified && l == len && modified.is_some() => summary,
+            _ => summarize_file(&path),
+        };
+        fresh.insert(path, (modified, len, summary));
+    }
+    let out = fresh.values().filter_map(|(_, _, s)| s.clone()).collect();
+    // Files that are gone drop out here.
+    *cache = fresh;
     out
 }
 
@@ -543,28 +568,46 @@ pub struct SearchHit {
 }
 
 /// Case-insensitive search over whole files. Fine for thousands of meetings, and it takes
-/// no lock, unlike core's per-query FTS index.
+/// no lock, unlike core's per-query FTS index. Files are read on a few threads.
 pub fn search(query: &str) -> Vec<SearchHit> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return vec![];
     }
-    list()
-        .into_iter()
-        .filter_map(|m| {
-            let content = std::fs::read_to_string(&m.path).ok()?;
-            let (_, body) = split_frontmatter(&content);
-            let in_title = m.title.to_lowercase().contains(&q);
-            let line = body.lines().find(|l| l.to_lowercase().contains(&q));
-            if !in_title && line.is_none() {
-                return None;
-            }
-            Some(SearchHit {
-                path: m.path,
-                excerpt: line.map(plain_line).unwrap_or_default(),
-            })
-        })
-        .collect()
+    let meetings = list();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let chunk = meetings.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = meetings
+            .chunks(chunk)
+            .map(|part| scope.spawn(|| part.iter().filter_map(|m| search_file(m, &q)).collect::<Vec<_>>()))
+            .collect();
+        // Chunks are joined in order, so hits keep the library's order.
+        parts.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
+}
+
+fn search_file(m: &MeetingSummary, q: &str) -> Option<SearchHit> {
+    let content = std::fs::read_to_string(&m.path).ok()?;
+    let (_, body) = split_frontmatter(&content);
+    let in_title = m.title.to_lowercase().contains(q);
+    let line = find_line(body, q);
+    if !in_title && line.is_none() {
+        return None;
+    }
+    Some(SearchHit { path: m.path.clone(), excerpt: line.map(plain_line).unwrap_or_default() })
+}
+
+/// The first line of `body` that contains the lowercase `q`, ignoring case.
+fn find_line<'a>(body: &'a str, q: &str) -> Option<&'a str> {
+    if !q.is_ascii() {
+        return body.lines().find(|l| l.to_lowercase().contains(q));
+    }
+    // ASCII lowercasing keeps every byte offset, so a match maps straight back to `body`.
+    let at = body.to_ascii_lowercase().find(q)?;
+    let start = body[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = body[at..].find('\n').map_or(body.len(), |i| at + i);
+    Some(body[start..end].trim_end_matches('\r'))
 }
 
 fn plain_line(line: &str) -> String {
@@ -637,6 +680,30 @@ mod tests {
         let fm: serde_yaml::Value = serde_yaml::from_str("action_items:\n- assignee: unassigned\n  task: ship it\n  due: Friday\n  status: done\n").unwrap();
         let items = action_items(&fm, "## Action Items\n- [ ] other\n");
         assert_eq!(items, vec![ActionItem { task: "ship it".into(), assignee: None, due: Some("Friday".into()), done: true }]);
+    }
+
+    #[test]
+    fn list_cache_follows_file_changes() {
+        let dir = std::env::temp_dir().join(format!("margin-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.md");
+        let titles = |files: Vec<PathBuf>| cached_summaries(files).into_iter().map(|m| m.title).collect::<Vec<_>>();
+        std::fs::write(&file, "---\ntitle: One\ntype: meeting\n---\n").unwrap();
+        assert_eq!(titles(vec![file.clone()]), ["One"]);
+        std::fs::write(&file, "---\ntitle: Second\ntype: meeting\n---\n").unwrap();
+        assert_eq!(titles(vec![file.clone()]), ["Second"]);
+        std::fs::remove_file(&file).unwrap();
+        assert!(titles(vec![file]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_the_matching_line_ignoring_case() {
+        let body = "## Notes\n\n- Legal Review on Friday\n\n## Transcript\n\n[0:01] héllo LEGAL\n";
+        assert_eq!(find_line(body, "legal review"), Some("- Legal Review on Friday"));
+        assert_eq!(find_line(body, "héllo"), Some("[0:01] héllo LEGAL"));
+        assert_eq!(find_line(body, "zebra"), None);
+        assert_eq!(find_line("one\r\ntwo LEGAL\r\n", "legal"), Some("two LEGAL"));
     }
 
     #[test]

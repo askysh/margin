@@ -97,6 +97,10 @@ pub fn job_views() -> Vec<JobView> {
 
 /// Polls job files, pushes changes to the UI, and puts the user's exact notes into the
 /// finished meeting file.
+///
+/// Each second it reads only the active job files (usually none) and the timestamps of the
+/// archive and drafts folders. The full listing, which reads every archived job, runs only
+/// when one of those changed (docs/perf.md).
 pub fn spawn_watcher() {
     // Resume anything left from a previous run (crash, quit mid-processing).
     if !jobs::active_jobs().is_empty() {
@@ -106,35 +110,55 @@ pub fn spawn_watcher() {
         .name("margin-jobs".into())
         .spawn(move || {
             let mut last: HashMap<String, JobView> = HashMap::new();
+            let mut last_key = None;
             let mut first = true;
             let mut idle_polls = 0u32;
             loop {
-                let views = job_views();
-                let mut changed = false;
-                for view in &views {
-                    if last.get(&view.id) != Some(view) {
-                        changed = true;
-                        if view.state.is_terminal() {
-                            finish(view, !first);
+                // list_jobs also re-queues jobs whose worker died, so it runs every poll.
+                let active = jobs::list_jobs();
+                let key = change_key(&active);
+                if last_key.as_ref() != Some(&key) {
+                    last_key = Some(key);
+                    let views = job_views();
+                    let mut changed = false;
+                    for view in &views {
+                        if last.get(&view.id) != Some(view) {
+                            changed = true;
+                            if view.state.is_terminal() {
+                                finish(view, !first);
+                            }
                         }
                     }
+                    first = false;
+                    if changed || views.len() != last.len() {
+                        events::emit("jobs", &views);
+                        last = views.into_iter().map(|v| (v.id.clone(), v)).collect();
+                    }
                 }
-                first = false;
                 // A job queued just as the worker finished its loop would wait forever.
-                let pending = views.iter().any(|v| v.state == JobState::Queued);
+                let pending = active.iter().any(|j| j.state == JobState::Queued);
                 idle_polls = if pending && !jobs::worker_active() { idle_polls + 1 } else { 0 };
                 if idle_polls >= 5 {
                     idle_polls = 0;
                     spawn_worker();
                 }
-                if changed || views.len() != last.len() {
-                    events::emit("jobs", &views);
-                    last = views.into_iter().map(|v| (v.id.clone(), v)).collect();
-                }
                 std::thread::sleep(Duration::from_millis(1000));
             }
         })
         .expect("spawn job watcher");
+}
+
+/// Changes whenever a job view can change: an active job file, a job moved into or out of
+/// the archive, or a draft written or removed. Core and Margin write all of these by
+/// rename, which updates the folder's modification time.
+fn change_key(active: &[jobs::ProcessingJob]) -> String {
+    let stamp = |dir: std::path::PathBuf| std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+    format!(
+        "{}|{:?}|{:?}",
+        serde_json::to_string(active).unwrap_or_default(),
+        stamp(jobs::archive_dir()),
+        stamp(paths::drafts_dir()),
+    )
 }
 
 /// `announce` is false on the first poll, so old jobs from the archive don't each fire
