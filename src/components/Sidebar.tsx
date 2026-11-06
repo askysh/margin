@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import { api, type Job, type MeetingSummary } from "../api";
 import type { Selection } from "../App";
-import { clock, groupLabel, shortTime } from "../util";
+import { clock, groupLabel, meetingFileReady, shortTime } from "../util";
 
 interface Props {
   meetings: MeetingSummary[];
@@ -43,7 +43,9 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
 
   const groups = useMemo(() => {
     const who = person?.toLowerCase();
-    const shown = meetings.filter((m) => (!hits || hits.has(m.path)) && (!who || m.people.some((p) => p.toLowerCase() === who)));
+    // A meeting that is still finishing shows once, as its job row.
+    const finishing = new Set(jobs.map((j) => j.output_path));
+    const shown = meetings.filter((m) => !finishing.has(m.path) && (!hits || hits.has(m.path)) && (!who || m.people.some((p) => p.toLowerCase() === who)));
     const out: Group[] = [];
     for (const m of shown) {
       const label = groupLabel(m.date);
@@ -52,7 +54,7 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
       else out.push({ label, items: [m] });
     }
     return out;
-  }, [meetings, hits, person]);
+  }, [meetings, jobs, hits, person]);
 
   const selectedPath = selection.type === "meeting" ? selection.path : null;
 
@@ -93,8 +95,8 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
         {jobs.map((j) => (
           <button
             key={j.id}
-            className={`row row-job ${selection.type === "processing" && selection.jobId === j.id ? "selected" : ""}`}
-            onClick={() => onSelect({ type: "processing", jobId: j.id, notes: "", title: j.title })}
+            className={`row row-job ${(selection.type === "processing" && selection.jobId === j.id) || (!!j.output_path && selectedPath === j.output_path) ? "selected" : ""}`}
+            onClick={() => onSelect(meetingFileReady(j) ? { type: "meeting", path: j.output_path, jobId: j.id } : { type: "processing", jobId: j.id, notes: "", title: j.title })}
           >
             <span className="row-title">{j.title || "New meeting"}</span>
             <span className="row-meta"><span className="spinner" aria-hidden />{j.stage ?? "Processing"}</span>

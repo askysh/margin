@@ -1,3 +1,4 @@
+import type { Job } from "./api";
 import { useEffect, useRef } from "react";
 
 export function clock(secs: number): string {
@@ -123,4 +124,10 @@ export async function copyText(text: string): Promise<boolean> {
     ta.remove();
     return ok;
   }
+}
+
+/** Core has written the job's meeting file. It can open now, while speakers are still being
+ * separated (DECISIONS.md D42). */
+export function meetingFileReady(job: Job): job is Job & { output_path: string } {
+  return !!job.output_path && ["transcript-only", "diarizing", "summarizing", "saving", "complete", "needs-review"].includes(job.state);
 }

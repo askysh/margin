@@ -227,6 +227,10 @@ pub mod ops {
         Ok(processing::job_views())
     }
 
+    pub fn live_draft(job_id: String) -> Res<Vec<crate::recorder::LiveLine>> {
+        Ok(processing::live_draft(&job_id))
+    }
+
     pub fn retry_job(id: String) -> Res<()> {
         minutes_core::jobs::requeue_job(&id).map_err(|e| e.to_string())?;
         processing::spawn_worker();
@@ -238,19 +242,26 @@ pub mod ops {
     }
 
     pub fn read_meeting(path: String) -> Res<library::MeetingDetail> {
-        let mut detail = library::read(&PathBuf::from(&path))?;
+        let p = PathBuf::from(&path);
+        let mut detail = library::read(&p)?;
         detail.summarizing = summaries::is_running(&path);
+        // Until the job is done, the file has core's copy of the notes; the draft has yours.
+        if let Some(notes) = processing::notes_draft_for(&p) {
+            detail.notes = notes;
+        }
         Ok(detail)
     }
 
     pub fn save_notes(path: String, notes: String) -> Res<()> {
         let p = PathBuf::from(path);
         library::ensure_inside_output(&p)?;
-        library::replace_notes(&p, &notes)
+        processing::save_notes(&p, &notes)
     }
 
     pub fn set_meeting_title(path: String, title: String) -> Res<()> {
-        library::set_title(&PathBuf::from(path), &title)?;
+        let p = PathBuf::from(path);
+        processing::ensure_not_processing(&p)?;
+        library::set_title(&p, &title)?;
         crate::events::refresh_tray();
         Ok(())
     }
@@ -260,7 +271,9 @@ pub mod ops {
     }
 
     pub fn trash_meeting(path: String) -> Res<()> {
-        library::trash(&PathBuf::from(&path))?;
+        let p = PathBuf::from(&path);
+        processing::ensure_not_processing(&p)?;
+        library::trash(&p)?;
         let _ = chat::clear(Some(&path));
         crate::events::refresh_tray();
         Ok(())
@@ -280,12 +293,15 @@ pub mod ops {
     }
 
     pub fn rename_speaker(path: String, label: String, name: String, remember_voice: bool) -> Res<speakers::RenameResult> {
-        speakers::rename(&PathBuf::from(path), &label, &name, remember_voice)
+        let p = PathBuf::from(path);
+        processing::ensure_not_processing(&p)?;
+        speakers::rename(&p, &label, &name, remember_voice)
     }
 
     pub fn summarize_meeting(path: String) -> Res<()> {
         let p = PathBuf::from(path);
         library::ensure_inside_output(&p)?;
+        processing::ensure_not_processing(&p)?;
         let cfg = corecfg::load();
         if cfg.summarization.engine == "none" {
             return Err("Summaries are off. Turn on Claude or Ollama in Settings → Summaries.".into());
@@ -330,7 +346,9 @@ pub mod ops {
     }
 
     pub fn set_action_item(path: String, index: usize, done: bool) -> Res<()> {
-        library::set_action_item(&PathBuf::from(path), index, done)
+        let p = PathBuf::from(path);
+        processing::ensure_not_processing(&p)?;
+        library::set_action_item(&p, index, done)
     }
 
     pub fn list_voices() -> Res<Vec<speakers::VoiceProfileView>> {
@@ -427,6 +445,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "set_recording_title" => out(ops::set_recording_title(arg(a, "title")?)),
         "discard_orphaned_draft" => out(ops::discard_orphaned_draft()),
         "list_jobs" => out(ops::list_jobs()),
+        "live_draft" => out(ops::live_draft(arg(a, "jobId")?)),
         "retry_job" => out(ops::retry_job(arg(a, "id")?)),
         "list_meetings" => out(ops::list_meetings()),
         "read_meeting" => out(ops::read_meeting(arg(a, "path")?)),
@@ -490,6 +509,7 @@ pub mod tauri_cmds {
     cmd!(set_recording_title(title: Option<String>) -> ());
     cmd!(discard_orphaned_draft() -> ());
     cmd!(list_jobs() -> Vec<processing::JobView>);
+    cmd!(live_draft(job_id: String) -> Vec<crate::recorder::LiveLine>);
     cmd!(retry_job(id: String) -> ());
     cmd!(list_meetings() -> Vec<library::MeetingSummary>);
     cmd!(read_meeting(path: String) -> library::MeetingDetail);
