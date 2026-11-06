@@ -7,6 +7,7 @@ import { NotesEditor } from "./NotesEditor";
 import { Rule } from "./LiveView";
 import { ActionItems } from "./ActionItems";
 import { AudioPlayer, type AudioHandle } from "./AudioPlayer";
+import { MoreMenu } from "./MoreMenu";
 import { CopyMenu } from "./CopyMenu";
 import { ACTION_HEADING, meetingMarkdown, summaryMarkdown, transcriptMarkdown, tsSeconds } from "../meetingMarkdown";
 
@@ -196,8 +197,6 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
         </div>
         <div className="actions">
           {onAsk && <button className="link-btn" onClick={onAsk} title="Ask Claude about this meeting (⌘J)">Ask about this meeting</button>}
-          <button className="link-btn" onClick={() => api.reveal(path)}>Show in Finder</button>
-          {m.in_obsidian_vault && <button className="link-btn" onClick={() => api.openInObsidian(path).catch((e) => notify(errorText(e), "error"))}>Open in Obsidian</button>}
           <CopyMenu choices={copyChoices} notify={notify} />
           {m.transcript.length > 0 && (
             <button className="link-btn" onClick={summarize} disabled={summarizing || processing}>
@@ -207,7 +206,13 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
           {m.transcript.length > 0 && (
             <button className="link-btn" onClick={() => setShowTranscript((s) => !s)}>{showTranscript ? "Hide transcript" : "Show transcript"}</button>
           )}
-          <button className="link-btn danger" onClick={trash}>Move to Trash</button>
+          <MoreMenu
+            choices={[
+              { label: "Show in Finder", onSelect: () => api.reveal(path) },
+              ...(m.in_obsidian_vault ? [{ label: "Open in Obsidian", onSelect: () => api.openInObsidian(path).catch((e) => notify(errorText(e), "error")) }] : []),
+              { label: "Move to Trash…", onSelect: trash, danger: true },
+            ]}
+          />
         </div>
 
         {processing && (

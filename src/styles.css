@@ -456,3 +456,6 @@ textarea.field { max-width: none; resize: vertical; min-height: 64px; line-heigh
 .md-link-btn:hover { color: var(--rule); }
 .ask-error .md, .ask-setup .md { font-size: inherit; color: inherit; }
 .ask-error .md p, .ask-setup .md p { margin: 0; }
+.menu-compact { width: 190px; }
+.menu-compact strong { font-weight: 500; font-size: 13px; }
+.menu button.danger strong { color: var(--tally); }

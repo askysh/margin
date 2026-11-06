@@ -69,7 +69,7 @@ each one locally.
 - **Patch:** `Config::minutes_dir().join("templates")`, with a fallback that reads the
   legacy path.
 - **Workaround:** Margin writes a project template in `<state>/.minutes/templates/` and
-  runs with the state directory as its working directory (DECISIONS.md, S2).
+  runs with the state directory as its working directory (DECISIONS.md D14).
 
 ## 7. Summary instructions in the config
 - **Where:** `crates/core/src/config.rs` `SummarizationConfig`.

@@ -41,7 +41,7 @@ measured: that needs the app window. The bridge figures stand in for it.
 | Fonts | 682 KB in 4 subsets | unchanged |
 
 Note: with the old profile, the new code gave a 39.37 MiB app. The smaller app comes from
-the release profile (DECISIONS.md P6).
+the release profile (DECISIONS.md D36).
 
 ### Command latency (release build, 600 meetings)
 
@@ -92,7 +92,7 @@ The rest of the "new line" cost is the scroll to the newest line.
 | Page start to the notepad font | 96–108 ms | 102–111 ms |
 
 No measurable change. A font preload was tried and removed, because it did not change the
-font time (DECISIONS.md P7).
+font time (DECISIONS.md D37).
 
 ### Processing the 39 s test file (release build)
 
@@ -119,9 +119,9 @@ same data no longer re-renders the sidebar or the meeting.
 
 - **Jobs watcher** (`processing.rs`). Each second it reads only the active job files and
   the timestamps of the archive and drafts folders. It lists the archive only when one of
-  those changes. DECISIONS.md P2.
+  those changes. DECISIONS.md D32.
 - **Library list cache** (`library.rs`). Entries are kept while a file's size and
-  modification time stay the same. DECISIONS.md P3.
+  modification time stay the same. DECISIONS.md D33.
 - **Search** (`library.rs`). Files are read on up to 8 threads. For an ASCII query, each
   file is lowercased once instead of once per line.
 - **Lazy views** (`App.tsx`). Settings and Onboarding load on first use.
@@ -133,7 +133,7 @@ same data no longer re-renders the sidebar or the meeting.
     once.
   - `MeetingView.tsx`: memoised, and a reload that returns the same file does not
     re-render the transcript.
-- **Release profile** (`Cargo.toml`): `lto = "fat"`, `codegen-units = 1`. DECISIONS.md P6.
+- **Release profile** (`Cargo.toml`): `lto = "fat"`, `codegen-units = 1`. DECISIONS.md D36.
 
 ## Not done
 

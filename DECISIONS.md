@@ -85,11 +85,11 @@ Product and technical decisions made without asking. Each one lists the options 
 - It is compiled into debug builds only (`cfg!(debug_assertions)`). Release builds
   ignore the variable.
 
-## Settings parity (to renumber)
+## Settings parity
 
 The full comparison with upstream is in `docs/parity/settings.md`.
 
-### S1. Add only the settings a meeting notepad needs
+### D13. Add only the settings a meeting notepad needs
 - Options: copy upstream's panel (about 80 controls in six tabs), or add the settings that
   change a meeting's result.
 - Pick: **the second**. Margin adds ten:
@@ -108,7 +108,7 @@ The full comparison with upstream is in `docs/parity/settings.md`.
   leaves its stored value unchanged. So an onboarding screen that does not know the new
   fields cannot reset them.
 
-### S2. Summary instructions are a project template, not a file in `~/.minutes`
+### D14. Summary instructions are a project template, not a file in `~/.minutes`
 - Core reads extra prompt text only from a template. It looks for templates in
   `<cwd>/.minutes/templates/`, then in `~/.minutes/templates/`, then in the bundled set.
 - Options:
@@ -124,7 +124,7 @@ The full comparison with upstream is in `docs/parity/settings.md`.
   falls back to the bundled template when the instructions are cleared.
 - Reset clears the state directory, so it also clears the instructions.
 
-### S3. "Keep audio" deletes old audio for good
+### D15. "Keep audio" deletes old audio for good
 - D10 says delete means "move to the Trash". Audio retention is different. Its purpose
   is to free disk space and to keep less private audio, and the Trash keeps both.
 - Pick: core's `retention` plan deletes the files. Transcripts and notes are never
@@ -134,7 +134,7 @@ The full comparison with upstream is in `docs/parity/settings.md`.
 - Cost: with 7 days, "Recognise this voice" does not work on a meeting older than a
   week, because the voice sample comes from the audio.
 
-### S4. Open at login is a LaunchAgent that opens Margin by bundle ID
+### D16. Open at login is a LaunchAgent that opens Margin by bundle ID
 - Options: `SMAppService` (needs a signed bundle, and it cannot be tested with a sandbox
   `HOME`), the autostart plugin (one more dependency), or a LaunchAgent plist.
 - Pick: **a LaunchAgent** that runs `open -b com.akashmishra.margin --args --at-login`.
@@ -142,7 +142,7 @@ The full comparison with upstream is in `docs/parity/settings.md`.
   and does not show its window. The e2e pass checks the file in a sandbox `HOME`.
 - Reset turns it off.
 
-### S5. A missing microphone falls back to the system default
+### D17. A missing microphone falls back to the system default
 - Core fails to start a recording when the chosen device is not connected.
 - Pick: Margin checks the device before each recording. When the device is missing,
   Margin uses the system default and shows a toast. Settings marks the device
@@ -150,17 +150,19 @@ The full comparison with upstream is in `docs/parity/settings.md`.
 - Calls take the mic from `recording.sources.voice`, which core reads in place of
   `recording.device`. Margin sets both.
 
-### S6. No completion notification and no global recording shortcut yet
+### D18. No completion notification and no global recording shortcut yet (superseded)
+- Superseded by D22 (notifications) and D23 (global shortcut), which the app-parity
+  work added later the same day. The original reasoning:
 - A macOS notification needs the notification permission and a signed app. A global
   shortcut needs a new plugin. Neither can be tested headless without a prompt.
 - Margin already opens the finished meeting in its window, and the menu bar item starts
   a recording from any app.
 
-## App parity (to renumber)
+## App parity
 
 The full comparison is in `docs/parity/app.md`.
 
-### P1. Add only upstream features that help a notepad, plus a few small extras
+### D19. Add only upstream features that help a notepad, plus a few small extras
 - Options: (a) copy every upstream surface; (b) take the upstream features that a
   Granola-like notepad needs, and skip the rest; (c) (b) plus small extras that upstream
   does not have.
@@ -172,7 +174,7 @@ The full comparison is in `docs/parity/app.md`.
 - Skipped: dictation, coach, palette, terminal, calendar, memo mode, sensitive meetings,
   mic mute, archive. The reason for each is in the parity doc.
 
-### P2. Playback goes through Tauri's asset protocol with a per-file scope
+### D20. Playback goes through Tauri's asset protocol with a per-file scope
 - Options: (a) a custom URI scheme with our own byte-range code; (b) the asset protocol
   with a wide scope such as the meetings folder; (c) the asset protocol with an empty
   scope, and the backend adds one `.wav` when the meeting view asks for it.
@@ -180,7 +182,7 @@ The full comparison is in `docs/parity/app.md`.
   seek. The page can read only recordings that the backend checked are inside the
   meetings folder.
 
-### P3. Action items: frontmatter first, body checklist second
+### D21. Action items: frontmatter first, body checklist second
 - Core writes structured `action_items` when its summary has them, and keeps a
   `- [ ]` checklist in the body. Some engines write only the checklist.
 - Pick: show the structured items when present. Otherwise show the checklist lines under
@@ -189,7 +191,7 @@ The full comparison is in `docs/parity/app.md`.
   The plain "Action Items" section is hidden when the block shows, so the list appears
   once.
 
-### P4. Notifications only when the window is not in front, with no setting
+### D22. Notifications only when the window is not in front, with no setting
 - Upstream sends "processing complete" when the window is hidden or not focused, behind
   a setting that is on by default.
 - Pick: the same rule, without a setting. macOS can turn off Margin's notifications in
@@ -198,34 +200,34 @@ The full comparison is in `docs/parity/app.md`.
 - Not copied: upstream's reminder every 20 seconds and bringing the window forward. Both
   interrupt the call.
 
-### P5. Global shortcut ⌃⌥⌘R, off by default
+### D23. Global shortcut ⌃⌥⌘R, off by default
 - Options: ⌘⇧R (already the in-window shortcut, but browsers use it for a hard reload),
   ⌘⇧M (upstream's memo key), ⌃⌥⌘R.
 - Pick: **⌃⌥⌘R**, off by default. A global shortcut takes the keys from every app, so it
   must be rare and opt-in. It records a call (or in person, when that is the default
   kind) and shows the notepad; pressed again, it stops.
 
-### P6. Sound cues are on by default
+### D24. Sound cues are on by default
 - Upstream plays the same four sounds by default, with one switch. They confirm a start
   or stop from the menu bar or the shortcut when the window is hidden.
 - Pick: the same, stored in `prefs.json` as `mute_cues` so that a missing key means on.
 
-### P7. People filter from attendee names
+### D25. People filter from attendee names
 - Upstream has no library filter. Its related-people chips run a search.
 - Pick: attendee names in the meeting view are links. A click shows a "With <name>" pill
   in the sidebar and lists only meetings with that attendee. No new control in the
   sidebar until a filter is active.
 
-## Chat (to renumber)
+## Ask (chat with Claude)
 
-### C1. Ask uses the user's own `claude` CLI, headless
+### D26. Ask uses the user's own `claude` CLI, headless
 - Options: (a) the Anthropic API with a key in Settings, (b) the `claude` CLI that
   Margin already uses for summaries, (c) Ollama.
 - Pick: **(b)**. No key to store, and the user's own login and plan apply. Margin
   uses the binary chosen in Settings → Summaries, or else the one it finds.
 - Ollama is not in v1 (docs/parity/chat.md).
 
-### C2. Claude can read the meetings folder, and nothing else
+### D27. Claude can read the meetings folder, and nothing else
 - Options: (a) no tools, with context packed into the prompt (upstream), (b) read-only
   tools in the meetings folder.
 - Pick: **(b)**. The working directory is the meetings folder, and the flags are
@@ -238,7 +240,7 @@ The full comparison is in `docs/parity/app.md`.
 - If `claude --help` does not show `--tools`, `dontAsk` and `--resume`, Ask refuses to
   run and tells the user to update Claude Code.
 
-### C3. One conversation per meeting, plus one across all meetings
+### D28. One conversation per meeting, plus one across all meetings
 - A meeting chat puts the whole meeting file in its first prompt. The chat across all
   meetings puts a list of meetings (date, title, file) in its first prompt, and Claude
   uses Grep and Read.
@@ -248,28 +250,28 @@ The full comparison is in `docs/parity/app.md`.
   conversation. Reset wipes `state/` and stops any answer in progress first. Move to
   Trash deletes that meeting's chat.
 
-### C4. The panel docks on the right, over the transcript
+### D29. The panel docks on the right, over the transcript
 - Options: a page of its own, a bar at the bottom of the meeting, a docked panel.
 - Pick: **a docked panel**, opened with ⌘J, from the sidebar ("Ask about your
   meetings") or from a meeting ("Ask about this meeting"). A switch in the panel picks
   "This meeting" or "All meetings". Source links open a meeting and keep the panel open,
   so you can read the answer and the meeting together.
 
-### C5. Calm states
+### D30. Calm states
 - Not installed, not signed in and too old each show one sentence that says how to fix
   it, plus **Check again**.
 - After 10 s the panel shows the time. After 60 s it suggests a narrower question.
   After 5 minutes Margin stops the turn.
 - Stop keeps the partial answer, marked "Stopped.".
 
-## Perf and onboarding (to renumber)
+## Performance and onboarding
 
-### P1. Measure first, keep only what the numbers support
+### D31. Measure first, keep only what the numbers support
 - The numbers are in `docs/perf.md`, with the scripts that produced them.
 - Kept: the jobs-watcher change, the library cache, faster search, lazy views and
   fewer re-renders. Each one has a before and after figure.
 
-### P2. The jobs watcher reads the archive only when something changed
+### D32. The jobs watcher reads the archive only when something changed
 - Context: minutes-core never prunes `jobs/archive/`, so it has one file per processed
   meeting. The watcher read and parsed all of them every second. With 600 meetings the
   idle app used 2.1% CPU.
@@ -282,12 +284,12 @@ The full comparison is in `docs/parity/app.md`.
   timestamp. `list_jobs` still runs every second, so a job whose worker died is still
   re-queued.
 
-### P3. The library list is cached by file size and modification time
+### D33. The library list is cached by file size and modification time
 - The cache lives in memory and is rebuilt on each list. Entries for files that are gone
   drop out. A change that keeps both the size and the modification time is missed. That
   needs a same-size write in the same nanosecond, and Margin and core write by rename.
 
-### P4. Onboarding: five short steps, every one with a default
+### D34. Onboarding: five short steps, every one with a default
 - Steps: You → Setup (folder and model together) → Permissions → Summaries → Ready.
 - Return continues on every step. A user can finish with Return alone.
 - Folder and model share a page. Both have good defaults (Documents, Balanced), and the
@@ -299,14 +301,14 @@ The full comparison is in `docs/parity/app.md`.
   bar and the shortcuts.
 - Summaries still default to None (D6).
 
-### P5. No microphone level check during onboarding
+### D35. No microphone level check during onboarding
 - A level meter must open the microphone. That shows the macOS prompt if access is not
   decided yet. If access is already granted, it records real audio in a test run, which
   the QA rules forbid.
 - Pick: **no meter**. The live view's rule already shows the level during the first
   recording. Add a meter later, shown only after `microphone == granted`.
 
-### P6. Release profile: fat LTO in one codegen unit
+### D36. Release profile: fat LTO in one codegen unit
 - Options: keep `lto = "thin"`, or use `lto = "fat"` with `codegen-units = 1`.
 - Measured (`docs/perf.md`): the app is 11% smaller (39.3 MiB → 35.0 MiB). Command
   latency and processing time are the same within noise. A release build after a small
@@ -316,7 +318,7 @@ The full comparison is in `docs/parity/app.md`.
 - Not picked: `panic = "abort"`. A panic in one command would then end the whole app
   instead of failing that command.
 
-### P7. Measured and dropped
+### D37. Measured and dropped
 - **Preloading the notepad font.** The font was loaded about 100 ms after navigation with
   and without the preload, so the change was removed.
 - **Code-splitting Settings and Onboarding** is kept, but only for size: the startup

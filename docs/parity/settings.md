@@ -22,7 +22,7 @@ Status:
 | Name variants (`identity.aliases`) | Other forms of your name, for hints and matching. | skipped | "Names and words to spell right" covers the transcription use. |
 | Display language (`ui.language`) | Language of the app's menus and text. | skipped | Margin is English only in v1. |
 | Theme, accent colors (`customize.toml`) | Light/dark and accent color. | skipped | Margin follows the system appearance. Few choices by design. |
-| Show completion alerts (`notifications.completion_enabled`) | A macOS notification when a meeting is ready. | skipped | Needs the notification permission and a signed app. It cannot be checked headless. Margin opens the finished meeting in its window instead. |
+| Show completion alerts (`notifications.completion_enabled`) | A macOS notification when a meeting is ready. | added (no setting) | The app-parity work sends it when the window is not in front (DECISIONS.md D22). macOS System Settings turns it off. |
 | Critical Coach alerts (`notifications.copilot_critical_enabled`) | Coach notifications while its HUD is hidden. | skipped | No Coach in Margin. |
 | Sound cues | Sounds for start, stop and complete. | skipped | Low value. One more choice. |
 | Open Minutes at login (autostart plugin) | Starts the app when you log in. | added | "Open Margin when you log in". A LaunchAgent opens Margin in the menu bar only. |
@@ -39,7 +39,7 @@ Status:
 | Command palette shortcut (`palette`) | A global key for the palette. | skipped | Margin has no command palette. |
 | Silence auto-stop (`recording.silence_auto_stop_secs`) | Stops a recording after a period with no sound. Config file only upstream. | added | "Stop after silence": Never, 5, 15, 30 (default) or 60 minutes. |
 | Silence reminder, max duration, minimum disk space (`recording.*`) | Other recording safety limits. Config file only. | skipped | Core defaults are good. Few choices. |
-| Recording shortcut | Margin's ⌘⇧R / ⌘⇧I work in the window. Upstream has no global record key. | has | A global key needs a new plugin and cannot be checked headless. The menu bar item starts a recording from any app. |
+| Recording shortcut | Margin's ⌘⇧R / ⌘⇧I work in the window. Upstream has no global record key. | added | ⌃⌥⌘R starts and stops a recording from any app. It is off by default (DECISIONS.md D23). |
 
 ## Transcription
 
