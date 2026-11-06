@@ -32,7 +32,8 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-15
+    # minutes-core uses the macOS 26 Speech APIs, which need Xcode 26 or later.
+    runs-on: macos-26
     timeout-minutes: 90
     env:
       VERSION: ${{ github.event.inputs.version || github.ref_name }}
@@ -52,6 +53,13 @@ jobs:
             echo "::notice title=Release exists::v$VERSION already has a release; nothing to build."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Use the newest Xcode
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          xcode="$(find /Applications -maxdepth 1 -name 'Xcode_*.app' | sort -V | tail -n 1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
 
       - uses: oven-sh/setup-bun@v2
         if: steps.exists.outputs.skip != 'true'
