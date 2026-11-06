@@ -231,6 +231,7 @@ button { cursor: default; }
 
 .page-home { overflow-y: auto; }
 .home-inner { max-width: 620px; margin: 0 auto; padding: 8vh 32px 60px; }
+.page-home .download { margin: 0 0 22px; }
 .home-title { font-family: var(--f-note); font-variation-settings: "CASL" 1; font-weight: 640; font-size: 30px; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 12px; }
 .home-body { font-size: 14.5px; line-height: 1.6; color: var(--ink-2); margin: 0 0 28px; }
 .home-choices { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 18px; }
@@ -242,21 +243,68 @@ button { cursor: default; }
 .choice-body { color: var(--pencil); font-size: 12.5px; }
 
 /* ---------------------------------------------------------------- onboarding */
-.onboarding { height: 100%; background: var(--paper); display: grid; place-items: center; padding: 40px 24px; overflow-y: auto; }
-.ob-card { width: min(620px, 100%); position: relative; }
-.ob-steps { list-style: none; display: flex; gap: 18px; padding: 0; margin: 0 0 30px; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--pencil); }
-.ob-steps li { position: relative; padding-left: 12px; }
-.ob-steps li::before { content: ""; position: absolute; left: 0; top: 4px; width: 6px; height: 6px; border-radius: 50%; border: 1.25px solid currentColor; }
+/* A page of the pad: faint ruling, and the green margin rule down the left of the card. */
+.onboarding {
+  height: 100%; display: grid; place-items: center; padding: 40px 24px; overflow-y: auto;
+  background: var(--paper); position: relative; isolation: isolate;
+}
+/* Ruling fades out towards the window edges, so it reads as paper, not as a grid. */
+.onboarding::before {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background: repeating-linear-gradient(to bottom, transparent 0, transparent 27px, var(--hair) 27px, var(--hair) 28px);
+  opacity: 0.45; -webkit-mask-image: radial-gradient(ellipse 70% 75% at 50% 50%, #000 30%, transparent 100%); mask-image: radial-gradient(ellipse 70% 75% at 50% 50%, #000 30%, transparent 100%);
+}
+.ob-card { width: min(640px, 100%); position: relative; padding: 4px 0 8px 40px; }
+.ob-card::before { content: ""; position: absolute; left: 0; top: -12px; bottom: -12px; width: 1.5px; border-radius: 1px; background: var(--rule-soft); }
+.ob-head { display: flex; align-items: center; gap: 22px; margin-bottom: 34px; }
+.ob-brand { font-family: var(--f-note); font-variation-settings: "CASL" 1; font-weight: 640; font-size: 15px; letter-spacing: -0.01em; color: var(--ink); }
+.ob-steps { list-style: none; display: flex; gap: 16px; padding: 0; margin: 0; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--pencil); }
+.ob-steps li { position: relative; padding-left: 11px; transition: color 200ms; }
+.ob-steps li::before { content: ""; position: absolute; left: 0; top: 4px; width: 5px; height: 5px; border-radius: 50%; border: 1.25px solid currentColor; transition: background 200ms, border-color 200ms; }
 .ob-steps li.done { color: var(--ink-2); }
 .ob-steps li.done::before { background: var(--rule); border-color: var(--rule); }
 .ob-steps li.now { color: var(--rule); }
-.ob-step { display: grid; gap: 0; }
-.ob-title { font-family: var(--f-note); font-variation-settings: "CASL" 1; font-weight: 660; font-size: 32px; line-height: 1.16; letter-spacing: -0.02em; margin: 0 0 14px; }
-.ob-body { font-size: 14.5px; line-height: 1.6; color: var(--ink-2); margin: 0 0 24px; max-width: 540px; }
-.ob-actions { margin-top: 26px; display: flex; justify-content: flex-start; }
-.ob-back { position: absolute; top: -4px; right: 0; border: none; background: none; color: var(--pencil); font-size: 12px; }
+.ob-back { margin-left: auto; border: none; background: none; color: var(--pencil); font-size: 12px; padding: 2px 4px; }
 .ob-back:hover { color: var(--ink); }
+.ob-step { display: grid; justify-items: start; animation: ob-in 260ms ease-out; }
+.ob-step > * { max-width: 100%; }
+@keyframes ob-in { from { opacity: 0; transform: translateY(6px); } }
+.ob-title { font-family: var(--f-note); font-variation-settings: "CASL" 1; font-weight: 660; font-size: 32px; line-height: 1.16; letter-spacing: -0.02em; margin: 0 0 12px; }
+.ob-body { font-size: 14.5px; line-height: 1.6; color: var(--ink-2); margin: 0 0 22px; max-width: 540px; }
+.ob-sub { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--rule); margin: 24px 0 8px; }
+.ob-hint { font-size: 12.5px; color: var(--pencil); margin: 10px 0 0; max-width: 540px; }
+.ob-actions { margin-top: 28px; display: flex; align-items: center; gap: 14px; }
+.ob-key { font-size: 12px; color: var(--pencil); }
+.ob-foot { margin-top: 30px; width: 100%; }
+.ob-foot .download { margin-top: 0; }
 .ob-error { color: var(--danger); margin: 14px 0 0; }
+.ob-step .field { max-width: 380px; }
+.ob-step .options { width: 100%; }
+.options-tight { gap: 6px; }
+.options-tight .option { padding: 10px 14px; }
+
+.segmented { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--hair-strong); border-radius: 10px; background: var(--sheet); }
+.segmented button { border: none; background: none; padding: 6px 14px; border-radius: 7px; font-weight: 500; font-size: 13px; color: var(--ink-2); transition: background 120ms, color 120ms; }
+.segmented button:hover:not(.on) { background: var(--paper-2); color: var(--ink); }
+.segmented button.on { background: var(--ink); color: var(--paper); }
+.segmented .mono { margin-left: 5px; font-size: 11.5px; opacity: 0.62; }
+
+.perms { width: 100%; }
+.perm-icon { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; flex: none; background: var(--rule-wash); color: var(--rule); transition: background 200ms, color 200ms; }
+.perm.is-granted .perm-icon { background: var(--rule); color: var(--paper); }
+.perm-text { flex: 1; min-width: 0; }
+
+.ways { list-style: none; padding: 0; margin: 0 0 22px; display: grid; gap: 8px; width: 100%; }
+.ways li { display: grid; grid-template-columns: 128px minmax(0, 1fr); align-items: center; gap: 14px; padding: 12px 16px; border: 1px solid var(--hair); border-radius: 11px; background: var(--sheet); }
+.way-demo { display: flex; align-items: center; gap: 3px; }
+.way-text { font-size: 13px; color: var(--ink-2); line-height: 1.45; }
+.way-text strong { color: var(--ink); font-weight: 600; }
+.demo-btn { font-size: 12px; padding: 3px 10px; pointer-events: none; }
+.demo-menubar { display: inline-flex; align-items: center; justify-content: flex-end; width: 74px; height: 22px; padding: 0 8px; border-radius: 6px; background: var(--paper-2); border: 1px solid var(--hair); }
+.demo-glyph { width: 12px; height: 14px; border: 1.5px solid var(--ink); border-radius: 2.5px; position: relative; }
+.demo-glyph::before { content: ""; position: absolute; left: 2.5px; top: 1px; bottom: 1px; width: 1.25px; background: var(--ink); }
+kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 12px; min-width: 24px; height: 24px; padding: 0 5px; display: inline-grid; place-items: center; border: 1px solid var(--hair-strong); border-bottom-width: 2px; border-radius: 6px; background: var(--paper); color: var(--ink); }
+@media (prefers-reduced-motion: reduce) { .ob-step { animation: none; } }
 .field-label { font-size: 12.5px; font-weight: 500; color: var(--ink-2); margin-bottom: 6px; display: block; }
 .field { border: 1px solid var(--hair-strong); border-radius: 8px; padding: 8px 11px; background: var(--sheet); outline: none; width: 100%; max-width: 360px; font-size: 14px; }
 .field:focus { border-color: var(--rule); box-shadow: 0 0 0 3px var(--rule-wash); }
@@ -288,6 +336,7 @@ button { cursor: default; }
 .bar { height: 4px; background: var(--hair); border-radius: 2px; overflow: hidden; }
 .bar-fill { height: 100%; background: var(--rule); border-radius: 2px; transition: width 200ms linear; }
 .download-error { color: var(--danger); font-size: 12.5px; margin: 0; }
+.download-note { color: var(--pencil); font-size: 12px; margin: 0; }
 
 /* ---------------------------------------------------------------- settings sheet */
 .sheet-backdrop, .dialog-backdrop { position: fixed; inset: 0; background: rgba(20, 26, 32, 0.28); display: grid; place-items: center; z-index: 50; padding: 24px; }

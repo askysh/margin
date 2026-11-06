@@ -12,11 +12,11 @@ export function SummaryChoice({ backends, value, onChange }: Props) {
   const ollama = backends?.ollama_running;
   return (
     <div className="options" role="radiogroup">
-      <button role="radio" aria-checked={engine === "none"} className={`option ${engine === "none" ? "on" : ""}`} onClick={() => onChange({ ...value, summary_engine: "none" })}>
+      <button type="button" role="radio" aria-checked={engine === "none"} className={`option ${engine === "none" ? "on" : ""}`} onClick={() => onChange({ ...value, summary_engine: "none" })}>
         <span className="option-title">No summaries</span>
         <span className="option-body">Transcript and notes only. Nothing is sent anywhere.</span>
       </button>
-      <button
+      <button type="button"
         role="radio"
         aria-checked={engine === "claude"}
         disabled={!claude}
@@ -29,7 +29,7 @@ export function SummaryChoice({ backends, value, onChange }: Props) {
         </span>
         {claude && <span className="option-path path">{claude}</span>}
       </button>
-      <button
+      <button type="button"
         role="radio"
         aria-checked={engine === "ollama"}
         disabled={!ollama || !backends?.ollama_models.length}

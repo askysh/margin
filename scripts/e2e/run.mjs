@@ -77,7 +77,7 @@ async function check(name, fn) {
     results.push({ id, name, ok: false, error: String(e?.message ?? e).split("\n")[0] });
     console.log(`FAIL ${id} ${name}: ${String(e?.message ?? e).split("\n")[0]}`);
   }
-  await page.screenshot({ path: path.join(out, `${id}-${name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.png`) }).catch(() => {});
+  await page.screenshot({ path: path.join(out, `${id}-${name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.png`), animations: "disabled" }).catch(() => {});
 }
 const assert = (cond, msg) => {
   if (!cond) throw new Error(msg);
@@ -101,9 +101,9 @@ const button = (name) => page.getByRole("button", { name, exact: false });
 await check("onboarding shows on first run", async () => {
   await page.getByText("Notes in your words.").waitFor({ timeout: 8000 });
 });
-await check("name step saves your name", async () => {
+await check("name step saves your name (Return continues)", async () => {
   await page.getByLabel("Your name, so transcripts can label you").fill("Akash QA");
-  await button("Continue").click();
+  await page.keyboard.press("Enter");
   await page.getByText("Where should meetings go?").waitFor();
   const cfg = fs.readFileSync(path.join(marginHome, "config.toml"), "utf8");
   assert(cfg.includes('name = "Akash QA"'), "identity.name not written");
@@ -111,28 +111,38 @@ await check("name step saves your name", async () => {
   assert(/\[calendar\][^[]*enabled = false/s.test(cfg), "calendar not disabled");
   assert(!fs.existsSync(meetingsDir), "default folder created before it was chosen");
 });
-await check("folder step defaults to Documents/Meetings", async () => {
-  await page.getByRole("radio", { name: /Documents/ }).click();
-  await button("Use this folder").click();
-  await page.getByText("How accurate should transcripts be?").waitFor();
+await check("setup step: Documents and Balanced preselected, saved, download starts", async () => {
+  await page.getByRole("radio", { name: /Documents/ }).waitFor();
+  assert((await page.getByRole("radio", { name: /Documents/ }).getAttribute("aria-checked")) === "true", "Documents not preselected");
+  assert((await page.getByRole("radio", { name: /Balanced/ }).getAttribute("aria-checked")) === "true", "Balanced not preselected");
+  assert(!fs.existsSync(meetingsDir), "default folder created before Continue");
+  await button("Continue").click();
+  await page.getByText("Let Margin hear the meeting.").waitFor();
   assert(fs.existsSync(meetingsDir), "meetings folder not created");
-});
-await check("model step: Balanced, continue", async () => {
-  await page.getByRole("radio", { name: /Balanced/ }).click();
-  await button("Download and continue").click();
-  await page.getByText("Two permissions, both explained.").waitFor();
+  const cfg = fs.readFileSync(path.join(marginHome, "config.toml"), "utf8");
+  assert(cfg.includes(`output_dir = "${meetingsDir}"`), "output_dir not saved");
+  assert(/\[transcription\][^[]*model = "small"/s.test(cfg), "model not saved as small");
+  await page.getByText(/Speech models ready|Downloading speech models/).waitFor({ timeout: 10000 });
+  assert((await page.evaluate(() => window.__E2E__.calls)).includes("download_models"), "download not started on setup");
 });
 await check("permissions step explains and never prompts", async () => {
   await page.getByText("System audio", { exact: true }).waitFor();
   await page.getByText(/Margin never records your screen/).waitFor();
-  await page.getByText(/Speech models ready|Downloading speech models/).waitFor({ timeout: 10000 });
-  await button("Continue").click();
+  await page.keyboard.press("Enter");
   await page.getByText("Want summaries too?").waitFor();
 });
-await check("summaries step: finish setup", async () => {
-  const done = button("Start using Margin");
-  await done.waitFor({ timeout: seed ? 15000 : 600000 });
-  await done.click();
+await check("summaries step: none preselected and saved", async () => {
+  assert((await page.getByRole("radio", { name: /No summaries/ }).getAttribute("aria-checked")) === "true", "No summaries not preselected");
+  await button("Continue").click();
+  await page.getByText("You're ready.").waitFor();
+  const cfg = fs.readFileSync(path.join(marginHome, "config.toml"), "utf8");
+  assert(/\[summarization\][^[]*engine = "none"/s.test(cfg), "summaries choice not saved");
+});
+await check("ready step shows how to record, then setup finishes", async () => {
+  await page.getByText("From the menu bar.").waitFor();
+  await page.getByText(/⌘⇧R/).first().waitFor();
+  await page.getByText("Speech models ready").waitFor({ timeout: seed ? 15000 : 600000 });
+  await button("Start using Margin").click();
   await page.getByText(/Your first meeting starts here/).waitFor({ timeout: 8000 });
   assert(JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8")).onboarding_complete, "prefs not saved");
 });
@@ -385,12 +395,12 @@ await check("reset keeps meetings and models, then runs setup again", async () =
   assert(meetingFiles().length === before, `meetings changed: ${before} -> ${meetingFiles().length}`);
 });
 await check("after re-onboarding the kept meetings are back", async () => {
-  await button("Continue").click();
-  await page.getByRole("radio", { name: /Documents/ }).click();
-  await button("Use this folder").click();
-  await button("Download and continue").click();
-  await button("Continue").click();
-  await button("Start using Margin").click();
+  // Keyboard only: Return takes each step with its default.
+  for (const heading of ["Where should meetings go?", "Let Margin hear the meeting.", "Want summaries too?", "You're ready."]) {
+    await page.keyboard.press("Enter");
+    await page.getByText(heading).waitFor({ timeout: 5000 });
+  }
+  await page.keyboard.press("Enter");
   await page.locator(".row").filter({ hasText: "QA launch sync" }).first().waitFor({ timeout: 10000 });
 });
 await check("deleting meetings requires typing delete", async () => {

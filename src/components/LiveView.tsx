@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { api, type LiveLine, type RecorderView } from "../api";
 import { clock, useDebounced } from "../util";
 import { NotesEditor } from "./NotesEditor";
@@ -27,7 +27,10 @@ export function LiveView({ recorder, lines, level }: Props) {
   liveDraft.notes = notes;
   liveDraft.title = title;
 
-  const started = recorder.started_at ? new Date(recorder.started_at) : new Date();
+  const startedLabel = useMemo(
+    () => (recorder.started_at ? new Date(recorder.started_at) : new Date()).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }),
+    [recorder.started_at],
+  );
   const kindLabel = recorder.kind === "call" ? "Call" : "In person";
 
   return (
@@ -41,7 +44,7 @@ export function LiveView({ recorder, lines, level }: Props) {
           aria-label="Meeting title"
         />
         <div className="meta-line">
-          <span>{started.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" })}</span>
+          <span>{startedLabel}</span>
           <span className="dot-sep" />
           <span>{kindLabel}</span>
         </div>
@@ -68,7 +71,8 @@ export function Rule({ level, live }: { level: number; live: boolean }) {
   );
 }
 
-function LiveTranscript({ lines, call }: { lines: LiveLine[]; call: boolean }) {
+/** Memoised: the level meter updates twice a second, the lines only when one arrives. */
+const LiveTranscript = memo(function LiveTranscript({ lines, call }: { lines: LiveLine[]; call: boolean }) {
   const end = useRef<HTMLDivElement>(null);
   const box = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
@@ -91,19 +95,20 @@ function LiveTranscript({ lines, call }: { lines: LiveLine[]; call: boolean }) {
       {lines.length === 0 ? (
         <p className="transcript-empty">Listening… Lines appear here a few seconds after they're spoken.</p>
       ) : (
-        lines.map((l, i) => {
-          const prev = lines[i - 1];
-          const showSpeaker = call && l.speaker && l.speaker !== prev?.speaker;
-          return (
-            <div key={l.line} className={`live-line ${l.speaker ?? ""}`}>
-              {showSpeaker && <div className="live-speaker">{l.speaker === "you" ? "You" : "Them"}</div>}
-              <span className="ts mono">{clock(l.offset_ms / 1000)}</span>
-              <span className="live-text">{l.text}</span>
-            </div>
-          );
-        })
+        lines.map((l, i) => <LiveLineRow key={l.line} line={l} showSpeaker={call && !!l.speaker && l.speaker !== lines[i - 1]?.speaker} />)
       )}
       <div ref={end} />
     </aside>
   );
-}
+});
+
+/** One live line. Memoised, so a new line doesn't re-render the hundreds before it. */
+const LiveLineRow = memo(function LiveLineRow({ line, showSpeaker }: { line: LiveLine; showSpeaker: boolean }) {
+  return (
+    <div className={`live-line ${line.speaker ?? ""}`}>
+      {showSpeaker && <div className="live-speaker">{line.speaker === "you" ? "You" : "Them"}</div>}
+      <span className="ts mono">{clock(line.offset_ms / 1000)}</span>
+      <span className="live-text">{line.text}</span>
+    </div>
+  );
+});

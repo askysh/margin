@@ -1,13 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import { api, errorText, on, type Boot, type Job, type Kind, type LiveLine, type MeetingSummary, type RecorderView } from "./api";
-import { Onboarding } from "./components/Onboarding";
 import { Sidebar } from "./components/Sidebar";
 import { LiveView, liveDraft } from "./components/LiveView";
 import { MeetingView } from "./components/MeetingView";
 import { ProcessingView } from "./components/ProcessingView";
 import { Home } from "./components/Home";
-import { SettingsSheet } from "./components/Settings";
 import { clock } from "./util";
+
+// Rarely shown, so loaded on first use instead of at startup (docs/perf.md).
+const Onboarding = lazy(() => import("./components/Onboarding").then((m) => ({ default: m.Onboarding })));
+const SettingsSheet = lazy(() => import("./components/Settings").then((m) => ({ default: m.SettingsSheet })));
 
 export type Selection =
   | { type: "home" }
@@ -37,7 +39,22 @@ export default function App() {
     window.setTimeout(() => setToast((t) => (t?.text === text ? null : t)), tone === "error" ? 9000 : 4000);
   }, []);
 
-  const refreshMeetings = useCallback(() => api.listMeetings().then(setMeetings).catch(() => {}), []);
+  // Focus, saves and finished jobs all refresh the list. Most refreshes change nothing, and
+  // then the sidebar is left alone.
+  const lastList = useRef("");
+  const refreshMeetings = useCallback(
+    () =>
+      api
+        .listMeetings()
+        .then((list) => {
+          const json = JSON.stringify(list);
+          if (json === lastList.current) return;
+          lastList.current = json;
+          setMeetings(list);
+        })
+        .catch(() => {}),
+    [],
+  );
 
   const reboot = useCallback(() => {
     api
@@ -67,7 +84,14 @@ export default function App() {
         recorderRef.current = v;
         setRecorder(v);
       }),
-      on<LiveLine[]>("live-lines", (l) => setLines((prev) => [...prev, ...l.filter((x) => !prev.some((p) => p.line === x.line))])),
+      on<LiveLine[]>("live-lines", (l) =>
+        setLines((prev) => {
+          // Line numbers only grow, so anything at or below the last one is a repeat.
+          const last = prev.length ? prev[prev.length - 1].line : 0;
+          const fresh = l.filter((x) => x.line > last);
+          return fresh.length ? [...prev, ...fresh] : prev;
+        }),
+      ),
       on<{ elapsed_secs: number; level: number }>("recorder-tick", setTick),
       on<Job[]>("jobs", setJobs),
       on<{ job_id: string; path: string }>("meeting-ready", ({ job_id, path }) => {
@@ -92,6 +116,11 @@ export default function App() {
       window.removeEventListener("focus", onFocus);
     };
   }, [reboot, refreshMeetings, notify]);
+
+  const goHome = useCallback(() => {
+    setSelection({ type: "home" });
+    refreshMeetings();
+  }, [refreshMeetings]);
 
   const start = async (kind: Kind) => {
     setBusy(true);
@@ -128,7 +157,11 @@ export default function App() {
   if (bootError) return <div className="fatal">Margin couldn't start: {bootError}</div>;
   if (!boot) return <div className="splash" />;
   if (!boot.onboarded) {
-    return <Onboarding initial={boot.settings} onDone={() => { reboot(); refreshMeetings(); }} />;
+    return (
+      <Suspense fallback={<div className="splash" />}>
+        <Onboarding initial={boot.settings} onDone={() => { reboot(); refreshMeetings(); }} />
+      </Suspense>
+    );
   }
 
   const recording = !!recorder?.recording;
@@ -189,7 +222,7 @@ export default function App() {
               path={selection.path}
               notify={notify}
               onChanged={refreshMeetings}
-              onDeleted={() => { setSelection({ type: "home" }); refreshMeetings(); }}
+              onDeleted={goHome}
               processing={active.some((j) => j.output_path === selection.path)}
             />
           )}
@@ -206,13 +239,15 @@ export default function App() {
         </section>
       </main>
       {settingsOpen && (
+        <Suspense fallback={null}>
         <SettingsSheet
           boot={boot}
           onClose={() => setSettingsOpen(false)}
           onSaved={(s) => { setBoot({ ...boot, settings: s }); refreshMeetings(); }}
-          onReset={() => { setSettingsOpen(false); setSelection({ type: "home" }); setMeetings([]); reboot(); }}
+          onReset={() => { setSettingsOpen(false); setSelection({ type: "home" }); lastList.current = ""; setMeetings([]); reboot(); }}
           notify={notify}
         />
+        </Suspense>
       )}
       {toast && (
         <div className={`toast toast-${toast.tone}`} role="status" onClick={() => setToast(null)}>{toast.text}</div>
