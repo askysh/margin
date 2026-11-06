@@ -114,6 +114,18 @@ it says otherwise.
     and MCP read.
   - With "Recognise this voice" checked, it saves a voice sample, and the next meeting
     labels that person automatically.
+- **Meeting tools** (see `docs/parity/app.md`):
+  - **Copy** puts the summary, your notes, the transcript or the whole meeting on the
+    clipboard as Markdown.
+  - **Action items** show as a checklist with owner and due date. Ticking one writes the
+    file.
+  - **Summarize again** replaces the summary and keeps your notes.
+  - **Play** the recording. Click a time in the transcript to play from there.
+  - Click an attendee to list only the meetings with that person.
+- **Menu bar and notifications.** The menu bar shows the elapsed time while recording,
+  and lists the five newest meetings. "Meeting ready" and "a call app is active"
+  notifications appear when the window is not in front. Sounds confirm start and stop.
+  An optional global shortcut, ⌃⌥⌘R, starts and stops a recording from any app.
 - **Library.** Meetings are grouped Today / Yesterday / This week / by month. Search covers
   titles, notes and transcripts. Each meeting can be shown in Finder, opened in Obsidian
   (when it's in a vault) or moved to the Trash.
