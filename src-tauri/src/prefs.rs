@@ -13,6 +13,8 @@ pub struct Prefs {
     pub mute_cues: bool,
     /// The global start/stop shortcut (`RECORD_SHORTCUT`). Off unless you turn it on.
     pub record_shortcut: bool,
+    /// Check for updates and download them. Stored inverted so a missing key is on.
+    pub no_auto_update: bool,
 }
 
 /// The preferences the UI can change.
@@ -20,11 +22,17 @@ pub struct Prefs {
 pub struct AppPrefs {
     pub sound_cues: bool,
     pub record_shortcut: bool,
+    #[serde(default = "yes")]
+    pub auto_update: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Prefs {
     pub fn app(&self) -> AppPrefs {
-        AppPrefs { sound_cues: !self.mute_cues, record_shortcut: self.record_shortcut }
+        AppPrefs { sound_cues: !self.mute_cues, record_shortcut: self.record_shortcut, auto_update: !self.no_auto_update }
     }
 }
 

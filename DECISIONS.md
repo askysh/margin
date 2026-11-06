@@ -324,3 +324,31 @@ The full comparison is in `docs/parity/app.md`.
 - **Code-splitting Settings and Onboarding** is kept, but only for size: the startup
   chunk is 8% smaller (194 → 179 KB). Time to the first `boot` call did not change
   measurably (about 55 ms either way under the same load).
+
+## Updates and distribution
+
+### D38. Auto-update with Tauri's updater, installed on restart or quit
+- Options: (a) Sparkle, as benchbar uses; (b) Tauri's updater plugin; (c) only
+  `brew upgrade`.
+- Pick: **(b)**. It is built for Tauri apps and needs no extra framework in the bundle. It
+  checks one `latest.json` on the latest GitHub release and verifies a minisign signature
+  against the public key in `tauri.conf.json` before it installs anything. Sparkle's EdDSA
+  keys stay benchbar's.
+- Behaviour: the first check is 20 s after launch, then one every six hours. A newer
+  version downloads in the background. Margin then shows "Margin X is ready" with
+  **Restart to update** in the toolbar, in the menu bar and in Settings → Updates. If you
+  do nothing, it installs when you quit. It never installs or restarts during a recording.
+  Settings has one switch to turn checking off.
+- The update archive is packed after the app is notarized and stapled, so an update is
+  the same notarized app that the DMG has.
+- Only a published release is "latest", so a draft never reaches anyone's app.
+
+### D39. Homebrew cask in askysh/homebrew-tap, updated on publish
+- `brew install --cask askysh/tap/margin`. The cask has `auto_updates true`, so brew
+  leaves updates to the app (D38).
+- `.github/workflows/homebrew-tap.yml` runs when a release is published. It checks the
+  DMG against `SHA256SUMS`, renders `packaging/homebrew/margin.rb`, runs brew style, audit,
+  install and uninstall, and opens a pull request on the tap that merges itself. This is
+  the same flow as benchbar's.
+- `uninstall` unloads the login item and quits the app. `zap` removes Margin's own
+  folders. It never removes the meetings folder.

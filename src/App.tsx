@@ -6,6 +6,7 @@ import { MeetingView } from "./components/MeetingView";
 import { ProcessingView } from "./components/ProcessingView";
 import { Home } from "./components/Home";
 import { AskPanel, type AskScope } from "./components/AskPanel";
+import { UpdateBanner } from "./components/Updates";
 import { clock } from "./util";
 import { useCues } from "./cues";
 
@@ -204,6 +205,7 @@ export default function App() {
               <button className="icon-btn small" aria-label="Dismiss" onClick={() => setCallApp(null)}>×</button>
             </div>
           )}
+          <UpdateBanner recording={recording} notify={notify} />
           {recording ? (
             <div className="rec-control">
               <span className="rec-dot" aria-hidden />

@@ -22,21 +22,46 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "transparent": true,
-        "trafficLightPosition": { "x": 18, "y": 22 }
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 22
+        }
       }
     ],
-    "security": { "csp": null, "assetProtocol": { "enable": true, "scope": [] } }
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      }
+    }
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "category": "public.app-category.productivity",
     "shortDescription": "Local-first meeting notes",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.png"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.png"
+    ],
     "macOS": {
       "minimumSystemVersion": "14.4",
       "infoPlist": "Info.plist",
       "entitlements": "entitlements.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ1OUY0MUQ3QzIzNzM5MDMKUldRRE9UZkMxMEdmMVdFS3NZdlpBRWZIcE9VQ2s0SXFnNGIwRFVCdE9oNzhQMnErUThPbzJsTW0K",
+      "endpoints": [
+        "https://github.com/askysh/margin/releases/latest/download/latest.json"
+      ]
     }
   }
 }

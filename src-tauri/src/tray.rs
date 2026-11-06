@@ -23,6 +23,8 @@ struct MenuState {
     recording: bool,
     title: Option<String>,
     onboarded: bool,
+    /// A downloaded update waiting for a restart.
+    update: Option<String>,
     /// (path, label), newest first.
     recent: Vec<(String, String)>,
 }
@@ -40,7 +42,7 @@ fn gather() -> MenuState {
     } else {
         vec![]
     };
-    MenuState { recording: view.recording, title: view.title, onboarded, recent }
+    MenuState { recording: view.recording, title: view.title, onboarded, update: crate::updater::ready_version(), recent }
 }
 
 fn recent_label(title: &str, date: Option<&str>) -> String {
@@ -71,6 +73,10 @@ fn menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
         menu.append(&recent)?;
     }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
+    if let Some(version) = &state.update {
+        // Not while recording: the restart would cut the meeting.
+        menu.append(&MenuItem::with_id(app, "update", format!("Restart to update to {version}"), !state.recording, None::<&str>)?)?;
+    }
     menu.append(&MenuItem::with_id(app, "open", "Open Margin", true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "Quit Margin", true, Some("CmdOrCtrl+Q"))?)?;
     *RECENT_PATHS.lock().unwrap() = state.recent.iter().map(|(p, _)| p.clone()).collect();
@@ -169,6 +175,14 @@ fn handle(app: &AppHandle, id: &str) {
             });
         }
         "open" => show_main(app),
+        "update" => {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = crate::updater::install_and_restart(&app) {
+                    events::emit("error-toast", error);
+                }
+            });
+        }
         id if id.starts_with(RECENT_PREFIX) => {
             let path = id[RECENT_PREFIX.len()..].parse::<usize>().ok().and_then(|i| RECENT_PATHS.lock().unwrap().get(i).cloned());
             if let Some(path) = path {

@@ -785,6 +785,26 @@ await check("settings: sounds and the global shortcut are saved", async () => {
 });
 
 // ---------------------------------------------------------------- reset
+await check("a long meeting's transcript and notes scroll", async () => {
+  // An 80-minute meeting: hundreds of turns. The columns must scroll, not grow past the window.
+  const turns = Array.from({ length: 400 }, (_, i) => `[SPEAKER_${i % 3} ${Math.floor(i / 5)}:${String((i * 12) % 60).padStart(2, "0")}] Line ${i} of a long meeting about the bill of materials.`);
+  const notes = Array.from({ length: 80 }, (_, i) => `- note ${i}`).join("\n");
+  fs.writeFileSync(path.join(meetingsDir, "2026-11-05-qa-long-meeting.md"),
+    `---\ntitle: QA long meeting\ntype: meeting\ndate: 2026-11-05T10:36:00+05:30\nduration: 80m 32s\n---\n\n## Notes\n\n${notes}\n\n## Transcript\n\n${turns.join("\n")}\n`);
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.locator(".row").filter({ hasText: "QA long meeting" }).first().click();
+  await page.locator(".turn").nth(399).waitFor({ state: "attached", timeout: 8000 });
+  for (const col of [".transcript-col", ".notes-col"]) {
+    const [sh, ch, bottom, vh] = await page.locator(col).evaluate((el) => [el.scrollHeight, el.clientHeight, el.getBoundingClientRect().bottom, window.innerHeight]);
+    assert(bottom <= vh + 0.5, `${col} ends at ${bottom}px, below the window (${vh}px)`);
+    assert(sh > ch, `${col} does not overflow (${sh} vs ${ch})`);
+    await page.locator(col).hover();
+    await page.mouse.wheel(0, 2000);
+    await page.waitForTimeout(300);
+    assert((await page.locator(col).evaluate((el) => el.scrollTop)) > 0, `${col} did not scroll`);
+  }
+});
+
 await check("reset keeps meetings and models, then runs setup again", async () => {
   const before = meetingFiles().length;
   await page.getByRole("button", { name: "Settings" }).click();

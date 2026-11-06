@@ -10,6 +10,12 @@
 #   NOTARY_API_KEY_P8           contents of the App Store Connect API key (.p8)
 #   NOTARY_API_KEY_ID           the key's ID
 #   NOTARY_API_ISSUER_ID        the issuer ID
+#   TAURI_SIGNING_PRIVATE_KEY           the in-app updater's private key (~/keys/margin-updater.key)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password
+#
+# The release is a draft. Publishing it makes it "latest", which is when the app's
+# updater sees it (it reads releases/latest/download/latest.json) and when
+# homebrew-tap.yml updates the cask.
 name: release
 
 on:
@@ -70,12 +76,21 @@ jobs:
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           rm -f "$RUNNER_TEMP/cert.p12"
 
-      - name: Write the notary key
+      - name: Write the notary and updater keys
         env:
           KEY: ${{ secrets.NOTARY_API_KEY_P8 }}
+          UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          UPDATER_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          umask 077
           printf '%s\n' "$KEY" > "$RUNNER_TEMP/notary.p8"
-          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+          printf '%s' "$UPDATER_KEY" > "$RUNNER_TEMP/updater.key"
+          printf '%s' "$UPDATER_PASSWORD" > "$RUNNER_TEMP/updater.password"
+          {
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8"
+            echo "MARGIN_UPDATER_KEY_PATH=$RUNNER_TEMP/updater.key"
+            echo "MARGIN_UPDATER_KEY_PASSWORD_PATH=$RUNNER_TEMP/updater.password"
+          } >> "$GITHUB_ENV"
 
       - name: Build, sign, notarize, package
         env:
@@ -89,11 +104,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v$VERSION" release/Margin-"$VERSION".dmg release/Margin-"$VERSION".zip release/SHA256SUMS \
+          gh release create "v$VERSION" release/Margin-"$VERSION".dmg release/Margin-"$VERSION".zip \
+            release/Margin.app.tar.gz release/Margin.app.tar.gz.sig release/latest.json release/SHA256SUMS \
             --draft --title "Margin $VERSION" --generate-notes --target "$GITHUB_SHA"
 
       - name: Remove the keys
         if: always()
         run: |
-          rm -f "$RUNNER_TEMP/notary.p8"
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/updater.key" "$RUNNER_TEMP/updater.password"
           security delete-keychain "$RUNNER_TEMP/release.keychain-db" 2>/dev/null || true

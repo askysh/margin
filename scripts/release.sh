@@ -13,8 +13,12 @@
 #   NOTARY_KEY_PATH       App Store Connect API key (.p8)
 #   NOTARY_KEY_ID         the key's ID
 #   NOTARY_ISSUER_ID      the issuer ID from App Store Connect, Users and Access, Integrations
+#   MARGIN_UPDATER_KEY_PATH           the updater's private key (tauri signer generate)
+#   MARGIN_UPDATER_KEY_PASSWORD_PATH  a file that holds that key's password
 #
-# Output in release/: Margin-<version>.zip, Margin-<version>.dmg, SHA256SUMS.
+# Output in release/: Margin-<version>.zip, Margin-<version>.dmg, the in-app update
+# (Margin.app.tar.gz, its .sig, and latest.json, which the app reads to find it) and
+# SHA256SUMS. RELEASE_NOTES sets the notes the app shows with an update.
 # The version must match package.json, src-tauri/tauri.conf.json and
 # src-tauri/Cargo.toml.
 
@@ -36,7 +40,7 @@ for arg in "$@"; do
   case "$arg" in
     --sign-only) NOTARIZE=0 ;;
     --check) CHECK_ONLY=1 ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     -*) die "unknown option: $arg" ;;
     *) VERSION="$arg" ;;
   esac
@@ -52,7 +56,7 @@ for tool in xcrun codesign ditto hdiutil shasum bun; do
   command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 missing=()
-need=(MARGIN_SIGN_IDENTITY)
+need=(MARGIN_SIGN_IDENTITY MARGIN_UPDATER_KEY_PATH MARGIN_UPDATER_KEY_PASSWORD_PATH)
 [[ "$NOTARIZE" == "1" ]] && need+=(NOTARY_KEY_PATH NOTARY_KEY_ID NOTARY_ISSUER_ID)
 for var in "${need[@]}"; do
   [[ -n "${!var:-}" ]] || missing+=("$var")
@@ -130,6 +134,31 @@ fi
 ditto -c -k --keepParent "$APP" "$ZIP"
 
 # ------------------------------------------------------------------- DMG
+# ------------------------------------------------------------ in-app update
+# Packed after stapling, so the update carries the ticket too. The app checks the
+# signature against the public key in tauri.conf.json before it installs.
+step "in-app update"
+UPDATE="${DIST}/Margin.app.tar.gz"
+# No AppleDouble (._) files or extended attributes in the archive.
+COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$UPDATE" -C "$(dirname "$APP")" Margin.app
+(cd "$ROOT" && bunx tauri signer sign -f "$MARGIN_UPDATER_KEY_PATH" -p "$(cat "$MARGIN_UPDATER_KEY_PASSWORD_PATH")" "$UPDATE" >/dev/null)
+[[ -s "${UPDATE}.sig" ]] || die "the update was not signed"
+export VERSION
+NOTES="${RELEASE_NOTES:-Release notes: https://github.com/askysh/margin/releases/tag/v${VERSION}}" \
+  SIG="$(cat "${UPDATE}.sig")" python3 -I -c '
+import json, os, datetime
+v = os.environ["VERSION"]
+print(json.dumps({
+    "version": v,
+    "notes": os.environ["NOTES"],
+    "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "platforms": {"darwin-aarch64": {
+        "signature": os.environ["SIG"],
+        "url": f"https://github.com/askysh/margin/releases/download/v{v}/Margin.app.tar.gz",
+    }},
+}, indent=2))' > "${DIST}/latest.json"
+ok "Margin.app.tar.gz, its signature and latest.json"
+
 step "disk image"
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
@@ -143,7 +172,7 @@ if [[ "$NOTARIZE" == "1" ]]; then
 fi
 ok "dmg ready"
 
-(cd "$DIST" && shasum -a 256 "Margin-${VERSION}.zip" "Margin-${VERSION}.dmg" > SHA256SUMS)
+(cd "$DIST" && shasum -a 256 "Margin-${VERSION}.zip" "Margin-${VERSION}.dmg" Margin.app.tar.gz latest.json > SHA256SUMS)
 step "done"
 ls -lh "$DIST"
 cat "$DIST/SHA256SUMS"

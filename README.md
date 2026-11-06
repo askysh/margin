@@ -241,26 +241,43 @@ This re-seeds `src-tauri/Cargo.lock` from upstream's lock at that tag. That matt
 downstream crates don't see upstream's lockfile, and minutes-core's loose `ort` range
 otherwise resolves to a release that breaks `pyannote-rs`.
 
+### Install
+
+```bash
+brew install --cask askysh/tap/margin
+```
+
+Or download the DMG from the [latest release](https://github.com/askysh/margin/releases/latest).
+Margin updates itself (Settings → Updates).
+
 ### Releasing
 
 `scripts/release.sh` builds `Margin.app`, signs it with the Developer ID (hardened
-runtime and `src-tauri/entitlements.plist`), notarizes and staples it, and writes
-`release/Margin-<version>.zip`, `.dmg` and `SHA256SUMS`.
+runtime and `src-tauri/entitlements.plist`), notarizes and staples it, and writes these
+files to `release/`:
+- `Margin-<version>.dmg` and `.zip`
+- the in-app update: `Margin.app.tar.gz`, its `.sig`, and `latest.json`
+- `SHA256SUMS`
 
 ```bash
 scripts/release.sh --check            # tools, signing identity, versions
-scripts/release.sh 0.0.1 --sign-only  # signed, not sent to Apple
-scripts/release.sh 0.0.1              # signed, notarized, stapled
+scripts/release.sh 0.0.2 --sign-only  # signed, not sent to Apple
+scripts/release.sh 0.0.2              # signed, notarized, stapled
 ```
 
-- **Settings** come from `~/keys/margin-signing.env` (`MARGIN_SIGN_IDENTITY`,
-  `NOTARY_KEY_PATH`, `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`). These are the same Developer
-  ID and App Store Connect API key that benchbar uses.
+- **Settings** come from `~/keys/margin-signing.env`:
+  - `MARGIN_SIGN_IDENTITY`, `NOTARY_KEY_PATH`, `NOTARY_KEY_ID` and `NOTARY_ISSUER_ID`.
+    These are the same Developer ID and App Store Connect API key that benchbar uses.
+  - `MARGIN_UPDATER_KEY_PATH` and `MARGIN_UPDATER_KEY_PASSWORD_PATH`: the updater's
+    own key, `~/keys/margin-updater.key`. If it is lost, installed copies can't verify
+    new updates. Keep a copy in your password manager.
 - **The version** must be the same in `package.json`, `src-tauri/tauri.conf.json` and
   `src-tauri/Cargo.toml`.
-- **CI:** `.github/workflows/release.yml` runs the same script on a `v*` tag and drafts a
-  GitHub release. It needs six repository secrets, which are listed at the top of that
-  file. They have the same names and values as benchbar's.
-- **Homebrew (later):** the cask should use `depends_on macos: :sonoma` and
-  `uninstall quit: "com.akashmishra.margin"`, and its `zap` should cover
-  `~/Library/Application Support/Margin`.
+- **CI:** push a `v*` tag. `.github/workflows/release.yml` runs the same script and drafts
+  a GitHub release. Publish the draft: from then on the apps see the update, and
+  `homebrew-tap.yml` updates the cask in `askysh/homebrew-tap`. Its secrets are listed at
+  the top of each workflow file.
+- **Test an update locally:** run an older build with
+  `MARGIN_UPDATE_ENDPOINT=http://127.0.0.1:<port>/latest.json`, pointing at a newer
+  build's files. The download must still verify against the built-in key.
+  `MARGIN_UPDATE_AUTO_INSTALL=1` installs and restarts as soon as the download finishes.

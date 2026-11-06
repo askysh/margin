@@ -23,6 +23,7 @@ mod shortcut;
 mod speakers;
 mod summaries;
 mod tray;
+mod updater;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
@@ -57,6 +58,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(shortcut::plugin())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             let handle = app.handle().clone();
             let sink = handle.clone();
@@ -74,6 +76,7 @@ fn main() {
             shortcut::refresh(&handle);
             processing::spawn_watcher();
             calldetect::spawn();
+            updater::spawn(&handle);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -126,6 +129,9 @@ fn main() {
             commands::tauri_cmds::chat_send,
             commands::tauri_cmds::chat_stop,
             commands::tauri_cmds::chat_clear,
+            update_status,
+            check_updates,
+            install_update,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Margin");
@@ -144,8 +150,25 @@ fn main() {
                 });
             }
         }
+        // Quitting with an update downloaded installs it (not during a recording).
+        RunEvent::Exit => updater::install_on_quit(),
         _ => {}
     });
+}
+
+#[tauri::command]
+fn update_status() -> updater::UpdateStatus {
+    updater::status()
+}
+
+#[tauri::command]
+async fn check_updates(app: tauri::AppHandle) -> updater::UpdateStatus {
+    tauri::async_runtime::spawn_blocking(move || updater::check(&app)).await.unwrap_or_else(|_| updater::status())
+}
+
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || updater::install_and_restart(&app)).await.map_err(|e| e.to_string())?
 }
 
 /// Where a backend event goes in the app: host actions (menu bar, shortcut, system

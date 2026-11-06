@@ -116,6 +116,7 @@ pub mod ops {
         let mut p = prefs::load();
         p.mute_cues = !prefs.sound_cues;
         p.record_shortcut = prefs.record_shortcut;
+        p.no_auto_update = !prefs.auto_update;
         prefs::save(&p)?;
         crate::events::emit(crate::events::SHORTCUT_REFRESH, ());
         crate::events::emit("app-prefs", p.app());
@@ -400,6 +401,9 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "save_settings" => out(ops::save_settings(arg(a, "settings")?)),
         "settings_options" => out(ops::settings_options()),
         "save_app_prefs" => out(ops::save_app_prefs(arg(a, "prefs")?)),
+        // The bridge has no app bundle to update.
+        "update_status" | "check_updates" => out(Ok::<_, String>(crate::updater::unsupported())),
+        "install_update" => Err("Updates work only in the app.".into()),
         "folder_choices" => out(ops::folder_choices()),
         "complete_onboarding" => out(ops::complete_onboarding()),
         "models_status" => out(ops::models_status()),

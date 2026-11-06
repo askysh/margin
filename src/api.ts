@@ -53,6 +53,18 @@ export interface RecorderView {
 export interface AppPrefs {
   sound_cues: boolean;
   record_shortcut: boolean;
+  auto_update: boolean;
+}
+
+/** The updater's state. `ready` is a newer version that is downloaded. */
+export interface UpdateStatus {
+  supported: boolean;
+  current: string;
+  ready: string | null;
+  notes: string | null;
+  checking: boolean;
+  checked_secs_ago: number | null;
+  error: string | null;
 }
 
 export interface Boot {
@@ -202,6 +214,9 @@ export const api = {
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
   settingsOptions: () => invoke<SettingsOptions>("settings_options"),
   saveAppPrefs: (prefs: AppPrefs) => invoke<AppPrefs>("save_app_prefs", { prefs }),
+  updateStatus: () => invoke<UpdateStatus>("update_status"),
+  checkUpdates: () => invoke<UpdateStatus>("check_updates"),
+  installUpdate: () => invoke<void>("install_update"),
   folderChoices: () =>
     invoke<{ default_dir: string; obsidian_vaults: { name: string; path: string }[] }>("folder_choices"),
   completeOnboarding: () => invoke<void>("complete_onboarding"),
