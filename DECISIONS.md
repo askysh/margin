@@ -84,3 +84,74 @@ Product and technical decisions made without asking. Each one lists the options 
   process be tested without TCC.
 - It is compiled into debug builds only (`cfg!(debug_assertions)`). Release builds
   ignore the variable.
+
+## Settings parity (to renumber)
+
+The full comparison with upstream is in `docs/parity/settings.md`.
+
+### S1. Add only the settings a meeting notepad needs
+- Options: copy upstream's panel (about 80 controls in six tabs), or add the settings that
+  change a meeting's result.
+- Pick: **the second**. Margin adds ten:
+  - keep audio
+  - microphone
+  - stop after silence
+  - call suggestions
+  - open at login
+  - meeting language
+  - speaker separation
+  - names and words to spell right
+  - summary language
+  - summary instructions
+- Dictation, Coach, the command palette, the terminal, Parakeet and calendar stay out.
+- Each new field in `AppSettings` is optional. A caller that does not send a field
+  leaves its stored value unchanged. So an onboarding screen that does not know the new
+  fields cannot reset them.
+
+### S2. Summary instructions are a project template, not a file in `~/.minutes`
+- Core reads extra prompt text only from a template. It looks for templates in
+  `<cwd>/.minutes/templates/`, then in `~/.minutes/templates/`, then in the bundled set.
+- Options:
+  - (a) Write `~/.minutes/templates/`. That shares the file with the upstream app and
+    breaks D3.
+  - (b) Run Margin with its state directory as the working directory, and write
+    `state/.minutes/templates/meeting.md`.
+- Pick: **(b)**. The app, the processing worker and the QA bridge start in the state
+  directory. The dev CLI keeps your shell's directory, because its arguments are
+  relative paths.
+- The template uses the slug `meeting`, the same as core's bundled default. A meeting
+  file records `template: meeting`. That name resolves in every Minutes install, and it
+  falls back to the bundled template when the instructions are cleared.
+- Reset clears the state directory, so it also clears the instructions.
+
+### S3. "Keep audio" deletes old audio for good
+- D10 says delete means "move to the Trash". Audio retention is different. Its purpose
+  is to free disk space and to keep less private audio, and the Trash keeps both.
+- Pick: core's `retention` plan deletes the files. Transcripts and notes are never
+  touched. The choices are Forever (the default), 30 days and 7 days. Failed and
+  no-speech audio follow the same limit.
+- Margin runs the cleanup when you change the setting and after each meeting is ready.
+- Cost: with 7 days, "Recognise this voice" does not work on a meeting older than a
+  week, because the voice sample comes from the audio.
+
+### S4. Open at login is a LaunchAgent that opens Margin by bundle ID
+- Options: `SMAppService` (needs a signed bundle, and it cannot be tested with a sandbox
+  `HOME`), the autostart plugin (one more dependency), or a LaunchAgent plist.
+- Pick: **a LaunchAgent** that runs `open -b com.akashmishra.margin --args --at-login`.
+  It keeps working when the app moves. With `--at-login`, Margin starts in the menu bar
+  and does not show its window. The e2e pass checks the file in a sandbox `HOME`.
+- Reset turns it off.
+
+### S5. A missing microphone falls back to the system default
+- Core fails to start a recording when the chosen device is not connected.
+- Pick: Margin checks the device before each recording. When the device is missing,
+  Margin uses the system default and shows a toast. Settings marks the device
+  "(not connected)".
+- Calls take the mic from `recording.sources.voice`, which core reads in place of
+  `recording.device`. Margin sets both.
+
+### S6. No completion notification and no global recording shortcut yet
+- A macOS notification needs the notification permission and a signed app. A global
+  shortcut needs a new plugin. Neither can be tested headless without a prompt.
+- Margin already opens the finished meeting in its window, and the menu bar item starts
+  a recording from any app.

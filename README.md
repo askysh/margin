@@ -124,6 +124,12 @@ it says otherwise.
 - **Settings.**
   - Name, folder, model (switching downloads it with progress), summaries, permission
     status, and recognised voices (each can be forgotten).
+  - Recording: microphone, stop after silence, call suggestions and open at login.
+  - Transcription: meeting language, speaker separation, and names and words to spell
+    right.
+  - Summaries: summary language and your own instructions.
+  - How long to keep audio. `docs/parity/settings.md` compares every setting with the
+    upstream app.
   - An MCP snippet, so Claude can read your meetings.
 - **Reset.** Choose **Reset Margin…** under *Start over*.
   - It always clears settings, the processing queue, logs and state, then runs setup
