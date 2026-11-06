@@ -357,6 +357,168 @@ if (summaries !== "none") {
   });
 }
 
+// ---------------------------------------------------------------- settings parity
+const cfgText = () => fs.readFileSync(path.join(marginHome, "config.toml"), "utf8");
+const inSection = (section, line) => new RegExp(`^\\[${section}\\]\\n(?:[^\\[].*\\n)*?${line}$`, "m").test(cfgText());
+const loginPlist = path.join(home, "Library/LaunchAgents/com.akashmishra.margin.login.plist");
+const openSettings = async () => {
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("dialog", { name: "Settings" }).waitFor();
+};
+const settled = () => page.waitForTimeout(700); // saves are queued; let the last one land
+const toggle = (name) => page.getByRole("switch", { name });
+// The sheet scrolls, so take one screenshot per screenful.
+const shootSheet = async (name) => {
+  const body = page.locator(".sheet-body");
+  const [h, vh] = await body.evaluate((el) => [el.scrollHeight, el.clientHeight]);
+  for (let y = 0, i = 1; y < h; y += vh - 40, i++) {
+    await body.evaluate((el, top) => el.scrollTo(0, top), y);
+    await page.screenshot({ path: path.join(out, `${name}-${i}.png`) });
+  }
+  await body.evaluate((el) => el.scrollTo(0, 0));
+};
+
+await check("settings: new choices start at calm defaults", async () => {
+  await openSettings();
+  await page.getByRole("heading", { name: "Recording", exact: true }).waitFor();
+  const value = (label) => page.getByLabel(label, { exact: true }).inputValue();
+  assert((await value("Microphone")) === "", "microphone is not the system default");
+  assert((await value("Keep audio")) === "0", "audio is not kept forever");
+  assert((await value("Language spoken in meetings")) === "auto", "language is not auto-detect");
+  assert((await value("Stop after silence")) === "30", "silence limit is not 30 minutes");
+  assert(await toggle(/Tell speakers apart/).isChecked(), "speaker separation off");
+  assert(await toggle(/Suggest recording when a call starts/).isChecked(), "call suggestions off");
+  assert(!(await toggle(/Open Margin when you log in/).isChecked()), "open at login on");
+  await shootSheet("settings-sheet");
+});
+await check("settings: language, microphone and silence limit are saved for core", async () => {
+  await page.getByLabel("Language spoken in meetings").selectOption("en");
+  const mic = (await page.getByLabel("Microphone", { exact: true }).locator("option").allInnerTexts()).find((m) => m !== "System default");
+  if (mic) await page.getByLabel("Microphone", { exact: true }).selectOption({ label: mic });
+  await page.getByLabel("Stop after silence").selectOption("15");
+  await settled();
+  assert(inSection("transcription", 'language = "en"'), "transcription.language not written");
+  assert(inSection("recording", "silence_auto_stop_secs = 900"), "silence limit not written");
+  if (mic) assert(inSection("recording", `device = "${mic}"`), "microphone not written");
+  await button("Done").click();
+  await openSettings();
+  assert((await page.getByLabel("Language spoken in meetings").inputValue()) === "en", "language not kept");
+  assert((await page.getByLabel("Stop after silence").inputValue()) === "15", "silence limit not kept");
+  // Back to the default so nothing below depends on this Mac's hardware.
+  await page.getByLabel("Microphone", { exact: true }).selectOption("");
+  await settled();
+  assert(!/^device = /m.test(cfgText()), "system default not restored");
+});
+await check("settings: names to spell right go to core's vocabulary", async () => {
+  const box = page.getByLabel("Names and words to spell right");
+  await box.fill("Priya Raman\nKubernetes\npriya raman");
+  await box.blur();
+  await settled();
+  const voc = fs.readFileSync(path.join(marginHome, "state/vocabulary.toml"), "utf8");
+  assert(voc.includes('canonical = "Priya Raman"') && voc.includes('canonical = "Kubernetes"'), "terms missing:\n" + voc);
+  assert(voc.match(/Priya Raman/gi).length === 1, "duplicate term kept");
+  assert(voc.includes('source = "manual"'), "terms not marked as yours");
+});
+await check("settings: open at login adds and removes a login item", async () => {
+  const sw = toggle(/Open Margin when you log in/);
+  await sw.check();
+  await settled();
+  assert(fs.existsSync(loginPlist), "no LaunchAgent written");
+  execFileSync("/usr/bin/plutil", ["-lint", loginPlist]);
+  assert(fs.readFileSync(loginPlist, "utf8").includes("<string>--at-login</string>"), "LaunchAgent lacks --at-login");
+  await sw.uncheck();
+  await settled();
+  assert(!fs.existsSync(loginPlist), "LaunchAgent not removed");
+  await sw.check(); // left on: Reset must turn it off
+  await settled();
+});
+await check("settings: call suggestions follow the switch", async () => {
+  // A stand-in process named like Zoom's, which core's call detection looks for. (A
+  // copy of /bin/sleep is killed by macOS; a symlink keeps its own name in `ps`.)
+  const zoom = path.join(base, "bin/zoom.us");
+  fs.mkdirSync(path.dirname(zoom), { recursive: true });
+  fs.rmSync(zoom, { force: true });
+  fs.symlinkSync("/bin/sleep", zoom);
+  await toggle(/Suggest recording when a call starts/).uncheck();
+  await settled();
+  assert(inSection("call_detection", "enabled = false"), "call_detection.enabled not false");
+  await button("Done").click();
+  const fake = spawn(zoom, ["300"], { stdio: "ignore" });
+  procs.push(fake);
+  await page.waitForTimeout(17000); // the detector polls every 15 s
+  assert((await page.locator(".call-banner").count()) === 0, "banner shown while switched off");
+  await openSettings();
+  await toggle(/Suggest recording when a call starts/).check();
+  await settled();
+  await button("Done").click();
+  await page.locator(".call-banner", { hasText: "Zoom looks active" }).waitFor({ timeout: 20000 });
+  fake.kill();
+  await page.locator(".call-banner").getByRole("button", { name: "Dismiss" }).click();
+});
+if (summaries === "fake-ollama") {
+  await check("settings: summary language and instructions reach the summarizer", async () => {
+    await openSettings();
+    await page.getByLabel("Summary language").selectOption("French");
+    const box = page.getByLabel("Instructions for summaries");
+    await box.fill("Start with decisions. Keep each point short.");
+    await box.blur();
+    await settled();
+    assert(inSection("summarization", 'language = "French"'), "summary language not written");
+    await button("Done").click();
+    const log = path.join(out, "ollama-requests.log");
+    const seen = fs.readFileSync(log, "utf8").split("\n").filter(Boolean).length;
+    await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
+    await button("Summarize").click();
+    await page.locator(".toast").filter({ hasText: /Summary added|failed|returned nothing/ }).waitFor({ timeout: 120000 });
+    assert((await page.locator(".toast").innerText()).includes("Summary added"), await page.locator(".toast").innerText());
+    const sent = fs.readFileSync(log, "utf8").split("\n").filter(Boolean).slice(seen).map((l) => JSON.parse(l));
+    const text = sent.map((r) => `${r.system}\n${r.prompt}`).join("\n");
+    assert(text.includes("Start with decisions. Keep each point short."), "instructions not sent");
+    assert(text.includes("Always respond in French"), "summary language not sent");
+    const md = fs.readFileSync(path.join(meetingsDir, meetingFiles().find((x) => x.includes("qa-follow-up"))), "utf8");
+    assert(/^template: meeting$/m.test(md), "meeting not tagged with the template");
+  });
+}
+await check("settings: with speaker separation off, a meeting has no speaker labels", async () => {
+  await openSettings();
+  await toggle(/Tell speakers apart/).uncheck();
+  await settled();
+  assert(inSection("diarization", 'engine = "none"'), "diarization.engine not none");
+  await button("Done").click();
+  dev("queue", audio, "QA no speakers");
+  await page.locator(".row").filter({ hasText: "QA no speakers" }).first().waitFor({ timeout: 120000 });
+  await page.locator(".row-job").waitFor({ state: "detached", timeout: 120000 });
+  const md = fs.readFileSync(path.join(meetingsDir, meetingFiles().find((x) => x.includes("qa-no-speakers"))), "utf8");
+  fs.writeFileSync(path.join(out, "no-speakers.md"), md);
+  assert(md.includes("## Transcript"), "no transcript");
+  assert(!/^\[(SPEAKER_\d+|Priya) \d+:\d\d\]/m.test(md), "transcript still has speaker labels");
+  await openSettings();
+  await toggle(/Tell speakers apart/).check();
+  await settled();
+  assert(inSection("diarization", 'engine = "auto"'), "diarization not back on");
+  await button("Done").click();
+});
+await check("settings: keep audio for 7 days deletes only older audio", async () => {
+  const recent = meetingFiles().find((x) => x.includes("qa-launch-sync"));
+  const recentWav = path.join(meetingsDir, recent.replace(/\.md$/, ".wav"));
+  const oldMd = path.join(meetingsDir, "2026-09-01-qa-old-meeting.md");
+  const oldWav = oldMd.replace(/\.md$/, ".wav");
+  const longAgo = new Date(Date.now() - 40 * 86400e3).toISOString();
+  fs.writeFileSync(oldMd, fs.readFileSync(path.join(meetingsDir, recent), "utf8").replace(/^date: .*$/m, `date: ${longAgo}`).replace(/^title: .*$/m, "title: QA old meeting"));
+  fs.copyFileSync(recentWav, oldWav);
+  await openSettings();
+  await page.getByLabel("Keep audio").selectOption("7");
+  await settled();
+  assert(inSection("retention", "auto_cleanup = true") && inSection("retention", "successful_audio_days = 7"), "retention not written");
+  assert(!fs.existsSync(oldWav), "old audio kept");
+  assert(fs.existsSync(oldMd), "old meeting file removed");
+  assert(fs.existsSync(recentWav), "recent audio removed");
+  await page.getByLabel("Keep audio").selectOption("0");
+  await settled();
+  assert(inSection("retention", "auto_cleanup = false"), "forever not restored");
+  await button("Done").click();
+});
+
 // ---------------------------------------------------------------- settings: model switch
 if (flag("--download")) {
   await check("switching to Fast downloads it with progress", async () => {
@@ -382,6 +544,7 @@ await check("reset keeps meetings and models, then runs setup again", async () =
   assert(!fs.existsSync(path.join(marginHome, "config.toml")), "config not removed");
   assert(!fs.existsSync(path.join(marginHome, "prefs.json")), "prefs not removed");
   assert(fs.existsSync(path.join(marginHome, "state/models")), "models removed");
+  assert(!fs.existsSync(loginPlist), "open at login not turned off");
   assert(meetingFiles().length === before, `meetings changed: ${before} -> ${meetingFiles().length}`);
 });
 await check("after re-onboarding the kept meetings are back", async () => {

@@ -10,6 +10,24 @@ export interface Settings {
   claude_path: string | null;
   ollama_model: string;
   user_name: string;
+  // Filled by the backend. Leave a field out of a save to keep its stored value.
+  transcription_language?: string;
+  summary_language?: string;
+  input_device?: string;
+  speaker_separation?: boolean;
+  silence_stop_minutes?: number;
+  keep_audio_days?: number;
+  call_detection?: boolean;
+  vocabulary?: string[];
+  summary_instructions?: string;
+  open_at_login?: boolean;
+}
+
+export interface SettingsOptions {
+  languages: { code: string; name: string }[];
+  input_devices: string[];
+  silence_stop_minutes: number[];
+  keep_audio_days: number[];
 }
 
 export interface LiveLine {
@@ -134,6 +152,7 @@ export interface Voice {
 export const api = {
   boot: () => invoke<Boot>("boot"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
+  settingsOptions: () => invoke<SettingsOptions>("settings_options"),
   folderChoices: () =>
     invoke<{ default_dir: string; obsidian_vaults: { name: string; path: string }[] }>("folder_choices"),
   completeOnboarding: () => invoke<void>("complete_onboarding"),
