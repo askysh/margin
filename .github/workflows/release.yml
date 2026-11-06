@@ -37,8 +37,18 @@ jobs:
     timeout-minutes: 90
     env:
       VERSION: ${{ github.event.inputs.version || github.ref_name }}
+      # minutes-core compiles Swift bridges against the macOS 26 SDK (SpeechAnalyzer,
+      # AssetInventory). The image's default Xcode is 16.4, whose SDK lacks them.
+      # Upstream pins the same Xcode in its macOS jobs.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
+
+      - name: Xcode 26
+        run: |
+          test -d "$DEVELOPER_DIR" || { echo "::error::$DEVELOPER_DIR is not on this runner image"; exit 1; }
+          xcodebuild -version
+          xcrun --show-sdk-version
 
       - name: Version without the v
         run: echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
