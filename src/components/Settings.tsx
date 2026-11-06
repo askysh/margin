@@ -1,10 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { api, errorText, type Backends, type Boot, type Permissions, type ResetPreview, type Settings, type Voice } from "../api";
+import { api, errorText, type Backends, type Boot, type Permissions, type ResetPreview, type Settings, type SettingsOptions, type Voice } from "../api";
 import { bytes, copyText, tildify } from "../util";
 import { DownloadProgress, MODEL_CHOICES } from "./Onboarding";
 import { PermissionRow } from "./PermissionRow";
 import { SummaryChoice } from "./SummaryChoice";
+import { SelectRow, TextRow, ToggleRow, type Choice } from "./SettingsRows";
+
+/** Settings stored outside config.toml. A save sends them only when they changed. */
+const EXTRA_KEYS = ["vocabulary", "summary_instructions", "open_at_login"] as const;
+
+type Save = (patch: Partial<Settings>) => void;
 
 interface Props {
   boot: Boot;
@@ -22,6 +28,7 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
   const [mcp, setMcp] = useState("");
   const [resetOpen, setResetOpen] = useState(false);
   const [nameDraft, setNameDraft] = useState(boot.settings.user_name);
+  const [options, setOptions] = useState<SettingsOptions | null>(null);
 
   const refreshPerms = () => api.permissions().then(setPerms).catch(() => {});
   const onCloseRef = useRef(onClose);
@@ -33,6 +40,7 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
     refreshPerms();
     api.listVoices().then(setVoices).catch(() => {});
     api.mcpSnippet().then(setMcp).catch(() => {});
+    api.settingsOptions().then(setOptions).catch(() => setOptions({ languages: [], input_devices: [], silence_stop_minutes: [], keep_audio_days: [] }));
     const esc = (e: KeyboardEvent) => e.key === "Escape" && !resetOpenRef.current && onCloseRef.current();
     window.addEventListener("keydown", esc);
     window.addEventListener("focus", refreshPerms);
@@ -50,7 +58,9 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
     pendingSaves.current++;
     queue.current = queue.current.then(async () => {
       try {
-        const saved = await api.saveSettings(latest.current);
+        const payload: Settings = { ...latest.current };
+        for (const k of EXTRA_KEYS) if (!(k in patch)) delete payload[k];
+        const saved = await api.saveSettings(payload);
         pendingSaves.current--;
         if (pendingSaves.current === 0) {
           latest.current = saved;
@@ -81,7 +91,8 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
           <h1>Settings</h1>
           <button className="btn btn-quiet" onClick={onClose}>Done</button>
         </header>
-        <div className="sheet-body">
+        {/* The drop-downs need their choices, so the body waits for them (a few ms). */}
+        {options && <div className="sheet-body">
           <section className="set">
             <h2 className="eyebrow">You</h2>
             <label className="field-label" htmlFor="set-name">Name in transcripts</label>
@@ -98,7 +109,17 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
               </div>
             </div>
             <p className="set-help">New meetings are saved here. Meetings already saved stay where they are.</p>
+            <SelectRow
+              id="set-keep-audio"
+              label="Keep audio"
+              help="Transcripts and notes are always kept. Older audio files are deleted for good."
+              value={s.keep_audio_days ?? 0}
+              choices={(options?.keep_audio_days ?? [0]).map((d) => ({ value: d, label: d === 0 ? "Forever" : `For ${d} days` }))}
+              onChange={(d) => save({ keep_audio_days: d })}
+            />
           </section>
+
+          <RecordingSection s={s} options={options} save={save} />
 
           <section className="set">
             <h2 className="eyebrow">Transcription</h2>
@@ -111,11 +132,34 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
               ))}
             </div>
             <DownloadProgress compact key={s.model} />
+            <SelectRow
+              id="set-language"
+              label="Language spoken in meetings"
+              help="Choose one only if auto-detect gets your meetings wrong."
+              value={s.transcription_language ?? "auto"}
+              choices={[{ value: "auto", label: "Auto-detect" }, ...(options?.languages ?? []).map((l) => ({ value: l.code, label: l.name }))]}
+              onChange={(code) => save({ transcription_language: code })}
+            />
+            <ToggleRow
+              title="Tell speakers apart"
+              help="Labels who said what. Turn it off for faster processing without speaker names."
+              checked={s.speaker_separation ?? true}
+              onChange={(on) => save({ speaker_separation: on })}
+            />
+            <TextRow
+              id="set-vocabulary"
+              label="Names and words to spell right"
+              help="One per line: people, products, acronyms. The transcriber gets up to 8 of them as hints."
+              placeholder={"Priya Raman\nKubernetes"}
+              value={(s.vocabulary ?? []).join("\n")}
+              onSave={(text) => save({ vocabulary: text.split("\n") })}
+            />
           </section>
 
           <section className="set">
             <h2 className="eyebrow">Summaries</h2>
             <SummaryChoice backends={backends} value={s} onChange={(v) => save(v)} />
+            {s.summary_engine !== "none" && <SummaryOptions s={s} options={options} save={save} />}
           </section>
 
           <section className="set">
@@ -168,11 +212,83 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
           </section>
 
           <footer className="sheet-foot">Margin {boot.version} · built on minutes-core {boot.upstream_tag}</footer>
-        </div>
+        </div>}
       </div>
       {resetOpen && <ResetDialog onCancel={() => setResetOpen(false)} onDone={onReset} notify={notify} />}
     </div>
   );
+}
+
+function RecordingSection({ s, options, save }: { s: Settings; options: SettingsOptions | null; save: Save }) {
+  const device = s.input_device ?? "";
+  const devices = options?.input_devices ?? [];
+  const mics: Choice<string>[] = [
+    { value: "", label: "System default" },
+    ...devices.map((d) => ({ value: d, label: d })),
+    ...(device && !devices.includes(device) ? [{ value: device, label: `${device} (not connected)` }] : []),
+  ];
+  const silence = (options?.silence_stop_minutes ?? [s.silence_stop_minutes ?? 30]).map((m) => ({ value: m, label: minutesLabel(m) }));
+  return (
+    <section className="set">
+      <h2 className="eyebrow">Recording</h2>
+      <SelectRow
+        id="set-mic"
+        label="Microphone"
+        help="Used for calls and in-person meetings. If it isn't connected, Margin uses the system default."
+        value={device}
+        choices={mics}
+        onChange={(d) => save({ input_device: d })}
+      />
+      <SelectRow
+        id="set-silence"
+        label="Stop after silence"
+        help="Stops and saves a recording after this long with no sound. A call that is still going keeps recording."
+        value={s.silence_stop_minutes ?? 30}
+        choices={silence}
+        onChange={(m) => save({ silence_stop_minutes: m })}
+      />
+      <ToggleRow
+        title="Suggest recording when a call starts"
+        help="Shows a banner when Zoom, Teams or another call app opens."
+        checked={s.call_detection ?? true}
+        onChange={(on) => save({ call_detection: on })}
+      />
+      <ToggleRow
+        title="Open Margin when you log in"
+        help="Margin waits in the menu bar, ready for your first meeting."
+        checked={s.open_at_login ?? false}
+        onChange={(on) => save({ open_at_login: on })}
+      />
+    </section>
+  );
+}
+
+function SummaryOptions({ s, options, save }: { s: Settings; options: SettingsOptions | null; save: Save }) {
+  return (
+    <>
+      <SelectRow
+        id="set-summary-language"
+        label="Summary language"
+        value={s.summary_language ?? "auto"}
+        choices={[{ value: "auto", label: "Same as the meeting" }, ...(options?.languages ?? []).map((l) => ({ value: l.name, label: l.name }))]}
+        onChange={(name) => save({ summary_language: name })}
+      />
+      <TextRow
+        id="set-summary-instructions"
+        label="Instructions for summaries"
+        help="Added to every new summary. Leave it empty for the standard summary."
+        placeholder="For example: Start with decisions. Keep each point to one line."
+        value={s.summary_instructions ?? ""}
+        onSave={(text) => save({ summary_instructions: text })}
+      />
+    </>
+  );
+}
+
+function minutesLabel(m: number): string {
+  if (m === 0) return "Never";
+  if (m % 60 === 0) return m === 60 ? "After 1 hour" : `After ${m / 60} hours`;
+  return `After ${m} minutes`;
 }
 
 function ResetDialog({ onCancel, onDone, notify }: { onCancel: () => void; onDone: () => void; notify: Props["notify"] }) {

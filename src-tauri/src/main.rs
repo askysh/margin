@@ -6,6 +6,7 @@ mod corecfg;
 mod devcli;
 mod devserve;
 mod events;
+mod extras;
 mod fsutil;
 mod library;
 mod models;
@@ -37,16 +38,20 @@ fn main() {
     extend_path();
 
     if std::env::args().any(|a| a == processing::WORKER_FLAG) {
+        extras::use_state_cwd();
         minutes_core::exit_without_cxx_teardown(processing::run_worker_mode());
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--dev") {
         minutes_core::exit_without_cxx_teardown(devcli::run(&args[1..]));
     }
+    extras::use_state_cwd();
+    // Opened by "Open at login": start in the menu bar only.
+    let at_login = args.iter().any(|a| a == extras::LOGIN_ARG);
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
             let sink = handle.clone();
             events::set_sink(Box::new(move |name, payload| {
@@ -62,7 +67,7 @@ fn main() {
                     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
                     let _ = apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None);
                 }
-                let _ = window.show();
+                let _ = if at_login { window.hide() } else { window.show() };
             }
             tray::init(&handle)?;
             processing::spawn_watcher();
@@ -79,6 +84,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::tauri_cmds::boot,
             commands::tauri_cmds::save_settings,
+            commands::tauri_cmds::settings_options,
             commands::tauri_cmds::folder_choices,
             commands::tauri_cmds::complete_onboarding,
             commands::tauri_cmds::models_status,

@@ -3,7 +3,7 @@
 //! `--dev serve` QA bridge calls the same functions over HTTP.
 
 use crate::recorder::{recorder, Kind, RecorderView, Stopped};
-use crate::{corecfg, library, models, paths, permissions, prefs, processing, reset, speakers, summaries};
+use crate::{corecfg, extras, library, models, paths, permissions, prefs, processing, reset, speakers, summaries};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -26,7 +26,7 @@ pub mod ops {
         tracing::info!("ui connected (boot)");
         Ok(Boot {
             onboarded: prefs::load().onboarding_complete && corecfg::exists(),
-            settings: corecfg::settings(&corecfg::load()),
+            settings: current_settings(),
             recorder: recorder().view(),
             orphaned_draft: crate::recorder::orphaned_draft(),
             upstream_tag: "v0.32.1",
@@ -39,6 +39,7 @@ pub mod ops {
         let _one_at_a_time = SAVING.lock().unwrap_or_else(|e| e.into_inner());
         let first_save = !corecfg::exists();
         let mut cfg = corecfg::load();
+        let keep_audio_before = corecfg::settings(&cfg).keep_audio_days;
         corecfg::apply(&mut cfg, &settings)?;
         // Onboarding saves your name before you choose a folder. Don't create the default
         // folder until it has actually been chosen.
@@ -46,7 +47,47 @@ pub mod ops {
             std::fs::create_dir_all(&cfg.output_dir).map_err(|e| format!("Can't use that folder: {e}"))?;
         }
         corecfg::save(&mut cfg)?;
-        Ok(corecfg::settings(&corecfg::load()))
+        extras::apply(&settings)?;
+        if settings.keep_audio_days.is_some() && settings.keep_audio_days != keep_audio_before {
+            corecfg::audio_cleanup(&cfg);
+        }
+        Ok(current_settings())
+    }
+
+    pub fn current_settings() -> corecfg::AppSettings {
+        extras::fill(corecfg::settings(&corecfg::load()))
+    }
+
+    #[derive(Serialize)]
+    pub struct SettingsOptions {
+        languages: Vec<Language>,
+        input_devices: Vec<String>,
+        silence_stop_minutes: &'static [u64],
+        keep_audio_days: &'static [u32],
+    }
+
+    #[derive(Serialize)]
+    pub struct Language {
+        code: &'static str,
+        name: &'static str,
+    }
+
+    /// The choices Settings offers. Listing input devices reads Core Audio's device list
+    /// only; it opens no device, so it raises no permission prompt.
+    pub fn settings_options() -> Res<SettingsOptions> {
+        let mut languages: Vec<Language> = corecfg::LANGUAGES.iter().map(|&(code, name)| Language { code, name }).collect();
+        languages.sort_by_key(|l| l.name);
+        let input_devices = minutes_core::capture::list_devices_categorized()
+            .into_iter()
+            .filter(|d| d.category == minutes_core::capture::DeviceCategory::Microphone)
+            .map(|d| d.name)
+            .collect();
+        Ok(SettingsOptions {
+            languages,
+            input_devices,
+            silence_stop_minutes: corecfg::SILENCE_STOP_CHOICES,
+            keep_audio_days: corecfg::KEEP_AUDIO_CHOICES,
+        })
     }
 
     #[derive(Serialize)]
@@ -221,7 +262,11 @@ pub mod ops {
         let report = minutes_core::resummarize::resummarize_meeting(
             &p,
             &cfg,
-            &minutes_core::resummarize::ResummarizeOptions { apply: true, template_override: None, refresh: Default::default() },
+            &minutes_core::resummarize::ResummarizeOptions {
+                apply: true,
+                template_override: extras::summary_template_slug(),
+                refresh: Default::default(),
+            },
         )
         .map_err(|e| {
             if cfg.summarization.engine == "ollama" {
@@ -286,6 +331,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
     match cmd {
         "boot" => out(ops::boot()),
         "save_settings" => out(ops::save_settings(arg(a, "settings")?)),
+        "settings_options" => out(ops::settings_options()),
         "folder_choices" => out(ops::folder_choices()),
         "complete_onboarding" => out(ops::complete_onboarding()),
         "models_status" => out(ops::models_status()),
@@ -340,6 +386,7 @@ pub mod tauri_cmds {
 
     cmd!(boot() -> ops::Boot);
     cmd!(save_settings(settings: corecfg::AppSettings) -> corecfg::AppSettings);
+    cmd!(settings_options() -> ops::SettingsOptions);
     cmd!(folder_choices() -> ops::FolderChoices);
     cmd!(complete_onboarding() -> ());
     cmd!(models_status() -> Vec<models::ModelFile>);

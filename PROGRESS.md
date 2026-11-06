@@ -115,3 +115,21 @@ testing, so the two don't record at once.
   recording shows no You/Them labels.
 - Load test: 600 one-hour meetings (40 MB). The library list takes 0.1 s, and a full-text
   search 0.1–0.2 s (debug build).
+
+### Settings parity with upstream (branch t3/settings-parity-upstream)
+- `docs/parity/settings.md` compares every upstream setting with Margin.
+- Ten settings added. Each is checked end to end in a sandbox:
+  - Keep audio: a 40-day-old meeting loses its audio, and the recent audio stays.
+  - Microphone: `--dev preflight` uses the chosen mic for in-person meetings and calls. An
+    unplugged mic falls back to the default.
+  - Stop after silence and call suggestions. A stand-in `zoom.us` process shows the
+    banner only while the switch is on.
+  - Open at login: the LaunchAgent is written, passes `plutil -lint`, and Reset removes
+    it.
+  - Meeting language and speaker separation: a meeting processed in English with speaker
+    separation off has a transcript and no speaker labels.
+  - Names to spell right reach core's `vocabulary.toml`.
+  - Summary language and instructions reach the summarizer's prompt.
+- e2e: 39/39 in light mode and in dark mode.
+- Not verified: a real recording with a chosen mic (needs the permission prompt), and a
+  real login.

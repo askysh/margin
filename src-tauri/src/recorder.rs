@@ -316,7 +316,7 @@ impl Recorder {
                 Some(finished_at),
                 None,
                 None,
-                None,
+                crate::extras::summary_template_slug(),
                 None,
                 None,
                 None,
@@ -396,14 +396,35 @@ fn ensure_permissions(kind: Kind) -> Result<(), String> {
 
 pub fn session_config(kind: Kind) -> Config {
     let mut cfg = corecfg::load();
+    cfg.recording.device = available_device(cfg.recording.device.take());
+    session_sources(&mut cfg, kind);
+    cfg
+}
+
+/// Calls take the mic from `sources.voice` (core ignores `device` there), so the chosen
+/// microphone goes in both places.
+fn session_sources(cfg: &mut Config, kind: Kind) {
     match kind {
         Kind::Call => {
             cfg.recording.capture_backend = "core-audio-tap".into();
-            cfg.recording.sources = Some(SourcesConfig { voice: None, call: Some("auto".into()) });
+            cfg.recording.sources = Some(SourcesConfig { voice: cfg.recording.device.clone(), call: Some("auto".into()) });
         }
         Kind::InPerson => cfg.recording.sources = None,
     }
-    cfg
+}
+
+/// The microphone chosen in Settings, or `None` (the system default) when it isn't
+/// plugged in. Recording should still start when a headset is left at home.
+fn available_device(device: Option<String>) -> Option<String> {
+    let name = device?;
+    match capture::check_input_device_availability(&name) {
+        capture::DeviceAvailability::Missing => {
+            tracing::warn!(device = %name, "chosen microphone not found; using the system default");
+            events::emit("error-toast", format!("{name} isn't connected, so Margin is using the default microphone."));
+            None
+        }
+        _ => Some(name),
+    }
 }
 
 fn discard_current_capture() {
@@ -672,6 +693,19 @@ mod tests {
         assert!(loud > 0.2, "loud {loud}");
         assert!(quiet < 0.01, "quiet {quiet}");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn calls_use_the_chosen_microphone_as_their_voice_source() {
+        let mut cfg = Config::default();
+        cfg.recording.device = Some("USB Mic".into());
+        session_sources(&mut cfg, Kind::Call);
+        let sources = cfg.recording.sources.as_ref().unwrap();
+        assert_eq!(sources.voice.as_deref(), Some("USB Mic"));
+        assert_eq!(sources.call.as_deref(), Some("auto"));
+        session_sources(&mut cfg, Kind::InPerson);
+        assert!(cfg.recording.sources.is_none());
+        assert_eq!(cfg.recording.device.as_deref(), Some("USB Mic"));
     }
 
     #[test]

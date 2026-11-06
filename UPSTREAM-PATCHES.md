@@ -60,3 +60,30 @@ each one locally.
 - **Workaround:** Margin reads the growing `.voice.wav` / `.system.wav` stems and compares
   loudness for each line (`recorder.rs::guess_speaker`). It works, but has to infer
   timing from the line's write time.
+
+## 6. User templates should follow `MINUTES_DATA_DIR`
+- **Where:** `crates/core/src/template.rs` `default_user_templates_dir()` (v0.32.1 ~line
+  333). It hardcodes `$HOME/.minutes/templates`.
+- **Why:** this is the same leak as #1. A host that isolates its state cannot keep its
+  own templates without sharing them with every other Minutes install.
+- **Patch:** `Config::minutes_dir().join("templates")`, with a fallback that reads the
+  legacy path.
+- **Workaround:** Margin writes a project template in `<state>/.minutes/templates/` and
+  runs with the state directory as its working directory (DECISIONS.md, S2).
+
+## 7. Summary instructions in the config
+- **Where:** `crates/core/src/config.rs` `SummarizationConfig`.
+- **Why:** a host that wants a "custom instructions" box must write a template file and
+  pass its slug to every queued job and every re-summary.
+- **Patch:** add `summarization.additional_instructions: String`, applied in
+  `build_system_prompt` after the template's own instructions.
+- **Workaround:** the project template from #6.
+
+## 8. Vocabulary hints are capped at 8 and sorted by name
+- **Where:** `crates/core/src/pipeline.rs` `build_decode_hints` (`decode_phrases(8)`), and
+  `transcribe.rs` `whisper_initial_prompt` (12 phrases in total).
+- **Why:** when a user lists more than 8 terms of the same priority, the decoder gets the
+  first 8 in alphabetical order, not the 8 that matter.
+- **Patch:** keep the order the user gave (or a per-entry rank), and make the cap a
+  config value.
+- **Workaround:** Settings says that the transcriber gets up to 8 of the terms.

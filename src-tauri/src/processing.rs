@@ -52,7 +52,8 @@ pub fn spawn_worker() {
         .append(true)
         .open(log_dir.join("margin-worker.log"));
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg(WORKER_FLAG).stdin(std::process::Stdio::null());
+    // The state directory, where core finds the summary-instructions template.
+    cmd.arg(WORKER_FLAG).current_dir(paths::state_dir()).stdin(std::process::Stdio::null());
     if let Ok(log) = log {
         if let Ok(clone) = log.try_clone() {
             cmd.stdout(clone);
@@ -170,5 +171,7 @@ fn finish(job: &JobView, announce: bool) {
     }
     if announce {
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
+        // Settings → "Keep audio": a good moment to drop audio that is now too old.
+        std::thread::spawn(|| corecfg::audio_cleanup(&corecfg::load()));
     }
 }
