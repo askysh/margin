@@ -19,6 +19,7 @@ mod prefs;
 mod processing;
 mod recorder;
 mod reset;
+mod rolling;
 mod shortcut;
 mod speakers;
 mod summaries;

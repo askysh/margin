@@ -1,0 +1,124 @@
+diff --git a/crates/core/src/transcribe.rs b/crates/core/src/transcribe.rs
+index 29619afd..b6e6f99a 100644
+--- a/crates/core/src/transcribe.rs
++++ b/crates/core/src/transcribe.rs
+@@ -903,6 +903,14 @@ fn transcribe_whisper_chunk_ranges(
+         audio_duration_secs,
+         ..Default::default()
+     };
++    // PROTOTYPE (Margin research): pack neighbouring VAD chunks into one whisper
++    // window, and reuse one whisper state (and its cached Silero VAD) across chunks.
++    let packed = pack_chunk_ranges(chunk_ranges, pack_window_samples());
++    if packed.len() != chunk_ranges.len() {
++        tracing::info!(chunks = chunk_ranges.len(), windows = packed.len(), "packed VAD chunks into whisper windows");
++    }
++    let chunk_ranges = &packed[..];
++    let _reuse = ReusedStateGuard::install(&ctx);
+ 
+     for (chunk_index, (start_sample, end_sample)) in chunk_ranges.iter().enumerate() {
+         let chunk_samples = &samples[*start_sample..*end_sample];
+@@ -1386,6 +1394,75 @@ fn correlate_whisper_segments(
+     result
+ }
+ 
++
++// ---- PROTOTYPE helpers (Margin research, not upstream code) ----
++#[cfg(feature = "whisper")]
++thread_local! {
++    static REUSED_STATE: std::cell::RefCell<Option<whisper_rs::WhisperState>> = const { std::cell::RefCell::new(None) };
++    static REUSE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// Puts the state back for the next chunk when reuse is on; drops it otherwise.
++#[cfg(feature = "whisper")]
++struct ReturnState(Option<whisper_rs::WhisperState>);
++#[cfg(feature = "whisper")]
++impl Drop for ReturnState {
++    fn drop(&mut self) {
++        if REUSE_ENABLED.with(|c| c.get()) {
++            if let Some(state) = self.0.take() {
++                REUSED_STATE.with(|c| *c.borrow_mut() = Some(state));
++            }
++        }
++    }
++}
++
++#[cfg(feature = "whisper")]
++struct ReusedStateGuard;
++#[cfg(feature = "whisper")]
++impl ReusedStateGuard {
++    fn install(ctx: &whisper_rs::WhisperContext) -> Option<Self> {
++        if !std::env::var_os("MINUTES_PROTO_REUSE_STATE").is_some_and(|v| v == "1") {
++            return None;
++        }
++        let state = ctx.create_state().ok()?;
++        REUSED_STATE.with(|c| *c.borrow_mut() = Some(state));
++        REUSE_ENABLED.with(|c| c.set(true));
++        Some(Self)
++    }
++}
++#[cfg(feature = "whisper")]
++impl Drop for ReusedStateGuard {
++    fn drop(&mut self) {
++        REUSE_ENABLED.with(|c| c.set(false));
++        REUSED_STATE.with(|c| *c.borrow_mut() = None);
++    }
++}
++
++/// `MINUTES_PROTO_PACK_SECS` (0 = off): the longest window, silence included.
++fn pack_window_samples() -> usize {
++    std::env::var("MINUTES_PROTO_PACK_SECS")
++        .ok()
++        .and_then(|v| v.parse::<f64>().ok())
++        .map(|secs| (secs * 16000.0) as usize)
++        .unwrap_or(0)
++}
++
++/// Merge neighbouring chunks while the merged span (the silence between them
++/// included, so the timeline is unchanged) stays within `window` samples.
++fn pack_chunk_ranges(ranges: &[(usize, usize)], window: usize) -> Vec<(usize, usize)> {
++    if window == 0 {
++        return ranges.to_vec();
++    }
++    let mut out: Vec<(usize, usize)> = Vec::new();
++    for &(start, end) in ranges {
++        match out.last_mut() {
++            Some(last) if end - last.0 <= window => last.1 = end,
++            _ => out.push((start, end)),
++        }
++    }
++    out
++}
++
+ /// Build `WhisperContextParameters` with GPU explicitly enabled when a GPU
+ /// backend was compiled in. All call sites should use this instead of
+ /// `WhisperContextParameters::default()`.
+@@ -1401,6 +1478,10 @@ pub(crate) fn whisper_context_params() -> whisper_rs::WhisperContextParameters<'
+         feature = "vulkan",
+     ));
+     params.use_gpu = gpu_compiled;
++    // PROTOTYPE: flash attention (DTW is not used by minutes).
++    if std::env::var_os("MINUTES_PROTO_FLASH_ATTN").is_some_and(|v| v == "1") {
++        params.flash_attn = true;
++    }
+ 
+     let backend = if cfg!(feature = "metal") {
+         "metal"
+@@ -1655,9 +1736,14 @@ fn transcribe_with_whisper(
+         "starting whisper transcription"
+     );
+ 
+-    let mut state = ctx
+-        .create_state()
+-        .map_err(|e| TranscribeError::TranscriptionFailed(format!("create state: {}", e)))?;
++    let mut state = match REUSED_STATE.with(|c| c.borrow_mut().take()) {
++        Some(state) => state,
++        None => ctx
++            .create_state()
++            .map_err(|e| TranscribeError::TranscriptionFailed(format!("create state: {}", e)))?,
++    };
++    let mut state = ReturnState(Some(state));
++    let state = state.0.as_mut().unwrap();
+ 
+     // Resolve VAD model path and convert to string for FullParams lifetime.
+     // Skip VAD on retry — it may have been too aggressive on this audio.

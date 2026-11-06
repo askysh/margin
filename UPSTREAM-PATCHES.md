@@ -104,3 +104,70 @@ each one locally.
   captured frames (or write silence, to keep stem timing aligned) and pause the live
   transcript. Record the paused spans in the job, so durations stay right.
 - **Workaround:** none. Margin has no pause.
+
+## 11. Let a meeting job start from transcript checkpoints (rolling transcription)
+- **Where:** `crates/core/src/jobs.rs` (`ProcessingJob`, `queue_live_capture_with_recording_health`)
+  and `crates/core/src/pipeline.rs` `transcribe_independent_stems` (v0.32.1 ~line 2509).
+- **Why:** the job always transcribes the whole WAV after Stop. For a long call that is
+  most of the wait: 32 of 39.6 minutes for an 80-minute call. A host that transcribes
+  during the recording has no way to hand its work to the job. `write_transcript_artifact`
+  accepts text, but it drops the stem-aware speaker labels and the job states.
+- **Patch:**
+  - A `transcript_checkpoint: Option<PathBuf>` on the job. It points at a JSON file with,
+    for each stem, `covered_until_samples` and the `[m:ss] text` lines found so far.
+  - In `transcribe_independent_stems`, take those lines, run chunk detection only on the
+    samples after `covered_until_samples`, and offset the new lines.
+  - Check the checkpoint against the stem's length and model id, and ignore it when it
+    does not match.
+  - The rest of the pipeline is unchanged. Chunks are independent (`no_context` is on),
+    so the result equals the batch pass.
+- **Evidence:** docs/research/live-transcription.md, option 2. With 120 s pieces, 12 s of
+  transcription is left at Stop for a 60-minute call, at the same WER.
+- **Workaround:** none. Margin's prototype (`margin --dev rolling`) only measures.
+
+## 12. Whisper meeting chunks: reuse the state, flash attention, fewer calls
+- **Where:** `crates/core/src/transcribe.rs` `transcribe_whisper_chunk_ranges` (~line 893),
+  `transcribe_with_whisper` (~line 1642), `whisper_context_params` (~line 1392).
+- **Why:** each VAD chunk is one `full()` call on a new state. So each call reloads the
+  Silero VAD model and pays a full 30 s encoder pass. The real 80-minute call made 717
+  calls, and a 2 s chunk cost about as much as a 15 s one.
+- **Patch:**
+  - Make one `WhisperState` per stem and reuse it for every chunk.
+  - Set `flash_attn = true` when DTW is not used.
+  - Pack neighbouring chunks into one window of up to 30 s, but keep whisper's segment
+    timestamps. Do not give a packed window one timestamp: in a call, the mic and system
+    lines then interleave in the wrong order.
+- **Evidence:** a prototype is in `docs/research/patches/minutes-core-whisper-chunks.prototype.diff`.
+  On a 20-minute call: −13% (state reuse), −11% (flash attention), −29% (all three). The
+  WER of each stem was unchanged.
+- **Workaround:** none.
+
+## 13. A cap on whisper's temperature fallback for meeting chunks
+- **Where:** `crates/whisper-guard/src/params.rs` (`best_of 5`, `temperature_inc 0.2`).
+- **Why:** on the real 80-minute call, the 100 slowest calls (14%) took 57% of the
+  transcription time, at 20–37 s each for short chunks with few words. That is the fallback
+  re-decoding at higher temperatures, five candidates each time.
+- **Patch:** `transcription.max_fallback_temperature` (for example 0.4) and
+  `transcription.fallback_best_of` (for example 2), with today's values as defaults until
+  a test on real meetings shows the quality cost.
+- **Workaround:** none.
+
+## 14. Skip or slim the second speaker pass
+- **Where:** `crates/core/src/pipeline.rs` `single_stem_speaker_self_attribution`
+  (~line 3171), which calls `diarize::diarize(&stems.voice, ..)`.
+- **Why:** after the summary, core runs pyannote again on the whole mic stem, only to check
+  whether the mic speaker matches the owner's voice profile. It changes no label. It took
+  63 s on the 80-minute call, and 18–25 s of that loads and prepares audio that run 1 just
+  loaded.
+- **Patch:** skip it when no voice profile exists for `identity.name`. Otherwise reuse the
+  decoded audio from run 1, and embed only a sample of the mic segments.
+- **Workaround:** none.
+
+## 15. The live model should fall back to an installed model
+- **Where:** `crates/core/src/live_transcript.rs` `resolve_live_model_path` (~line 2855).
+- **Why:** with `live_transcript.model` empty, the sidecar uses the dictation model, "base".
+  If only `transcription.model` is installed, every utterance fails. A real 80-minute call
+  got 0 live lines, with one warning per utterance and no visible error.
+- **Patch:** if the resolved model is missing, use `transcription.model` when it is
+  `base` or `small`. Report the failure through the live status once, not per utterance.
+- **Workaround:** Margin sets `live_transcript.model` itself.
