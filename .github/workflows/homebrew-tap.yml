@@ -95,6 +95,8 @@ jobs:
             git clone https://github.com/askysh/homebrew-tap.git "$tap"
           fi
           scripts/homebrew-render.sh --version "$VERSION" --dmg "$DIR/Margin-${VERSION}.dmg" "$tap"
+          # Newer Homebrew loads a third-party tap's casks only once the tap is trusted.
+          brew trust askysh/tap 2>/dev/null || true
           echo "path=$tap" >> "$GITHUB_OUTPUT"
 
       - name: brew style, audit, install and uninstall
