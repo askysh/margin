@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod calldetect;
+mod chat;
 mod commands;
 mod corecfg;
 mod devcli;
@@ -110,6 +111,11 @@ fn main() {
             commands::tauri_cmds::reset_preview,
             commands::tauri_cmds::reset_app,
             commands::tauri_cmds::mcp_snippet,
+            commands::tauri_cmds::chat_status,
+            commands::tauri_cmds::chat_thread,
+            commands::tauri_cmds::chat_send,
+            commands::tauri_cmds::chat_stop,
+            commands::tauri_cmds::chat_clear,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Margin");

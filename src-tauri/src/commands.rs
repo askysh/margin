@@ -3,7 +3,7 @@
 //! `--dev serve` QA bridge calls the same functions over HTTP.
 
 use crate::recorder::{recorder, Kind, RecorderView, Stopped};
-use crate::{corecfg, library, models, paths, permissions, prefs, processing, reset, speakers, summaries};
+use crate::{chat, corecfg, library, models, paths, permissions, prefs, processing, reset, speakers, summaries};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -181,7 +181,9 @@ pub mod ops {
     }
 
     pub fn trash_meeting(path: String) -> Res<()> {
-        library::trash(&PathBuf::from(path))
+        library::trash(&PathBuf::from(&path))?;
+        let _ = chat::clear(Some(&path));
+        Ok(())
     }
 
     pub fn reveal_in_finder(path: String) -> Res<()> {
@@ -262,6 +264,27 @@ pub mod ops {
         .unwrap_or_default())
     }
 
+    pub fn chat_status() -> Res<chat::Readiness> {
+        Ok(chat::readiness())
+    }
+
+    pub fn chat_thread(meeting: Option<String>) -> Res<chat::Thread> {
+        Ok(chat::load(meeting.as_deref()))
+    }
+
+    pub fn chat_send(meeting: Option<String>, text: String) -> Res<chat::Thread> {
+        chat::send(meeting.as_deref(), &text)
+    }
+
+    pub fn chat_stop(meeting: Option<String>) -> Res<()> {
+        chat::stop(meeting.as_deref());
+        Ok(())
+    }
+
+    pub fn chat_clear(meeting: Option<String>) -> Res<()> {
+        chat::clear(meeting.as_deref())
+    }
+
     fn percent_encode(s: &str) -> String {
         s.bytes()
             .map(|b| match b {
@@ -317,6 +340,11 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "reset_preview" => out(ops::reset_preview()),
         "reset_app" => out(ops::reset_app(arg(a, "options")?)),
         "mcp_snippet" => out(ops::mcp_snippet()),
+        "chat_status" => out(ops::chat_status()),
+        "chat_thread" => out(ops::chat_thread(arg(a, "meeting")?)),
+        "chat_send" => out(ops::chat_send(arg(a, "meeting")?, arg(a, "text")?)),
+        "chat_stop" => out(ops::chat_stop(arg(a, "meeting")?)),
+        "chat_clear" => out(ops::chat_clear(arg(a, "meeting")?)),
         other => Err(format!("unknown command {other}")),
     }
 }
@@ -371,4 +399,9 @@ pub mod tauri_cmds {
     cmd!(reset_preview() -> reset::ResetPreview);
     cmd!(reset_app(options: reset::ResetOptions) -> reset::ResetReport);
     cmd!(mcp_snippet() -> String);
+    cmd!(chat_status() -> chat::Readiness);
+    cmd!(chat_thread(meeting: Option<String>) -> chat::Thread);
+    cmd!(chat_send(meeting: Option<String>, text: String) -> chat::Thread);
+    cmd!(chat_stop(meeting: Option<String>) -> ());
+    cmd!(chat_clear(meeting: Option<String>) -> ());
 }

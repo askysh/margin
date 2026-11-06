@@ -36,7 +36,7 @@ pub fn find_claude() -> Option<String> {
     (!path.is_empty() && is_executable(std::path::Path::new(&path))).then_some(path)
 }
 
-fn is_executable(path: &std::path::Path) -> bool {
+pub(crate) fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)

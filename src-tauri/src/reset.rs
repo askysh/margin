@@ -102,6 +102,9 @@ pub fn run(recorder: &Recorder, opts: &ResetOptions) -> Result<ResetReport, Stri
         }
     }
 
+    // Chats live in state/chat. Stop any answer in progress so it isn't saved afterwards.
+    crate::chat::forget_all();
+
     // State: everything under state/, except models unless asked.
     let state = paths::state_dir();
     if let Ok(entries) = std::fs::read_dir(&state) {
