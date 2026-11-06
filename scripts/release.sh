@@ -14,15 +14,16 @@
 #   NOTARY_KEY_ID         the key's ID
 #   NOTARY_ISSUER_ID      the issuer ID from App Store Connect, Users and Access, Integrations
 #
-# Output in dist/: Margin-<version>.zip, Margin-<version>.dmg, SHA256SUMS.
+# Output in release/: Margin-<version>.zip, Margin-<version>.dmg, SHA256SUMS.
 # The version must match package.json, src-tauri/tauri.conf.json and
 # src-tauri/Cargo.toml.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST="${ROOT}/dist"
-APP="${ROOT}/src-tauri/target/release/bundle/macos/Margin.app"
+DIST="${ROOT}/release"
+# CARGO_TARGET_DIR builds somewhere else, e.g. to leave a running copy of the app alone.
+APP="${CARGO_TARGET_DIR:-${ROOT}/src-tauri/target}/release/bundle/macos/Margin.app"
 VERSION=""
 NOTARIZE=1
 CHECK_ONLY=0
@@ -57,7 +58,8 @@ for var in "${need[@]}"; do
   [[ -n "${!var:-}" ]] || missing+=("$var")
 done
 [[ "${#missing[@]}" == "0" ]] || die "missing settings: ${missing[*]}" "set them in $SIGNING_ENV (see the header of this script)"
-security find-identity -v -p codesigning | grep -qF "$MARGIN_SIGN_IDENTITY" \
+identities="$(security find-identity -v -p codesigning)"
+grep -qF "$MARGIN_SIGN_IDENTITY" <<<"$identities" \
   || die "signing identity not in the keychain: $MARGIN_SIGN_IDENTITY" "import the Developer ID .p12 into the login keychain"
 [[ "$NOTARIZE" == "0" || -f "$NOTARY_KEY_PATH" ]] || die "no API key at $NOTARY_KEY_PATH"
 ok "signing identity present"
@@ -101,10 +103,14 @@ export CXXFLAGS="-I${sdk}/usr/include/c++/v1" MACOSX_DEPLOYMENT_TARGET=14.4
   APPLE_SIGNING_IDENTITY="$MARGIN_SIGN_IDENTITY" bunx tauri build --bundles app
 )
 codesign --verify --deep --strict --verbose=2 "$APP"
-codesign -d --entitlements - "$APP" 2>/dev/null | grep -q "com.apple.security.device.audio-input" \
+# Read each listing into a variable first: grep -q would close the pipe early, and
+# pipefail would count that as a failure.
+entitlements="$(codesign -d --entitlements - "$APP" 2>/dev/null)"
+grep -q "com.apple.security.device.audio-input" <<<"$entitlements" \
   || die "the app is signed without the microphone entitlement"
-codesign -d --verbose=2 "$APP" 2>&1 | grep -q "flags=.*runtime" || die "the app is signed without the hardened runtime"
-ok "signed: $(codesign -d --verbose=2 "$APP" 2>&1 | sed -n 's/^Authority=//p' | head -n 1)"
+details="$(codesign -d --verbose=2 "$APP" 2>&1)"
+grep -q "flags=.*runtime" <<<"$details" || die "the app is signed without the hardened runtime"
+ok "signed: $(sed -n 's/^Authority=//p' <<<"$details" | head -n 1)"
 
 rm -rf "$DIST"
 mkdir -p "$DIST"

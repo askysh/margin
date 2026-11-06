@@ -1,32 +1,31 @@
 # Progress
 
-## Start here (morning of 2026-11-06)
+## Start here (afternoon of 2026-11-06)
 
-What I could not do overnight is the one thing that needs you: real microphone and
-system-audio capture, because macOS asks a person for permission. Everything else was
-tested end to end (31/31). Suggested first run, about 10 minutes:
+New today: settings and app parity with Minutes, Ask (chat with Claude), faster list,
+search and idle use, a shorter onboarding, and a signing pipeline for v0.0.1. The repo
+is private at https://github.com/askysh/margin.
 
-1. `scripts/build-app.sh && open src-tauri/target/release/bundle/macos/Margin.app`
-2. Onboarding:
-   - Your name.
-   - Pick the **Obsidian: Workspace 42** option, or Documents.
-   - **Balanced** model: a 523 MB download.
-   - **Allow** both permissions.
-   - Summaries: **Claude** (it found `~/.local/bin/claude`).
-3. **Record in person** (⌘⇧I) for 30 s while talking. Type a couple of notes, then Stop.
-   You should see:
-   - live lines on the right
-   - the red rule moving with your voice
-   - processing, then the finished meeting with your notes.
-4. **Record call** (⌘⇧R) with a YouTube video playing. Live lines should alternate
-   You / Them.
-5. Rename a speaker. Edit notes, then open the file in Obsidian. Settings → **Reset
-   Margin…**.
+Real microphone and system-audio capture still need you (macOS asks a person). Try this,
+about 10 minutes. Quit the Margin.app that is open now first, and quit Minutes.app so
+the two don't record at once.
 
-If capture fails, the error toast says why, and `~/Library/Application
-Support/Margin/state/logs/margin.log` has the details. Margin doesn't touch the upstream
-Minutes app's settings, and the two can be installed side by side. Quit Minutes.app while
-testing, so the two don't record at once.
+1. Open the new build (see "Release" below for the signed one), or
+   `scripts/build-app.sh && open src-tauri/target/release/bundle/macos/Margin.app`.
+2. Onboarding is five steps, and Return accepts each default. On **Setup** pick the
+   Obsidian vault or Documents. The model download keeps going while you finish.
+   **Allow** both permissions. Pick **Claude** for summaries.
+3. **Record in person** (⌘⇧I) for 30 s. Type notes, Stop. Expect live lines, the red
+   rule moving with your voice, then the finished meeting with your notes.
+4. **Record call** (⌘⇧R) with a video playing. Live lines should alternate You / Them.
+5. In the meeting: press play, click a transcript time, tick an action item, use
+   **Copy**, rename a speaker. Press **⌘J** and ask "What did I commit to?".
+6. Settings: choose a microphone, add names to spell right, try **Reset Margin…**.
+7. Optional: turn on the ⌃⌥⌘R shortcut and "Open Margin when you log in", then check
+   that both work.
+
+If capture fails, the toast says why, and `~/Library/Application
+Support/Margin/state/logs/margin.log` has the details.
 
 ## 2026-11-06
 
@@ -175,3 +174,18 @@ testing, so the two don't record at once.
 - **Not verified:** Ask in the real app window (only the headless WebKit e2e and the dev
   CLI ran). The "not installed" state has no test; the "too old" flag check has a unit
   test only.
+
+### M4: parity, Ask, performance, onboarding, release (done, 2026-11-06)
+- Four agents worked in parallel worktrees: settings parity, app parity (meeting view,
+  library, menu bar), Ask, and performance plus onboarding. All four are merged into
+  `main`. The decisions are D13 to D37 in DECISIONS.md.
+- e2e after the merge: 57/57 checks pass.
+- A bug found only after the merge: the Settings sheet waited for the microphone list,
+  and Core Audio can stall while it looks for devices (an iPhone's Continuity mic, for
+  one). The lookup now runs on its own thread, and after 2 s the last list is used.
+- The rarely used meeting actions (Show in Finder, Open in Obsidian, Move to Trash) are
+  now under **More**, so the action line fits on one row.
+- Release: version 0.0.1, `scripts/release.sh` (Developer ID, hardened runtime,
+  notarization, stapling, zip and DMG), `.github/workflows/release.yml` (draft release
+  on a `v*` tag) and `ci.yml` (UI type check and build on each push).
+

@@ -241,11 +241,26 @@ This re-seeds `src-tauri/Cargo.lock` from upstream's lock at that tag. That matt
 downstream crates don't see upstream's lockfile, and minutes-core's loose `ort` range
 otherwise resolves to a release that breaks `pyannote-rs`.
 
-### Packaging (later)
+### Releasing
 
-The build produces one `Margin.app` with no installer, which is what a Homebrew cask
-expects. Signing and notarization should follow benchbar's flow and upstream's
-`.github/workflows/release-macos.yml`. Sign inside-out with `--options runtime`, staple,
-then ship a DMG. The cask should use `depends_on macos: :sonoma` and
-`uninstall quit: "com.akashmishra.margin"`, and its `zap` should cover
-`~/Library/Application Support/Margin`.
+`scripts/release.sh` builds `Margin.app`, signs it with the Developer ID (hardened
+runtime and `src-tauri/entitlements.plist`), notarizes and staples it, and writes
+`release/Margin-<version>.zip`, `.dmg` and `SHA256SUMS`.
+
+```bash
+scripts/release.sh --check            # tools, signing identity, versions
+scripts/release.sh 0.0.1 --sign-only  # signed, not sent to Apple
+scripts/release.sh 0.0.1              # signed, notarized, stapled
+```
+
+- **Settings** come from `~/keys/margin-signing.env` (`MARGIN_SIGN_IDENTITY`,
+  `NOTARY_KEY_PATH`, `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`). These are the same Developer
+  ID and App Store Connect API key that benchbar uses.
+- **The version** must be the same in `package.json`, `src-tauri/tauri.conf.json` and
+  `src-tauri/Cargo.toml`.
+- **CI:** `.github/workflows/release.yml` runs the same script on a `v*` tag and drafts a
+  GitHub release. It needs six repository secrets, which are listed at the top of that
+  file. They have the same names and values as benchbar's.
+- **Homebrew (later):** the cask should use `depends_on macos: :sonoma` and
+  `uninstall quit: "com.akashmishra.margin"`, and its `zap` should cover
+  `~/Library/Application Support/Margin`.
