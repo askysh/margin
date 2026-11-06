@@ -21,6 +21,8 @@ export interface Settings {
   vocabulary?: string[];
   summary_instructions?: string;
   open_at_login?: boolean;
+  /** Transcribe during the meeting (Fast and Balanced only). */
+  rolling_transcription?: boolean;
 }
 
 export interface SettingsOptions {

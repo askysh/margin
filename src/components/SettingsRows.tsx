@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 
 /** A labelled on/off switch with one line of help. */
-export function ToggleRow({ title, help, checked, onChange }: { title: string; help: string; checked: boolean; onChange: (on: boolean) => void }) {
+export function ToggleRow({ title, help, checked, onChange, disabled }: { title: string; help: string; checked: boolean; onChange: (on: boolean) => void; disabled?: boolean }) {
   return (
-    <label className="set-toggle">
+    <label className={`set-toggle${disabled ? " set-toggle-off" : ""}`}>
       <span className="set-toggle-text">
         <span className="set-toggle-title">{title}</span>
         <span className="set-help">{help}</span>
       </span>
-      <input type="checkbox" role="switch" className="switch" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <input type="checkbox" role="switch" className="switch" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
     </label>
   );
 }

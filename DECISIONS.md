@@ -416,3 +416,56 @@ The full comparison is in `docs/parity/app.md`.
 - In debug builds, the worker waits at "separating speakers" while
   `$MARGIN_HOME/e2e-hold-speakers` exists (two minutes at most). The e2e run uses it to look
   at a meeting that is open while core still processes it. Release builds ignore the file.
+
+## 0.0.4 (to renumber)
+
+### A minutes-core fork with one patch
+- Rolling transcription needs core to take transcript work from the host. Core v0.32.1
+  always transcribes the whole recording after Stop (UPSTREAM-PATCHES.md #11).
+- Options: (a) wait for upstream; (b) a `[patch]` on the tagged core; (c) a fork with the
+  patch, pinned by commit, and the same patch sent upstream.
+- Pick: **(c)**. `minutes-core` comes from `askysh/minutes`, branch
+  `margin/v0.32.1-rolling`: the v0.32.1 tag plus one commit, pinned by its SHA in
+  `src-tauri/Cargo.toml`. The same patch is proposed upstream as a pull request on
+  `silverstein/minutes`.
+- The fork changes no dependency, so `Cargo.lock` is still seeded from upstream's lock at
+  the tag, and the `ort` pin stays. `scripts/bump-upstream.sh <tag> <commit>` moves to a new
+  tag once the patch is rebased in the fork (README, "Updating minutes-core").
+- When upstream ships the patch, `scripts/bump-upstream.sh <tag>` goes back to upstream by
+  tag. If upstream declines it, Margin keeps rebasing one commit per core release.
+- What the patch adds (core API):
+  - `transcript_checkpoint::transcribe_span` transcribes a span of one source with the
+    final pass's chunking and settings.
+  - `jobs::queue_live_capture_with_transcript_checkpoint` queues a capture with those
+    spans.
+  - The final pass reuses a span only if its audio digest and settings fingerprint match
+    the final file and settings. Otherwise it transcribes that range again.
+
+### Rolling transcription
+- While a meeting records, `rolling.rs` transcribes each source (the mic and call stems,
+  or the in-person recording) in pieces of about 2 minutes. Each piece ends at the
+  quietest 100 ms of its last 15 s. At Stop, the pieces go to the job, and core
+  transcribes only the rest.
+- Fast and Balanced only. Best (large-v3-turbo) needs about 4× the compute of Balanced,
+  and cannot keep up on a MacBook Air (docs/research/live-transcription.md).
+- Settings → Recording → "Transcribe during the meeting", on by default. With Best it is
+  off and cannot be changed.
+- It must never risk the capture:
+  - The thread only reads the growing files. It runs at utility priority.
+  - A failed piece is dropped, and the final pass transcribes that range.
+  - If it falls more than 8 minutes behind, or a piece panics, it stops for the rest of
+    the meeting.
+- Stop waits up to 20 s for a piece that is being transcribed, because the final pass
+  would take longer to redo it.
+- A title typed during the meeting changes the transcriber's hints. Pieces made before the
+  change no longer match, and core transcribes their range again after Stop.
+- Measured with `margin --dev rolling-job` on the synthetic calls, Balanced (details in
+  docs/research/live-transcription.md, "Rolling transcription in the app"):
+  - 20-minute call: the transcript is ready 6.9 s after Stop, against 78 s without
+    rolling. Complete: 42 s against 114 s.
+  - 60-minute call (played at 3× real time): ready 6.5 s after Stop, against 236 s.
+    Complete: 109 s against 341 s. The speaker passes are now most of the wait.
+  - WER is the same: 8.4% against 8.3% (20 min), 8.3% against 8.3% (60 min).
+  - Core accepted every piece (20 of 20, 63 of 63).
+- Not measured yet: GPU, battery and heat during a real call, with the live transcript
+  running at the same time.

@@ -53,6 +53,9 @@ pub struct AppSettings {
     pub summary_instructions: Option<String>,
     #[serde(default)]
     pub open_at_login: Option<bool>,
+    /// Transcribe during the meeting (rolling.rs). Kept in prefs.json.
+    #[serde(default)]
+    pub rolling_transcription: Option<bool>,
 }
 
 /// Choices offered for "Stop after silence", in minutes. 30 is core's default.
@@ -173,6 +176,7 @@ pub fn settings(cfg: &Config) -> AppSettings {
         vocabulary: None,
         summary_instructions: None,
         open_at_login: None,
+        rolling_transcription: None,
     }
 }
 

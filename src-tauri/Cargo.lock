@@ -2926,7 +2926,7 @@ dependencies = [
 [[package]]
 name = "minutes-core"
 version = "0.32.1"
-source = "git+https://github.com/silverstein/minutes?tag=v0.32.1#b92ef3486e5329462fdc420dc8b36f2d9138ce99"
+source = "git+https://github.com/askysh/minutes?rev=d3b724ed7fa8656e344f885956eda71724eee628#d3b724ed7fa8656e344f885956eda71724eee628"
 dependencies = [
  "base64 0.23.1",
  "block2",
@@ -6597,7 +6597,7 @@ dependencies = [
 [[package]]
 name = "whisper-guard"
 version = "0.3.2"
-source = "git+https://github.com/silverstein/minutes?tag=v0.32.1#b92ef3486e5329462fdc420dc8b36f2d9138ce99"
+source = "git+https://github.com/askysh/minutes?rev=d3b724ed7fa8656e344f885956eda71724eee628#d3b724ed7fa8656e344f885956eda71724eee628"
 dependencies = [
  "tracing",
  "whisper-rs",

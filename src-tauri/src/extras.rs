@@ -7,6 +7,7 @@
 //!   and Margin runs with the state directory as its working directory (`use_state_cwd`),
 //!   so nothing is written to the shared `~/.minutes` (DECISIONS.md, settings parity).
 //! - **Open at login**: a LaunchAgent in `~/Library/LaunchAgents`.
+//! - **Transcribe during the meeting**: Margin's prefs.json (rolling.rs).
 
 use crate::{corecfg::AppSettings, paths};
 use minutes_core::template::TemplateFrontmatter;
@@ -26,6 +27,7 @@ pub fn fill(mut s: AppSettings) -> AppSettings {
     s.vocabulary = Some(vocabulary_terms());
     s.summary_instructions = Some(summary_instructions());
     s.open_at_login = Some(open_at_login());
+    s.rolling_transcription = Some(crate::rolling::pref());
     s
 }
 
@@ -39,6 +41,9 @@ pub fn apply(s: &AppSettings) -> Result<(), String> {
     }
     if let Some(on) = s.open_at_login {
         set_open_at_login(on)?;
+    }
+    if let Some(on) = s.rolling_transcription {
+        crate::rolling::set_pref(on)?;
     }
     Ok(())
 }
