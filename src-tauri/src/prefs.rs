@@ -15,6 +15,8 @@ pub struct Prefs {
     pub record_shortcut: bool,
     /// Check for updates and download them. Stored inverted so a missing key is on.
     pub no_auto_update: bool,
+    /// Transcribe during the meeting (rolling.rs). Stored inverted so a missing key is on.
+    pub no_rolling_transcription: bool,
 }
 
 /// The preferences the UI can change.

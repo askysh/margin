@@ -250,6 +250,7 @@ function RecordingSection({ s, options, save }: { s: Settings; options: Settings
         choices={silence}
         onChange={(m) => save({ silence_stop_minutes: m })}
       />
+      <RollingToggle s={s} save={save} />
       <ToggleRow
         title="Suggest recording when a call starts"
         help="Shows a banner when Zoom, Teams or another call app opens."
@@ -263,6 +264,24 @@ function RecordingSection({ s, options, save }: { s: Settings; options: Settings
         onChange={(on) => save({ open_at_login: on })}
       />
     </section>
+  );
+}
+
+/** Rolling transcription (rolling.rs). Best is too slow to keep up during a meeting. */
+function RollingToggle({ s, save }: { s: Settings; save: Save }) {
+  const supported = s.model === "base" || s.model === "small";
+  return (
+    <ToggleRow
+      title="Transcribe during the meeting"
+      help={
+        supported
+          ? "Most of the transcript is done by the time you press Stop, so a long meeting is ready in seconds. Uses more battery while recording."
+          : "Not with the Best model, which is too slow to keep up. Best transcribes after Stop."
+      }
+      checked={supported && (s.rolling_transcription ?? true)}
+      disabled={!supported}
+      onChange={(on) => save({ rolling_transcription: on })}
+    />
   );
 }
 

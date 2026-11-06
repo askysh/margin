@@ -12,7 +12,7 @@ and a working **Reset**.
 
 - Mac only: Apple Silicon, macOS 14.4 or later.
 - MIT licensed.
-- Built against minutes-core `v0.32.1`.
+- Built against minutes-core `v0.32.1`, plus one patch (see "Updating minutes-core").
 
 ## Build and run
 
@@ -233,13 +233,37 @@ Margin never reads or writes the upstream Minutes app's `~/.config/minutes` or
 
 ### Updating minutes-core
 
+Margin uses minutes-core from [askysh/minutes](https://github.com/askysh/minutes), a fork
+of upstream with one patch: transcript checkpoints, which rolling transcription needs. It is
+pinned by commit, while upstream reviews the same patch (DECISIONS.md, "A minutes-core fork
+with one patch"). The fork's branch `margin/<tag>-rolling` is the tag plus that one commit.
+
+To move to a new tag, rebase the patch first, in a clone of the fork:
+
 ```bash
-scripts/bump-upstream.sh v0.33.0
+git remote add upstream https://github.com/silverstein/minutes.git   # once
+git fetch upstream --tags
+git checkout -b margin/v0.33.0-rolling v0.33.0
+git cherry-pick origin/margin/v0.32.1-rolling        # the previous branch's one commit
+# Fix any conflicts, then run core's tests (build the CLI first; some tests run it):
+cargo build -p minutes-cli --no-default-features
+cargo test -p minutes-core --no-default-features --lib -- --test-threads=1
+git push origin margin/v0.33.0-rolling
 ```
 
-This re-seeds `src-tauri/Cargo.lock` from upstream's lock at that tag. That matters because
-downstream crates don't see upstream's lockfile, and minutes-core's loose `ort` range
-otherwise resolves to a release that breaks `pyannote-rs`.
+Then point Margin at the new commit:
+
+```bash
+scripts/bump-upstream.sh v0.33.0 <commit>
+```
+
+- The script checks that the commit is the tag plus commits, sets the `minutes-core` line
+  in `src-tauri/Cargo.toml`, and re-seeds `src-tauri/Cargo.lock` from upstream's lock at
+  that tag. That matters because downstream crates don't see upstream's lockfile, and
+  minutes-core's loose `ort` range otherwise resolves to a release that breaks
+  `pyannote-rs`.
+- When upstream ships the patch, run `scripts/bump-upstream.sh <tag>` with no commit. That
+  goes back to `silverstein/minutes` by tag.
 
 ### Install
 

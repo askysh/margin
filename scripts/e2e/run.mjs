@@ -46,7 +46,8 @@ if (seed) {
   fs.cpSync(seed, dest, { recursive: true });
 }
 const meetingsDir = path.join(home, "Documents/Meetings");
-const env = { ...process.env, HOME: home, MARGIN_HOME: marginHome, ...(simulate ? { MARGIN_SIMULATE_CAPTURE: path.resolve(simulate) } : {}) };
+// With --simulate, rolling transcription cuts 8 s pieces, so the short call has several.
+const env = { ...process.env, HOME: home, MARGIN_HOME: marginHome, ...(simulate ? { MARGIN_SIMULATE_CAPTURE: path.resolve(simulate), MARGIN_ROLLING_PIECE_SECS: "8" } : {}) };
 const bin = path.join(process.env.CARGO_TARGET_DIR || path.join(root, "src-tauri/target"), "debug/margin");
 // Ports can be moved so several runs (one per checkout) don't collide.
 const port = { bridge: process.env.E2E_BRIDGE_PORT || "4545", ui: process.env.E2E_UI_PORT || "4174", ollama: process.env.E2E_OLLAMA_PORT || "11435" };
@@ -212,6 +213,45 @@ if (simulate) {
     const labels = [...new Set([...liveMd.matchAll(/^\[([^\]]+?) \d+:\d\d\]/gm)].map((m) => m[1]))];
     assert(labels.length >= 2, `labels: ${labels.join(", ")}`);
     fs.writeFileSync(path.join(out, "live-call.md"), liveMd);
+  });
+  await check("rolling: pieces are transcribed during the recording and reused", async () => {
+    const events = await bridgeEvents();
+    const stopped = events.findIndex((e) => e.event === "recording-stopped");
+    const before = events.slice(0, stopped).filter((e) => e.event === "rolling").map((e) => e.payload);
+    const last = before.at(-1);
+    assert(last && last.pieces >= 2 && !last.stopped, `progress before Stop: ${JSON.stringify(last)}`);
+    // Core checks each piece against the final audio and settings before it reuses it.
+    const log = fs.readFileSync(path.join(marginHome, "state/logs/margin.log"), "utf8");
+    const used = [...log.matchAll(/checkpoint spans offered=(\d+) accepted=(\d+)/g)].map((m) => [+m[1], +m[2]]);
+    const offered = used.reduce((n, [o]) => n + o, 0);
+    const accepted = used.reduce((n, [, a]) => n + a, 0);
+    assert(used.length === 2 && accepted === offered && accepted === last.pieces, `offered ${offered}, accepted ${accepted}, pieces ${last.pieces}`);
+  });
+  await check("rolling: the meeting matches a normal run", async () => {
+    // The audio this meeting recorded (kept beside it, with its stems), processed after
+    // Stop only, in a separate sandbox.
+    const recorded = path.join(meetingsDir, meetingFiles().find((x) => x.includes("qa-live-call")).replace(/\.md$/, ".wav"));
+    assert(fs.existsSync(recorded.replace(/\.wav$/, ".voice.wav")), "no recorded stems beside the meeting");
+    const sb = path.join(base, "batch");
+    fs.rmSync(sb, { recursive: true, force: true });
+    fs.mkdirSync(path.join(sb, "home"), { recursive: true });
+    fs.cpSync(seed, path.join(sb, "margin/state/models"), { recursive: true });
+    const benv = { ...process.env, HOME: path.join(sb, "home"), MARGIN_HOME: path.join(sb, "margin") };
+    execFileSync(bin, ["--dev", "process", recorded, "QA live call"], { env: benv, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const dir = path.join(sb, "home/Documents/Meetings");
+    const batch = fs.readFileSync(path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith(".md"))), "utf8");
+    const words = (md) => md.slice(md.indexOf("## Transcript")).replace(/^\[[^\]]*\]/gm, "").toLowerCase().replace(/[^a-z0-9' ]+/g, " ").split(/\s+/).filter(Boolean);
+    const [a, b] = [words(batch), words(liveMd)];
+    let prev = [...Array(b.length + 1).keys()];
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i];
+      for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+    const wer = prev[b.length] / Math.max(a.length, 1);
+    fs.writeFileSync(path.join(out, "batch-call.md"), batch);
+    console.log(`     rolling vs batch: ${b.length} / ${a.length} words, WER ${(wer * 100).toFixed(1)}%`);
+    assert(a.length > 20 && wer <= 0.05, `WER ${(wer * 100).toFixed(1)}% over ${a.length} words`);
   });
 }
 
@@ -534,7 +574,21 @@ await check("settings: new choices start at calm defaults", async () => {
   assert(await toggle(/Tell speakers apart/).isChecked(), "speaker separation off");
   assert(await toggle(/Suggest recording when a call starts/).isChecked(), "call suggestions off");
   assert(!(await toggle(/Open Margin when you log in/).isChecked()), "open at login on");
+  assert(await toggle(/Transcribe during the meeting/).isChecked(), "rolling transcription off for Balanced");
   await shootSheet("settings-sheet");
+});
+await check("settings: transcribing during the meeting can be turned off", async () => {
+  const prefsFile = path.join(marginHome, "prefs.json");
+  const rollingOff = () => JSON.parse(fs.readFileSync(prefsFile, "utf8")).no_rolling_transcription === true;
+  await toggle(/Transcribe during the meeting/).uncheck();
+  await settled();
+  assert(rollingOff(), "switch off not saved");
+  await button("Done").click();
+  await openSettings();
+  assert(!(await toggle(/Transcribe during the meeting/).isChecked()), "switch off not kept");
+  await toggle(/Transcribe during the meeting/).check();
+  await settled();
+  assert(!rollingOff(), "switch on not saved");
 });
 await check("settings: language, microphone and silence limit are saved for core", async () => {
   await page.getByLabel("Language spoken in meetings").selectOption("en");

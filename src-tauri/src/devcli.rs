@@ -6,6 +6,8 @@
 //!                                  in-process, printing the time of each stage
 //!   margin --dev live-replay <wav> [speed] [model]   run a WAV through the live sidecar
 //!   margin --dev rolling <wav> [segment-secs] [out.md]   the rolling-transcription prototype
+//!   margin --dev rolling-job <wav> [speed] [--off]   a recording with rolling transcription,
+//!                                  from Start to Complete, with the time after Stop
 //!   margin --dev list              list meetings as JSON
 //!   margin --dev rename <md> <label> <name> [--no-voice]
 //!   margin --dev permissions       print permission state
@@ -87,6 +89,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         }
         Some("live-replay") => live_replay(&mut cfg, &args[1..]),
         Some("rolling") => crate::rolling::bench(&cfg, &args[1..]),
+        Some("rolling-job") => crate::rolling::measure_job(&cfg, &args[1..]),
         Some("queue") => {
             // What Stop does after capture: queue the audio with the notes draft and start
             // the worker child. A running app (or QA bridge) then finishes the job.

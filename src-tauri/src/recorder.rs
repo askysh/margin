@@ -67,6 +67,8 @@ struct Active {
     lines: Vec<LiveLine>,
     notes: String,
     stopping: bool,
+    /// Transcribes finished pieces while recording (rolling.rs).
+    rolling: Option<crate::rolling::Session>,
 }
 
 #[derive(Default)]
@@ -135,6 +137,9 @@ impl Recorder {
         let changed = match self.active.lock().unwrap().as_mut().filter(|a| !a.stopping) {
             Some(a) => {
                 a.title = title.filter(|t| !t.trim().is_empty());
+                if let Some(rolling) = &a.rolling {
+                    rolling.set_title(a.title.clone());
+                }
                 true
             }
             None => false,
@@ -235,10 +240,12 @@ impl Recorder {
         };
 
         let session = self.sessions.fetch_add(1, Ordering::SeqCst) + 1;
+        let title = title.filter(|t| !t.trim().is_empty());
+        let rolling = crate::rolling::start(kind == Kind::Call, &wav, title.clone());
         *guard = Some(Active {
             session,
             kind,
-            title: title.filter(|t| !t.trim().is_empty()),
+            title,
             started_at,
             stop,
             handle: Some(handle),
@@ -246,6 +253,7 @@ impl Recorder {
             lines: vec![],
             notes: String::new(),
             stopping: false,
+            rolling,
         });
         drop(guard);
         spawn_ticker(session);
@@ -262,7 +270,7 @@ impl Recorder {
     }
 
     fn stop_session(&self, session: Option<u64>, notes: Option<String>, title: Option<String>) -> Result<Stopped, String> {
-        let handle = {
+        let (handle, rolling) = {
             let mut guard = self.active.lock().unwrap();
             let a = guard.as_mut().ok_or("Not recording.")?;
             if session.is_some_and(|s| s != a.session) {
@@ -279,13 +287,15 @@ impl Recorder {
                 a.title = Some(t).filter(|t| !t.trim().is_empty());
             }
             a.stop.store(true, Ordering::SeqCst);
-            a.handle.take()
+            (a.handle.take(), a.rolling.take())
         };
         events::emit("recorder", self.view());
         let capture_result = handle
             .map(|h| h.join().unwrap_or_else(|_| Err("The recorder crashed.".into())))
             .unwrap_or(Ok(()));
         let finished_at = Local::now();
+        // Pieces transcribed during the meeting; core transcribes the rest.
+        let checkpoint = rolling.and_then(|r| r.finish(crate::rolling::STOP_WAIT));
         let (wav, title, started_at, draft) = {
             let guard = self.active.lock().unwrap();
             let a = guard.as_ref().expect("active while stopping");
@@ -306,7 +316,7 @@ impl Recorder {
             if let Err(error) = &capture_result {
                 tracing::warn!(%error, size, "capture ended with an error; processing what was recorded");
             }
-            let job = jobs::queue_live_capture_with_recording_health(
+            let job = jobs::queue_live_capture_with_transcript_checkpoint(
                 CaptureMode::Meeting,
                 title,
                 &wav,
@@ -320,6 +330,7 @@ impl Recorder {
                 None,
                 None,
                 None,
+                checkpoint.as_ref(),
             )
             .map_err(|e| {
                 recover_leftover_capture(&corecfg::load());
