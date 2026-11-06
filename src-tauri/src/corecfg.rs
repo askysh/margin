@@ -89,10 +89,20 @@ pub fn load() -> Config {
     if !path.exists() {
         return fresh();
     }
-    Config::load_strict_from(&path).unwrap_or_else(|error| {
+    let mut cfg = Config::load_strict_from(&path).unwrap_or_else(|error| {
         tracing::warn!(%error, "config unreadable; using fresh defaults");
         fresh()
-    })
+    });
+    // Files written by an older Margin lack newer pinned keys (the live model, for one).
+    pin_owned_keys(&mut cfg);
+    cfg
+}
+
+/// The model for the live transcript while recording. Core's default is the dictation
+/// model ("base"), which Margin never downloads, so the live transcript stayed empty.
+/// Use the chosen model, except the large one, which is too slow to keep up live.
+pub fn live_model(model: &str) -> String {
+    if model.starts_with("large") { "base".into() } else { model.into() }
 }
 
 pub fn exists() -> bool {
@@ -122,6 +132,10 @@ fn pin_owned_keys(cfg: &mut Config) {
     cfg.diarization.model_path = paths::diarization_models_dir();
     cfg.vault.enabled = false;
     cfg.live_transcript.recording_sidecar = true;
+    cfg.live_transcript.model = live_model(&cfg.transcription.model);
+    // Summaries run after the meeting is shown (D40), so a long one can take its time:
+    // core's 5-minute default cut off Claude on an 80-minute meeting.
+    cfg.summarization.agent_timeout_secs = cfg.summarization.agent_timeout_secs.max(900);
     if cfg.summarization.engine.trim().is_empty() {
         cfg.summarization.engine = "none".into();
     }

@@ -110,6 +110,8 @@ export interface MeetingDetail extends MeetingSummary {
   in_obsidian_vault: boolean;
   has_audio: boolean;
   action_items: ActionItem[];
+  /** Margin is writing this meeting's summary now. */
+  summarizing: boolean;
 }
 
 export interface ActionItem {

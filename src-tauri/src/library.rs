@@ -61,6 +61,8 @@ pub struct MeetingDetail {
     pub in_obsidian_vault: bool,
     pub has_audio: bool,
     pub action_items: Vec<ActionItem>,
+    /// Margin is writing the summary now (set by the command, not read from the file).
+    pub summarizing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -364,6 +366,7 @@ pub fn read(path: &Path) -> Result<MeetingDetail, String> {
         in_obsidian_vault: obsidian_vault_for(path).is_some(),
         has_audio: path.with_extension("wav").exists(),
         action_items,
+        summarizing: false,
     })
 }
 

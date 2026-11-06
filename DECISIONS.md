@@ -352,3 +352,23 @@ The full comparison is in `docs/parity/app.md`.
   the same flow as benchbar's.
 - `uninstall` unloads the login item and quits the app. `zap` removes Margin's own
   folders. It never removes the meetings folder.
+
+### D40. The meeting opens when the transcript is ready; the summary follows
+- Before: core's pipeline wrote the summary before the job finished, so a long meeting
+  waited for it. On an 80-minute meeting, Claude ran for 300 s and then hit core's limit,
+  so the meeting waited five minutes and got no summary.
+- Now: the processing worker runs with summaries off. When the meeting is ready, Margin
+  opens it and writes the summary in the background with the engine from Settings. The
+  meeting view says "Writing the summary" and fills it in when it lands. Margin holds the
+  file's lock during the rewrite, so notes typed meanwhile are saved after it.
+- Claude gets 15 minutes for a summary instead of 5, because nothing waits for it now.
+- Cost: core's LLM speaker naming (it guesses names from the notes during the summary
+  step) no longer runs during processing. Renaming a speaker once, with voice memory,
+  still names them in later meetings.
+
+### D41. The live transcript uses the chosen model
+- Core's live sidecar defaults to the dictation model ("base"), which Margin never
+  downloads. With "small" chosen, the live sidecar found no model and wrote no lines: an
+  80-minute meeting had an empty live transcript.
+- Now `live_transcript.model` is the chosen model. For "Best" (large), which is too slow
+  to keep up live, it is "base", and Margin downloads it too.

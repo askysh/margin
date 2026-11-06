@@ -172,7 +172,7 @@ pub fn install_and_restart(app: &AppHandle) -> Result<(), String> {
 
 /// Quitting with an update downloaded installs it, so the next launch is the new one.
 pub fn install_on_quit() {
-    if recorder().is_recording() {
+    if recorder().is_recording() || STATE.lock().unwrap().ready.is_none() {
         return;
     }
     if let Err(error) = install() {

@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { api, errorText, type MeetingDetail, type Turn } from "../api";
+import { api, errorText, on, type MeetingDetail, type Turn } from "../api";
 import { isRawSpeaker, meetingDate, speakerNames, useDebounced } from "../util";
 import { Markdown } from "./Markdown";
 import { NotesEditor } from "./NotesEditor";
@@ -34,6 +34,8 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
   const [save, setSave] = useState<SaveState>("idle");
   const [showTranscript, setShowTranscript] = useState(true);
   const [summarizing, setSummarizing] = useState(false);
+  // Margin writes the summary after processing (D40); this follows that run.
+  const [writing, setWriting] = useState(false);
   const player = useRef<AudioHandle>(null);
   const [activeTurn, setActiveTurn] = useState(-1);
   // Every edit bumps `edits`; a save records the count it wrote. Unsaved = they differ.
@@ -59,6 +61,19 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
   }, [path]);
 
   useEffect(load, [load]);
+  useEffect(() => { if (m) setWriting(m.summarizing); }, [m]);
+  useEffect(() => {
+    const sub = on<{ path: string; running: boolean; error?: string | null }>("summary-status", (e) => {
+      if (e.path !== path) return;
+      setWriting(e.running);
+      if (!e.running) {
+        load();
+        onChanged();
+        if (e.error) notify(`No summary: ${e.error}`, "error");
+      }
+    });
+    return () => { sub.then((u) => u()); };
+  }, [path, load, onChanged, notify]);
   useEffect(() => {
     // Pick up edits made in Obsidian or another editor, unless there are unsaved changes here.
     const f = () => !unsaved() && load();
@@ -199,8 +214,8 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
           {onAsk && <button className="link-btn" onClick={onAsk} title="Ask Claude about this meeting (⌘J)">Ask about this meeting</button>}
           <CopyMenu choices={copyChoices} notify={notify} />
           {m.transcript.length > 0 && (
-            <button className="link-btn" onClick={summarize} disabled={summarizing || processing}>
-              {summarizing ? "Summarizing…" : hasSummary ? "Summarize again" : "Summarize"}
+            <button className="link-btn" onClick={summarize} disabled={summarizing || writing || processing}>
+              {summarizing || writing ? "Summarizing…" : hasSummary ? "Summarize again" : "Summarize"}
             </button>
           )}
           {m.transcript.length > 0 && (
@@ -230,6 +245,10 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
         )}
 
         {m.has_audio && <AudioPlayer ref={player} path={path} onTime={onTime} />}
+
+        {writing && !summarizing && (
+          <p className="quiet-note writing-summary"><span className="spinner" aria-hidden /> Writing the summary. You can read and add notes meanwhile.</p>
+        )}
 
         {summary.map((s, i) => (
           <div key={s.heading}>

@@ -238,7 +238,9 @@ pub mod ops {
     }
 
     pub fn read_meeting(path: String) -> Res<library::MeetingDetail> {
-        library::read(&PathBuf::from(path))
+        let mut detail = library::read(&PathBuf::from(&path))?;
+        detail.summarizing = summaries::is_running(&path);
+        Ok(detail)
     }
 
     pub fn save_notes(path: String, notes: String) -> Res<()> {
@@ -298,7 +300,12 @@ pub mod ops {
                 _ => {}
             }
         }
-        let report = minutes_core::resummarize::resummarize_meeting(
+        let Some(_running) = summaries::start(&p.display().to_string()) else {
+            return Err("Margin is already writing this meeting's summary.".into());
+        };
+        // Hold the file's lock while core rewrites the file, so notes typed meanwhile are
+        // saved after it, not overwritten by it.
+        let report = crate::fsutil::with_file_lock(&p, || minutes_core::resummarize::resummarize_meeting(
             &p,
             &cfg,
             &minutes_core::resummarize::ResummarizeOptions {
@@ -306,7 +313,7 @@ pub mod ops {
                 template_override: extras::summary_template_slug(),
                 refresh: Default::default(),
             },
-        )
+        ))
         .map_err(|e| {
             if cfg.summarization.engine == "ollama" {
                 format!(

@@ -479,6 +479,27 @@ if (summaries !== "none") {
     const asked = fs.readFileSync(path.join(out, "ollama-requests.log"), "utf8").trim().split("\n").length;
     assert(asked >= 2, `ollama asked ${asked} times`);
   });
+  await check("a new meeting opens first, then gets its summary by itself", async () => {
+    // The stand-in Ollama answers slowly now, so the order is visible: the meeting is ready
+    // without a summary, shows that one is being written, then gets it (D40).
+    const slow = path.join(out, "ollama-requests.log.slow");
+    fs.writeFileSync(slow, "");
+    try {
+      dev("queue", audio, "QA auto summary");
+      await page.locator(".row").filter({ hasText: "QA auto summary" }).first().waitFor({ timeout: 120000 });
+      await page.locator(".row-job").waitFor({ state: "detached", timeout: 120000 });
+      await page.locator(".row").filter({ hasText: "QA auto summary" }).first().click();
+      const file = path.join(meetingsDir, meetingFiles().find((x) => x.includes("qa-auto-summary")));
+      assert(!fs.readFileSync(file, "utf8").includes("## Summary"), "the summary was written before the meeting was ready");
+      await page.locator(".writing-summary").waitFor({ timeout: 5000 });
+      await page.screenshot({ path: path.join(out, "writing-summary.png") });
+    } finally {
+      fs.rmSync(slow, { force: true });
+    }
+    await page.locator(".eyebrow", { hasText: "Summary" }).waitFor({ timeout: 120000 });
+    await page.locator(".writing-summary").waitFor({ state: "detached", timeout: 5000 });
+    assert(fs.readFileSync(path.join(meetingsDir, meetingFiles().find((x) => x.includes("qa-auto-summary"))), "utf8").includes("## Summary"), "no summary in the file");
+  });
 }
 
 // ---------------------------------------------------------------- settings parity

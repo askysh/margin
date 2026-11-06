@@ -71,3 +71,52 @@ pub fn detect(ollama_url: &str) -> SummaryBackends {
         ollama_models: models.unwrap_or_default(),
     }
 }
+
+/// Meetings whose summary is being written now.
+static RUNNING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn is_running(path: &str) -> bool {
+    RUNNING.lock().unwrap().iter().any(|p| p == path)
+}
+
+/// Marks a meeting as summarizing for as long as the guard lives. `None` when a summary
+/// for it is already being written.
+pub fn start(path: &str) -> Option<RunningGuard> {
+    let mut running = RUNNING.lock().unwrap();
+    if running.iter().any(|p| p == path) {
+        return None;
+    }
+    running.push(path.to_string());
+    drop(running);
+    crate::events::emit("summary-status", serde_json::json!({ "path": path, "running": true }));
+    Some(RunningGuard(path.to_string()))
+}
+
+pub struct RunningGuard(String);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        RUNNING.lock().unwrap().retain(|p| p != &self.0);
+    }
+}
+
+/// After a meeting is ready: write its summary, if summaries are on (D40).
+pub fn summarize_in_background(path: String) {
+    if crate::corecfg::load().summarization.engine == "none" {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("margin-summary".into())
+        .spawn(move || {
+            let result = crate::commands::ops::summarize_meeting(path.clone());
+            if let Err(error) = &result {
+                tracing::warn!(%error, path, "summary after processing failed");
+            }
+            crate::events::emit(
+                "summary-status",
+                serde_json::json!({ "path": path, "running": false, "error": result.err() }),
+            );
+            crate::events::refresh_tray();
+        })
+        .expect("spawn summary");
+}

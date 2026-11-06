@@ -465,3 +465,4 @@ textarea.field { max-width: none; resize: vertical; min-height: 64px; line-heigh
 .menu-compact { width: 190px; }
 .menu-compact strong { font-weight: 500; font-size: 13px; }
 .menu button.danger strong { color: var(--tally); }
+.writing-summary { display: flex; align-items: center; gap: 8px; margin: 0 0 22px; }

@@ -41,14 +41,21 @@ pub fn required(cfg: &Config) -> Vec<ModelFile> {
         .find(|(id, _, _)| id == model)
         .map(|(_, label, bytes)| (*label, *bytes))
         .unwrap_or(("Custom", 0));
-    let mut files = vec![ModelFile {
+    let whisper = |model: &str, label: String, approx: u64| ModelFile {
         id: format!("whisper-{model}"),
-        label: format!("Transcription model ({label})"),
+        label,
         url: format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model}.bin"),
         dest: models.join(format!("ggml-{model}.bin")),
         approx_bytes: approx,
         installed: false,
-    }];
+    };
+    let mut files = vec![whisper(model, format!("Transcription model ({label})"), approx)];
+    // The live transcript uses a smaller model when the chosen one is too slow for it.
+    let live = corecfg::live_model(model);
+    if &live != model {
+        let approx = corecfg::MODELS.iter().find(|(id, _, _)| *id == live).map(|(_, _, b)| *b).unwrap_or(0);
+        files.push(whisper(&live, "Live transcript model".into(), approx));
+    }
     if cfg.transcription.vad_model == "silero-v6.2.0" {
         files.push(ModelFile {
             id: "vad".into(),

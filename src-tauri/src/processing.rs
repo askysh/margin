@@ -24,7 +24,11 @@ pub struct JobView {
 }
 
 pub fn run_worker_mode() -> i32 {
-    let cfg = corecfg::load();
+    let mut cfg = corecfg::load();
+    // The meeting opens as soon as the transcript and speakers are done; Margin writes the
+    // summary afterwards, in the app (DECISIONS.md D40). A long meeting no longer waits
+    // minutes for its summary before you can read it.
+    cfg.summarization.engine = "none".into();
     let code = match jobs::process_pending_jobs(&cfg, |job| {
         tracing::info!(id = %job.id, state = ?job.state, "job update");
     }) {
@@ -203,6 +207,7 @@ fn finish(job: &JobView, announce: bool) {
     }
     if announce {
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
+        crate::summaries::summarize_in_background(output.to_string());
         // Settings → "Keep audio": a good moment to drop audio that is now too old.
         std::thread::spawn(|| corecfg::audio_cleanup(&corecfg::load()));
         events::notify(events::Notice {
