@@ -15,7 +15,7 @@ export function AppPrefsBlock({ initial, notify }: { initial: AppPrefs; notify: 
   };
   return (
     <section className="set">
-      <h2 className="eyebrow">Recording</h2>
+      <h2 className="eyebrow">Sounds and shortcut</h2>
       <label className="check">
         <input type="checkbox" checked={prefs.sound_cues} onChange={(e) => change({ ...prefs, sound_cues: e.target.checked })} />
         Play a sound when a recording starts, stops and is ready
