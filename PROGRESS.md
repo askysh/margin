@@ -126,8 +126,8 @@ testing, so the two don't record at once.
     banner only while the switch is on.
   - Open at login: the LaunchAgent is written, passes `plutil -lint`, and Reset removes
     it.
-  - Meeting language and speaker separation: a meeting processed with them off has no
-    speaker labels.
+  - Meeting language and speaker separation: a meeting processed in English with speaker
+    separation off has a transcript and no speaker labels.
   - Names to spell right reach core's `vocabulary.toml`.
   - Summary language and instructions reach the summarizer's prompt.
 - e2e: 39/39 in light mode and in dark mode.
