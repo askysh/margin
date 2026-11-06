@@ -187,3 +187,19 @@ fn handle(app: &AppHandle, id: &str) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_and_labels() {
+        assert_eq!(clock(5), "0:05");
+        assert_eq!(clock(754), "12:34");
+        assert_eq!(clock(3725), "1:02:05");
+        let long = "a".repeat(60);
+        assert_eq!(recent_label(&long, None).chars().count(), 40);
+        assert!(recent_label("Weekly", Some("2026-11-06T10:15:04+05:30")).starts_with("Weekly  ·  "));
+        assert_eq!(recent_label("Weekly", Some("not a date")), "Weekly");
+    }
+}
