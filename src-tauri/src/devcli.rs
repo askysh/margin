@@ -94,7 +94,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 Some(chrono::Local::now()),
                 None,
                 None,
-                None,
+                crate::extras::summary_template_slug(),
                 None,
                 None,
                 None,
@@ -106,7 +106,9 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("summarize") => {
-            let md = args.get(1).ok_or("usage: summarize <md> [claude|ollama]")?.clone();
+            let md = args.get(1).ok_or("usage: summarize <md> [claude|ollama]")?;
+            let md = std::fs::canonicalize(md).map_err(|e| e.to_string())?.display().to_string();
+            crate::extras::use_state_cwd();
             if let Some(engine) = args.get(2) {
                 let mut s = corecfg::settings(&cfg);
                 s.summary_engine = engine.clone();
@@ -147,6 +149,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         }
         Some("serve") => {
             let port = args.get(1).and_then(|p| p.parse().ok()).unwrap_or(4545);
+            crate::extras::use_state_cwd();
             crate::devserve::serve(port)
         }
         Some("preflight") => {

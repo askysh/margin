@@ -115,6 +115,8 @@ pub fn run(recorder: &Recorder, opts: &ResetOptions) -> Result<ResetReport, Stri
     }
     report.models_deleted = opts.delete_models;
 
+    // "Open at login" is a setting too.
+    let _ = crate::extras::set_open_at_login(false);
     for file in [paths::config_path(), paths::prefs_path()] {
         let _ = std::fs::remove_file(file);
     }

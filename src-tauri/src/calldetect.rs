@@ -16,7 +16,13 @@ pub fn spawn() {
                     last = None;
                     continue;
                 }
-                let now = minutes_core::capture::detect_active_call_app(&corecfg::load());
+                let cfg = corecfg::load();
+                // Settings → Recording → "Suggest recording when a call starts".
+                if !cfg.call_detection.enabled {
+                    last = None;
+                    continue;
+                }
+                let now = minutes_core::capture::detect_active_call_app(&cfg);
                 if now.is_some() && now != last {
                     events::emit("call-detected", now.clone());
                 }
