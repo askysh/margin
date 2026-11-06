@@ -42,14 +42,28 @@ jobs:
       - name: Version without the v
         run: echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
 
+      # A release built and uploaded by hand (scripts/release.sh) already has its files.
+      - name: Skip when the release exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice title=Release exists::v$VERSION already has a release; nothing to build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: oven-sh/setup-bun@v2
+        if: steps.exists.outputs.skip != 'true'
 
       - name: Rust toolchain
+        if: steps.exists.outputs.skip != 'true'
         run: |
           rustup toolchain install stable --profile minimal
           brew list cmake >/dev/null 2>&1 || brew install cmake
 
       - uses: actions/cache@v4
+        if: steps.exists.outputs.skip != 'true'
         with:
           path: |
             ~/.cargo/registry
@@ -59,6 +73,7 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Import the Developer ID certificate
+        if: steps.exists.outputs.skip != 'true'
         env:
           CERT: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -77,6 +92,7 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12"
 
       - name: Write the notary and updater keys
+        if: steps.exists.outputs.skip != 'true'
         env:
           KEY: ${{ secrets.NOTARY_API_KEY_P8 }}
           UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -93,6 +109,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build, sign, notarize, package
+        if: steps.exists.outputs.skip != 'true'
         env:
           MARGIN_SIGNING_ENV: /dev/null
           MARGIN_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
@@ -101,6 +118,7 @@ jobs:
         run: scripts/release.sh "$VERSION"
 
       - name: Draft the GitHub release
+        if: steps.exists.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
