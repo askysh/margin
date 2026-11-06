@@ -5,6 +5,7 @@ import { bytes, copyText, tildify } from "../util";
 import { DownloadProgress, MODEL_CHOICES } from "./Onboarding";
 import { PermissionRow } from "./PermissionRow";
 import { SummaryChoice } from "./SummaryChoice";
+import { AppPrefsBlock } from "./AppPrefsBlock";
 
 interface Props {
   boot: Boot;
@@ -158,6 +159,8 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
             <pre className="code">{mcp}</pre>
             <button className="btn btn-quiet" onClick={async () => notify((await copyText(mcp)) ? "Copied." : "Couldn't copy. Select the text and press ⌘C.")}>Copy</button>
           </section>
+
+          <AppPrefsBlock initial={boot.prefs} notify={notify} />
 
           <section className="set set-danger">
             <h2 className="eyebrow">Start over</h2>

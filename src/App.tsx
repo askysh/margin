@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, errorText, on, type Boot, type Job, type Kind, type LiveLine, type MeetingSummary, type RecorderView } from "./api";
+import { api, errorText, on, type AppPrefs, type Boot, type Job, type Kind, type LiveLine, type MeetingSummary, type RecorderView } from "./api";
 import { Onboarding } from "./components/Onboarding";
 import { Sidebar } from "./components/Sidebar";
 import { LiveView, liveDraft } from "./components/LiveView";
@@ -8,6 +8,7 @@ import { ProcessingView } from "./components/ProcessingView";
 import { Home } from "./components/Home";
 import { SettingsSheet } from "./components/Settings";
 import { clock } from "./util";
+import { useCues } from "./cues";
 
 export type Selection =
   | { type: "home" }
@@ -28,6 +29,8 @@ export default function App() {
   const [toast, setToast] = useState<{ text: string; tone: "info" | "error" } | null>(null);
   const [busy, setBusy] = useState(false);
   const [callApp, setCallApp] = useState<string | null>(null);
+  const [person, setPerson] = useState<string | null>(null);
+  useCues(boot?.prefs.sound_cues ?? false);
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
   const recorderRef = useRef<RecorderView | null>(null);
@@ -78,6 +81,9 @@ export default function App() {
       on<string>("error-toast", (t) => notify(t, "error")),
       on<string>("recording-ended", (t) => notify(t)),
       on<string | null>("call-detected", (a) => setCallApp(a)),
+      // The menu bar's recent meetings and a click on a "meeting ready" notification.
+      on<string>("open-meeting", (path) => setSelection({ type: "meeting", path })),
+      on<AppPrefs>("app-prefs", (prefs) => setBoot((b) => b && { ...b, prefs })),
       // However a recording ended (Stop here, the menu bar, auto-stop), follow it to its
       // processing view if you were looking at it.
       on<{ job_id: string; title: string | null; notes: string }>("recording-stopped", ({ job_id, title, notes }) => {
@@ -144,6 +150,8 @@ export default function App() {
         recordingTitle={recorder?.title ?? null}
         elapsed={tick.elapsed_secs}
         onSelect={setSelection}
+        person={person}
+        onPerson={setPerson}
       />
       <main className="pane">
         <header className="toolbar" data-tauri-drag-region>
@@ -191,6 +199,7 @@ export default function App() {
               onChanged={refreshMeetings}
               onDeleted={() => { setSelection({ type: "home" }); refreshMeetings(); }}
               processing={active.some((j) => j.output_path === selection.path)}
+              onPerson={setPerson}
             />
           )}
           {(selection.type === "home" || (selection.type === "live" && !recorder?.recording)) && (

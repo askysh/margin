@@ -51,7 +51,8 @@
     unregisterCallback(id) {
       callbacks.delete(id);
     },
-    convertFileSrc: (p) => p,
+    // The app's asset protocol: the bridge serves the same files (with byte ranges).
+    convertFileSrc: (p, protocol = "asset") => `${BRIDGE}/${protocol}?path=${encodeURIComponent(p)}`,
     async invoke(cmd, args) {
       if (cmd === "plugin:event|listen") {
         if (!listeners.has(args.event)) listeners.set(args.event, new Set());

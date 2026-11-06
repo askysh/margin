@@ -17,8 +17,15 @@ pub fn spawn() {
                     continue;
                 }
                 let now = minutes_core::capture::detect_active_call_app(&corecfg::load());
-                if now.is_some() && now != last {
-                    events::emit("call-detected", now.clone());
+                if let Some(app) = now.as_ref().filter(|_| now != last) {
+                    events::emit("call-detected", Some(app));
+                    // Shown only when the window isn't in front, where the banner is.
+                    events::notify(events::Notice {
+                        title: format!("{app} looks active"),
+                        body: "Record this call in Margin?".into(),
+                        meeting: None,
+                        call_app: Some(app.clone()),
+                    });
                 }
                 last = now;
             }

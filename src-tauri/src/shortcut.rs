@@ -1,0 +1,62 @@
+//! The global shortcut: ⌃⌥⌘R starts a recording from any app, and stops it again. Off
+//! until you turn it on in Settings, because a global shortcut takes those keys from every
+//! other app.
+
+use crate::recorder::{recorder, Kind};
+use crate::{commands::ops, events, prefs, tray};
+use tauri::{AppHandle, Wry};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+/// Rarely used by other apps; shown in Settings as ⌃⌥⌘R.
+pub const RECORD_SHORTCUT: &str = "Control+Alt+Super+R";
+
+pub fn plugin() -> tauri::plugin::TauriPlugin<Wry> {
+    tauri_plugin_global_shortcut::Builder::new()
+        .with_handler(|app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                toggle(app);
+            }
+        })
+        .build()
+}
+
+/// Register or drop the shortcut to match prefs.json.
+pub fn refresh(app: &AppHandle) {
+    let prefs = prefs::load();
+    let want = prefs.onboarding_complete && prefs.record_shortcut;
+    let shortcuts = app.global_shortcut();
+    let have = shortcuts.is_registered(RECORD_SHORTCUT);
+    let result = match (want, have) {
+        (true, false) => shortcuts.register(RECORD_SHORTCUT),
+        (false, true) => shortcuts.unregister(RECORD_SHORTCUT),
+        _ => Ok(()),
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, "global shortcut");
+        events::emit("error-toast", "Another app already uses ⌃⌥⌘R, so Margin couldn't take it.");
+    }
+}
+
+fn toggle(app: &AppHandle) {
+    let recording = recorder().is_recording();
+    if !recording {
+        // The notepad is where a meeting starts.
+        tray::show_main(app);
+    }
+    std::thread::spawn(move || {
+        let result = if recording {
+            recorder().stop(None, None).map(|_| ())
+        } else {
+            let kind = match prefs::load().default_kind.as_deref() {
+                Some("in-person") => Kind::InPerson,
+                _ => Kind::Call,
+            };
+            ops::start_recording(kind, None).map(|_| ())
+        };
+        if let Err(error) = result {
+            if error != crate::recorder::ALREADY_STOPPING {
+                events::emit("error-toast", error);
+            }
+        }
+    });
+}

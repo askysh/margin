@@ -139,6 +139,14 @@ pub fn spawn_watcher() {
 /// `announce` is false on the first poll, so old jobs from the archive don't each fire
 /// "meeting-ready". Their leftover drafts are still restored.
 fn finish(job: &JobView, announce: bool) {
+    if announce && job.state == JobState::Failed {
+        events::notify(events::Notice {
+            title: "A meeting couldn't be processed".into(),
+            body: "Open Margin to see why and try again.".into(),
+            meeting: None,
+            call_app: None,
+        });
+    }
     let draft = paths::drafts_dir().join(format!("{}.md", job.id));
     let Some(output) = job.output_path.as_deref() else {
         return;
@@ -170,5 +178,13 @@ fn finish(job: &JobView, announce: bool) {
     }
     if announce {
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
+        events::notify(events::Notice {
+            title: "Meeting ready".into(),
+            body: format!("“{}” is transcribed and saved.", job.title.as_deref().unwrap_or("Your meeting")),
+            meeting: Some(output.to_string()),
+            call_app: None,
+        });
+        // A new meeting for the menu bar's recent list.
+        events::refresh_tray();
     }
 }

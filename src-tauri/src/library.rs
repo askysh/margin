@@ -20,6 +20,8 @@ pub struct MeetingSummary {
     pub kind: String,
     pub status: Option<String>,
     pub snippet: String,
+    /// Attendees from the frontmatter, for the library's people filter.
+    pub people: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +58,15 @@ pub struct MeetingDetail {
     pub speakers: Vec<Speaker>,
     pub in_obsidian_vault: bool,
     pub has_audio: bool,
+    pub action_items: Vec<ActionItem>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ActionItem {
+    pub task: String,
+    pub assignee: Option<String>,
+    pub due: Option<String>,
+    pub done: bool,
 }
 
 pub fn output_dir() -> PathBuf {
@@ -184,6 +195,7 @@ fn summarize_file(path: &Path) -> Option<MeetingSummary> {
         kind: str_field(&fm, "type").unwrap_or_else(|| "meeting".into()),
         status: str_field(&fm, "status"),
         snippet,
+        people: string_list(&fm, "attendees"),
     })
 }
 
@@ -312,11 +324,8 @@ pub fn read(path: &Path) -> Result<MeetingDetail, String> {
             }),
         }
     }
-    let attendees = fm
-        .get("attendees")
-        .and_then(|v| v.as_sequence())
-        .map(|s| s.iter().filter_map(|a| a.as_str().map(String::from)).collect())
-        .unwrap_or_default();
+    let attendees = string_list(&fm, "attendees");
+    let action_items = action_items(&fm, body);
     Ok(MeetingDetail {
         summary,
         attendees,
@@ -329,7 +338,108 @@ pub fn read(path: &Path) -> Result<MeetingDetail, String> {
         speakers,
         in_obsidian_vault: obsidian_vault_for(path).is_some(),
         has_audio: path.with_extension("wav").exists(),
+        action_items,
     })
+}
+
+fn string_list(fm: &serde_yaml::Value, key: &str) -> Vec<String> {
+    fm.get(key)
+        .and_then(|v| v.as_sequence())
+        .map(|s| s.iter().filter_map(|a| a.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// The meeting's action items. Core's structured `action_items` frontmatter wins; a
+/// summary without it (some engines write only the body) falls back to the checklist
+/// under `## Action Items`. The order is the one `set_action_item` uses.
+pub fn action_items(fm: &serde_yaml::Value, body: &str) -> Vec<ActionItem> {
+    let structured: Vec<ActionItem> = fm
+        .get("action_items")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|e| {
+                    Some(ActionItem {
+                        task: e.get("task")?.as_str()?.trim().to_string(),
+                        assignee: e
+                            .get("assignee")
+                            .and_then(|a| a.as_str())
+                            .map(|a| a.trim().to_string())
+                            .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("unassigned")),
+                        due: e.get("due").and_then(|d| d.as_str()).map(String::from).filter(|d| !d.trim().is_empty()),
+                        done: e.get("status").and_then(|s| s.as_str()) == Some("done"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !structured.is_empty() {
+        return structured;
+    }
+    checklist_lines(body).into_iter().map(|(_, line)| checklist_item(&line)).collect()
+}
+
+/// `(byte offset of the box character, line)` for each `- [ ]` / `- [x]` line under
+/// `## Action Items`.
+fn checklist_lines(body: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let t = line.trim_end();
+        if let Some(h) = t.strip_prefix("## ") {
+            in_section = h.trim() == "Action Items";
+        } else if in_section && ["- [ ] ", "- [x] ", "- [X] "].iter().any(|p| t.starts_with(p)) {
+            out.push((offset + 3, t.to_string()));
+        }
+        offset += line.len();
+    }
+    out
+}
+
+/// `- [ ] @Priya: send the deck` → task "send the deck", assignee "Priya".
+fn checklist_item(line: &str) -> ActionItem {
+    let done = !line.starts_with("- [ ]");
+    let rest = line[6..].trim();
+    let (assignee, task) = match rest.strip_prefix('@').and_then(|r| r.split_once(':')) {
+        Some((who, task)) => (Some(who.trim().to_string()), task.trim()),
+        None => (None, rest),
+    };
+    ActionItem { task: task.to_string(), assignee, due: None, done }
+}
+
+/// Check or uncheck one action item, by its position in `action_items`. Structured
+/// items go through core (frontmatter status plus the matching body line); body-only
+/// items change their checklist box.
+pub fn set_action_item(path: &Path, index: usize, done: bool) -> Result<(), String> {
+    ensure_inside_output(path)?;
+    crate::fsutil::with_file_lock(path, || {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let (fm, body) = frontmatter(&content);
+        let structured = fm.get("action_items").and_then(|v| v.as_sequence()).is_some_and(|s| !s.is_empty());
+        if structured {
+            return minutes_core::markdown::set_action_item_status(path, index, done).map_err(|e| e.to_string());
+        }
+        let (at, _) = checklist_lines(body).into_iter().nth(index).ok_or("That action item is gone. Reopen the meeting.")?;
+        let at = content.len() - body.len() + at;
+        let mut updated = content.clone();
+        updated.replace_range(at..at + 1, if done { "x" } else { " " });
+        crate::fsutil::write_atomic(path, updated.as_bytes(), None).map_err(|e| e.to_string())
+    })
+    .map_err(|e| format!("Couldn't update the action item: {e}"))?;
+    let _ = minutes_core::derived::refresh_derived_views(path, &corecfg::load(), &Default::default());
+    Ok(())
+}
+
+/// The recording next to a meeting file, if there is one.
+pub fn audio_path(path: &Path) -> Result<PathBuf, String> {
+    ensure_inside_output(path)?;
+    let wav = path.with_extension("wav");
+    if wav.is_file() {
+        Ok(wav)
+    } else {
+        Err("This meeting has no recording.".into())
+    }
 }
 
 /// Only touch files under the configured output folder.
@@ -510,6 +620,23 @@ mod tests {
         let out = splice_notes(FILE, "  ");
         assert!(!out.contains("## Notes"));
         assert!(out.contains("## Summary\n\nS\n\n## Transcript"));
+    }
+
+    #[test]
+    fn action_items_fall_back_to_the_checklist() {
+        let body = "## Summary\n\n- [ ] not an action\n\n## Action Items\n- [ ] @Priya: send the deck\n- [x] book the room\n\n## Notes\n\n- [ ] mine\n";
+        let items = action_items(&serde_yaml::Value::Null, body);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], ActionItem { task: "send the deck".into(), assignee: Some("Priya".into()), due: None, done: false });
+        assert!(items[1].done);
+        assert_eq!(&body[checklist_lines(body)[1].0..][..1], "x");
+    }
+
+    #[test]
+    fn structured_action_items_win() {
+        let fm: serde_yaml::Value = serde_yaml::from_str("action_items:\n- assignee: unassigned\n  task: ship it\n  due: Friday\n  status: done\n").unwrap();
+        let items = action_items(&fm, "## Action Items\n- [ ] other\n");
+        assert_eq!(items, vec![ActionItem { task: "ship it".into(), assignee: None, due: Some("Friday".into()), done: true }]);
     }
 
     #[test]

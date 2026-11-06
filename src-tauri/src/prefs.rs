@@ -9,6 +9,23 @@ pub struct Prefs {
     pub onboarding_complete: bool,
     /// "call" | "in-person": what the big Record button does.
     pub default_kind: Option<String>,
+    /// Sounds on start, stop, ready and failure. Stored inverted so a missing key is on.
+    pub mute_cues: bool,
+    /// The global start/stop shortcut (`RECORD_SHORTCUT`). Off unless you turn it on.
+    pub record_shortcut: bool,
+}
+
+/// The preferences the UI can change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppPrefs {
+    pub sound_cues: bool,
+    pub record_shortcut: bool,
+}
+
+impl Prefs {
+    pub fn app(&self) -> AppPrefs {
+        AppPrefs { sound_cues: !self.mute_cues, record_shortcut: self.record_shortcut }
+    }
 }
 
 pub fn load() -> Prefs {

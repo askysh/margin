@@ -31,9 +31,16 @@ export interface RecorderView {
   notes: string;
 }
 
+/** Margin's own preferences (prefs.json), not minutes-core's config. */
+export interface AppPrefs {
+  sound_cues: boolean;
+  record_shortcut: boolean;
+}
+
 export interface Boot {
   onboarded: boolean;
   settings: Settings;
+  prefs: AppPrefs;
   recorder: RecorderView;
   orphaned_draft: string | null;
   upstream_tag: string;
@@ -48,6 +55,7 @@ export interface MeetingSummary {
   kind: string;
   status: string | null;
   snippet: string;
+  people: string[];
 }
 
 export interface Turn {
@@ -71,6 +79,14 @@ export interface MeetingDetail extends MeetingSummary {
   speakers: Speaker[];
   in_obsidian_vault: boolean;
   has_audio: boolean;
+  action_items: ActionItem[];
+}
+
+export interface ActionItem {
+  task: string;
+  assignee: string | null;
+  due: string | null;
+  done: boolean;
 }
 
 export type JobState =
@@ -134,6 +150,7 @@ export interface Voice {
 export const api = {
   boot: () => invoke<Boot>("boot"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
+  saveAppPrefs: (prefs: AppPrefs) => invoke<AppPrefs>("save_app_prefs", { prefs }),
   folderChoices: () =>
     invoke<{ default_dir: string; obsidian_vaults: { name: string; path: string }[] }>("folder_choices"),
   completeOnboarding: () => invoke<void>("complete_onboarding"),
@@ -163,6 +180,9 @@ export const api = {
   renameSpeaker: (path: string, label: string, name: string, rememberVoice: boolean) =>
     invoke<{ voice_saved: boolean; note: string | null }>("rename_speaker", { path, label, name, rememberVoice }),
   summarize: (path: string) => invoke<void>("summarize_meeting", { path }),
+  setActionItem: (path: string, index: number, done: boolean) => invoke<void>("set_action_item", { path, index, done }),
+  /** The recording's file path, readable through the asset protocol (convertFileSrc). */
+  meetingAudio: (path: string) => invoke<string>("meeting_audio", { path }),
   listVoices: () => invoke<Voice[]>("list_voices"),
   forgetVoice: (slug: string) => invoke<void>("forget_voice", { slug }),
   resetPreview: () => invoke<ResetPreview>("reset_preview"),
