@@ -411,7 +411,11 @@ await check("no UI errors or failed commands", async () => {
   assert(real.length === 0 && consoleErrors.length === 0, [...real, ...consoleErrors].join(" | "));
 });
 
-fs.writeFileSync(path.join(out, "report.json"), JSON.stringify(results, null, 2));
+// How often each command ran: a check on redundant refreshes (docs/perf.md).
+const calls = await page.evaluate(() => window.__E2E__.calls).catch(() => []);
+const tally = Object.fromEntries(Object.entries(calls.reduce((n, c) => ({ ...n, [c]: (n[c] || 0) + 1 }), {})).sort((a, b) => b[1] - a[1]));
+console.log(`commands: ${calls.length} (${Object.entries(tally).slice(0, 6).map(([k, v]) => `${k} ${v}`).join(", ")})`);
+fs.writeFileSync(path.join(out, "report.json"), JSON.stringify({ results, calls: tally }, null, 2));
 await browser.close();
 for (const p of procs) p.kill();
 const failed = results.filter((r) => !r.ok);
