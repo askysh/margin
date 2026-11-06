@@ -349,3 +349,34 @@ If upstream does not take patch 11, Margin can carry it as a `[patch]` on the ta
   `cargo build --release --config 'patch."https://github.com/silverstein/minutes".minutes-core.path="<copy>/crates/core"'`
   in a separate `CARGO_TARGET_DIR`, then restore `Cargo.lock`.
 - `docs/research/live-scripts/`: the corpus, evaluation and run scripts.
+
+## Rolling transcription in the app
+
+Measured on 2026-11-06 after the app change (`src-tauri/src/rolling.rs`) and core patch 11
+(the `askysh/minutes` fork). `margin --dev rolling-job <wav> [speed] [--off]` writes the
+call to the recorder's files at `speed` × real time, while the real rolling session
+transcribes them in 120 s pieces. Then it stops the session as Stop does, queues the job
+with the checkpoint and processes it. Release build, Balanced (`small`), Claude summary
+off, a fresh sandbox for each run, load 2.4–3.3 (a debug build and the unit tests ran during the 20-minute batch run).
+
+| | 20 min, batch | 20 min, rolling (1×) | 60 min, batch | 60 min, rolling (3×) |
+|---|---|---|---|---|
+| Stop waited for a piece | — | 0.05 s | — | 0.6 s |
+| Stop to transcript ready | 78.4 s | **6.9 s** | 236.1 s | **6.5 s** |
+| Stop to Complete | 113.5 s | 41.5 s | 341.1 s | 109.5 s |
+| Pieces made / accepted by core | — | 20 / 20 | — | 63 / 63 |
+| Compute during the meeting | — | 74 s | — | 221 s |
+| WER against the reference | 8.32% | 8.43% | 8.32% | 8.30% |
+| WER, mic / system stem | 5.2% / 9.4% | 5.6% / 9.4% | 6.8% / 9.0% | 7.0% / 8.9% |
+| Word difference to the batch run | — | 1.2% | — | 1.2% |
+
+- After Stop, core transcribes only the open piece of each stem and checks the digests.
+  That takes about 6–7 s here, whatever the length of the meeting.
+- The 60-minute run played the call at 3× real time. So the thread had a third of the
+  time for its work, and it still kept up (compute was 221 s for 1,200 s of play).
+- With rolling, the speaker passes are most of what is left before Complete: about 35 s
+  (20 min) and 103 s (60 min). Patch 14 is the next step for that.
+- Real speech needs about 4.5× the compute of this synthetic speech (24 s against 5.4 s for
+  each meeting minute). So on a real call, expect a piece in progress at Stop more often
+  (Stop waits up to 20 s for it) and a tail of about 25–50 s.
+

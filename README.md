@@ -97,6 +97,9 @@ it says otherwise.
   - *Record call* opens the notepad with a live transcript beside it. In calls, lines are
     marked You / Them by comparing your mic and the call audio.
   - Notes typed right up to *Stop* are kept.
+  - With Fast or Balanced, Margin transcribes the meeting in 2-minute pieces while it
+    records, so after *Stop* only the last piece or two is left (DECISIONS.md, "Rolling
+    transcription"). Settings → Recording → "Transcribe during the meeting" turns it off.
   - Processing (transcribe, tell speakers apart, save) runs in a background worker, and
     the window then opens the finished meeting.
   - Closing the window keeps Margin in the menu bar. Quitting mid-recording saves the

@@ -459,7 +459,13 @@ The full comparison is in `docs/parity/app.md`.
   would take longer to redo it.
 - A title typed during the meeting changes the transcriber's hints. Pieces made before the
   change no longer match, and core transcribes their range again after Stop.
-- Measured (synthetic calls, Balanced; details in docs/research/live-transcription.md):
-  RESULTS_PLACEHOLDER
+- Measured with `margin --dev rolling-job` on the synthetic calls, Balanced (details in
+  docs/research/live-transcription.md, "Rolling transcription in the app"):
+  - 20-minute call: the transcript is ready 6.9 s after Stop, against 78 s without
+    rolling. Complete: 42 s against 114 s.
+  - 60-minute call (played at 3× real time): ready 6.5 s after Stop, against 236 s.
+    Complete: 109 s against 341 s. The speaker passes are now most of the wait.
+  - WER is the same: 8.4% against 8.3% (20 min), 8.3% against 8.3% (60 min).
+  - Core accepted every piece (20 of 20, 63 of 63).
 - Not measured yet: GPU, battery and heat during a real call, with the live transcript
   running at the same time.
