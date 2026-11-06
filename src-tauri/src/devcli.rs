@@ -2,7 +2,10 @@
 //! with `MARGIN_HOME=/some/tmp/dir` to stay away from your real data.
 //!
 //!   margin --dev models            download missing models, printing progress
-//!   margin --dev process <wav>     queue a WAV as a meeting and process it in-process
+//!   margin --dev process <wav>     queue a WAV (and its call stems) as a meeting and process it
+//!                                  in-process, printing the time of each stage
+//!   margin --dev live-replay <wav> [speed] [model]   run a WAV through the live sidecar
+//!   margin --dev rolling <wav> [segment-secs] [out.md]   the rolling-transcription prototype
 //!   margin --dev list              list meetings as JSON
 //!   margin --dev rename <md> <label> <name> [--no-voice]
 //!   margin --dev permissions       print permission state
@@ -47,6 +50,14 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             // Queue a copy, as the recorder does, then drain the queue in this process.
             let copy = minutes_core::config::Config::minutes_dir().join("dev-input.wav");
             std::fs::copy(&wav, &copy).map_err(|e| e.to_string())?;
+            // A call's `.voice.wav` / `.system.wav` stems go along, as after a real call.
+            if let (Some(src), Some(dst)) = (minutes_core::capture::stem_paths_for(&wav), minutes_core::capture::stem_paths_for(&copy)) {
+                if src.voice.exists() && src.system.exists() {
+                    std::fs::copy(&src.voice, &dst.voice).map_err(|e| e.to_string())?;
+                    std::fs::copy(&src.system, &dst.system).map_err(|e| e.to_string())?;
+                    eprintln!("with stems");
+                }
+            }
             let job = minutes_core::jobs::queue_live_capture_with_recording_health(
                 minutes_core::pid::CaptureMode::Meeting,
                 args.get(2).cloned(),
@@ -65,13 +76,17 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
             eprintln!("queued job {}", job.id);
             let t = std::time::Instant::now();
-            minutes_core::jobs::process_pending_jobs(&cfg, |j| eprintln!("  {:?} {:?}", j.state, j.stage))
-                .map_err(|e| e.to_string())?;
+            minutes_core::jobs::process_pending_jobs(&cfg, |j| {
+                eprintln!("  {:>7.1}s {:?} {:?}", t.elapsed().as_secs_f32(), j.state, j.stage)
+            })
+            .map_err(|e| e.to_string())?;
             let done = minutes_core::jobs::load_job(&job.id);
             eprintln!("finished in {:.1}s", t.elapsed().as_secs_f32());
             println!("{}", serde_json::to_string_pretty(&done.map(|j| (j.state, j.output_path, j.error))).unwrap());
             Ok(())
         }
+        Some("live-replay") => live_replay(&mut cfg, &args[1..]),
+        Some("rolling") => crate::rolling::bench(&cfg, &args[1..]),
         Some("queue") => {
             // What Stop does after capture: queue the audio with the notes draft and start
             // the worker child. A running app (or QA bridge) then finishes the job.
@@ -174,8 +189,57 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             println!("{}", serde_json::to_string_pretty(&permissions::state()).unwrap());
             Ok(())
         }
-        _ => Err("commands: models | process <wav> [title] | list | read <md> | rename <md> <label> <name> | permissions".into()),
+        _ => Err("commands: models | process <wav> [title] | live-replay <wav> [speed] [model] | rolling <wav> [secs] [out.md] | list | read <md> | rename <md> <label> <name> | permissions".into()),
     }
+}
+
+/// `live-replay <wav> [speed] [model]`: feed a WAV through core's live-transcript sidecar
+/// (the same thread that runs during a recording) at `speed` × real time, and print how
+/// long it took and how many lines it wrote. The lines are in the live-transcript JSONL.
+/// Research tool for docs/research/live-transcription.md.
+fn live_replay(cfg: &mut minutes_core::config::Config, args: &[String]) -> Result<(), String> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let wav = PathBuf::from(args.first().ok_or("usage: live-replay <wav> [speed] [model]")?);
+    let speed: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    if let Some(model) = args.get(2) {
+        cfg.live_transcript.model = model.clone();
+    }
+    cfg.ensure_dirs().map_err(|e| e.to_string())?;
+    let jsonl = minutes_core::pid::live_transcript_jsonl_path();
+    let _ = std::fs::write(&jsonl, b"");
+    let samples: Vec<f32> = hound::WavReader::open(&wav)
+        .map_err(|e| e.to_string())?
+        .samples::<i16>()
+        .map(|s| s.map(|s| s as f32 / 32768.0))
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let sidecar = {
+        let (cfg, stop) = (cfg.clone(), stop.clone());
+        std::thread::spawn(move || minutes_core::live_transcript::run_sidecar_mpsc(rx, stop, &cfg, None))
+    };
+    let start = std::time::Instant::now();
+    for (i, chunk) in samples.chunks(1600).enumerate() {
+        tx.send(chunk.to_vec()).map_err(|e| e.to_string())?;
+        let due = std::time::Duration::from_secs_f64((i + 1) as f64 * 0.1 / speed);
+        if let Some(wait) = due.checked_sub(start.elapsed()) {
+            std::thread::sleep(wait);
+        }
+    }
+    let fed = start.elapsed();
+    drop(tx);
+    let _ = sidecar.join();
+    let lines = std::fs::read_to_string(&jsonl).unwrap_or_default().lines().count();
+    eprintln!(
+        "audio {:.0}s fed in {:.1}s; sidecar done {:.1}s after the last sample; {lines} lines in {}",
+        samples.len() as f64 / 16000.0,
+        fed.as_secs_f64(),
+        (start.elapsed() - fed).as_secs_f64(),
+        jsonl.display()
+    );
+    Ok(())
 }
 
 /// `ask [--meeting <md>] <question> [<follow-up> ...]`: what the Ask panel does, with the
