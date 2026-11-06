@@ -12,6 +12,7 @@
 // --dark runs the whole pass in dark mode (for screenshots).
 // --download also tests a real model switch + download (Fast model, ~148 MB).
 // Screenshots and report.json go to $E2E_OUT (default /tmp/margin-e2e/out).
+// E2E_BRIDGE_PORT, E2E_UI_PORT, E2E_OLLAMA_PORT and CARGO_TARGET_DIR move a run off the defaults.
 import { webkit } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -45,7 +46,9 @@ if (seed) {
 }
 const meetingsDir = path.join(home, "Documents/Meetings");
 const env = { ...process.env, HOME: home, MARGIN_HOME: marginHome, ...(simulate ? { MARGIN_SIMULATE_CAPTURE: path.resolve(simulate) } : {}) };
-const bin = path.join(root, "src-tauri/target/debug/margin");
+const bin = path.join(process.env.CARGO_TARGET_DIR || path.join(root, "src-tauri/target"), "debug/margin");
+// Ports can be moved so several runs (one per checkout) don't collide.
+const port = { bridge: process.env.E2E_BRIDGE_PORT || "4545", ui: process.env.E2E_UI_PORT || "4174", ollama: process.env.E2E_OLLAMA_PORT || "11435" };
 
 const procs = [];
 const start = (cmd, args, extra = {}) => {
@@ -56,9 +59,9 @@ const start = (cmd, args, extra = {}) => {
   procs.push(p);
   return p;
 };
-start(bin, ["--dev", "serve", "4545"]);
-if (summaries === "fake-ollama") start("/usr/bin/python3", ["-I", path.join(root, "scripts/e2e/fake-ollama.py"), "11435", path.join(out, "ollama-requests.log")]);
-start("bunx", ["vite", "preview", "--port", "4174", "--strictPort"]);
+start(bin, ["--dev", "serve", port.bridge]);
+if (summaries === "fake-ollama") start("/usr/bin/python3", ["-I", path.join(root, "scripts/e2e/fake-ollama.py"), port.ollama, path.join(out, "ollama-requests.log")]);
+start("bunx", ["vite", "preview", "--port", port.ui, "--strictPort"]);
 await new Promise((r) => setTimeout(r, 2500));
 
 const results = [];
@@ -88,8 +91,9 @@ const page = await ctx.newPage();
 const consoleErrors = [];
 page.on("pageerror", (e) => consoleErrors.push(e.message));
 page.on("console", (m) => m.type() === "error" && consoleErrors.push(m.text()));
+await page.addInitScript(`window.__E2E_BRIDGE__ = "http://127.0.0.1:${port.bridge}";`);
 await page.addInitScript({ path: path.join(root, "scripts/e2e/bridge-shim.js") });
-await page.goto("http://localhost:4174");
+await page.goto(`http://localhost:${port.ui}`);
 const ui = (sel) => page.locator(sel);
 const button = (name) => page.getByRole("button", { name, exact: false });
 
@@ -333,7 +337,7 @@ if (summaries !== "none") {
   await check(`summaries via ${summaries}`, async () => {
     if (summaries === "fake-ollama") {
       const cfgPath = path.join(marginHome, "config.toml");
-      fs.writeFileSync(cfgPath, fs.readFileSync(cfgPath, "utf8").replace(/^ollama_url = .*$/m, 'ollama_url = "http://127.0.0.1:11435"'));
+      fs.writeFileSync(cfgPath, fs.readFileSync(cfgPath, "utf8").replace(/^ollama_url = .*$/m, `ollama_url = "http://127.0.0.1:${port.ollama}"`));
     }
     await page.getByRole("button", { name: "Settings" }).click();
     const label = /Ollama, on this Mac/;
