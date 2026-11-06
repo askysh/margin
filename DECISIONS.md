@@ -84,3 +84,52 @@ Product and technical decisions made without asking. Each one lists the options 
   process be tested without TCC.
 - It is compiled into debug builds only (`cfg!(debug_assertions)`). Release builds
   ignore the variable.
+
+## Perf and onboarding (to renumber)
+
+### P1. Measure first, keep only what the numbers support
+- The numbers are in `docs/perf.md`, with the scripts that produced them.
+- Kept: the jobs-watcher change, the library cache, faster search, lazy views and
+  fewer re-renders. Each one has a before and after figure.
+
+### P2. The jobs watcher reads the archive only when something changed
+- Context: minutes-core never prunes `jobs/archive/`, so it has one file per processed
+  meeting. The watcher read and parsed all of them every second. With 600 meetings the
+  idle app used 2.1% CPU.
+- Options:
+  - (a) Poll less often. The UI then notices a finished meeting later.
+  - (b) Prune the archive. That changes core's data, which the CLI also reads.
+  - (c) Each second, read only the active job files and the timestamps of the archive and
+    drafts folders. Do the full listing only when one of them changes.
+- Pick: **(c)**. Core writes job files by rename, so every change moves a folder
+  timestamp. `list_jobs` still runs every second, so a job whose worker died is still
+  re-queued.
+
+### P3. The library list is cached by file size and modification time
+- The cache lives in memory and is rebuilt on each list. Entries for files that are gone
+  drop out. A change that keeps both the size and the modification time is missed. That
+  needs a same-size write in the same nanosecond, and Margin and core write by rename.
+
+### P4. Onboarding: five short steps, every one with a default
+- Steps: You → Setup (folder and model together) → Permissions → Summaries → Ready.
+- Return continues on every step. A user can finish with Return alone.
+- Folder and model share a page. Both have good defaults (Documents, Balanced), and the
+  download starts one step earlier.
+- The download runs in the background. Nothing waits for it. The Ready step and Home show
+  its progress, and recording starts working when it finishes. Before, the last step
+  blocked until the download finished.
+- The Ready step shows the three ways to start a recording: the window button, the menu
+  bar and the shortcuts.
+- Summaries still default to None (D6).
+
+### P5. No microphone level check during onboarding
+- A level meter must open the microphone. That shows the macOS prompt if access is not
+  decided yet. If access is already granted, it records real audio in a test run, which
+  the QA rules forbid.
+- Pick: **no meter**. The live view's rule already shows the level during the first
+  recording. Add a meter later, shown only after `microphone == granted`.
+
+### P6. Release profile unchanged
+- See `docs/perf.md`. The size and speed gain of `codegen-units = 1` and fat LTO is small
+  next to the cost in build time, because most of the binary is whisper.cpp and ONNX
+  Runtime, which these settings do not touch.

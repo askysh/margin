@@ -83,14 +83,15 @@ $M --dev serve [port]                    # QA bridge for scripts/e2e
 Everything below was checked by the end-to-end pass, 31 of 31 (see PROGRESS.md), unless
 it says otherwise.
 
-- **Onboarding.** It runs in this order:
+- **Onboarding.** Five short steps. Each one has a default, so Return alone finishes setup.
   1. Your name.
-  2. The meetings folder: `~/Documents/Meetings`, your Obsidian vaults (found through
-     Obsidian's own vault list) or any folder you pick.
-  3. Model choice: Fast / Balanced / Best. The download starts in the background with a
-     progress bar.
-  4. Microphone and System Audio permissions, each with a one-line reason.
-  5. Optional summaries.
+  2. Setup: the meetings folder (`~/Documents/Meetings`, your Obsidian vaults, found
+     through Obsidian's own vault list, or any folder you pick) and the model (Fast /
+     Balanced / Best). The download starts here and continues in the background.
+  3. Microphone and System Audio permissions, each with a one-line reason.
+  4. Optional summaries.
+  5. Ready: the three ways to start a recording, and the download progress. Home also
+     shows the progress until the download finishes.
 - **Recording (simulated mic).**
   - *Record call* opens the notepad with a live transcript beside it. In calls, lines are
     marked You / Them by comparing your mic and the call audio.
