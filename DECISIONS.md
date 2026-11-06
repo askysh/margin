@@ -417,9 +417,9 @@ The full comparison is in `docs/parity/app.md`.
   `$MARGIN_HOME/e2e-hold-speakers` exists (two minutes at most). The e2e run uses it to look
   at a meeting that is open while core still processes it. Release builds ignore the file.
 
-## 0.0.4 (to renumber)
+## 0.0.4: transcribe during the meeting
 
-### A minutes-core fork with one patch
+### D46. A minutes-core fork with one patch
 - Rolling transcription needs core to take transcript work from the host. Core v0.32.1
   always transcribes the whole recording after Stop (UPSTREAM-PATCHES.md #11).
 - Options: (a) wait for upstream; (b) a `[patch]` on the tagged core; (c) a fork with the
@@ -441,7 +441,7 @@ The full comparison is in `docs/parity/app.md`.
   - The final pass reuses a span only if its audio digest and settings fingerprint match
     the final file and settings. Otherwise it transcribes that range again.
 
-### Rolling transcription
+### D47. Rolling transcription
 - While a meeting records, `rolling.rs` transcribes each source (the mic and call stems,
   or the in-person recording) in pieces of about 2 minutes. Each piece ends at the
   quietest 100 ms of its last 15 s. At Stop, the pieces go to the job, and core
