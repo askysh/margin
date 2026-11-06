@@ -189,3 +189,16 @@ Support/Margin/state/logs/margin.log` has the details.
   notarization, stapling, zip and DMG), `.github/workflows/release.yml` (draft release
   on a `v*` tag) and `ci.yml` (UI type check and build on each push).
 
+
+### M5: v0.0.1 released (2026-11-06)
+- https://github.com/askysh/margin/releases/tag/v0.0.1: signed with the Developer ID,
+  notarized and stapled (app and DMG). Install with
+  `brew install --cask askysh/tap/margin` (askysh/homebrew-tap #8).
+- Auto-update (D38): tested on this Mac from 0.0.1 to a local test 0.0.2: download,
+  signature check, bundle swap, restart. The first update over HTTPS from GitHub runs
+  with 0.0.2.
+- On publish, `homebrew-tap.yml` installed the cask from the published DMG on a GitHub
+  runner, checked `codesign` and Gatekeeper (`spctl`), and opened the tap PR, which
+  merged after the tap's tests.
+- Fixed: long transcripts and notes did not scroll, and pages ended 52px below the window.
+- Next: faster processing after Stop for long meetings (research running).
