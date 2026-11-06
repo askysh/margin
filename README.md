@@ -74,13 +74,14 @@ $M --dev queue meeting.wav "Title" notes.md   # what Stop does: queue + worker c
 $M --dev list | read <file.md>
 $M --dev rename <file.md> SPEAKER_2 Priya
 $M --dev summarize <file.md> claude|ollama
+$M --dev ask [--meeting <file.md>] "question" ["follow-up" ...]   # Ask, with timings
 $M --dev reset [--meetings] [--models] [--voices]
 $M --dev serve [port]                    # QA bridge for scripts/e2e
 ```
 
 ## What works
 
-Everything below was checked by the end-to-end pass, 31 of 31 (see PROGRESS.md), unless
+Everything below was checked by the end-to-end pass, 40 of 40 (see PROGRESS.md), unless
 it says otherwise.
 
 - **Onboarding.** It runs in this order:
@@ -133,6 +134,17 @@ it says otherwise.
   - **None** (the default): nothing leaves the Mac.
   - **Claude**, through your own `claude` CLI. Checked headlessly with a real login: 10 s.
   - **Ollama**. The flow is checked against a stand-in server. See the limits below.
+- **Ask (chat with Claude).** Press ⌘J, click *Ask about your meetings* in the sidebar,
+  or click *Ask about this meeting*.
+  - It uses your own `claude` CLI. Claude can only read files in your meetings folder:
+    it gets Read, Grep and Glob and nothing else. It cannot write files or run commands.
+  - Answers stream in. Follow-up questions continue the same conversation. **Stop** ends
+    an answer. The meetings an answer used are shown as links that open them.
+  - Each meeting has its own conversation, and there is one across all meetings. They are
+    kept after a restart. **Clear** deletes one, and Reset deletes all of them.
+  - If Claude Code is not installed or not signed in, the panel says how to fix it.
+  - Checked with a real login (`margin --dev ask`): about 6 s for a question about one
+    meeting, about 14 s for a question across five meetings. See docs/parity/chat.md.
 - **Settings.**
   - Name, folder, model (switching downloads it with progress), summaries, permission
     status, and recognised voices (each can be forgotten).
@@ -203,6 +215,7 @@ it says otherwise.
 | Meetings (`.md` and `.wav`) | the folder you chose, default `~/Documents/Meetings` |
 | Settings (minutes-core config) | `~/Library/Application Support/Margin/config.toml` |
 | Models, jobs, logs, state | `~/Library/Application Support/Margin/state/` |
+| Ask conversations | `…/Margin/state/chat/` |
 | Voice profiles (shared) | `~/.minutes/voices.db` |
 | Logs | `…/Margin/state/logs/margin.log`, `margin-worker.log` |
 

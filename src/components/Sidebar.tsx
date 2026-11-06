@@ -14,9 +14,11 @@ interface Props {
   /** Show only meetings with this attendee. */
   person: string | null;
   onPerson: (p: string | null) => void;
+  askOpen: boolean;
+  onAsk: () => void;
 }
 
-export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, elapsed, onSelect, person, onPerson }: Props) {
+export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, elapsed, onSelect, person, onPerson, askOpen, onAsk }: Props) {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<Map<string, string> | null>(null);
 
@@ -67,6 +69,13 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
           aria-label="Search meetings"
         />
       </label>
+      <button className={`row row-ask ${askOpen ? "selected" : ""}`} onClick={onAsk} title="Ask Claude about your meetings (⌘J)">
+        <span className="row-title">
+          <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" fill="none" /></svg>
+          Ask about your meetings
+        </span>
+        <kbd className="row-kbd">⌘J</kbd>
+      </button>
       {person && (
         <div className="filter-pill" role="status">
           <span>With <strong>{person}</strong></span>

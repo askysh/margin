@@ -6,6 +6,7 @@
 //!   margin --dev list              list meetings as JSON
 //!   margin --dev rename <md> <label> <name> [--no-voice]
 //!   margin --dev permissions       print permission state
+//!   margin --dev ask [--meeting <md>] <question> [<follow-up> ...]   chat with Claude
 
 use crate::{corecfg, library, models, permissions, speakers};
 use std::path::PathBuf;
@@ -168,10 +169,65 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             println!("{}", serde_json::to_string_pretty(&p).unwrap());
             Ok(())
         }
+        Some("ask") => ask(&args[1..]),
         Some("permissions") => {
             println!("{}", serde_json::to_string_pretty(&permissions::state()).unwrap());
             Ok(())
         }
         _ => Err("commands: models | process <wav> [title] | list | read <md> | rename <md> <label> <name> | permissions".into()),
     }
+}
+
+/// `ask [--meeting <md>] <question> [<follow-up> ...]`: what the Ask panel does, with the
+/// answer streamed to stderr and timings printed. Each extra argument is a follow-up.
+fn ask(args: &[String]) -> Result<(), String> {
+    let (meeting, questions) = match args {
+        [flag, md, rest @ ..] if flag == "--meeting" => (Some(md.clone()), rest),
+        rest => (None, rest),
+    };
+    if questions.is_empty() {
+        return Err("usage: ask [--meeting <md>] <question> [<follow-up> ...]".into());
+    }
+    // (characters printed, time of first text, number of text updates)
+    let shown = std::sync::Arc::new(std::sync::Mutex::new((0usize, None::<std::time::Instant>, 0usize)));
+    let sink = shown.clone();
+    crate::events::set_sink(Box::new(move |name, payload| {
+        let text = payload["text"].as_str().unwrap_or_default();
+        let mut s = sink.lock().unwrap();
+        match name {
+            "chat-delta" => {
+                s.2 += 1;
+                if text.len() < s.0 {
+                    eprintln!("\n[preamble cleared]");
+                    s.0 = 0;
+                }
+                eprint!("{}", &text[s.0..]);
+                s.0 = text.len();
+                if !text.is_empty() {
+                    s.1.get_or_insert_with(std::time::Instant::now);
+                }
+            }
+            "chat-activity" => eprintln!("[{text}]"),
+            _ => {}
+        }
+    }));
+    eprintln!("{}", serde_json::to_string(&crate::chat::readiness()).unwrap());
+    for q in questions {
+        *shown.lock().unwrap() = (0, None, 0);
+        eprintln!("\n> {q}");
+        let start = std::time::Instant::now();
+        crate::chat::send(meeting.as_deref(), q)?;
+        while crate::chat::load(meeting.as_deref()).running {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let thread = crate::chat::load(meeting.as_deref());
+        let last = thread.messages.last().ok_or("no answer")?;
+        let (_, first, updates) = *shown.lock().unwrap();
+        let first_text = first.map(|t| (t - start).as_secs_f32());
+        eprintln!("\n[first text after {:.1}s, {updates} text updates, done after {:.1}s]", first_text.unwrap_or(-1.0), start.elapsed().as_secs_f32());
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "question": q, "answer": last.text, "sources": last.sources, "error": last.error, "session": thread.session_id,
+        })).unwrap());
+    }
+    Ok(())
 }

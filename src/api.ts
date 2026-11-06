@@ -165,6 +165,38 @@ export interface Voice {
   samples: number;
 }
 
+export interface ChatSource {
+  path: string;
+  title: string;
+}
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  text: string;
+  sources: ChatSource[];
+  error: string | null;
+  stopped: boolean;
+  at: string;
+}
+
+/** One Ask conversation: about one meeting, or across all of them (meeting = null). */
+export interface ChatThread {
+  key: string;
+  meeting: string | null;
+  session_id: string | null;
+  messages: ChatMessage[];
+  running: boolean;
+  partial: string;
+  activity: string | null;
+  elapsed_secs: number;
+}
+
+export interface ChatReadiness {
+  ready: boolean;
+  problem: "not-installed" | "not-signed-in" | "too-old" | null;
+  message: string | null;
+}
+
 export const api = {
   boot: () => invoke<Boot>("boot"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
@@ -208,6 +240,11 @@ export const api = {
   reset: (options: { delete_meetings: boolean; delete_models: boolean; forget_voices: boolean }) =>
     invoke<{ meetings_trashed: number; models_deleted: boolean; voices_forgotten: number }>("reset_app", { options }),
   mcpSnippet: () => invoke<string>("mcp_snippet"),
+  chatStatus: () => invoke<ChatReadiness>("chat_status"),
+  chatThread: (meeting: string | null) => invoke<ChatThread>("chat_thread", { meeting }),
+  chatSend: (meeting: string | null, text: string) => invoke<ChatThread>("chat_send", { meeting, text }),
+  chatStop: (meeting: string | null) => invoke<void>("chat_stop", { meeting }),
+  chatClear: (meeting: string | null) => invoke<void>("chat_clear", { meeting }),
 };
 
 export function on<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn> {

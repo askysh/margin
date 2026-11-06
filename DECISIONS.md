@@ -215,3 +215,49 @@ The full comparison is in `docs/parity/app.md`.
 - Pick: attendee names in the meeting view are links. A click shows a "With <name>" pill
   in the sidebar and lists only meetings with that attendee. No new control in the
   sidebar until a filter is active.
+
+## Chat (to renumber)
+
+### C1. Ask uses the user's own `claude` CLI, headless
+- Options: (a) the Anthropic API with a key in Settings, (b) the `claude` CLI that
+  Margin already uses for summaries, (c) Ollama.
+- Pick: **(b)**. No key to store, and the user's own login and plan apply. Margin
+  uses the binary chosen in Settings → Summaries, or else the one it finds.
+- Ollama is not in v1 (docs/parity/chat.md).
+
+### C2. Claude can read the meetings folder, and nothing else
+- Options: (a) no tools, with context packed into the prompt (upstream), (b) read-only
+  tools in the meetings folder.
+- Pick: **(b)**. The working directory is the meetings folder, and the flags are
+  `--tools Read,Grep,Glob --permission-mode dontAsk`. `dontAsk` denies every action that
+  needs a permission prompt, and that includes reading outside the working folder.
+  `--safe-mode`, `--setting-sources ""` and an empty `--strict-mcp-config` stop the
+  user's CLAUDE.md, hooks, plugins and MCP servers from loading.
+- Margin does not send `--allowedTools`: a bare `Read` rule would also approve reads
+  outside the folder.
+- If `claude --help` does not show `--tools`, `dontAsk` and `--resume`, Ask refuses to
+  run and tells the user to update Claude Code.
+
+### C3. One conversation per meeting, plus one across all meetings
+- A meeting chat puts the whole meeting file in its first prompt. The chat across all
+  meetings puts a list of meetings (date, title, file) in its first prompt, and Claude
+  uses Grep and Read.
+- Follow-ups use `--resume` with the saved session ID. If Claude no longer has the
+  session, Margin starts a new one and replays the last turns.
+- History is saved in `state/chat/`, so it survives a restart. **Clear** deletes one
+  conversation. Reset wipes `state/` and stops any answer in progress first. Move to
+  Trash deletes that meeting's chat.
+
+### C4. The panel docks on the right, over the transcript
+- Options: a page of its own, a bar at the bottom of the meeting, a docked panel.
+- Pick: **a docked panel**, opened with ⌘J, from the sidebar ("Ask about your
+  meetings") or from a meeting ("Ask about this meeting"). A switch in the panel picks
+  "This meeting" or "All meetings". Source links open a meeting and keep the panel open,
+  so you can read the answer and the meeting together.
+
+### C5. Calm states
+- Not installed, not signed in and too old each show one sentence that says how to fix
+  it, plus **Check again**.
+- After 10 s the panel shows the time. After 60 s it suggests a narrower question.
+  After 5 minutes Margin stops the turn.
+- Stop keeps the partial answer, marked "Stopped.".

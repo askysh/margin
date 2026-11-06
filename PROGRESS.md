@@ -148,3 +148,30 @@ testing, so the two don't record at once.
 - Not verified (needs the GUI app): system notifications and their buttons, the global
   shortcut, the menu-bar clock and recent meetings, playback through the asset protocol
   in the app's WebView, and cues while the window is hidden.
+
+### Ask: chat with Claude (done, 2026-11-06)
+- Ask about one meeting or across all meetings: ⌘J, the sidebar, or the meeting view.
+  The panel docks on the right. Decisions are in DECISIONS.md "Chat"; the comparison with
+  upstream Recall is in docs/parity/chat.md.
+- Backend: `src-tauri/src/chat.rs`. It runs `claude -p` with stream-json, read-only tools
+  confined to the meetings folder (`dontAsk`), `--resume` for follow-ups, a process group
+  for Stop, and history in `state/chat/`.
+- e2e: 40/40 in light and dark mode. The 9 new checks use a stand-in claude
+  (`scripts/e2e/fake-claude.py`): not signed in, a streamed answer with source links, a
+  follow-up that resumes the session, Stop kills the process, a link opens the meeting,
+  meeting context in the prompt, history after a reload, Clear, and Reset.
+- Real smoke test (`margin --dev ask`, real login, sandbox folder of 5 test meetings):
+  - Across all meetings, "What did I commit to, and what decisions were made?": first text
+    after 2.4 s, done after 14.4 s. Claude read all 5 files. The answer was correct and
+    linked 4 meetings.
+  - A follow-up ("Draft a short follow-up email to Priya") resumed the session: done after
+    6.2 s, with a ready-to-paste email.
+  - One meeting, "What decisions were made?": first text after 2.2 s, 52 streamed updates,
+    done after 5.7 s.
+  - A request to read a file outside the folder was refused, and its content did not
+    appear.
+- The smoke test found a race (a finished answer was briefly missing from the history)
+  and dropped trailing stream updates. Both are fixed.
+- **Not verified:** Ask in the real app window (only the headless WebKit e2e and the dev
+  CLI ran). The "not installed" state has no test; the "too old" flag check has a unit
+  test only.

@@ -7,6 +7,7 @@ import { MeetingView } from "./components/MeetingView";
 import { ProcessingView } from "./components/ProcessingView";
 import { Home } from "./components/Home";
 import { SettingsSheet } from "./components/Settings";
+import { AskPanel, type AskScope } from "./components/AskPanel";
 import { clock } from "./util";
 import { useCues } from "./cues";
 
@@ -30,6 +31,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [callApp, setCallApp] = useState<string | null>(null);
   const [person, setPerson] = useState<string | null>(null);
+  const [ask, setAsk] = useState<AskScope | null>(null);
   useCues(boot?.prefs.sound_cues ?? false);
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
@@ -138,6 +140,7 @@ export default function App() {
   }
 
   const recording = !!recorder?.recording;
+  const openMeeting = selection.type === "meeting" ? meetings.find((m) => m.path === selection.path) : undefined;
   const active = jobs.filter((j) => !["complete", "failed", "needs-review"].includes(j.state));
 
   return (
@@ -152,6 +155,8 @@ export default function App() {
         onSelect={setSelection}
         person={person}
         onPerson={setPerson}
+        askOpen={ask === "all"}
+        onAsk={() => setAsk((a) => (a === "all" ? null : "all"))}
       />
       <main className="pane">
         <header className="toolbar" data-tauri-drag-region>
@@ -200,6 +205,7 @@ export default function App() {
               onDeleted={() => { setSelection({ type: "home" }); refreshMeetings(); }}
               processing={active.some((j) => j.output_path === selection.path)}
               onPerson={setPerson}
+              onAsk={() => setAsk("meeting")}
             />
           )}
           {(selection.type === "home" || (selection.type === "live" && !recorder?.recording)) && (
@@ -212,6 +218,15 @@ export default function App() {
               busy={busy}
             />
           )}
+          {ask && (
+            <AskPanel
+              meeting={openMeeting ? { path: openMeeting.path, title: openMeeting.title } : null}
+              scope={ask}
+              onScope={setAsk}
+              onOpenMeeting={(path) => setSelection({ type: "meeting", path })}
+              onClose={() => setAsk(null)}
+            />
+          )}
         </section>
       </main>
       {settingsOpen && (
@@ -219,14 +234,19 @@ export default function App() {
           boot={boot}
           onClose={() => setSettingsOpen(false)}
           onSaved={(s) => { setBoot({ ...boot, settings: s }); refreshMeetings(); }}
-          onReset={() => { setSettingsOpen(false); setSelection({ type: "home" }); setMeetings([]); reboot(); }}
+          onReset={() => { setSettingsOpen(false); setAsk(null); setSelection({ type: "home" }); setMeetings([]); reboot(); }}
           notify={notify}
         />
       )}
       {toast && (
         <div className={`toast toast-${toast.tone}`} role="status" onClick={() => setToast(null)}>{toast.text}</div>
       )}
-      <KeyboardShortcuts onSettings={() => setSettingsOpen(true)} onStart={start} canStart={!recording && !busy && !settingsOpen} />
+      <KeyboardShortcuts
+        onSettings={() => setSettingsOpen(true)}
+        onStart={start}
+        canStart={!recording && !busy && !settingsOpen}
+        onAsk={() => setAsk((a) => (a ? null : openMeeting ? "meeting" : "all"))}
+      />
     </div>
   );
 }
@@ -269,8 +289,8 @@ function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => 
   );
 }
 
-/** In-window shortcuts: ⌘, settings, ⌘F search, ⌘⇧R record a call, ⌘⇧I record in person. */
-function KeyboardShortcuts({ onSettings, onStart, canStart }: { onSettings: () => void; onStart: (k: Kind) => void; canStart: boolean }) {
+/** In-window shortcuts: ⌘, settings, ⌘F search, ⌘J Ask, ⌘⇧R record a call, ⌘⇧I record in person. */
+function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk }: { onSettings: () => void; onStart: (k: Kind) => void; canStart: boolean; onAsk: () => void }) {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (!e.metaKey) return;
@@ -281,6 +301,9 @@ function KeyboardShortcuts({ onSettings, onStart, canStart }: { onSettings: () =
       } else if (key === "f" && !e.shiftKey) {
         e.preventDefault();
         document.querySelector<HTMLInputElement>(".search input")?.focus();
+      } else if (key === "j" && !e.shiftKey) {
+        e.preventDefault();
+        onAsk();
       } else if (e.shiftKey && (key === "r" || key === "i") && canStart) {
         e.preventDefault();
         onStart(key === "r" ? "call" : "in-person");
@@ -288,6 +311,6 @@ function KeyboardShortcuts({ onSettings, onStart, canStart }: { onSettings: () =
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [onSettings, onStart, canStart]);
+  }, [onSettings, onStart, canStart, onAsk]);
   return null;
 }
