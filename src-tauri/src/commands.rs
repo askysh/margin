@@ -16,6 +16,7 @@ pub mod ops {
     pub struct Boot {
         onboarded: bool,
         settings: corecfg::AppSettings,
+        prefs: prefs::AppPrefs,
         recorder: RecorderView,
         orphaned_draft: Option<String>,
         upstream_tag: &'static str,
@@ -27,6 +28,7 @@ pub mod ops {
         Ok(Boot {
             onboarded: prefs::load().onboarding_complete && corecfg::exists(),
             settings: current_settings(),
+            prefs: prefs::load().app(),
             recorder: recorder().view(),
             orphaned_draft: crate::recorder::orphaned_draft(),
             upstream_tag: "v0.32.1",
@@ -90,6 +92,16 @@ pub mod ops {
         })
     }
 
+    pub fn save_app_prefs(prefs: prefs::AppPrefs) -> Res<prefs::AppPrefs> {
+        let mut p = prefs::load();
+        p.mute_cues = !prefs.sound_cues;
+        p.record_shortcut = prefs.record_shortcut;
+        prefs::save(&p)?;
+        crate::events::emit(crate::events::SHORTCUT_REFRESH, ());
+        crate::events::emit("app-prefs", p.app());
+        Ok(p.app())
+    }
+
     #[derive(Serialize)]
     pub struct FolderChoices {
         default_dir: String,
@@ -127,6 +139,7 @@ pub mod ops {
         p.onboarding_complete = true;
         prefs::save(&p)?;
         crate::events::refresh_tray();
+        crate::events::emit(crate::events::SHORTCUT_REFRESH, ());
         Ok(())
     }
 
@@ -214,7 +227,9 @@ pub mod ops {
     }
 
     pub fn set_meeting_title(path: String, title: String) -> Res<()> {
-        library::set_title(&PathBuf::from(path), &title)
+        library::set_title(&PathBuf::from(path), &title)?;
+        crate::events::refresh_tray();
+        Ok(())
     }
 
     pub fn search_meetings(query: String) -> Res<Vec<library::SearchHit>> {
@@ -222,7 +237,9 @@ pub mod ops {
     }
 
     pub fn trash_meeting(path: String) -> Res<()> {
-        library::trash(&PathBuf::from(path))
+        library::trash(&PathBuf::from(path))?;
+        crate::events::refresh_tray();
+        Ok(())
     }
 
     pub fn reveal_in_finder(path: String) -> Res<()> {
@@ -283,6 +300,10 @@ pub mod ops {
         Ok(())
     }
 
+    pub fn set_action_item(path: String, index: usize, done: bool) -> Res<()> {
+        library::set_action_item(&PathBuf::from(path), index, done)
+    }
+
     pub fn list_voices() -> Res<Vec<speakers::VoiceProfileView>> {
         Ok(speakers::list_voices())
     }
@@ -296,7 +317,11 @@ pub mod ops {
     }
 
     pub fn reset_app(options: reset::ResetOptions) -> Res<reset::ResetReport> {
-        reset::run(recorder(), &options)
+        let report = reset::run(recorder(), &options)?;
+        // Prefs are gone: the shortcut is off and the menu has no meetings until setup.
+        crate::events::emit(crate::events::SHORTCUT_REFRESH, ());
+        crate::events::refresh_tray();
+        Ok(report)
     }
 
     pub fn mcp_snippet() -> Res<String> {
@@ -332,6 +357,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "boot" => out(ops::boot()),
         "save_settings" => out(ops::save_settings(arg(a, "settings")?)),
         "settings_options" => out(ops::settings_options()),
+        "save_app_prefs" => out(ops::save_app_prefs(arg(a, "prefs")?)),
         "folder_choices" => out(ops::folder_choices()),
         "complete_onboarding" => out(ops::complete_onboarding()),
         "models_status" => out(ops::models_status()),
@@ -358,6 +384,9 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "reveal_in_finder" | "open_in_obsidian" => Ok(serde_json::Value::Null),
         "rename_speaker" => out(ops::rename_speaker(arg(a, "path")?, arg(a, "label")?, arg(a, "name")?, arg(a, "rememberVoice")?)),
         "summarize_meeting" => out(ops::summarize_meeting(arg(a, "path")?)),
+        "set_action_item" => out(ops::set_action_item(arg(a, "path")?, arg(a, "index")?, arg(a, "done")?)),
+        // The app adds the file to the asset scope; the bridge serves it at /asset.
+        "meeting_audio" => out(library::audio_path(&PathBuf::from(arg::<String>(a, "path")?)).map(|p| p.display().to_string())),
         "list_voices" => out(ops::list_voices()),
         "forget_voice" => out(ops::forget_voice(arg(a, "slug")?)),
         "reset_preview" => out(ops::reset_preview()),
@@ -387,6 +416,7 @@ pub mod tauri_cmds {
     cmd!(boot() -> ops::Boot);
     cmd!(save_settings(settings: corecfg::AppSettings) -> corecfg::AppSettings);
     cmd!(settings_options() -> ops::SettingsOptions);
+    cmd!(save_app_prefs(prefs: prefs::AppPrefs) -> prefs::AppPrefs);
     cmd!(folder_choices() -> ops::FolderChoices);
     cmd!(complete_onboarding() -> ());
     cmd!(models_status() -> Vec<models::ModelFile>);
@@ -413,6 +443,7 @@ pub mod tauri_cmds {
     cmd!(open_in_obsidian(path: String) -> ());
     cmd!(rename_speaker(path: String, label: String, name: String, remember_voice: bool) -> speakers::RenameResult);
     cmd!(summarize_meeting(path: String) -> ());
+    cmd!(set_action_item(path: String, index: usize, done: bool) -> ());
     cmd!(list_voices() -> Vec<speakers::VoiceProfileView>);
     cmd!(forget_voice(slug: String) -> ());
     cmd!(reset_preview() -> reset::ResetPreview);

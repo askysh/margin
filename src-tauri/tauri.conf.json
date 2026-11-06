@@ -25,7 +25,7 @@
         "trafficLightPosition": { "x": 18, "y": 22 }
       }
     ],
-    "security": { "csp": null }
+    "security": { "csp": null, "assetProtocol": { "enable": true, "scope": [] } }
   },
   "bundle": {
     "active": true,

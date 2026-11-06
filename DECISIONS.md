@@ -155,3 +155,63 @@ The full comparison with upstream is in `docs/parity/settings.md`.
   shortcut needs a new plugin. Neither can be tested headless without a prompt.
 - Margin already opens the finished meeting in its window, and the menu bar item starts
   a recording from any app.
+
+## App parity (to renumber)
+
+The full comparison is in `docs/parity/app.md`.
+
+### P1. Add only upstream features that help a notepad, plus a few small extras
+- Options: (a) copy every upstream surface; (b) take the upstream features that a
+  Granola-like notepad needs, and skip the rest; (c) (b) plus small extras that upstream
+  does not have.
+- Pick: **(c)**. Margin adds action-item checkboxes, Summarize again, Copy as Markdown,
+  notifications and sound cues from upstream. The extras are playback with click-to-play
+  times, the people filter, a global shortcut and the menu-bar clock and recent meetings.
+  Each extra uses data Margin already keeps (the `.wav`, attendees) and adds no new
+  setting except the shortcut.
+- Skipped: dictation, coach, palette, terminal, calendar, memo mode, sensitive meetings,
+  mic mute, archive. The reason for each is in the parity doc.
+
+### P2. Playback goes through Tauri's asset protocol with a per-file scope
+- Options: (a) a custom URI scheme with our own byte-range code; (b) the asset protocol
+  with a wide scope such as the meetings folder; (c) the asset protocol with an empty
+  scope, and the backend adds one `.wav` when the meeting view asks for it.
+- Pick: **(c)**. Tauri's asset protocol already serves byte ranges, which WebKit needs to
+  seek. The page can read only recordings that the backend checked are inside the
+  meetings folder.
+
+### P3. Action items: frontmatter first, body checklist second
+- Core writes structured `action_items` when its summary has them, and keeps a
+  `- [ ]` checklist in the body. Some engines write only the checklist.
+- Pick: show the structured items when present. Otherwise show the checklist lines under
+  `## Action Items`. Ticking uses core's `set_action_item_status` for structured items
+  (status and body line change together), and changes only the box for checklist items.
+  The plain "Action Items" section is hidden when the block shows, so the list appears
+  once.
+
+### P4. Notifications only when the window is not in front, with no setting
+- Upstream sends "processing complete" when the window is hidden or not focused, behind
+  a setting that is on by default.
+- Pick: the same rule, without a setting. macOS can turn off Margin's notifications in
+  System Settings, so a second switch adds a choice for little gain. A click opens the
+  meeting. The call notification has a **Record call** button.
+- Not copied: upstream's reminder every 20 seconds and bringing the window forward. Both
+  interrupt the call.
+
+### P5. Global shortcut ⌃⌥⌘R, off by default
+- Options: ⌘⇧R (already the in-window shortcut, but browsers use it for a hard reload),
+  ⌘⇧M (upstream's memo key), ⌃⌥⌘R.
+- Pick: **⌃⌥⌘R**, off by default. A global shortcut takes the keys from every app, so it
+  must be rare and opt-in. It records a call (or in person, when that is the default
+  kind) and shows the notepad; pressed again, it stops.
+
+### P6. Sound cues are on by default
+- Upstream plays the same four sounds by default, with one switch. They confirm a start
+  or stop from the menu bar or the shortcut when the window is hidden.
+- Pick: the same, stored in `prefs.json` as `mute_cues` so that a missing key means on.
+
+### P7. People filter from attendee names
+- Upstream has no library filter. Its related-people chips run a search.
+- Pick: attendee names in the meeting view are links. A click shows a "With <name>" pill
+  in the sidebar and lists only meetings with that attendee. No new control in the
+  sidebar until a filter is active.

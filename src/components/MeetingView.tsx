@@ -5,6 +5,10 @@ import { isRawSpeaker, meetingDate, speakerNames, useDebounced } from "../util";
 import { Markdown } from "./Markdown";
 import { NotesEditor } from "./NotesEditor";
 import { Rule } from "./LiveView";
+import { ActionItems } from "./ActionItems";
+import { AudioPlayer, type AudioHandle } from "./AudioPlayer";
+import { CopyMenu } from "./CopyMenu";
+import { ACTION_HEADING, meetingMarkdown, summaryMarkdown, transcriptMarkdown, tsSeconds } from "../meetingMarkdown";
 
 interface Props {
   path: string;
@@ -13,17 +17,21 @@ interface Props {
   onDeleted: () => void;
   /** Core is still writing this file (diarizing or summarizing); edits would make it fail. */
   processing: boolean;
+  /** Show the meetings this person was in. */
+  onPerson?: (name: string) => void;
 }
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
-export function MeetingView({ path, notify, onChanged, onDeleted, processing }: Props) {
+export function MeetingView({ path, notify, onChanged, onDeleted, processing, onPerson }: Props) {
   const [m, setM] = useState<MeetingDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [save, setSave] = useState<SaveState>("idle");
   const [showTranscript, setShowTranscript] = useState(true);
   const [summarizing, setSummarizing] = useState(false);
+  const player = useRef<AudioHandle>(null);
+  const [activeTurn, setActiveTurn] = useState(-1);
   // Every edit bumps `edits`; a save records the count it wrote. Unsaved = they differ.
   // Saves run one at a time, so an older save can never land after a newer one.
   const edits = useRef(0);
@@ -80,19 +88,47 @@ export function MeetingView({ path, notify, onChanged, onDeleted, processing }: 
     return base;
   }, [m]);
 
+  // Transcript start times in seconds, for following playback.
+  const starts = useMemo(() => (m?.transcript ?? []).map((t) => tsSeconds(t.ts)), [m]);
+  const onTime = useCallback(
+    (secs: number) => {
+      let i = -1;
+      while (i + 1 < starts.length && starts[i + 1] <= secs) i++;
+      setActiveTurn(i);
+    },
+    [starts],
+  );
+
   if (error) return <div className="page page-empty"><p className="empty-title">Couldn't open this meeting</p><p className="empty-body">{error}</p></div>;
   if (!m) return <div className="page" />;
 
-  const summary = m.sections.filter((s) => s.body.trim());
+  const hasActions = m.action_items.length > 0;
+  // The action items block replaces core's plain checklist section.
+  const summary = m.sections.filter((s) => s.body.trim() && !(hasActions && s.heading === ACTION_HEADING));
   const hasSummary = summary.some((s) => s.heading === "Summary");
+  const copyChoices = [
+    hasSummary && { label: "Summary", hint: "The summary sections, as Markdown", done: "Summary copied.", text: () => summaryMarkdown(m) },
+    notes.trim() && { label: "Your notes", hint: "What you typed", done: "Notes copied.", text: () => notes.trim() + "\n" },
+    m.transcript.length > 0 && { label: "Transcript", hint: "Every line, with speakers and times", done: "Transcript copied.", text: () => transcriptMarkdown(m, names) + "\n" },
+    { label: "Whole meeting", hint: "Title, summary, notes and transcript", done: "Meeting copied as Markdown.", text: () => meetingMarkdown(m, names, notes) },
+  ].filter((c) => !!c) as Parameters<typeof CopyMenu>[0]["choices"];
 
   const summarize = async () => {
+    if (hasSummary) {
+      const sure = await ask("The current summary and action items are replaced. Your notes and the transcript stay as they are.", {
+        title: "Summarize this meeting again?",
+        kind: "info",
+        okLabel: "Summarize again",
+        cancelLabel: "Cancel",
+      });
+      if (!sure) return;
+    }
     setSummarizing(true);
     try {
       await api.summarize(path);
       load();
       onChanged();
-      notify("Summary added.");
+      notify(hasSummary ? "Summary updated." : "Summary added.");
     } catch (e) {
       notify(errorText(e), "error");
     } finally {
@@ -136,13 +172,28 @@ export function MeetingView({ path, notify, onChanged, onDeleted, processing }: 
         <div className="meta-line">
           <span>{meetingDate(m.date)}</span>
           {m.duration && (<><span className="dot-sep" /><span className="mono">{m.duration}</span></>)}
-          {m.attendees.length > 0 && (<><span className="dot-sep" /><span>{m.attendees.join(", ")}</span></>)}
+          {m.attendees.length > 0 && (
+            <>
+              <span className="dot-sep" />
+              <span className="people">
+                {m.attendees.map((a, i) => (
+                  <span key={a}>
+                    {i > 0 && ", "}
+                    {onPerson ? <button className="person-btn" title={`Show meetings with ${a}`} onClick={() => onPerson(a)}>{a}</button> : a}
+                  </span>
+                ))}
+              </span>
+            </>
+          )}
         </div>
         <div className="actions">
           <button className="link-btn" onClick={() => api.reveal(path)}>Show in Finder</button>
           {m.in_obsidian_vault && <button className="link-btn" onClick={() => api.openInObsidian(path).catch((e) => notify(errorText(e), "error"))}>Open in Obsidian</button>}
-          {!hasSummary && m.transcript.length > 0 && (
-            <button className="link-btn" onClick={summarize} disabled={summarizing}>{summarizing ? "Summarizing…" : "Summarize"}</button>
+          <CopyMenu choices={copyChoices} notify={notify} />
+          {m.transcript.length > 0 && (
+            <button className="link-btn" onClick={summarize} disabled={summarizing || processing}>
+              {summarizing ? "Summarizing…" : hasSummary ? "Summarize again" : "Summarize"}
+            </button>
           )}
           {m.transcript.length > 0 && (
             <button className="link-btn" onClick={() => setShowTranscript((s) => !s)}>{showTranscript ? "Hide transcript" : "Show transcript"}</button>
@@ -164,12 +215,23 @@ export function MeetingView({ path, notify, onChanged, onDeleted, processing }: 
           </div>
         )}
 
-        {summary.map((s) => (
-          <section key={s.heading} className="summary-block">
-            <h2 className="eyebrow">{s.heading}</h2>
-            <Markdown source={s.body} />
-          </section>
+        {m.has_audio && <AudioPlayer ref={player} path={path} onTime={onTime} />}
+
+        {summary.map((s, i) => (
+          <div key={s.heading}>
+            <section className="summary-block">
+              <h2 className="eyebrow">{s.heading}</h2>
+              <Markdown source={s.body} />
+            </section>
+            {/* Action items follow the summary, where core puts its checklist. */}
+            {hasActions && i === 0 && (
+              <ActionItems path={path} items={m.action_items} names={names} locked={processing} notify={notify} onChanged={() => { load(); onChanged(); }} />
+            )}
+          </div>
         ))}
+        {hasActions && summary.length === 0 && (
+          <ActionItems path={path} items={m.action_items} names={names} locked={processing} notify={notify} onChanged={() => { load(); onChanged(); }} />
+        )}
 
         <section className="your-notes">
           <h2 className="eyebrow">
@@ -187,7 +249,15 @@ export function MeetingView({ path, notify, onChanged, onDeleted, processing }: 
       {showTranscript && m.transcript.length > 0 && (
         <>
           <Rule level={0} live={false} />
-          <Transcript meeting={m} names={names} locked={processing} onRenamed={() => { load(); onChanged(); }} notify={notify} />
+          <Transcript
+            meeting={m}
+            names={names}
+            locked={processing}
+            onRenamed={() => { load(); onChanged(); }}
+            notify={notify}
+            active={activeTurn}
+            onSeek={m.has_audio ? (secs) => player.current?.playFrom(secs) : undefined}
+          />
         </>
       )}
     </div>
@@ -224,12 +294,15 @@ function TitleField({ value, onSave, disabled }: { value: string; onSave: (t: st
   );
 }
 
-function Transcript({ meeting, names, locked, onRenamed, notify }: {
+function Transcript({ meeting, names, locked, onRenamed, notify, active, onSeek }: {
   meeting: MeetingDetail;
   names: Map<string, string>;
   locked: boolean;
   onRenamed: () => void;
   notify: Props["notify"];
+  /** The turn the recording is playing, or -1. */
+  active: number;
+  onSeek?: (secs: number) => void;
 }) {
   const [renaming, setRenaming] = useState<string | null>(null);
   const turns = meeting.transcript;
@@ -263,21 +336,38 @@ function Transcript({ meeting, names, locked, onRenamed, notify }: {
           showSpeaker={!!t.speaker && t.speaker !== turns[i - 1]?.speaker}
           display={t.speaker ? names.get(t.speaker) ?? t.speaker : ""}
           onSpeaker={() => !locked && t.speaker && setRenaming(t.speaker)}
+          active={i === active}
+          onSeek={onSeek}
         />
       ))}
     </aside>
   );
 }
 
-function TurnRow({ turn, showSpeaker, display, onSpeaker }: { turn: Turn; showSpeaker: boolean; display: string; onSpeaker: () => void }) {
+function TurnRow({ turn, showSpeaker, display, onSpeaker, active, onSeek }: {
+  turn: Turn;
+  showSpeaker: boolean;
+  display: string;
+  onSpeaker: () => void;
+  active: boolean;
+  onSeek?: (secs: number) => void;
+}) {
+  const row = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (active) row.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [active]);
   return (
-    <div className="turn">
+    <div className={`turn ${active ? "playing" : ""}`} ref={row}>
       {showSpeaker && (
         <button className={`turn-speaker ${isRawSpeaker(turn.speaker) ? "unnamed" : ""}`} onClick={onSpeaker} title="Rename this speaker">
           {display}
         </button>
       )}
-      <span className="ts mono">{turn.ts}</span>
+      {onSeek ? (
+        <button className="ts ts-btn mono" onClick={() => onSeek(tsSeconds(turn.ts))} title="Play from here">{turn.ts}</button>
+      ) : (
+        <span className="ts mono">{turn.ts}</span>
+      )}
       <span className="turn-text">{turn.text}</span>
     </div>
   );

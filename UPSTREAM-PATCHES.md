@@ -87,3 +87,20 @@ each one locally.
 - **Patch:** keep the order the user gave (or a per-entry rank), and make the cap a
   config value.
 - **Workaround:** Settings says that the transcriber gets up to 8 of the terms.
+
+## 9. The mic-mute sentinel should honour `MINUTES_DATA_DIR`
+- **Where:** `crates/core/src/streaming.rs` `mic_mute_sentinel_path()` (v0.32.1 ~line
+  162). It hardcodes `~/.minutes/mic_mute`.
+- **Why:** like `voices.db` (#1), a host that isolates its state still shares this file.
+  If Margin muted the mic through it, a recording in the upstream app would be muted too.
+- **Patch:** `Config::minutes_dir().join("mic_mute")`.
+- **Workaround:** Margin has no mute control.
+
+## 10. Pause and resume for a recording
+- **Where:** `crates/core/src/capture.rs` `record_to_wav_with_lifecycle`.
+- **Why:** a meeting often has a break or an off-the-record part. Today the only choices
+  are to stop (and get two meetings) or to keep recording.
+- **Patch:** a `pause: Arc<AtomicBool>` beside the stop flag. While it is set, drop
+  captured frames (or write silence, to keep stem timing aligned) and pause the live
+  transcript. Record the paused spans in the job, so durations stay right.
+- **Workaround:** none. Margin has no pause.

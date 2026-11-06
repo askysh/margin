@@ -11,6 +11,26 @@ static SINK: OnceLock<Sink> = OnceLock::new();
 /// Pseudo-event asking the host to refresh the menu-bar item.
 pub const TRAY_REFRESH: &str = "__tray-refresh";
 
+/// Pseudo-event asking the host to register or drop the global shortcut.
+pub const SHORTCUT_REFRESH: &str = "__shortcut-refresh";
+
+/// A system notification for the host to show (the QA bridge only queues it).
+pub const NOTIFY: &str = "notify";
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct Notice {
+    pub title: String,
+    pub body: String,
+    /// Opened by a click on the notification.
+    pub meeting: Option<String>,
+    /// Set for "a call app is active": the notification offers Record.
+    pub call_app: Option<String>,
+}
+
+pub fn notify(notice: Notice) {
+    emit(NOTIFY, notice);
+}
+
 pub fn set_sink(sink: Sink) {
     let _ = SINK.set(sink);
 }

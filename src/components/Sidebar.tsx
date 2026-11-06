@@ -11,9 +11,12 @@ interface Props {
   recordingTitle: string | null;
   elapsed: number;
   onSelect: (s: Selection) => void;
+  /** Show only meetings with this attendee. */
+  person: string | null;
+  onPerson: (p: string | null) => void;
 }
 
-export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, elapsed, onSelect }: Props) {
+export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, elapsed, onSelect, person, onPerson }: Props) {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<Map<string, string> | null>(null);
 
@@ -37,7 +40,8 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
   }, [query]);
 
   const groups = useMemo(() => {
-    const shown = hits ? meetings.filter((m) => hits.has(m.path)) : meetings;
+    const who = person?.toLowerCase();
+    const shown = meetings.filter((m) => (!hits || hits.has(m.path)) && (!who || m.people.some((p) => p.toLowerCase() === who)));
     const out: { label: string; items: MeetingSummary[] }[] = [];
     for (const m of shown) {
       const label = groupLabel(m.date);
@@ -46,7 +50,7 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
       else out.push({ label, items: [m] });
     }
     return out;
-  }, [meetings, hits]);
+  }, [meetings, hits, person]);
 
   const selectedPath = selection.type === "meeting" ? selection.path : null;
 
@@ -63,6 +67,12 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
           aria-label="Search meetings"
         />
       </label>
+      {person && (
+        <div className="filter-pill" role="status">
+          <span>With <strong>{person}</strong></span>
+          <button className="icon-btn small" aria-label="Show all meetings" onClick={() => onPerson(null)}>×</button>
+        </div>
+      )}
 
       <nav className="list" aria-label="Meetings">
         {recording && (
@@ -103,6 +113,7 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
           </div>
         ))}
         {hits && groups.length === 0 && <p className="list-empty">No meetings mention “{query.trim()}”.</p>}
+        {!hits && person && groups.length === 0 && <p className="list-empty">No meetings with {person}.</p>}
       </nav>
     </aside>
   );

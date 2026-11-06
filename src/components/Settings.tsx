@@ -11,6 +11,7 @@ import { SelectRow, TextRow, ToggleRow, type Choice } from "./SettingsRows";
 const EXTRA_KEYS = ["vocabulary", "summary_instructions", "open_at_login"] as const;
 
 type Save = (patch: Partial<Settings>) => void;
+import { AppPrefsBlock } from "./AppPrefsBlock";
 
 interface Props {
   boot: Boot;
@@ -202,6 +203,8 @@ export function SettingsSheet({ boot, onClose, onSaved, onReset, notify }: Props
             <pre className="code">{mcp}</pre>
             <button className="btn btn-quiet" onClick={async () => notify((await copyText(mcp)) ? "Copied." : "Couldn't copy. Select the text and press ⌘C.")}>Copy</button>
           </section>
+
+          <AppPrefsBlock initial={boot.prefs} notify={notify} />
 
           <section className="set set-danger">
             <h2 className="eyebrow">Start over</h2>

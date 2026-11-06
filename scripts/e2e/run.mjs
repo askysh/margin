@@ -93,6 +93,21 @@ page.on("pageerror", (e) => consoleErrors.push(e.message));
 page.on("console", (m) => m.type() === "error" && consoleErrors.push(m.text()));
 await page.addInitScript(`window.__E2E_BRIDGE__ = "http://127.0.0.1:${port.bridge}";`);
 await page.addInitScript({ path: path.join(root, "scripts/e2e/bridge-shim.js") });
+// Record what the page copies and which sounds it plays, without needing a clipboard or speakers.
+await page.addInitScript(() => {
+  window.__copied = [];
+  window.__plays = [];
+  Object.defineProperty(navigator, "clipboard", { value: { writeText: async (t) => void window.__copied.push(t) }, configurable: true });
+  const play = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function () {
+    window.__plays.push(this.currentSrc || this.src);
+    return play.call(this);
+  };
+});
+const copied = () => page.evaluate(() => window.__copied.at(-1) ?? "");
+const plays = () => page.evaluate(() => window.__plays.map((s) => s.split("/").pop()));
+// Every event the backend sent, including system notifications the app would show.
+const bridgeEvents = async () => (await (await fetch(`http://127.0.0.1:${port.bridge}/events?since=0`)).json());
 await page.goto(`http://localhost:${port.ui}`);
 const ui = (sel) => page.locator(sel);
 const button = (name) => page.getByRole("button", { name, exact: false });
@@ -171,6 +186,12 @@ if (simulate) {
     liveMd = fs.readFileSync(path.join(meetingsDir, f), "utf8");
     assert(liveMd.includes("## Notes\n\n- risk: download size\n- last words before stop\n"), "notes not exact:\n" + liveMd.slice(liveMd.indexOf("## Notes"), liveMd.indexOf("## Transcript")));
   });
+  await check("sound cues play on start, stop and ready", async () => {
+    const heard = await plays();
+    for (const cue of ["cue-start.wav", "cue-stop.wav", "cue-complete.wav"]) assert(heard.includes(cue), `${cue} not played (${heard.join(", ")})`);
+    const r = await page.evaluate(() => fetch("audio/cue-start.wav").then((x) => [x.status, x.headers.get("content-type")]));
+    assert(r[0] === 200, `cue file not served: ${r}`);
+  });
   await check("transcript rows use the same names as the speaker chips", async () => {
     const chips = new Set(await page.locator(".chip").allInnerTexts());
     const rows = new Set(await page.locator(".turn-speaker").allInnerTexts());
@@ -193,6 +214,12 @@ await check("stopped recording is processed while the app is open", async () => 
   await page.locator(".row-job").waitFor({ state: "detached", timeout: 120000 });
 });
 let mdPath = null;
+await check("a 'meeting ready' notification is sent for it", async () => {
+  const ready = (await bridgeEvents()).filter((e) => e.event === "notify" && e.payload.title === "Meeting ready");
+  const n = ready.find((e) => e.payload.body.includes("QA launch sync"));
+  assert(n, `no notification: ${JSON.stringify(ready.map((e) => e.payload.body))}`);
+  assert(n.payload.meeting?.includes("qa-launch-sync"), `notification opens ${n.payload.meeting}`);
+});
 await check("meeting file has the exact notes and a transcript", async () => {
   const f = meetingFiles().find((x) => x.includes("qa-launch-sync"));
   assert(f, `meeting not found in ${meetingFiles().join(", ")}`);
@@ -234,6 +261,40 @@ await check("list continuation: Enter after a bullet starts a new bullet", async
   assert(fs.readFileSync(mdPath, "utf8").includes("- auto bullet"), "Enter did not continue the list");
 });
 
+// ---------------------------------------------------------------- playback and copy
+await check("play the recording and jump from a transcript time", async () => {
+  await page.locator(".player").waitFor({ timeout: 5000 });
+  await page.waitForFunction(() => (document.querySelector(".player audio")?.duration ?? 0) > 1, null, { timeout: 10000 });
+  const turn = page.locator(".turn").nth(2);
+  const ts = await turn.locator(".ts-btn").innerText();
+  const [m, sec] = ts.split(":").map(Number);
+  await turn.locator(".ts-btn").click();
+  await page.waitForFunction(() => !document.querySelector(".player audio").paused, null, { timeout: 5000 });
+  const at = await page.evaluate(() => document.querySelector(".player audio").currentTime);
+  assert(Math.abs(at - (m * 60 + sec)) < 1.5, `jumped to ${at}, wanted ${ts}`);
+  await page.locator(".turn.playing").first().waitFor({ timeout: 3000 });
+  await page.getByRole("button", { name: "Pause recording" }).click();
+  assert(await page.evaluate(() => document.querySelector(".player audio").paused), "pause did nothing");
+  // The bridge, like the asset protocol, serves byte ranges and nothing outside the folder.
+  const wav = await page.evaluate(() => document.querySelector(".player audio").src);
+  const r = await fetch(wav, { headers: { Range: "bytes=0-99" } });
+  assert(r.status === 206 && (await r.arrayBuffer()).byteLength === 100, `range: ${r.status}`);
+  const outside = await fetch(`http://127.0.0.1:${port.bridge}/asset?path=${encodeURIComponent(path.join(base, "silence.wav"))}`);
+  assert(outside.status === 404, `file outside the folder served: ${outside.status}`);
+});
+await check("copy the transcript and the whole meeting as Markdown", async () => {
+  await page.locator(".actions").getByRole("button", { name: "Copy", exact: true }).click();
+  await page.getByRole("menuitem", { name: /Transcript/ }).click();
+  await page.locator(".toast", { hasText: "Transcript copied." }).waitFor();
+  const t = await copied();
+  assert(/^\[Speaker 1 0:00\] /.test(t) && !t.includes("SPEAKER_"), `transcript copy: ${t.slice(0, 80)}`);
+  await page.locator(".actions").getByRole("button", { name: "Copy", exact: true }).click();
+  await page.getByRole("menuitem", { name: /Whole meeting/ }).click();
+  const all = await copied();
+  assert(all.startsWith("# QA launch sync\n") && !all.includes("\n---\n"), `meeting copy starts: ${all.slice(0, 60)}`);
+  assert(all.includes("## Notes\n\n- download size is the #1 risk") && all.includes("## Transcript\n\n[Speaker 1 0:00]"), "meeting copy is missing a part");
+});
+
 // ---------------------------------------------------------------- rename
 await check("rename a speaker everywhere and remember the voice", async () => {
   await page.locator(".chip.unnamed").first().click();
@@ -264,6 +325,43 @@ await check("a second meeting with the same voice is labelled automatically", as
   await page.locator(".chip", { hasText: "Priya" }).waitFor();
 });
 
+await check("click a person to see only their meetings", async () => {
+  await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
+  await page.locator(".person-btn", { hasText: "Priya" }).first().click();
+  await page.locator(".filter-pill", { hasText: "Priya" }).waitFor();
+  const rows = await page.locator(".list .row-title").allInnerTexts();
+  assert(rows.some((r) => r.includes("QA follow-up")) && rows.some((r) => r.includes("QA launch sync")), `rows: ${rows.join(" | ")}`);
+  assert(!rows.some((r) => r.includes("QA live call")), `a meeting without Priya is listed: ${rows.join(" | ")}`);
+  await page.getByRole("button", { name: "Show all meetings" }).click();
+  await page.locator(".filter-pill").waitFor({ state: "detached" });
+});
+await check("action items from the frontmatter can be ticked and copied", async () => {
+  const fixture = path.join(meetingsDir, "2026-11-01-qa-actions.md");
+  fs.writeFileSync(fixture, [
+    "---", "title: QA actions", "type: meeting", "date: 2026-11-01T10:00:00+05:30", "duration: 30m",
+    "attendees:", "- Priya", "action_items:",
+    "- assignee: Priya", "  task: send the deck", "  due: Friday", "  status: open",
+    "- assignee: unassigned", "  task: book the room", "  status: open", "---", "",
+    "## Summary", "", "- We planned the launch.", "", "## Action Items", "", "- [ ] @Priya: send the deck", "- [ ] book the room", "",
+    "## Transcript", "", "[Priya 0:00] Let's plan the launch.", "",
+  ].join("\n"), { mode: 0o600 });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.locator(".row").filter({ hasText: "QA actions" }).first().click();
+  const items = page.locator(".action-items li");
+  await items.first().waitFor({ timeout: 5000 });
+  assert((await items.count()) === 2, `items: ${await items.count()}`);
+  assert((await items.first().innerText()).includes("Priya · due Friday"), await items.first().innerText());
+  const plain = await page.locator(".summary-block > .eyebrow").allInnerTexts();
+  assert(!plain.some((h) => /^action items$/i.test(h.trim())), `checklist shown twice: ${plain.join(", ")}`);
+  await page.getByRole("checkbox", { name: "send the deck" }).click();
+  await page.waitForFunction(() => document.querySelector('[aria-label="send the deck"]')?.getAttribute("aria-checked") === "true");
+  await page.waitForTimeout(600);
+  const md = fs.readFileSync(fixture, "utf8");
+  assert(/task: send the deck\n  due: Friday\n  status: done/.test(md), "frontmatter status not done");
+  assert(md.includes("- [x] @Priya: send the deck") && md.includes("- [ ] book the room"), "body checkbox not ticked");
+  await page.locator(".action-items").getByRole("button", { name: "Copy" }).click();
+  assert((await copied()) === "- [x] @Priya: send the deck (due Friday)\n- [ ] book the room", `copied: ${await copied()}`);
+});
 await check("rename the meeting from its title", async () => {
   await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
   const title = page.getByLabel("Meeting title");
@@ -354,6 +452,21 @@ if (summaries !== "none") {
     assert(md.includes("## Summary"), "no summary in file");
     assert(md.includes("- decided: ship Fast by default"), "summarizing lost the user's notes");
     assert(/\[Priya \d+:\d\d\]/.test(md), "summarizing lost the rename");
+  });
+  await check("a summary's own checklist can be ticked", async () => {
+    await page.getByRole("checkbox", { name: /Build the settings screen/ }).click();
+    await page.waitForTimeout(800);
+    assert(fs.readFileSync(mdPath, "utf8").includes("- [x] Build the settings screen"), "checklist box not ticked");
+  });
+  await check("summarize again replaces the summary and keeps notes", async () => {
+    await page.getByRole("button", { name: "Summarize again" }).click();
+    await page.locator(".toast").filter({ hasText: /Summary updated|failed|nothing/ }).waitFor({ timeout: 300000 });
+    assert((await page.locator(".toast").innerText()).includes("Summary updated"), await page.locator(".toast").innerText());
+    const md = fs.readFileSync(mdPath, "utf8");
+    assert((md.match(/^## Summary$/gm) || []).length === 1, "summary duplicated");
+    assert(md.includes("- decided: ship Fast by default") && /\[Priya \d+:\d\d\]/.test(md), "summarizing again lost notes or names");
+    const asked = fs.readFileSync(path.join(out, "ollama-requests.log"), "utf8").trim().split("\n").length;
+    assert(asked >= 2, `ollama asked ${asked} times`);
   });
 }
 
@@ -531,6 +644,23 @@ if (flag("--download")) {
     await button("Done").click();
   });
 }
+
+// ---------------------------------------------------------------- sounds and shortcut prefs
+await check("settings: sounds and the global shortcut are saved", async () => {
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByLabel(/Play a sound/).uncheck();
+  await page.getByLabel(/from any app/).check();
+  await page.waitForTimeout(400);
+  const prefs = JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8"));
+  assert(prefs.mute_cues === true && prefs.record_shortcut === true, JSON.stringify(prefs));
+  await button("Done").click();
+  await page.getByRole("button", { name: "Settings" }).click();
+  assert(!(await page.getByLabel(/Play a sound/).isChecked()) && (await page.getByLabel(/from any app/).isChecked()), "prefs not shown after reopening");
+  await page.getByLabel(/Play a sound/).check();
+  await page.getByLabel(/from any app/).uncheck();
+  await page.waitForTimeout(400);
+  await button("Done").click();
+});
 
 // ---------------------------------------------------------------- reset
 await check("reset keeps meetings and models, then runs setup again", async () => {

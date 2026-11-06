@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
 mod calldetect;
 mod commands;
 mod corecfg;
@@ -10,12 +11,14 @@ mod extras;
 mod fsutil;
 mod library;
 mod models;
+mod notify;
 mod paths;
 mod permissions;
 mod prefs;
 mod processing;
 mod recorder;
 mod reset;
+mod shortcut;
 mod speakers;
 mod summaries;
 mod tray;
@@ -51,16 +54,12 @@ fn main() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(shortcut::plugin())
         .setup(move |app| {
             let handle = app.handle().clone();
             let sink = handle.clone();
-            events::set_sink(Box::new(move |name, payload| {
-                if name == events::TRAY_REFRESH {
-                    tray::refresh(&sink);
-                } else {
-                    let _ = sink.emit(name, payload);
-                }
-            }));
+            events::set_sink(Box::new(move |name, payload| route(&sink, name, payload)));
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "macos")]
                 {
@@ -70,6 +69,8 @@ fn main() {
                 let _ = if at_login { window.hide() } else { window.show() };
             }
             tray::init(&handle)?;
+            notify::init(&handle);
+            shortcut::refresh(&handle);
             processing::spawn_watcher();
             calldetect::spawn();
             Ok(())
@@ -85,6 +86,7 @@ fn main() {
             commands::tauri_cmds::boot,
             commands::tauri_cmds::save_settings,
             commands::tauri_cmds::settings_options,
+            commands::tauri_cmds::save_app_prefs,
             commands::tauri_cmds::folder_choices,
             commands::tauri_cmds::complete_onboarding,
             commands::tauri_cmds::models_status,
@@ -111,6 +113,8 @@ fn main() {
             commands::tauri_cmds::open_in_obsidian,
             commands::tauri_cmds::rename_speaker,
             commands::tauri_cmds::summarize_meeting,
+            commands::tauri_cmds::set_action_item,
+            audio::meeting_audio,
             commands::tauri_cmds::list_voices,
             commands::tauri_cmds::forget_voice,
             commands::tauri_cmds::reset_preview,
@@ -136,6 +140,26 @@ fn main() {
         }
         _ => {}
     });
+}
+
+/// Where a backend event goes in the app: host actions (menu bar, shortcut, system
+/// notifications) are handled here; everything else goes to the window.
+fn route(app: &tauri::AppHandle, name: &str, payload: serde_json::Value) {
+    match name {
+        events::TRAY_REFRESH => tray::refresh(app),
+        events::SHORTCUT_REFRESH => shortcut::refresh(app),
+        events::NOTIFY => {
+            if let Ok(notice) = serde_json::from_value(payload) {
+                notify::show(app, notice);
+            }
+        }
+        _ => {
+            if name == "recorder-tick" {
+                tray::tick(app, payload["elapsed_secs"].as_u64().unwrap_or(0));
+            }
+            let _ = app.emit(name, payload);
+        }
+    }
 }
 
 fn init_logging() {

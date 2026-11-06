@@ -51,7 +51,8 @@
     unregisterCallback(id) {
       callbacks.delete(id);
     },
-    convertFileSrc: (p) => p,
+    // The app's asset protocol: the bridge serves the same files (with byte ranges).
+    convertFileSrc: (p, protocol = "asset") => `${BRIDGE}/${protocol}?path=${encodeURIComponent(p)}`,
     async invoke(cmd, args) {
       if (cmd === "plugin:event|listen") {
         if (!listeners.has(args.event)) listeners.set(args.event, new Set());
@@ -64,6 +65,12 @@
       }
       if (cmd === "plugin:dialog|open") return e2e.pickFolder;
       if (cmd === "plugin:dialog|ask" || cmd === "plugin:dialog|confirm") return e2e.answer ?? true;
+      // ask() and confirm() go through "message" and compare the label of the button chosen.
+      if (cmd === "plugin:dialog|message") {
+        const b = args.buttons;
+        const [ok, cancel] = b?.OkCancelCustom ?? (b === "YesNo" ? ["Yes", "No"] : ["Ok", "Cancel"]);
+        return (e2e.answer ?? true) ? ok : cancel;
+      }
       if (cmd.startsWith("plugin:")) return null;
       return call(cmd, args);
     },

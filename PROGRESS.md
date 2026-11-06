@@ -133,3 +133,18 @@ testing, so the two don't record at once.
 - e2e: 39/39 in light mode and in dark mode.
 - Not verified: a real recording with a chosen mic (needs the permission prompt), and a
   real login.
+
+### App parity with upstream Minutes (2026-11-06)
+- `docs/parity/app.md` compares each upstream feature outside Settings with Margin.
+- Added from upstream: action-item checkboxes, Summarize again, Copy as Markdown (plus
+  summary, notes and transcript on their own), "meeting ready", "processing failed" and
+  "call app active" notifications, and the four sound cues.
+- Added for Margin only: playback with click-to-play transcript times, the people
+  filter, the global shortcut ⌃⌥⌘R (off by default), and the menu-bar clock and recent
+  meetings.
+- e2e: 40 of 40 checks pass, in light and dark mode. The 9 new checks cover cues, the
+  notification event, playback and byte ranges, copy, the people filter, both kinds of
+  action items, Summarize again and the new Settings rows.
+- Not verified (needs the GUI app): system notifications and their buttons, the global
+  shortcut, the menu-bar clock and recent meetings, playback through the asset protocol
+  in the app's WebView, and cues while the window is hidden.
