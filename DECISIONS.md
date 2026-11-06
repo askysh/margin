@@ -129,7 +129,19 @@ Product and technical decisions made without asking. Each one lists the options 
 - Pick: **no meter**. The live view's rule already shows the level during the first
   recording. Add a meter later, shown only after `microphone == granted`.
 
-### P6. Release profile unchanged
-- See `docs/perf.md`. The size and speed gain of `codegen-units = 1` and fat LTO is small
-  next to the cost in build time, because most of the binary is whisper.cpp and ONNX
-  Runtime, which these settings do not touch.
+### P6. Release profile: fat LTO in one codegen unit
+- Options: keep `lto = "thin"`, or use `lto = "fat"` with `codegen-units = 1`.
+- Measured (`docs/perf.md`): the app is 11% smaller (39.3 MiB → 35.0 MiB). Command
+  latency and processing time are the same within noise. A release build after a small
+  change takes 175 s instead of 99 s.
+- Pick: **fat LTO, one codegen unit**. Release builds are only for shipping; day-to-day
+  work uses debug builds, which this does not change.
+- Not picked: `panic = "abort"`. A panic in one command would then end the whole app
+  instead of failing that command.
+
+### P7. Measured and dropped
+- **Preloading the notepad font.** The font was loaded about 100 ms after navigation with
+  and without the preload, so the change was removed.
+- **Code-splitting Settings and Onboarding** is kept, but only for size: the startup
+  chunk is 8% smaller (194 → 179 KB). Time to the first `boot` call did not change
+  measurably (about 55 ms either way under the same load).

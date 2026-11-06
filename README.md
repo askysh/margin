@@ -28,8 +28,8 @@ scripts/build-app.sh              # → src-tauri/target/release/bundle/macos/Ma
 open src-tauri/target/release/bundle/macos/Margin.app
 ```
 
-A cold build takes about 2 minutes for debug and 2 minutes for release on an M-series
-Mac. The app is 38.5 MB and unsigned. On macOS 26 and later, cargo needs
+A cold build takes about 2 minutes for debug and longer for release (whole-program LTO) on an M-series
+Mac. The app is 35 MB and unsigned. On macOS 26 and later, cargo needs
 `CXXFLAGS="-I$(xcrun --show-sdk-path)/usr/include/c++/v1"`; the scripts set it for you.
 
 For development:

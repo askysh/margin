@@ -28,6 +28,11 @@ for (let i = 0; i < runs; i++) {
     window.__T_BOOT__ = null;
     const wrap = () => { const inv = window.__TAURI_INTERNALS__.invoke; window.__TAURI_INTERNALS__.invoke = (c, a) => { if (c === "boot" && window.__T_BOOT__ === null) window.__T_BOOT__ = performance.now(); return inv(c, a); }; };
     queueMicrotask(wrap);
+    // When the notepad font has loaded, timed from page start.
+    window.__T_FONT__ = null;
+    const poll = setInterval(() => {
+      if ([...document.fonts].some((f) => f.family.includes("Recursive") && f.status === "loaded")) { window.__T_FONT__ = performance.now(); clearInterval(poll); }
+    }, 1);
   });
   const before = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
   const n0 = Date.now();
@@ -35,7 +40,7 @@ for (let i = 0; i < runs; i++) {
   await page.locator(".row, .ob-title, .ob-step").first().waitFor({ timeout: 20000 });
   const nRows = Date.now() - n0;
   const tb = await page.evaluate(() => window.__T_BOOT__);
-  const tf = await page.evaluate(async () => { while (!document.fonts.check('600 16px "Recursive Variable"')) await new Promise((r) => setTimeout(r, 2)); return performance.now(); });
+  const tf = await page.evaluate(async () => { while (window.__T_FONT__ === null) await new Promise((r) => setTimeout(r, 5)); return window.__T_FONT__; });
   toFont.push(tf);
   toBoot.push(tb); toRows.push(nRows);
   const tail = fs.readFileSync(logFile).subarray(before).toString("utf8");
