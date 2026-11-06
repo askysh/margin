@@ -13,11 +13,13 @@ interface Props {
   onDeleted: () => void;
   /** Core is still writing this file (diarizing or summarizing); edits would make it fail. */
   processing: boolean;
+  /** Open Ask about this meeting. */
+  onAsk?: () => void;
 }
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
-export function MeetingView({ path, notify, onChanged, onDeleted, processing }: Props) {
+export function MeetingView({ path, notify, onChanged, onDeleted, processing, onAsk }: Props) {
   const [m, setM] = useState<MeetingDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
@@ -139,6 +141,7 @@ export function MeetingView({ path, notify, onChanged, onDeleted, processing }: 
           {m.attendees.length > 0 && (<><span className="dot-sep" /><span>{m.attendees.join(", ")}</span></>)}
         </div>
         <div className="actions">
+          {onAsk && <button className="link-btn" onClick={onAsk} title="Ask Claude about this meeting (⌘J)">Ask about this meeting</button>}
           <button className="link-btn" onClick={() => api.reveal(path)}>Show in Finder</button>
           {m.in_obsidian_vault && <button className="link-btn" onClick={() => api.openInObsidian(path).catch((e) => notify(errorText(e), "error"))}>Open in Obsidian</button>}
           {!hasSummary && m.transcript.length > 0 && (

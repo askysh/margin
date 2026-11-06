@@ -11,6 +11,7 @@
 // offered here; use `margin --dev summarize` for that.
 // --dark runs the whole pass in dark mode (for screenshots).
 // --download also tests a real model switch + download (Fast model, ~148 MB).
+// Ask (chat) runs against a stand-in claude (scripts/e2e/fake-claude.py), never the real one.
 // Screenshots and report.json go to $E2E_OUT (default /tmp/margin-e2e/out).
 // E2E_BRIDGE_PORT, E2E_UI_PORT, E2E_OLLAMA_PORT and CARGO_TARGET_DIR move a run off the defaults.
 import { webkit } from "playwright";
@@ -357,6 +358,117 @@ if (summaries !== "none") {
   });
 }
 
+// ---------------------------------------------------------------- ask (stand-in claude)
+const claudeDir = path.join(base, "fake-claude");
+const claudeBin = path.join(claudeDir, "claude");
+const claudeCalls = () => {
+  const f = path.join(claudeDir, "calls.jsonl");
+  return fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : [];
+};
+const argAfter = (call, flag) => call.args[call.args.indexOf(flag) + 1];
+const chatFile = (name) => path.join(marginHome, "state/chat", name);
+const useFakeClaude = () => {
+  const cfgPath = path.join(marginHome, "config.toml");
+  const cfg = fs.readFileSync(cfgPath, "utf8").replace(/(\[summarization\][^[]*?)agent_command = "[^"]*"/s, `$1agent_command = "${claudeBin}"`);
+  assert(cfg.includes(claudeBin), "could not point agent_command at the stand-in claude");
+  fs.writeFileSync(cfgPath, cfg);
+};
+const answered = () => page.locator(".ask-a:not(.ask-pending)").last();
+
+await check("ask: not signed in says how to fix it", async () => {
+  fs.rmSync(claudeDir, { recursive: true, force: true });
+  fs.mkdirSync(claudeDir, { recursive: true });
+  fs.copyFileSync(path.join(root, "scripts/e2e/fake-claude.py"), claudeBin);
+  fs.chmodSync(claudeBin, 0o755);
+  fs.writeFileSync(path.join(claudeDir, "logged-out"), "");
+  useFakeClaude();
+  await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
+  await page.getByLabel("Meeting title").waitFor();
+  await page.keyboard.press("Meta+j");
+  await page.locator(".ask").waitFor({ timeout: 5000 });
+  try {
+    await page.locator(".ask-setup", { hasText: /isn't signed in.*run claude/ }).waitFor({ timeout: 8000 });
+    assert(await page.locator(".ask-compose").getByRole("button", { name: "Ask" }).isDisabled(), "Ask enabled while not signed in");
+    await page.screenshot({ path: path.join(out, "ask-not-signed-in.png") });
+  } finally {
+    fs.rmSync(path.join(claudeDir, "logged-out"), { force: true });
+  }
+  await button("Check again").click();
+  await page.locator(".ask-setup").waitFor({ state: "detached", timeout: 8000 });
+});
+await check("ask across all meetings streams an answer with meeting links", async () => {
+  await page.locator(".ask").getByRole("radio", { name: "All meetings" }).click();
+  await page.getByText("Across all your meetings").waitFor();
+  await page.locator(".ask-chip", { hasText: "What did I commit to this week?" }).click();
+  // The answer shows while it streams, before it is done.
+  await page.waitForFunction(() => (document.querySelector(".ask-pending .md")?.textContent ?? "").includes("From"), null, { timeout: 10000 });
+  await page.screenshot({ path: path.join(out, "ask-streaming.png") });
+  await answered().locator(".ask-sources").waitFor({ timeout: 15000 });
+  const text = await answered().innerText();
+  assert(text.includes("build the settings screen"), `answer: ${text}`);
+  assert(await answered().locator(".ask-sources .link-btn", { hasText: "QA launch sync" }).count(), "no QA launch sync source");
+  const call = claudeCalls().at(-1);
+  assert(fs.realpathSync(call.cwd) === fs.realpathSync(meetingsDir), `cwd ${call.cwd}`);
+  assert(argAfter(call, "--tools") === "Read,Grep,Glob", `tools ${argAfter(call, "--tools")}`);
+  assert(argAfter(call, "--permission-mode") === "dontAsk", "not dontAsk");
+  assert(!call.args.includes("--resume") && !call.args.includes("--allowedTools"), "unexpected flags");
+  assert(call.prompt.includes("QA launch sync") && call.prompt.includes("Question: What did I commit to this week?"), "prompt lacks the meeting list");
+});
+await check("ask: a follow-up continues the same conversation", async () => {
+  await page.getByLabel("Ask a question").fill("And who owns it?");
+  await page.keyboard.press("Enter");
+  await page.locator(".ask-a:not(.ask-pending)", { hasText: "Following up on “What did I commit to this week?”" }).waitFor({ timeout: 15000 });
+  const call = claudeCalls().at(-1);
+  const saved = JSON.parse(fs.readFileSync(chatFile("all.json"), "utf8"));
+  assert(argAfter(call, "--resume") === saved.session_id, `resume ${argAfter(call, "--resume")} vs ${saved.session_id}`);
+  assert(call.prompt === "And who owns it?", `prompt: ${call.prompt.slice(0, 80)}`);
+});
+await check("ask: Stop ends a long answer and its process", async () => {
+  await page.getByLabel("Ask a question").fill("slow: walk me through everything");
+  await page.keyboard.press("Enter");
+  await page.locator(".ask-pending .md", { hasText: "Still going through it" }).waitFor({ timeout: 10000 });
+  const pid = Number(fs.readFileSync(path.join(claudeDir, "claude.pid"), "utf8"));
+  await page.locator(".ask-compose").getByRole("button", { name: "Stop", exact: true }).click();
+  await answered().locator(".quiet-note", { hasText: "Stopped." }).waitFor({ timeout: 5000 });
+  await page.waitForTimeout(1200);
+  let alive = true;
+  try { process.kill(pid, 0); } catch { alive = false; }
+  assert(!alive, `claude ${pid} still running`);
+});
+await check("ask: a meeting link in an answer opens that meeting", async () => {
+  assert((await page.getByLabel("Meeting title").inputValue()) === "QA follow-up", "expected to start on QA follow-up");
+  await page.locator(".ask-a .md-link-btn", { hasText: "QA launch sync" }).first().click();
+  await page.waitForFunction(() => document.querySelector('[aria-label="Meeting title"]')?.value?.startsWith("QA launch sync"), null, { timeout: 5000 });
+  assert(await page.locator(".ask").isVisible(), "Ask closed on navigation");
+});
+await check("ask about one meeting puts that meeting in context", async () => {
+  await page.locator(".ask").getByRole("radio", { name: "This meeting" }).click();
+  await page.getByText(/About “QA launch sync/).waitFor();
+  await page.locator(".ask-chip", { hasText: "Draft a follow-up email" }).waitFor();
+  await page.locator(".ask-chip", { hasText: "What decisions were made?" }).click();
+  await answered().locator(".ask-sources").waitFor({ timeout: 15000 });
+  const call = claudeCalls().at(-1);
+  assert(/<meeting file="2026-[^"]*qa-launch-sync[^"]*\.md">/.test(call.prompt) && call.prompt.includes("## Transcript"), "meeting file not in the prompt");
+  assert(!call.args.includes("--resume"), "a new meeting chat resumed a session");
+});
+await check("ask: history survives a reload", async () => {
+  await page.reload();
+  await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
+  await button("Ask about this meeting").click();
+  await page.locator(".ask-q", { hasText: "What decisions were made?" }).waitFor({ timeout: 8000 });
+  await page.locator(".ask").getByRole("radio", { name: "All meetings" }).click();
+  await page.locator(".ask-q", { hasText: "And who owns it?" }).waitFor();
+  await page.locator(".ask .quiet-note", { hasText: "Stopped." }).waitFor();
+});
+await check("ask: Clear removes a conversation", async () => {
+  await page.locator(".ask-head").getByRole("button", { name: "Clear" }).click();
+  await page.locator(".ask-chip").first().waitFor();
+  assert(!fs.existsSync(chatFile("all.json")), "all.json still there");
+  assert(fs.readdirSync(path.join(marginHome, "state/chat")).length === 1, "the meeting chat should remain");
+  await page.getByLabel("Ask a question").press("Escape");
+  await page.locator(".ask").waitFor({ state: "detached" });
+});
+
 // ---------------------------------------------------------------- settings: model switch
 if (flag("--download")) {
   await check("switching to Fast downloads it with progress", async () => {
@@ -383,6 +495,9 @@ await check("reset keeps meetings and models, then runs setup again", async () =
   assert(!fs.existsSync(path.join(marginHome, "prefs.json")), "prefs not removed");
   assert(fs.existsSync(path.join(marginHome, "state/models")), "models removed");
   assert(meetingFiles().length === before, `meetings changed: ${before} -> ${meetingFiles().length}`);
+});
+await check("reset also clears Ask history", async () => {
+  assert(!fs.existsSync(path.join(marginHome, "state/chat")), "state/chat survived reset");
 });
 await check("after re-onboarding the kept meetings are back", async () => {
   await button("Continue").click();

@@ -185,25 +185,32 @@ fn ask(args: &[String]) -> Result<(), String> {
     if questions.is_empty() {
         return Err("usage: ask [--meeting <md>] <question> [<follow-up> ...]".into());
     }
-    let shown = std::sync::Arc::new(std::sync::Mutex::new((0usize, None::<std::time::Instant>)));
+    // (characters printed, time of first text, number of text updates)
+    let shown = std::sync::Arc::new(std::sync::Mutex::new((0usize, None::<std::time::Instant>, 0usize)));
     let sink = shown.clone();
     crate::events::set_sink(Box::new(move |name, payload| {
         let text = payload["text"].as_str().unwrap_or_default();
         let mut s = sink.lock().unwrap();
         match name {
-            "chat-delta" if text.len() >= s.0 => {
+            "chat-delta" => {
+                s.2 += 1;
+                if text.len() < s.0 {
+                    eprintln!("\n[preamble cleared]");
+                    s.0 = 0;
+                }
                 eprint!("{}", &text[s.0..]);
                 s.0 = text.len();
-                s.1.get_or_insert_with(std::time::Instant::now);
+                if !text.is_empty() {
+                    s.1.get_or_insert_with(std::time::Instant::now);
+                }
             }
-            "chat-delta" => s.0 = text.len(),
             "chat-activity" => eprintln!("[{text}]"),
             _ => {}
         }
     }));
     eprintln!("{}", serde_json::to_string(&crate::chat::readiness()).unwrap());
     for q in questions {
-        *shown.lock().unwrap() = (0, None);
+        *shown.lock().unwrap() = (0, None, 0);
         eprintln!("\n> {q}");
         let start = std::time::Instant::now();
         crate::chat::send(meeting.as_deref(), q)?;
@@ -212,8 +219,9 @@ fn ask(args: &[String]) -> Result<(), String> {
         }
         let thread = crate::chat::load(meeting.as_deref());
         let last = thread.messages.last().ok_or("no answer")?;
-        let first_text = shown.lock().unwrap().1.map(|t| (t - start).as_secs_f32());
-        eprintln!("\n[first text after {:.1}s, done after {:.1}s]", first_text.unwrap_or(-1.0), start.elapsed().as_secs_f32());
+        let (_, first, updates) = *shown.lock().unwrap();
+        let first_text = first.map(|t| (t - start).as_secs_f32());
+        eprintln!("\n[first text after {:.1}s, {updates} text updates, done after {:.1}s]", first_text.unwrap_or(-1.0), start.elapsed().as_secs_f32());
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
             "question": q, "answer": last.text, "sources": last.sources, "error": last.error, "session": thread.session_id,
         })).unwrap());

@@ -315,7 +315,7 @@ then sections such as `## Summary`, `## Notes` ({name}'s own notes, typed during
 are the other people.\n\
 You can only read: use Grep, Glob and Read in this folder. Never ask to run commands or edit files.\n\
 Answer from the meetings only. If they don't contain the answer, say so in one sentence. Be brief and concrete: \
-short paragraphs or bullet lists, no preamble, no closing offers. Quote people only when it helps. \
+short paragraphs or bullet lists (no tables), no preamble, no closing offers. Quote people only when it helps. \
 When you write a draft (an email, a message), make it ready to paste.\n\
 When you use a meeting, cite it once as a Markdown link to its file name, for example \
 [Launch sync](2026-11-05-launch-sync.md). Don't cite line numbers."
@@ -458,6 +458,11 @@ impl Stream {
         for block in v["message"]["content"].as_array().into_iter().flatten() {
             match block["type"].as_str() {
                 Some("tool_use") => {
+                    // Text before a tool call is preamble ("Let me look"): hide it.
+                    if !self.text.is_empty() {
+                        self.text.clear();
+                        out.push(Update::Text);
+                    }
                     let name = block["name"].as_str().unwrap_or_default().to_string();
                     let path = block["input"]["file_path"].as_str().map(String::from);
                     if name == "Read" {
@@ -517,10 +522,15 @@ pub fn stop(meeting: Option<&str>) {
 }
 
 fn stop_key(key: &str, discard: bool) {
-    let Some(run) = running().lock().unwrap().get(key).cloned() else { return };
-    if discard {
-        run.discard.store(true, Ordering::SeqCst);
-    }
+    let run = {
+        let map = running().lock().unwrap();
+        let Some(run) = map.get(key).cloned() else { return };
+        // Under the map lock, so `finish` either saves before this or sees the flag.
+        if discard {
+            run.discard.store(true, Ordering::SeqCst);
+        }
+        run
+    };
     run.cancelled.store(true, Ordering::SeqCst);
     kill_group(&run);
 }
@@ -659,16 +669,12 @@ fn read_stream(stdout: Option<std::process::ChildStdout>, key: &str, run: &Runni
     let mut stream = Stream::default();
     let Some(stdout) = stdout else { return stream };
     let titles = Titles::default();
-    let mut last_emit = Instant::now() - Duration::from_secs(1);
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
         for update in stream.feed(&line) {
             match update {
                 Update::Text => {
                     *run.partial.lock().unwrap() = stream.text.clone();
-                    if last_emit.elapsed() >= Duration::from_millis(50) || stream.text.is_empty() {
-                        events::emit("chat-delta", KeyedText { key, text: &stream.text });
-                        last_emit = Instant::now();
-                    }
+                    events::emit("chat-delta", KeyedText { key, text: &stream.text });
                 }
                 Update::Thinking => set_activity(key, run, "Thinking…".into()),
                 Update::Tool { name, path } => set_activity(key, run, tool_activity(&name, path.as_deref(), &titles)),
@@ -732,12 +738,18 @@ fn finish(mut thread: Thread, outcome: Result<Outcome, String>, run: &Running) {
         Err(e) => assistant_message(String::new(), vec![], Some(e), false),
     };
     thread.messages.push(message);
-    running().lock().unwrap().remove(&thread.key);
-    if run.discard.load(Ordering::SeqCst) {
-        return;
-    }
-    if let Err(e) = save(&thread) {
-        tracing::warn!("chat not saved: {e}");
+    // Save before leaving the running map, so a load never sees the question without
+    // its answer. Clear and Reset set `discard` under the same lock.
+    {
+        let mut map = running().lock().unwrap();
+        if run.discard.load(Ordering::SeqCst) {
+            map.remove(&thread.key);
+            return;
+        }
+        if let Err(e) = save(&thread) {
+            tracing::warn!("chat not saved: {e}");
+        }
+        map.remove(&thread.key);
     }
     events::emit("chat-done", &thread);
 }
