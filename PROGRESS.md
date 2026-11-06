@@ -202,3 +202,11 @@ Support/Margin/state/logs/margin.log` has the details.
   merged after the tap's tests.
 - Fixed: long transcripts and notes did not scroll, and pages ended 52px below the window.
 - Next: faster processing after Stop for long meetings (research running).
+
+### 0.0.3: ready right after Stop (Phase 1 of docs/research/live-transcription.md)
+- After Stop, the processing view shows the live transcript as a draft at once.
+- The meeting opens when core writes the file (`transcript-only`), before speakers are
+  separated. It fills in by itself when the job completes.
+- Notes stay editable the whole time. During processing they go into the job's draft.
+- DECISIONS.md D42–D45. The e2e run has 62 checks.
+

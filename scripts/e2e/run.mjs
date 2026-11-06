@@ -183,20 +183,83 @@ if (simulate) {
     const first = await page.locator(".live-line").first().innerText();
     assert(first.includes("launch plan"), `first line: ${first}`);
   });
+  // While this file exists, the debug worker waits at "separating speakers", so the checks
+  // below can look at a meeting that is open while core still processes it.
+  const hold = path.join(marginHome, "e2e-hold-speakers");
+  const drafts = path.join(marginHome, "drafts");
+  const draftFiles = () => (fs.existsSync(drafts) ? fs.readdirSync(drafts) : []);
+  let stoppedAt = 0;
   await check("typing right up to Stop keeps every word", async () => {
+    fs.writeFileSync(hold, "");
     await page.keyboard.press("Enter");
     await page.keyboard.type("last words before stop");
     await page.getByRole("button", { name: "Stop" }).click();
+    stoppedAt = Date.now();
     await page.getByText(/Transcribing|Queued|Telling speakers apart|Saving/).first().waitFor({ timeout: 15000 });
   });
-  let liveMd = null;
-  await check("after processing, the meeting opens with the notes", async () => {
-    await page.locator(".turn").first().waitFor({ timeout: 180000 });
+  await check("right after Stop, the live transcript shows as a draft", async () => {
+    await page.locator(".draft-transcript .live-line").nth(3).waitFor({ timeout: 3000 });
+    const waited = Date.now() - stoppedAt;
+    assert(await page.locator(".steps").isVisible(), "processing steps not shown next to the draft");
+    await page.getByText("Draft from the live transcript; the final transcript replaces it.").waitFor();
+    const first = await page.locator(".draft-transcript .live-line").first().innerText();
+    assert(first.includes("launch plan"), `first draft line: ${first}`);
+    const who = await page.locator(".draft-transcript .live-speaker").allInnerTexts();
+    assert(who.includes("You") && who.includes("Them"), `draft speakers: ${who.join(",")}`);
+    assert(draftFiles().some((f) => f.endsWith(".live.json")), `live draft not kept with the job: ${draftFiles().join(", ")}`);
+    console.log(`     draft shown ${waited} ms after Stop`);
+  });
+  let liveFile = null;
+  await check("the meeting opens while speakers are still being separated", async () => {
+    await page.getByText("Finishing: separating speakers…").waitFor({ timeout: 180000 });
     assert((await page.getByLabel("Meeting title").inputValue()) === "QA live call", "did not land on the processed meeting");
+    await page.locator(".turn").first().waitFor();
+    const jobs = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke("list_jobs"));
+    const job = jobs.find((j) => j.title === "QA live call");
+    assert(job && job.state === "diarizing", `job is ${job?.state}, not still separating speakers`);
+    assert(await page.getByLabel("Meeting title").isDisabled(), "title editable while core still writes the file");
+    assert((await page.locator(".chip").count()) === 0, "speaker rename offered while core still writes the file");
+    assert((await page.getByLabel("Your notes").getAttribute("readonly")) === null, "notes locked while finishing");
     const f = meetingFiles().find((x) => x.includes("qa-live-call"));
-    assert(f, "no qa-live-call file");
-    liveMd = fs.readFileSync(path.join(meetingsDir, f), "utf8");
-    assert(liveMd.includes("## Notes\n\n- risk: download size\n- last words before stop\n"), "notes not exact:\n" + liveMd.slice(liveMd.indexOf("## Notes"), liveMd.indexOf("## Transcript")));
+    assert(f, "no qa-live-call file yet");
+    liveFile = path.join(meetingsDir, f);
+    // The page and the transcript column must survive the update (checked below).
+    await page.evaluate(() => {
+      document.querySelector(".page-meeting").dataset.e2eSame = "1";
+      const col = document.querySelector(".transcript-col");
+      col.scrollTop = 40;
+      window.__e2eScroll = col.scrollTop;
+    });
+  });
+  await check("notes typed while it finishes go to the draft, not the file", async () => {
+    const before = fs.readFileSync(liveFile, "utf8");
+    await page.getByLabel("Your notes").click();
+    await page.keyboard.press("Meta+ArrowDown");
+    await page.keyboard.press("Enter"); // continues the list with "- "
+    await page.keyboard.type("typed while finishing");
+    await page.getByText("Saved", { exact: true }).waitFor({ timeout: 5000 });
+    assert(fs.readFileSync(liveFile, "utf8") === before, "the meeting file was written while core still works on it");
+    const draft = draftFiles().find((x) => x.endsWith(".md") && x !== "current.md");
+    assert(draft && fs.readFileSync(path.join(drafts, draft), "utf8").endsWith("- typed while finishing"), `draft: ${draft}`);
+    // Typed just before the job completes.
+    await page.keyboard.type(" (just typed)");
+  });
+  let liveMd = null;
+  await check("when the job completes, the open meeting updates in place", async () => {
+    fs.rmSync(hold, { force: true });
+    await page.locator(".finishing").waitFor({ state: "detached", timeout: 120000 });
+    await page.locator(".chip").first().waitFor({ timeout: 5000 });
+    assert(await page.evaluate(() => document.querySelector(".page-meeting")?.dataset.e2eSame === "1"), "the meeting view was rebuilt, not updated");
+    const scroll = await page.evaluate(() => [document.querySelector(".transcript-col").scrollTop, window.__e2eScroll]);
+    assert(scroll[0] === scroll[1], `transcript scroll moved: ${scroll}`);
+    assert(!(await page.getByLabel("Meeting title").isDisabled()), "title still locked");
+    assert((await page.getByLabel("Your notes").inputValue()).endsWith("- typed while finishing (just typed)"), "the latest edit was lost");
+    await page.getByText("Saved", { exact: true }).waitFor({ timeout: 5000 });
+    await page.waitForTimeout(300);
+    liveMd = fs.readFileSync(liveFile, "utf8");
+    const notes = liveMd.slice(liveMd.indexOf("## Notes"), liveMd.indexOf("## Transcript"));
+    assert(notes === "## Notes\n\n- risk: download size\n- last words before stop\n- typed while finishing (just typed)\n\n", "notes not exact:\n" + notes);
+    assert(draftFiles().every((f) => f === "current.md"), `drafts left: ${draftFiles().join(", ")}`);
   });
   await check("sound cues play on start, stop and ready", async () => {
     const heard = await plays();

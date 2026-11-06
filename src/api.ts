@@ -238,6 +238,8 @@ export const api = {
   setRecordingTitle: (title: string) => invoke<void>("set_recording_title", { title }),
   discardOrphanedDraft: () => invoke<void>("discard_orphaned_draft"),
   listJobs: () => invoke<Job[]>("list_jobs"),
+  /** The live transcript lines kept with a job, shown as a draft until the meeting opens. */
+  liveDraft: (jobId: string) => invoke<LiveLine[]>("live_draft", { jobId }),
   retryJob: (id: string) => invoke<void>("retry_job", { id }),
   listMeetings: () => invoke<MeetingSummary[]>("list_meetings"),
   readMeeting: (path: string) => invoke<MeetingDetail>("read_meeting", { path }),

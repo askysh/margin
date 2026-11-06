@@ -7,7 +7,7 @@ import { ProcessingView } from "./components/ProcessingView";
 import { Home } from "./components/Home";
 import { AskPanel, type AskScope } from "./components/AskPanel";
 import { UpdateBanner } from "./components/Updates";
-import { clock } from "./util";
+import { clock, meetingFileReady } from "./util";
 import { useCues } from "./cues";
 
 // Rarely shown, so loaded on first use instead of at startup (docs/perf.md).
@@ -18,7 +18,9 @@ export type Selection =
   | { type: "home" }
   | { type: "live" }
   | { type: "processing"; jobId: string; notes: string; title: string | null }
-  | { type: "meeting"; path: string };
+  | { type: "meeting"; path: string; jobId?: string };
+
+const DONE: Job["state"][] = ["complete", "failed", "needs-review"];
 
 export default function App() {
   const [boot, setBoot] = useState<Boot | null>(null);
@@ -103,7 +105,8 @@ export default function App() {
       on<{ job_id: string; path: string }>("meeting-ready", ({ job_id, path }) => {
         refreshMeetings();
         const sel = selectionRef.current;
-        if (sel.type === "processing" && sel.jobId === job_id) setSelection({ type: "meeting", path });
+        const following = (sel.type === "processing" || sel.type === "meeting") && sel.jobId === job_id;
+        if (following && !(sel.type === "meeting" && sel.path === path)) setSelection({ type: "meeting", path, jobId: job_id });
       }),
       on<string>("error-toast", (t) => notify(t, "error")),
       on<string>("recording-ended", (t) => notify(t)),
@@ -125,6 +128,16 @@ export default function App() {
       window.removeEventListener("focus", onFocus);
     };
   }, [reboot, refreshMeetings, notify]);
+
+  // A processing view becomes the meeting as soon as core has written the file (D42).
+  useEffect(() => {
+    if (selection.type !== "processing") return;
+    const job = jobs.find((j) => j.id === selection.jobId);
+    if (job && meetingFileReady(job)) {
+      setSelection({ type: "meeting", path: job.output_path, jobId: job.id });
+      refreshMeetings();
+    }
+  }, [jobs, selection, refreshMeetings]);
 
   const goHome = useCallback(() => {
     setSelection({ type: "home" });
@@ -178,7 +191,8 @@ export default function App() {
 
   const recording = !!recorder?.recording;
   const openMeeting = selection.type === "meeting" ? meetings.find((m) => m.path === selection.path) : undefined;
-  const active = jobs.filter((j) => !["complete", "failed", "needs-review"].includes(j.state));
+  const active = jobs.filter((j) => !DONE.includes(j.state));
+  const finishing = selection.type === "meeting" ? active.find((j) => j.output_path === selection.path) ?? null : null;
 
   return (
     <div className={`shell ${recording ? "is-recording" : ""}`}>
@@ -227,6 +241,8 @@ export default function App() {
           )}
           {selection.type === "processing" && (
             <ProcessingView
+              key={selection.jobId}
+              jobId={selection.jobId}
               job={jobs.find((j) => j.id === selection.jobId) ?? null}
               notes={selection.notes || jobs.find((j) => j.id === selection.jobId)?.draft || ""}
               title={selection.title}
@@ -241,7 +257,7 @@ export default function App() {
               notify={notify}
               onChanged={refreshMeetings}
               onDeleted={goHome}
-              processing={active.some((j) => j.output_path === selection.path)}
+              job={finishing}
               onPerson={setPerson}
               onAsk={askMeeting}
             />

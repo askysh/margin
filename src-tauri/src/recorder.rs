@@ -34,13 +34,13 @@ pub enum Kind {
     InPerson,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveLine {
     pub line: usize,
     pub offset_ms: u64,
     pub text: String,
     /// "you" | "them" when the call-mode heuristic is confident.
-    pub speaker: Option<&'static str>,
+    pub speaker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -296,10 +296,13 @@ impl Recorder {
         let finished_at = Local::now();
         // Pieces transcribed during the meeting; core transcribes the rest.
         let checkpoint = rolling.and_then(|r| r.finish(crate::rolling::STOP_WAIT));
-        let (wav, title, started_at, draft) = {
-            let guard = self.active.lock().unwrap();
-            let a = guard.as_ref().expect("active while stopping");
-            (a.wav.clone(), a.title.clone(), a.started_at, a.notes.clone())
+        let (wav, title, started_at, draft, lines) = {
+            let mut guard = self.active.lock().unwrap();
+            let a = guard.as_mut().expect("active while stopping");
+            // Lines the sidecar wrote after the last tick, such as the final utterance.
+            let tail = read_live_lines(a.kind, &a.wav, a.lines.last().map_or(0, |l| l.line));
+            append_lines(&mut a.lines, tail);
+            (a.wav.clone(), a.title.clone(), a.started_at, a.notes.clone(), a.lines.clone())
         };
 
         let result = (|| {
@@ -337,6 +340,7 @@ impl Recorder {
                 format!("Couldn't queue the recording for processing: {e}. The audio is in your meetings folder under failed-captures.")
             })?;
             processing::save_draft(&job.id, &draft);
+            processing::save_live_draft(&job.id, &lines);
             let _ = pid::set_processing_status(
                 job.stage.as_deref(),
                 Some(CaptureMode::Meeting),
@@ -514,24 +518,11 @@ fn spawn_ticker(session: u64) {
                     }
                     return;
                 }
-                let read = live_transcript::read_since_line(since).unwrap_or_default();
-                let new_lines: Vec<LiveLine> = read
-                    .into_iter()
-                    .filter(|l| l.line > since)
-                    .map(|l| LiveLine {
-                        line: l.line,
-                        offset_ms: l.offset_ms.saturating_sub(l.duration_ms),
-                        speaker: match kind {
-                            Kind::Call => guess_speaker(&wav, l.ts, l.duration_ms),
-                            Kind::InPerson => None,
-                        },
-                        text: l.text,
-                    })
-                    .collect();
+                let new_lines = read_live_lines(kind, &wav, since);
                 if let Some(last) = new_lines.last() {
                     since = last.line;
-                    if let Some(a) = r.active.lock().unwrap().as_mut() {
-                        a.lines.extend(new_lines.iter().cloned());
+                    if let Some(a) = r.active.lock().unwrap().as_mut().filter(|a| a.session == session) {
+                        append_lines(&mut a.lines, new_lines.clone());
                     }
                     events::emit("live-lines", &new_lines);
                 }
@@ -544,6 +535,31 @@ fn spawn_ticker(session: u64) {
             }
         })
         .expect("spawn ticker");
+}
+
+/// Live transcript lines after line `since`, with a You / Them guess on calls.
+fn read_live_lines(kind: Kind, wav: &Path, since: usize) -> Vec<LiveLine> {
+    live_transcript::read_since_line(since)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|l| l.line > since)
+        .map(|l| LiveLine {
+            line: l.line,
+            offset_ms: l.offset_ms.saturating_sub(l.duration_ms),
+            speaker: match kind {
+                Kind::Call => guess_speaker(wav, l.ts, l.duration_ms).map(String::from),
+                Kind::InPerson => None,
+            },
+            text: l.text,
+        })
+        .collect()
+}
+
+/// Line numbers only grow, so a line at or below the last one kept is a repeat (the ticker
+/// and Stop can read the same lines).
+fn append_lines(kept: &mut Vec<LiveLine>, new: Vec<LiveLine>) {
+    let last = kept.last().map_or(0, |l| l.line);
+    kept.extend(new.into_iter().filter(|l| l.line > last));
 }
 
 /// Compare the loudness of the mic stem and the system stem over the line's audio.
@@ -717,6 +733,15 @@ mod tests {
         session_sources(&mut cfg, Kind::InPerson);
         assert!(cfg.recording.sources.is_none());
         assert_eq!(cfg.recording.device.as_deref(), Some("USB Mic"));
+    }
+
+    #[test]
+    fn live_lines_are_kept_once() {
+        let line = |n: usize| LiveLine { line: n, offset_ms: 0, text: format!("l{n}"), speaker: None };
+        let mut kept = vec![line(1), line(2)];
+        append_lines(&mut kept, vec![line(2), line(3)]);
+        append_lines(&mut kept, vec![line(3)]);
+        assert_eq!(kept.iter().map(|l| l.line).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     #[test]

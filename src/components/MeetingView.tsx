@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { api, errorText, on, type MeetingDetail, type Turn } from "../api";
+import { api, errorText, on, type Job, type MeetingDetail, type Turn } from "../api";
 import { isRawSpeaker, meetingDate, speakerNames, useDebounced } from "../util";
 import { Markdown } from "./Markdown";
 import { NotesEditor } from "./NotesEditor";
@@ -16,8 +16,9 @@ interface Props {
   notify: (t: string, tone?: "info" | "error") => void;
   onChanged: () => void;
   onDeleted: () => void;
-  /** Core is still writing this file (diarizing or summarizing); edits would make it fail. */
-  processing: boolean;
+  /** The job that is still finishing this file (separating speakers, saving), or null.
+   * Notes typed meanwhile go into the job's draft; edits that rewrite the file wait. */
+  job: Job | null;
   /** Show the meetings this person was in. */
   onPerson?: (name: string) => void;
   /** Open Ask about this meeting. */
@@ -27,7 +28,8 @@ interface Props {
 type SaveState = "idle" | "saving" | "saved" | "error";
 
 // Memoised so a recording's clock, ticking in App, doesn't re-render a long transcript.
-export const MeetingView = memo(function MeetingView({ path, notify, onChanged, onDeleted, processing, onPerson, onAsk }: Props) {
+export const MeetingView = memo(function MeetingView({ path, notify, onChanged, onDeleted, job, onPerson, onAsk }: Props) {
+  const processing = !!job;
   const [m, setM] = useState<MeetingDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
@@ -60,7 +62,10 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
       .catch((e) => setError(errorText(e)));
   }, [path]);
 
-  useEffect(load, [load]);
+  // Each job stage can rewrite the file, and the last one fills in the speakers: read it
+  // again in place. Unsaved notes and the scroll position stay as they are.
+  const jobState = job?.state;
+  useEffect(load, [load, jobState]);
   useEffect(() => { if (m) setWriting(m.summarizing); }, [m]);
   useEffect(() => {
     const sub = on<{ path: string; running: boolean; error?: string | null }>("summary-status", (e) => {
@@ -80,11 +85,6 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
     window.addEventListener("focus", f);
     return () => window.removeEventListener("focus", f);
   }, [load]);
-  useEffect(() => {
-    // Processing just finished: show the enriched file.
-    if (!processing) load();
-  }, [processing, load]);
-
   useDebounced(notes, 600, (v) => {
     if (!unsaved()) return;
     const upTo = edits.current;
@@ -230,11 +230,11 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
           />
         </div>
 
-        {processing && (
-          <div className="callout">
-            <p><strong>Still processing.</strong> Margin is separating speakers and finishing this meeting. You can
-              read it now; editing unlocks when it's done.</p>
-          </div>
+        {job && (
+          <p className="quiet-note finishing" role="status">
+            <span className="spinner" aria-hidden />
+            <span><strong>{finishingLabel(job.state)}</strong> You can read and add notes now. Renaming unlocks when it's done.</span>
+          </p>
         )}
 
         {m.status === "no-speech" && (
@@ -274,7 +274,6 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
           <NotesEditor
             value={notes}
             onChange={(v) => { edits.current++; setSave("idle"); setNotes(v); }}
-            readOnly={processing}
             placeholder="Add notes. They're saved into the meeting file."
           />
         </section>
@@ -296,6 +295,12 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
     </div>
   );
 });
+
+function finishingLabel(state: Job["state"]) {
+  if (state === "summarizing") return "Finishing: summarizing…";
+  if (state === "saving") return "Finishing: saving…";
+  return "Finishing: separating speakers…";
+}
 
 /** The meeting title, editable in place. Enter or leaving the field saves; Escape undoes. */
 function TitleField({ value, onSave, disabled }: { value: string; onSave: (t: string) => void; disabled?: boolean }) {
@@ -321,7 +326,7 @@ function TitleField({ value, onSave, disabled }: { value: string; onSave: (t: st
         }
       }}
       aria-label="Meeting title"
-      title="Click to rename this meeting"
+      title={disabled ? "You can rename it when Margin is done with it" : "Click to rename this meeting"}
       disabled={disabled}
     />
   );

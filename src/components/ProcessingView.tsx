@@ -1,4 +1,6 @@
-import type { Job } from "../api";
+import { useEffect, useState } from "react";
+import { api, type Job, type LiveLine } from "../api";
+import { LiveTranscript, Rule } from "./LiveView";
 
 const STEPS: { state: Job["state"][]; label: string }[] = [
   { state: ["queued"], label: "Queued" },
@@ -9,6 +11,7 @@ const STEPS: { state: Job["state"][]; label: string }[] = [
 ];
 
 interface Props {
+  jobId: string;
   job: Job | null;
   notes: string;
   title: string | null;
@@ -16,13 +19,14 @@ interface Props {
   onRetry: (id: string) => void;
 }
 
-export function ProcessingView({ job, notes, title, onOpen, onRetry }: Props) {
+export function ProcessingView({ jobId, job, notes, title, onOpen, onRetry }: Props) {
   const current = job ? STEPS.findIndex((s) => s.state.includes(job.state)) : 0;
   const done = job && ["complete", "needs-review"].includes(job.state);
   const failed = job?.state === "failed";
+  const lines = useLiveDraft(jobId);
 
   return (
-    <div className="page page-processing">
+    <div className={`page page-processing ${lines.length ? "has-draft" : ""}`}>
       <div className="notes-col">
         <h1 className="title">{title || job?.title || "New meeting"}</h1>
         {failed ? (
@@ -46,7 +50,8 @@ export function ProcessingView({ job, notes, title, onOpen, onRetry }: Props) {
           </ol>
         )}
         <p className="quiet-note">
-          Everything runs on this Mac. You can close the window; Margin keeps working from the menu bar.
+          Everything runs on this Mac. The meeting opens here when its transcript is ready. You can close the window;
+          Margin keeps working from the menu bar.
         </p>
         {notes.trim() && (
           <section className="your-notes">
@@ -56,6 +61,23 @@ export function ProcessingView({ job, notes, title, onOpen, onRetry }: Props) {
           </section>
         )}
       </div>
+      {lines.length > 0 && (
+        <>
+          <Rule level={0} live={false} />
+          <LiveTranscript lines={lines} call={lines.some((l) => !!l.speaker)} draft />
+        </>
+      )}
     </div>
   );
+}
+
+/** The live lines kept with the job. They are on disk, so they survive a restart. */
+function useLiveDraft(jobId: string) {
+  const [lines, setLines] = useState<LiveLine[]>([]);
+  useEffect(() => {
+    let live = true;
+    api.liveDraft(jobId).then((l) => live && setLines(l)).catch(() => {});
+    return () => { live = false; };
+  }, [jobId]);
+  return lines;
 }

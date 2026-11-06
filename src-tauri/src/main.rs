@@ -107,6 +107,7 @@ fn main() {
             commands::tauri_cmds::set_recording_title,
             commands::tauri_cmds::discard_orphaned_draft,
             commands::tauri_cmds::list_jobs,
+            commands::tauri_cmds::live_draft,
             commands::tauri_cmds::retry_job,
             commands::tauri_cmds::list_meetings,
             commands::tauri_cmds::read_meeting,

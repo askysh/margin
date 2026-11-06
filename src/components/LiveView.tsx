@@ -71,8 +71,9 @@ export function Rule({ level, live }: { level: number; live: boolean }) {
   );
 }
 
-/** Memoised: the level meter updates twice a second, the lines only when one arrives. */
-const LiveTranscript = memo(function LiveTranscript({ lines, call }: { lines: LiveLine[]; call: boolean }) {
+/** Memoised: the level meter updates twice a second, the lines only when one arrives.
+ * With `draft`, the same lines after Stop, until the final transcript replaces them. */
+export const LiveTranscript = memo(function LiveTranscript({ lines, call, draft }: { lines: LiveLine[]; call: boolean; draft?: boolean }) {
   const end = useRef<HTMLDivElement>(null);
   const box = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
@@ -87,11 +88,12 @@ const LiveTranscript = memo(function LiveTranscript({ lines, call }: { lines: Li
   };
 
   return (
-    <aside className="transcript-col" ref={box} onScroll={onScroll} aria-label="Live transcript" aria-live="polite">
+    <aside className={`transcript-col ${draft ? "draft-transcript" : ""}`} ref={box} onScroll={onScroll} aria-label={draft ? "Draft transcript" : "Live transcript"} aria-live={draft ? undefined : "polite"}>
       <div className="col-label">
-        Live transcript
+        {draft ? "Draft transcript" : "Live transcript"}
         {call && <span className="hint" title="Guessed from which side was louder. Real speaker names come after the meeting.">You / Them are approximate</span>}
       </div>
+      {draft && <p className="draft-note">Draft from the live transcript; the final transcript replaces it.</p>}
       {lines.length === 0 ? (
         <p className="transcript-empty">Listening… Lines appear here a few seconds after they're spoken.</p>
       ) : (

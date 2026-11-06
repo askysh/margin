@@ -373,6 +373,50 @@ The full comparison is in `docs/parity/app.md`.
 - Now `live_transcript.model` is the chosen model. For "Best" (large), which is too slow
   to keep up live, it is "base", and Margin downloads it too.
 
+## 0.0.3: the meeting is usable right after Stop
+
+### D42. The meeting opens when core writes the file, before speakers are separated
+- Context: an 80-minute call waited 39.6 minutes after Stop. Core writes the meeting file
+  when transcription ends and sets the job to `transcript-only` (jobs.rs:1710). Then it
+  separates speakers and rewrites the file once, at the end. Margin waited for Complete.
+- Options: (a) wait for Complete, as before; (b) an "Open transcript" button at
+  `transcript-only`, as upstream's app does; (c) go to the meeting by itself at that point.
+- Pick: **(c)**. The processing view becomes the meeting view when the job has an output
+  file and is at `transcript-only` or later. A status line says "Finishing: separating
+  speakers…". The view reads the file again at each job stage, in place, so the scroll
+  position and notes being typed stay. The sidebar shows the meeting once, as its job row,
+  until it is done.
+- Speaker rename, title, action items, Summarize and Move to Trash stay locked until the
+  job is done. The backend refuses them too (`processing::ensure_not_processing`), because
+  core's last rewrite fails if the file changed after it was written.
+
+### D43. Notes typed during processing go into the job's notes draft
+- Before: the meeting view locked the notes while processing, because a write to the file
+  made core's last rewrite fail.
+- Now: `save_notes` writes the job's notes draft (`drafts/<job>.md`) while a job can still
+  write the file, or while the draft is not in the file yet. `processing::finish` puts the
+  draft in the file when the job completes. A lock makes sure that an edit can never land in
+  a draft that was already moved. While the draft exists, the meeting view shows it, not
+  core's copy of the notes.
+- The Obsidian guard in `finish` now compares the file with the notes that were queued with
+  the job (`user_notes`), not with the draft. Before, an edit during processing would have
+  looked like an outside edit, and been dropped.
+- An empty draft is kept. It means that the notes were cleared.
+
+### D44. The live transcript is the draft after Stop
+- Stop saves the live lines, with their You / Them guesses, to `drafts/<job>.live.json`.
+  Stop reads the live transcript one more time first, so the last utterance is kept.
+- The processing view shows them at once as "Draft transcript", with the note "Draft from
+  the live transcript; the final transcript replaces it." The file survives a restart, and
+  `finish` removes it with the notes draft. A failed job keeps both until a retry succeeds.
+- The draft is for reading only. It is not the final transcript (see
+  docs/research/live-transcription.md, option 3).
+
+### D45. A debug-only hold for the e2e run
+- In debug builds, the worker waits at "separating speakers" while
+  `$MARGIN_HOME/e2e-hold-speakers` exists (two minutes at most). The e2e run uses it to look
+  at a meeting that is open while core still processes it. Release builds ignore the file.
+
 ## 0.0.4 (to renumber)
 
 ### A minutes-core fork with one patch
