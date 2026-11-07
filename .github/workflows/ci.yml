@@ -1,6 +1,6 @@
 # CI: type-check and build the UI on every push. The Rust side (minutes-core
 # with whisper.cpp) needs a macOS runner and a long build, so it runs only in
-# the release workflow and locally (see README, Testing).
+# the release workflow and locally (see docs/development.md, Testing).
 name: ci
 
 on:
