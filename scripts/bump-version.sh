@@ -5,10 +5,12 @@
 #
 # The files: package.json, src-tauri/tauri.conf.json, src-tauri/Cargo.toml, and Margin's
 # own entry in src-tauri/Cargo.lock (only that entry, as cargo itself would write it).
-# CHANGELOG.md gets a "## [X.Y.Z] - Unreleased" section on top, if it has none.
+# CHANGELOG.md gets a "## [X.Y.Z] - Unreleased" section on top, if it has none. The section
+# of the version before it, which is released now, gets today's date if it has none.
 #
 # A release branch starts with this script (docs/releasing.md). When the branch merges into
-# main, .github/workflows/release.yml tags the version and drafts the release.
+# main, .github/workflows/release.yml tags the version, drafts the release and starts the
+# next branch with this script. It runs on macOS and on Linux.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -25,8 +27,11 @@ if [[ -z "$current" ]]; then
   exit 1
 fi
 
-# One "version" line at the top level of each JSON file, two spaces in.
-sed -i '' -E "s/^  \"version\": \"[^\"]+\",$/  \"version\": \"$version\",/" package.json src-tauri/tauri.conf.json
+# One "version" line at the top level of each JSON file, two spaces in. sed -i is not the
+# same on macOS and Linux, so each edit writes a new file.
+for f in package.json src-tauri/tauri.conf.json; do
+  sed -E "s/^  \"version\": \"[^\"]+\",$/  \"version\": \"$version\",/" "$f" > "$f.new" && mv "$f.new" "$f"
+done
 # The [package] version is the first version line in Cargo.toml.
 awk -v v="$version" '!done && /^version = "/ { print "version = \"" v "\""; done = 1; next } { print }' \
   src-tauri/Cargo.toml > src-tauri/Cargo.toml.new && mv src-tauri/Cargo.toml.new src-tauri/Cargo.toml
@@ -40,6 +45,8 @@ done
 grep -A1 '^name = "margin"$' src-tauri/Cargo.lock | grep -q "\"$version\"" \
   || { echo "src-tauri/Cargo.lock does not have $version for margin now. Check it." >&2; exit 1; }
 
+today="$(date +%Y-%m-%d)"
+sed "s/^## \[$current\] - Unreleased$/## [$current] - $today/" CHANGELOG.md > CHANGELOG.md.new && mv CHANGELOG.md.new CHANGELOG.md
 if ! grep -q "^## \[$version\]" CHANGELOG.md; then
   awk -v v="$version" '!done && /^## \[/ { print "## [" v "] - Unreleased\n"; done = 1 } { print }' \
     CHANGELOG.md > CHANGELOG.md.new && mv CHANGELOG.md.new CHANGELOG.md
