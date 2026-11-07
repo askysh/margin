@@ -52,7 +52,7 @@ jobs:
       build: ${{ steps.plan.outputs.build }}
       ref: ${{ steps.plan.outputs.ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Decide what to build
         id: plan
@@ -113,7 +113,7 @@ jobs:
     env:
       VERSION: ${{ needs.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.plan.outputs.ref }}
 
@@ -141,7 +141,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           brew list cmake >/dev/null 2>&1 || brew install cmake
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
