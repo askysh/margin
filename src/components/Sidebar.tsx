@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { api, type Job, type MeetingSummary } from "../api";
 import type { Selection } from "../App";
 import { clock, groupLabel, meetingFileReady, shortTime } from "../util";
+import { Logo } from "./Logo";
 
 interface Props {
   meetings: MeetingSummary[];
@@ -60,7 +61,9 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
 
   return (
     <aside className="sidebar">
-      <div className="sidebar-top" data-tauri-drag-region />
+      <div className="sidebar-top" data-tauri-drag-region>
+        <span className="sidebar-brand"><Logo size={22} /></span>
+      </div>
       <label className="search">
         <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden><circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.6" fill="none" /><path d="M11 11l3.5 3.5" stroke="currentColor" strokeWidth="1.6" /></svg>
         <input

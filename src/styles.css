@@ -472,3 +472,22 @@ textarea.field { max-width: none; resize: vertical; min-height: 64px; line-heigh
 .writing-summary { display: flex; align-items: center; gap: 8px; margin: 0 0 22px; }
 .finishing { display: flex; align-items: baseline; gap: 8px; margin: 14px 0 18px; }
 .finishing .spinner { position: relative; top: 1px; margin-right: 0; }
+
+/* ---------------------------------------------------------------- Brand */
+/* The mark (src/components/Logo.tsx) takes --rule and --ink, so it follows the theme. */
+
+/* Sidebar: a small mark at the right of the title-bar strip, level with the traffic lights.
+   It lets drags through, so the strip still moves the window. */
+.sidebar-top { display: flex; justify-content: flex-end; align-items: flex-start; padding: 17px 16px 0 0; }
+.sidebar-brand { pointer-events: none; opacity: 0.9; }
+
+/* The mark sits in a square with room above and below the line; the negative margins
+   take that room back so the spacing matches the text around it. */
+
+/* Home: the mark above the greeting. */
+.home-logo { margin: -6px 0 10px -6px; }
+
+/* Onboarding: the card's own margin rule stands in for the mark's rule, so the line
+   crosses the page's rule. 0.3506 is where the rule sits across the mark's width. */
+.ob-logo { margin: -22px 0 0 calc(0.75px - 40px - 88px * 0.3506); }
+.ob-logo .logo-rule { display: none; }
