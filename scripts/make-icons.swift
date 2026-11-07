@@ -73,7 +73,7 @@ func squircle(_ r: CGRect, _ radius: CGFloat) -> CGPath {
 
 /// How much detail the mark keeps. Each size gets the most it can show cleanly.
 enum Level {
-    case full    // 128 px and up: two and a half waves, three loops, the ruling
+    case full    // 128 px and up: a rising three-crest waveform, three loops, the ruling
     case small   // 64 px: one and a half waves, two loops
     case tiny    // 32 px and the menu bar: one wave, one loop, heavy lines
     case micro   // 16 px: one wave and a straight line
@@ -91,7 +91,7 @@ struct Mark {
     var baseline: CGFloat { 560 }
     /// 16 px moves the rule right so the wave gets room enough to show.
     var ruleX: CGFloat { level == .micro ? 470 : 392 }
-    var stroke: CGFloat { [.full: 32, .small: 58, .tiny: 70, .micro: 84][level]! }
+    var stroke: CGFloat { [.full: 26, .small: 58, .tiny: 70, .micro: 84][level]! }
     var ruleWidth: CGFloat { [.full: 26, .small: 44, .tiny: 50, .micro: 64][level]! }
     var showsRuling: Bool { level == .full }
 
@@ -124,9 +124,8 @@ struct Mark {
             ]
         default: break
         }
-        let q = level == .full
-            ? Params(x0: 160, periods: 2.5, amp: 165, loops: 3, r: 20, d: 50, k: 92, decay: 0.55, stroke: 32, ruleWidth: 26)
-            : Params(x0: 175, periods: 1.5, amp: 150, loops: 2, r: 27, d: 50, k: 100, decay: 0.55, stroke: 58, ruleWidth: 44)
+        if level == .full { return fullLine() }
+        let q = Params(x0: 175, periods: 1.5, amp: 150, loops: 2, r: 27, d: 50, k: 100, decay: 0.55, stroke: 58, ruleWidth: 44)
         var segs: [Seg] = []
         // Sound: a sine under a swelling envelope, from the page edge to the rule.
         for i in 0...300 {
@@ -144,6 +143,41 @@ struct Mark {
             segs.append(.to(e))
         }
         segs.append(.curve(pt(e.x + 40, base + 2), pt(e.x + 70, base - 12), pt(e.x + 100, base - 24)))
+        return segs
+    }
+
+    /// The full mark as one pen movement: a trochoid whose phase t runs from -π/2 to 11π.
+    /// Up to 4π it is a waveform, a sine centred on the baseline with crests at 0, 2π and 4π
+    /// rising like a spoken word toward the rule. Over 4π…5π it blends into cursive loops that
+    /// stand on the baseline (tops at 6π, 8π, 10π) and shrink as they go, so the last crest
+    /// comes down past the rule, turns on the baseline and goes straight up into the first loop.
+    func fullLine() -> [Seg] {
+        let base = baseline, pi = CGFloat.pi
+        func smooth(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
+            let u = min(max((t - a) / (b - a), 0), 1); return u * u * (3 - 2 * u)
+        }
+        let t0 = -pi / 2, handoff = 5 * pi, t1 = 11 * pi, n = 1400
+        let dt = (t1 - t0) / CGFloat(n)
+        var pts: [CGPoint] = [], x: CGFloat = 0
+        for i in 0...n {
+            let t = t0 + CGFloat(i) * dt
+            let pen = smooth(4 * pi, handoff, t)               // 0 = sound, 1 = pen
+            // Units a radian: 84 a wave, 126 a loop, and a burst at the hand-off so the turn
+            // on the baseline is a round pen turn, not a corner.
+            let turn = 30 * exp(-pow((t - handoff) / 0.55, 2))
+            if i > 0 { x += (13.4 + 6.6 * pen + turn) * dt }
+            let shrink = 1 - 0.55 * max(0, (t - handoff) / (t1 - handoff))
+            let amp = 70 + 105 * max(0, t) / (4 * pi)          // crests 70, 122, 175
+            let loop = 92 * shrink
+            let sweep = smooth(4.6 * pi, 6 * pi, t)            // the loops' back-stroke, eased in
+            pts.append(CGPoint(x: x - 50 * shrink * sweep * sin(t),
+                               y: base - (amp * cos(t) * (1 - pen) + loop * (1 + cos(t)) * pen)))
+        }
+        // Put the hand-off, where the line first sits on the baseline, just past the rule.
+        let dx = ruleX + 28 - pts[Int(((handoff - t0) / dt).rounded())].x
+        var segs: [Seg] = pts.map { .to(CGPoint(x: $0.x + dx, y: $0.y)) }
+        let e = CGPoint(x: pts[n].x + dx, y: pts[n].y)
+        segs.append(.curve(CGPoint(x: e.x + 28, y: base + 2), CGPoint(x: e.x + 50, y: base - 9), CGPoint(x: e.x + 72, y: base - 20)))
         return segs
     }
 
@@ -200,8 +234,10 @@ func strokeLine(_ c: CGContext, _ m: Mark, _ color: CGColor, widen: CGFloat = 0)
 func drawIcon(_ c: CGContext, _ pal: Palette, level: Level) {
     let m = Mark(level: level)
     let shape = squircle(body, bodyRadius)
+    // Shadows ignore the transform: their offset and blur are in device pixels, y up.
+    let px = abs(c.ctm.a)
     c.saveGState()
-    c.setShadow(offset: CGSize(width: 0, height: 12), blur: 28, color: rgb(0x000000, 0.3))
+    c.setShadow(offset: CGSize(width: 0, height: -12 * px), blur: 28 * px, color: rgb(0x000000, 0.3))
     c.addPath(shape); c.setFillColor(pal.paperBottom); c.fillPath()
     c.restoreGState()
 
@@ -214,7 +250,8 @@ func drawIcon(_ c: CGContext, _ pal: Palette, level: Level) {
         for i in 0..<7 { c.fill(CGRect(x: 100, y: 257.5 + CGFloat(i) * 100, width: 824, height: 5)) }
     }
     fillCapsule(c, CGRect(x: m.ruleX - m.ruleWidth / 2, y: 60, width: m.ruleWidth, height: 1000), pal.rule)
-    c.setShadow(offset: CGSize(width: 0, height: 6), blur: 10, color: rgb(0x000000, 0.18))
+    // Ink: a hairline contact shadow only, 1.5 px at 1024.
+    c.setShadow(offset: CGSize(width: 0, height: -1.5 * px), blur: 1.5 * px, color: rgb(0x000000, 0.10))
     strokeLine(c, m, pal.ink)
     c.restoreGState()
 
