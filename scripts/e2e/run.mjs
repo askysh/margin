@@ -3,8 +3,15 @@
 // real settings, meetings or voices, and no macOS permission prompt can appear.
 //
 //   bun run build && (cd src-tauri && cargo build)
-//   node scripts/e2e/run.mjs --audio meeting.wav [--seed-models DIR] [--summaries claude|ollama|none] [--download]
+//   scripts/e2e/make-fixtures.sh /tmp/margin-fixtures
+//   node scripts/e2e/run.mjs --audio /tmp/margin-fixtures/meeting.wav \
+//     --seed-models /tmp/margin-fixtures/models --summaries fake-ollama \
+//     --simulate /tmp/margin-fixtures/call.wav [--dark] [--download]
 //
+// make-fixtures.sh makes the audio this pass expects with the macOS voices: meeting.wav
+// (two voices, says "legal review" for the search check) and call.wav with its stems and
+// live transcript (long enough that the test, not the file, stops the call). It also links
+// the small models from your Margin install into models/.
 // --seed-models copies model files into the sandbox (skips a ~520 MB download).
 // --summaries fake-ollama runs a stand-in Ollama (scripts/e2e/fake-ollama.py) so the whole
 // summary flow is tested without a real model. "claude" needs your real HOME, so it is not
@@ -113,6 +120,22 @@ const bridgeEvents = async () => (await (await fetch(`http://127.0.0.1:${port.br
 await page.goto(`http://localhost:${port.ui}`);
 const ui = (sel) => page.locator(sel);
 const button = (name) => page.getByRole("button", { name, exact: false });
+// Settings is a page with a section nav, not a dialog.
+const settingsPage = () => page.getByRole("region", { name: "Settings" });
+const settingsNav = () => page.getByRole("navigation", { name: "Settings sections" });
+const goSection = async (label) => {
+  await settingsNav().getByRole("button", { name: label, exact: true }).click();
+  await settingsPage().getByRole("heading", { level: 1, name: label === "About" ? "Margin" : label, exact: true }).waitFor();
+};
+const openSettings = async (section = "General") => {
+  if (!(await settingsPage().isVisible())) await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await settingsPage().waitFor();
+  await goSection(section);
+};
+const closeSettings = async () => {
+  await page.getByRole("button", { name: "Back", exact: true }).click();
+  await settingsPage().waitFor({ state: "detached" });
+};
 
 // ---------------------------------------------------------------- onboarding
 await check("onboarding shows on first run", async () => {
@@ -423,10 +446,10 @@ await check("rename a speaker everywhere and remember the voice", async () => {
   assert(md.includes("- decided: ship Fast by default"), "rename lost notes");
 });
 await check("the saved voice shows in Settings", async () => {
-  await page.getByRole("button", { name: "Settings" }).click();
-  await page.getByText("Voices Margin recognises").waitFor();
-  await page.locator(".voices li", { hasText: "Priya" }).waitFor();
-  await button("Done").click();
+  await openSettings("Voices");
+  await page.getByRole("list", { name: "Voices Margin recognises" }).getByText("Priya", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Forget Priya" }).waitFor();
+  await closeSettings();
 });
 await check("a second meeting with the same voice is labelled automatically", async () => {
   dev("queue", audio, "QA follow-up");
@@ -551,11 +574,11 @@ if (summaries !== "none") {
       const cfgPath = path.join(marginHome, "config.toml");
       fs.writeFileSync(cfgPath, fs.readFileSync(cfgPath, "utf8").replace(/^ollama_url = .*$/m, `ollama_url = "http://127.0.0.1:${port.ollama}"`));
     }
-    await page.getByRole("button", { name: "Settings" }).click();
+    await openSettings("Summaries");
     const label = /Ollama, on this Mac/;
     await page.getByRole("radio", { name: label }).click();
     await page.waitForTimeout(500);
-    await button("Done").click();
+    await closeSettings();
     await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
     await button("Summarize").click();
     await page.locator(".toast").filter({ hasText: /Summary added|Summary failed|returned nothing/ }).waitFor({ timeout: 300000 });
@@ -609,36 +632,111 @@ if (summaries !== "none") {
 const cfgText = () => fs.readFileSync(path.join(marginHome, "config.toml"), "utf8");
 const inSection = (section, line) => new RegExp(`^\\[${section}\\]\\n(?:[^\\[].*\\n)*?${line}$`, "m").test(cfgText());
 const loginPlist = path.join(home, "Library/LaunchAgents/com.akashmishra.margin.login.plist");
-const openSettings = async () => {
-  await page.getByRole("button", { name: "Settings" }).click();
-  await page.getByRole("dialog", { name: "Settings" }).waitFor();
-};
 const settled = () => page.waitForTimeout(700); // saves are queued; let the last one land
 const toggle = (name) => page.getByRole("switch", { name });
-// The sheet scrolls, so take one screenshot per screenful.
-const shootSheet = async (name) => {
-  const body = page.locator(".sheet-body");
-  const [h, vh] = await body.evaluate((el) => [el.scrollHeight, el.clientHeight]);
-  for (let y = 0, i = 1; y < h; y += vh - 40, i++) {
-    await body.evaluate((el, top) => el.scrollTo(0, top), y);
-    await page.screenshot({ path: path.join(out, `${name}-${i}.png`) });
+const SECTIONS = ["General", "Recording", "Transcription", "Summaries", "Voices", "Permissions", "Integrations", "Updates", "About", "Start over"];
+// One screenshot per section, plus one scrolled to the end when the section is taller than the window.
+const shootSections = async (name) => {
+  for (const label of SECTIONS) {
+    await goSection(label);
+    const slug = label.toLowerCase().replace(/ /g, "-");
+    await page.screenshot({ path: path.join(out, `${name}-${slug}.png`), animations: "disabled" });
+    const [h, vh] = await settingsPage().evaluate((el) => [el.scrollHeight, el.clientHeight]);
+    if (h > vh + 4) {
+      await settingsPage().evaluate((el) => el.scrollTo(0, el.scrollHeight));
+      await page.screenshot({ path: path.join(out, `${name}-${slug}-end.png`), animations: "disabled" });
+    }
   }
-  await body.evaluate((el) => el.scrollTo(0, 0));
 };
+const current = async () => (await settingsNav().locator('[aria-current="page"]').textContent()).trim();
+const focusedText = () => page.evaluate(() => document.activeElement?.textContent?.trim());
+let openTitle = "";
 
+await check("settings: a page with a section nav, opened with ⌘,", async () => {
+  await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
+  await page.getByLabel("Meeting title").waitFor();
+  openTitle = await page.getByLabel("Meeting title").inputValue();
+  await page.keyboard.press("Meta+Comma");
+  await settingsPage().waitFor();
+  // It reopens the section used last (Summaries, if the summary checks ran), as System Settings does.
+  assert((await current()) === (summaries === "none" ? "General" : "Summaries"), `current section: ${await current()}`);
+  assert(!(await page.getByRole("navigation", { name: "Meetings" }).isVisible()), "meeting list still showing next to Settings");
+  assert((await page.getByRole("button", { name: "Settings", exact: true }).getAttribute("aria-pressed")) === "true", "gear not shown as pressed");
+  await goSection("Recording");
+  assert((await current()) === "Recording", "nav did not follow the section");
+  assert((await settingsNav().locator('[aria-current="page"]').count()) === 1, "more than one current section");
+});
+await check("settings: arrow keys move through the sections, Return opens one", async () => {
+  await settingsNav().getByRole("button", { name: "Recording", exact: true }).focus();
+  await page.keyboard.press("ArrowDown");
+  assert((await focusedText()) === "Transcription", `ArrowDown moved focus to ${await focusedText()}`);
+  assert((await current()) === "Recording", "ArrowDown opened a section");
+  await page.keyboard.press("Enter");
+  await settingsPage().getByRole("heading", { level: 1, name: "Transcription" }).waitFor();
+  await page.keyboard.press("End");
+  assert((await focusedText()) === "Start over", `End moved focus to ${await focusedText()}`);
+});
+await check("settings: Back returns to the meeting you had open", async () => {
+  await closeSettings();
+  assert((await page.getByLabel("Meeting title").inputValue()) === openTitle, "the meeting is not open after Back");
+  assert(await page.locator(".row.selected").filter({ hasText: openTitle }).isVisible(), "sidebar selection lost");
+  // ⌘, again opens the section you were on.
+  await page.keyboard.press("Meta+Comma");
+  await settingsPage().getByRole("heading", { level: 1, name: "Transcription" }).waitFor();
+  await closeSettings();
+});
+await check("settings: Esc leaves, and a name typed just before is saved", async () => {
+  await openSettings("General");
+  await page.getByLabel("Name in transcripts").fill("Akash Escape");
+  await page.keyboard.press("Escape");
+  await settingsPage().waitFor({ state: "detached" });
+  await settled();
+  assert(fs.readFileSync(path.join(marginHome, "config.toml"), "utf8").includes('name = "Akash Escape"'), "name typed before Esc not saved");
+  await openSettings("General");
+  await page.getByLabel("Name in transcripts").fill("Akash QA");
+  await page.keyboard.press("Enter");
+  await settled();
+  assert(fs.readFileSync(path.join(marginHome, "config.toml"), "utf8").includes('name = "Akash QA"'), "Return did not save the name");
+  assert(await settingsPage().isVisible(), "Return left Settings");
+  await closeSettings();
+});
+await check("a permission error links to Settings → Permissions", async () => {
+  await page.evaluate(() => window.__E2E__.emit("error-toast", "Margin can't use the microphone. Allow it in System Settings → Privacy & Security → Microphone, then try again."));
+  await page.locator(".toast").getByRole("button", { name: "Open Permissions" }).click();
+  await settingsPage().getByRole("heading", { level: 1, name: "Permissions" }).waitFor();
+  assert((await current()) === "Permissions", "nav not on Permissions");
+  await settingsPage().getByText("Microphone", { exact: true }).waitFor();
+  await settingsPage().getByText("System audio", { exact: true }).waitFor();
+  await closeSettings();
+});
+await check("the menu bar's open-settings event opens Settings", async () => {
+  await page.evaluate(() => window.__E2E__.emit("open-settings", null));
+  await settingsPage().waitFor();
+  assert((await current()) === "Permissions", `opened on ${await current()}, not the last section`);
+  await closeSettings();
+});
+await check("settings: About shows the app and minutes-core versions", async () => {
+  await openSettings("About");
+  const text = await settingsPage().innerText();
+  assert(/Version\s+\d+\.\d+\.\d+/.test(text), `no app version: ${text}`);
+  assert(/minutes-core[\s\S]*\bv?\d+\.\d+\.\d+/.test(text), `no minutes-core version: ${text.replace(/\n/g, " | ")}`);
+  await closeSettings();
+});
 await check("settings: new choices start at calm defaults", async () => {
-  await openSettings();
-  await page.getByRole("heading", { name: "Recording", exact: true }).waitFor();
   const value = (label) => page.getByLabel(label, { exact: true }).inputValue();
-  assert((await value("Microphone")) === "", "microphone is not the system default");
+  await openSettings("General");
   assert((await value("Keep audio")) === "0", "audio is not kept forever");
-  assert((await value("Language spoken in meetings")) === "auto", "language is not auto-detect");
-  assert((await value("Stop after silence")) === "30", "silence limit is not 30 minutes");
-  assert(await toggle(/Tell speakers apart/).isChecked(), "speaker separation off");
-  assert(await toggle(/Suggest recording when a call starts/).isChecked(), "call suggestions off");
   assert(!(await toggle(/Open Margin when you log in/).isChecked()), "open at login on");
+  await goSection("Recording");
+  assert((await value("Microphone")) === "", "microphone is not the system default");
+  assert((await value("Stop after silence")) === "30", "silence limit is not 30 minutes");
+  assert(await toggle(/Suggest recording when a call starts/).isChecked(), "call suggestions off");
+  await goSection("Transcription");
+  assert((await value("Language spoken in meetings")) === "auto", "language is not auto-detect");
+  assert(await toggle(/Tell speakers apart/).isChecked(), "speaker separation off");
   assert(await toggle(/Transcribe during the meeting/).isChecked(), "rolling transcription off for Balanced");
-  await shootSheet("settings-sheet");
+  await shootSections("settings");
+  await goSection("Transcription");
 });
 await check("settings: transcribing during the meeting can be turned off", async () => {
   const prefsFile = path.join(marginHome, "prefs.json");
@@ -646,8 +744,8 @@ await check("settings: transcribing during the meeting can be turned off", async
   await toggle(/Transcribe during the meeting/).uncheck();
   await settled();
   assert(rollingOff(), "switch off not saved");
-  await button("Done").click();
-  await openSettings();
+  await closeSettings();
+  await openSettings("Transcription");
   assert(!(await toggle(/Transcribe during the meeting/).isChecked()), "switch off not kept");
   await toggle(/Transcribe during the meeting/).check();
   await settled();
@@ -655,6 +753,7 @@ await check("settings: transcribing during the meeting can be turned off", async
 });
 await check("settings: language, microphone and silence limit are saved for core", async () => {
   await page.getByLabel("Language spoken in meetings").selectOption("en");
+  await goSection("Recording");
   const mic = (await page.getByLabel("Microphone", { exact: true }).locator("option").allInnerTexts()).find((m) => m !== "System default");
   if (mic) await page.getByLabel("Microphone", { exact: true }).selectOption({ label: mic });
   await page.getByLabel("Stop after silence").selectOption("15");
@@ -662,9 +761,10 @@ await check("settings: language, microphone and silence limit are saved for core
   assert(inSection("transcription", 'language = "en"'), "transcription.language not written");
   assert(inSection("recording", "silence_auto_stop_secs = 900"), "silence limit not written");
   if (mic) assert(inSection("recording", `device = "${mic}"`), "microphone not written");
-  await button("Done").click();
-  await openSettings();
+  await closeSettings();
+  await openSettings("Transcription");
   assert((await page.getByLabel("Language spoken in meetings").inputValue()) === "en", "language not kept");
+  await goSection("Recording");
   assert((await page.getByLabel("Stop after silence").inputValue()) === "15", "silence limit not kept");
   // Back to the default so nothing below depends on this Mac's hardware.
   await page.getByLabel("Microphone", { exact: true }).selectOption("");
@@ -672,6 +772,7 @@ await check("settings: language, microphone and silence limit are saved for core
   assert(!/^device = /m.test(cfgText()), "system default not restored");
 });
 await check("settings: names to spell right go to core's vocabulary", async () => {
+  await goSection("Transcription");
   const box = page.getByLabel("Names and words to spell right");
   await box.fill("Priya Raman\nKubernetes\npriya raman");
   await box.blur();
@@ -682,6 +783,7 @@ await check("settings: names to spell right go to core's vocabulary", async () =
   assert(voc.includes('source = "manual"'), "terms not marked as yours");
 });
 await check("settings: open at login adds and removes a login item", async () => {
+  await goSection("General");
   const sw = toggle(/Open Margin when you log in/);
   await sw.check();
   await settled();
@@ -701,32 +803,33 @@ await check("settings: call suggestions follow the switch", async () => {
   fs.mkdirSync(path.dirname(zoom), { recursive: true });
   fs.rmSync(zoom, { force: true });
   fs.symlinkSync("/bin/sleep", zoom);
+  await goSection("Recording");
   await toggle(/Suggest recording when a call starts/).uncheck();
   await settled();
   assert(inSection("call_detection", "enabled = false"), "call_detection.enabled not false");
-  await button("Done").click();
+  await closeSettings();
   const fake = spawn(zoom, ["300"], { stdio: "ignore" });
   procs.push(fake);
   await page.waitForTimeout(17000); // the detector polls every 15 s
   assert((await page.locator(".call-banner").count()) === 0, "banner shown while switched off");
-  await openSettings();
+  await openSettings("Recording");
   await toggle(/Suggest recording when a call starts/).check();
   await settled();
-  await button("Done").click();
+  await closeSettings();
   await page.locator(".call-banner", { hasText: "Zoom looks active" }).waitFor({ timeout: 20000 });
   fake.kill();
   await page.locator(".call-banner").getByRole("button", { name: "Dismiss" }).click();
 });
 if (summaries === "fake-ollama") {
   await check("settings: summary language and instructions reach the summarizer", async () => {
-    await openSettings();
+    await openSettings("Summaries");
     await page.getByLabel("Summary language").selectOption("French");
     const box = page.getByLabel("Instructions for summaries");
     await box.fill("Start with decisions. Keep each point short.");
     await box.blur();
     await settled();
     assert(inSection("summarization", 'language = "French"'), "summary language not written");
-    await button("Done").click();
+    await closeSettings();
     const log = path.join(out, "ollama-requests.log");
     const seen = fs.readFileSync(log, "utf8").split("\n").filter(Boolean).length;
     await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
@@ -742,11 +845,11 @@ if (summaries === "fake-ollama") {
   });
 }
 await check("settings: with speaker separation off, a meeting has no speaker labels", async () => {
-  await openSettings();
+  await openSettings("Transcription");
   await toggle(/Tell speakers apart/).uncheck();
   await settled();
   assert(inSection("diarization", 'engine = "none"'), "diarization.engine not none");
-  await button("Done").click();
+  await closeSettings();
   dev("queue", audio, "QA no speakers");
   await page.locator(".row").filter({ hasText: "QA no speakers" }).first().waitFor({ timeout: 120000 });
   await page.locator(".row-job").waitFor({ state: "detached", timeout: 120000 });
@@ -754,11 +857,11 @@ await check("settings: with speaker separation off, a meeting has no speaker lab
   fs.writeFileSync(path.join(out, "no-speakers.md"), md);
   assert(md.includes("## Transcript"), "no transcript");
   assert(!/^\[(SPEAKER_\d+|Priya) \d+:\d\d\]/m.test(md), "transcript still has speaker labels");
-  await openSettings();
+  await openSettings("Transcription");
   await toggle(/Tell speakers apart/).check();
   await settled();
   assert(inSection("diarization", 'engine = "auto"'), "diarization not back on");
-  await button("Done").click();
+  await closeSettings();
 });
 await check("settings: keep audio for 7 days deletes only older audio", async () => {
   const recent = meetingFiles().find((x) => x.includes("qa-launch-sync"));
@@ -768,7 +871,7 @@ await check("settings: keep audio for 7 days deletes only older audio", async ()
   const longAgo = new Date(Date.now() - 40 * 86400e3).toISOString();
   fs.writeFileSync(oldMd, fs.readFileSync(path.join(meetingsDir, recent), "utf8").replace(/^date: .*$/m, `date: ${longAgo}`).replace(/^title: .*$/m, "title: QA old meeting"));
   fs.copyFileSync(recentWav, oldWav);
-  await openSettings();
+  await openSettings("General");
   await page.getByLabel("Keep audio").selectOption("7");
   await settled();
   assert(inSection("retention", "auto_cleanup = true") && inSection("retention", "successful_audio_days = 7"), "retention not written");
@@ -778,7 +881,7 @@ await check("settings: keep audio for 7 days deletes only older audio", async ()
   await page.getByLabel("Keep audio").selectOption("0");
   await settled();
   assert(inSection("retention", "auto_cleanup = false"), "forever not restored");
-  await button("Done").click();
+  await closeSettings();
 });
 
 // ---------------------------------------------------------------- ask (stand-in claude)
@@ -895,32 +998,58 @@ await check("ask: Clear removes a conversation", async () => {
 // ---------------------------------------------------------------- settings: model switch
 if (flag("--download")) {
   await check("switching to Fast downloads it with progress", async () => {
-    await page.getByRole("button", { name: "Settings" }).click();
+    await openSettings("Transcription");
     await page.getByRole("radio", { name: /Fast/ }).click();
     await page.getByText(/Downloading speech models/).waitFor({ timeout: 15000 });
     await page.screenshot({ path: path.join(out, "download-progress.png") });
     await page.getByText("Speech models ready").waitFor({ timeout: 600000 });
     assert(fs.existsSync(path.join(marginHome, "state/models/ggml-base.bin")), "base model missing");
-    await button("Done").click();
+    await closeSettings();
   });
 }
 
 // ---------------------------------------------------------------- sounds and shortcut prefs
 await check("settings: sounds and the global shortcut are saved", async () => {
-  await page.getByRole("button", { name: "Settings" }).click();
+  await openSettings("Recording");
   await page.getByLabel(/Play a sound/).uncheck();
   await page.getByLabel(/from any app/).check();
   await page.waitForTimeout(400);
   const prefs = JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8"));
   assert(prefs.mute_cues === true && prefs.record_shortcut === true, JSON.stringify(prefs));
-  await button("Done").click();
-  await page.getByRole("button", { name: "Settings" }).click();
+  await closeSettings();
+  await openSettings("Recording");
   assert(!(await page.getByLabel(/Play a sound/).isChecked()) && (await page.getByLabel(/from any app/).isChecked()), "prefs not shown after reopening");
   await page.getByLabel(/Play a sound/).check();
   await page.getByLabel(/from any app/).uncheck();
   await page.waitForTimeout(400);
-  await button("Done").click();
+  await closeSettings();
 });
+await check("settings: automatic updates switch is saved", async () => {
+  await openSettings("Updates");
+  const sw = toggle(/Update automatically/);
+  const was = await sw.isChecked();
+  await sw.setChecked(!was);
+  await page.waitForTimeout(400);
+  const prefs = () => JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8"));
+  assert(prefs().no_auto_update === was, `switch not saved: ${JSON.stringify(prefs())}`);
+  await sw.setChecked(was);
+  await page.waitForTimeout(400);
+  await settingsPage().getByRole("button", { name: "Check now" }).waitFor();
+  await closeSettings();
+});
+if (simulate) {
+  await check("a recording started from Settings takes over the window", async () => {
+    await openSettings("Recording");
+    await page.keyboard.press("Meta+Shift+I");
+    await page.locator(".page-live").waitFor({ timeout: 10000 });
+    await settingsPage().waitFor({ state: "detached" });
+    await page.getByLabel("Meeting title").fill("QA from settings");
+    await page.waitForTimeout(3000);
+    await page.getByRole("button", { name: "Stop" }).click();
+    await page.locator(".row-job").first().waitFor({ state: "detached", timeout: 180000 });
+    await page.locator(".row").filter({ hasText: "QA from settings" }).first().waitFor({ timeout: 20000 });
+  });
+}
 
 // ---------------------------------------------------------------- reset
 await check("a long meeting's transcript and notes scroll", async () => {
@@ -945,7 +1074,13 @@ await check("a long meeting's transcript and notes scroll", async () => {
 
 await check("reset keeps meetings and models, then runs setup again", async () => {
   const before = meetingFiles().length;
-  await page.getByRole("button", { name: "Settings" }).click();
+  await openSettings("Start over");
+  await button("Reset Margin…").click();
+  // Esc closes the dialog and keeps Settings open; focus goes back to the button.
+  await page.keyboard.press("Escape");
+  await page.getByRole("alertdialog").waitFor({ state: "detached" });
+  assert(await settingsPage().isVisible(), "Esc in the Reset dialog left Settings");
+  assert((await focusedText()) === "Reset Margin…", `focus on ${await focusedText()}, not Reset Margin…`);
   await button("Reset Margin…").click();
   await page.getByText("Reset Margin?").waitFor();
   await page.getByText(/Keep my meetings \(\d+ in/).waitFor();
@@ -970,7 +1105,7 @@ await check("after re-onboarding the kept meetings are back", async () => {
   await page.locator(".row").filter({ hasText: "QA launch sync" }).first().waitFor({ timeout: 10000 });
 });
 await check("deleting meetings requires typing delete", async () => {
-  await page.getByRole("button", { name: "Settings" }).click();
+  await openSettings("Start over");
   await button("Reset Margin…").click();
   await page.getByText("Keep my meetings").click();
   const go = page.getByRole("alertdialog").getByRole("button", { name: "Reset Margin" });
@@ -978,7 +1113,7 @@ await check("deleting meetings requires typing delete", async () => {
   await page.getByPlaceholder("delete").fill("delete");
   assert(!(await go.isDisabled()), "reset still disabled after typing delete");
   await page.getByRole("alertdialog").getByRole("button", { name: "Cancel" }).click();
-  await button("Done").click();
+  await closeSettings();
 });
 
 await check("no UI errors or failed commands", async () => {

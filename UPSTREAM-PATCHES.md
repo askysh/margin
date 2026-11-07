@@ -1,8 +1,7 @@
 # Upstream patches (candidates for PRs to silverstein/minutes)
 
-Each entry: what, why, where. Nothing here has been applied to upstream. We work around
-each one locally, except #11, which Margin carries in a fork (DECISIONS.md, "A minutes-core
-fork with one patch").
+Each entry: what, why, where. Upstream merged #11 (transcript checkpoints). Nothing else
+here has been applied to upstream, and we work around each of the others locally.
 
 ## 1. `voice::db_path()` should honour `MINUTES_DATA_DIR`
 - **Where:** `crates/core/src/voice.rs` `db_path()` (v0.32.1 ~line 135). It hardcodes
@@ -107,6 +106,9 @@ fork with one patch").
 - **Workaround:** none. Margin has no pause.
 
 ## 11. Let a meeting job start from transcript checkpoints (rolling transcription)
+- **Merged upstream** as https://github.com/silverstein/minutes/pull/1316 (merge commit
+  `209265f`, 2026-11-06). Margin pins that commit on upstream main until a tag has it
+  (DECISIONS.md, "Back on upstream minutes-core").
 - **Where:** `crates/core/src/jobs.rs` (`ProcessingJob`, `queue_live_capture_with_recording_health`)
   and `crates/core/src/pipeline.rs` `transcribe_independent_stems` (v0.32.1 ~line 2509).
 - **Why:** the job always transcribes the whole WAV after Stop. For a long call that is
@@ -124,16 +126,16 @@ fork with one patch").
     so the result equals the batch pass.
 - **Evidence:** docs/research/live-transcription.md, option 2. With 120 s pieces, 12 s of
   transcription is left at Stop for a 60-minute call, at the same WER.
-- **Status:** sent upstream as https://github.com/silverstein/minutes/pull/1316. The patch
-  as built differs from the sketch above:
+- **Status:** merged upstream as https://github.com/silverstein/minutes/pull/1316. The
+  patch as built differs from the sketch above:
   - Core makes the spans itself (`transcript_checkpoint::transcribe_span`), so a host
     cannot drift from the final pass's chunking or settings.
   - Each span has a source, a sample range, a SHA-256 of its samples and a settings
     fingerprint. The final pass reuses only spans that match the final file and settings,
     and transcribes every other range, so a failed piece in the middle is fine.
   - `jobs::queue_live_capture_with_transcript_checkpoint` saves them beside the job.
-- **Workaround:** Margin uses the same patch from `askysh/minutes` (branch
-  `margin/v0.32.1-rolling`), pinned by commit, until upstream ships it.
+- **Workaround:** none now. Until 0.0.4, Margin used the same patch from the
+  `askysh/minutes` fork.
 
 ## 12. Whisper meeting chunks: reuse the state, flash attention, fewer calls
 - **Where:** `crates/core/src/transcribe.rs` `transcribe_whisper_chunk_ranges` (~line 893),

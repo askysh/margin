@@ -30,8 +30,8 @@ Support/Margin/state/logs/margin.log` has the details.
 ## 2026-11-06
 
 ### M0: Phase 1 research (done)
-- RESEARCH.md, DECISIONS.md and UPSTREAM-PATCHES.md written. The detailed surveys are in
-  `docs/research/`.
+- RESEARCH.md (now [docs/research.md](research.md)), DECISIONS.md and UPSTREAM-PATCHES.md
+  written. The detailed surveys are in `docs/research/`.
 
 ### M1: Rust backend on minutes-core v0.32.1, verified headless (done)
 - The Tauri v2 crate in `src-tauri/` builds against `minutes-core` as a git dependency.

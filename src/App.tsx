@@ -9,10 +9,12 @@ import { AskPanel, type AskScope } from "./components/AskPanel";
 import { UpdateBanner } from "./components/Updates";
 import { clock, meetingFileReady } from "./util";
 import { useCues } from "./cues";
+import type { SectionId } from "./components/SettingsNav";
 
 // Rarely shown, so loaded on first use instead of at startup (docs/perf.md).
 const Onboarding = lazy(() => import("./components/Onboarding").then((m) => ({ default: m.Onboarding })));
-const SettingsSheet = lazy(() => import("./components/Settings").then((m) => ({ default: m.SettingsSheet })));
+const SettingsPage = lazy(() => import("./components/Settings").then((m) => ({ default: m.SettingsPage })));
+const SettingsNav = lazy(() => import("./components/Settings").then((m) => ({ default: m.SettingsNav })));
 
 export type Selection =
   | { type: "home" }
@@ -31,7 +33,17 @@ export default function App() {
   const [recorder, setRecorder] = useState<RecorderView | null>(null);
   const [lines, setLines] = useState<LiveLine[]>([]);
   const [tick, setTick] = useState({ elapsed_secs: 0, level: 0 });
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  // Settings is a page over the current view. The selection stays as it was, so Back returns to it.
+  const [settings, setSettings] = useState<SectionId | null>(null);
+  const lastSection = useRef<SectionId>("general");
+  if (settings) lastSection.current = settings;
+  // While Reset runs, nothing may leave Settings or start a recording: reset deletes the
+  // state a new recording writes (drafts/current.md) and then runs setup again.
+  const [resetting, setResetting] = useState(false);
+  const resettingRef = useRef(false);
+  resettingRef.current = resetting;
+  const onboardedRef = useRef(false);
+  onboardedRef.current = !!boot?.onboarded;
   const [toast, setToast] = useState<{ text: string; tone: "info" | "error" } | null>(null);
   const [busy, setBusy] = useState(false);
   const [callApp, setCallApp] = useState<string | null>(null);
@@ -88,6 +100,10 @@ export default function App() {
         if (v.recording && !recorderRef.current?.recording) {
           setLines(v.lines);
           setSelection({ type: "live" });
+          if (!resettingRef.current) {
+            blurSettingsField();
+            setSettings(null);
+          }
         }
         recorderRef.current = v;
         setRecorder(v);
@@ -112,7 +128,15 @@ export default function App() {
       on<string>("recording-ended", (t) => notify(t)),
       on<string | null>("call-detected", (a) => setCallApp(a)),
       // The menu bar's recent meetings and a click on a "meeting ready" notification.
-      on<string>("open-meeting", (path) => setSelection({ type: "meeting", path })),
+      on<string>("open-meeting", (path) => {
+        if (resettingRef.current) return;
+        setSelection({ type: "meeting", path });
+        blurSettingsField();
+        setSettings(null);
+      }),
+      // The menu bar's "Settings…": the same as ⌘,.
+      // Setup has no Settings yet, so the item waits until it is done.
+      on<null>("open-settings", () => onboardedRef.current && setSettings((now) => now ?? lastSection.current)),
       on<AppPrefs>("app-prefs", (prefs) => setBoot((b) => b && { ...b, prefs })),
       // However a recording ended (Stop here, the menu bar, auto-stop), follow it to its
       // processing view if you were looking at it.
@@ -146,6 +170,14 @@ export default function App() {
   // Stable, because Sidebar and MeetingView are memoised against the ticking clock.
   const askAll = useCallback(() => setAsk((a) => (a === "all" ? null : "all")), []);
   const askMeeting = useCallback(() => setAsk("meeting"), []);
+  // ⌘, opens the section you were on last, as System Settings does; a deep link (a
+  // permission error, say) picks one.
+  const openSettings = useCallback((section?: SectionId) => setSettings((now) => section ?? now ?? lastSection.current), []);
+  const closeSettings = useCallback(() => {
+    if (resettingRef.current) return;
+    blurSettingsField();
+    setSettings(null);
+  }, []);
 
   const start = async (kind: Kind) => {
     setBusy(true);
@@ -157,6 +189,8 @@ export default function App() {
       setLines([]);
       setTick({ elapsed_secs: 0, level: 0 });
       setSelection({ type: "live" });
+      blurSettingsField();
+      setSettings(null);
     } catch (e) {
       notify(errorText(e), "error");
     } finally {
@@ -195,7 +229,13 @@ export default function App() {
   const finishing = selection.type === "meeting" ? active.find((j) => j.output_path === selection.path) ?? null : null;
 
   return (
-    <div className={`shell ${recording ? "is-recording" : ""}`}>
+    <div className={`shell${recording ? " is-recording" : ""}${settings ? " is-settings" : ""}`}>
+      {settings && (
+        <Suspense fallback={<aside className="sidebar set-nav" />}>
+          <SettingsNav section={settings} onSection={setSettings} onBack={closeSettings} />
+        </Suspense>
+      )}
+      {/* Kept mounted under Settings, so search, scroll and an open meeting are as you left them. */}
       <Sidebar
         meetings={meetings}
         jobs={active}
@@ -231,11 +271,24 @@ export default function App() {
           ) : (
             <RecordButton busy={busy} onStart={start} />
           )}
-          <button className="icon-btn" title="Settings (⌘,)" aria-label="Settings" onClick={() => setSettingsOpen(true)}>
+          <button className="icon-btn" title={settings ? "Back (Esc)" : "Settings (⌘,)"} aria-label="Settings" aria-pressed={!!settings} onClick={() => (settings ? closeSettings() : openSettings())}>
             <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><path fill="currentColor" d="M11.4 1.5l.5 2.3c.5.2 1 .5 1.4.8l2.2-.8 1.4 2.4-1.7 1.6c.1.5.1 1.1 0 1.6l1.7 1.6-1.4 2.4-2.2-.8c-.4.3-.9.6-1.4.8l-.5 2.3H8.6l-.5-2.3c-.5-.2-1-.5-1.4-.8l-2.2.8-1.4-2.4 1.7-1.6a4 4 0 010-1.6L3.1 6.2l1.4-2.4 2.2.8c.4-.3.9-.6 1.4-.8l.5-2.3h2.8zM10 7a3 3 0 100 6 3 3 0 000-6z" /></svg>
           </button>
         </header>
         <section className="content">
+          {settings && (
+            <Suspense fallback={<div className="page page-settings" />}>
+              <SettingsPage
+                boot={boot}
+                section={settings}
+                onBack={closeSettings}
+                onSaved={(s) => { setBoot((b) => b && { ...b, settings: s }); refreshMeetings(); }}
+                onResetBusy={setResetting}
+                onReset={() => { setResetting(false); lastSection.current = "general"; setSettings(null); setAsk(null); setSelection({ type: "home" }); lastList.current = ""; setMeetings([]); reboot(); }}
+                notify={notify}
+              />
+            </Suspense>
+          )}
           {selection.type === "live" && recorder?.recording && (
             <LiveView recorder={recorder} lines={lines} level={tick.level} />
           )}
@@ -283,25 +336,26 @@ export default function App() {
           )}
         </section>
       </main>
-      {settingsOpen && (
-        <Suspense fallback={null}>
-        <SettingsSheet
-          boot={boot}
-          onClose={() => setSettingsOpen(false)}
-          onSaved={(s) => { setBoot({ ...boot, settings: s }); refreshMeetings(); }}
-          onReset={() => { setSettingsOpen(false); setAsk(null); setSelection({ type: "home" }); lastList.current = ""; setMeetings([]); reboot(); }}
-          notify={notify}
-        />
-        </Suspense>
-      )}
       {toast && (
-        <div className={`toast toast-${toast.tone}`} role="status" onClick={() => setToast(null)}>{toast.text}</div>
+        <div className={`toast toast-${toast.tone}`} role="status" onClick={() => setToast(null)}>
+          {toast.text}
+          {/* Permission errors name System Settings; Margin's own page shows the state and the way there. */}
+          {toast.tone === "error" && toast.text.includes("Privacy & Security") && (
+            <button className="toast-action" onClick={() => openSettings("permissions")}>Open Permissions</button>
+          )}
+        </div>
       )}
       <KeyboardShortcuts
-        onSettings={() => setSettingsOpen(true)}
+        onSettings={openSettings}
         onStart={start}
-        canStart={!recording && !busy && !settingsOpen}
-        onAsk={() => setAsk((a) => (a ? null : openMeeting ? "meeting" : "all"))}
+        canStart={!recording && !busy && !resetting}
+        onAsk={() => {
+          if (resettingRef.current) return;
+          // From Settings, ⌘J goes back and opens Ask rather than toggling it out of sight.
+          setAsk((a) => (a && !settings ? null : a ?? (openMeeting ? "meeting" : "all")));
+          closeSettings();
+        }}
+        onSearch={closeSettings}
       />
     </div>
   );
@@ -346,7 +400,7 @@ function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => 
 }
 
 /** In-window shortcuts: ⌘, settings, ⌘F search, ⌘J Ask, ⌘⇧R record a call, ⌘⇧I record in person. */
-function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk }: { onSettings: () => void; onStart: (k: Kind) => void; canStart: boolean; onAsk: () => void }) {
+function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk, onSearch }: { onSettings: () => void; onStart: (k: Kind) => void; canStart: boolean; onAsk: () => void; onSearch: () => void }) {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (!e.metaKey) return;
@@ -356,7 +410,9 @@ function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk }: { onSetting
         onSettings();
       } else if (key === "f" && !e.shiftKey) {
         e.preventDefault();
-        document.querySelector<HTMLInputElement>(".search input")?.focus();
+        onSearch();
+        // After Settings has gone, so the search field is visible and can take focus.
+        requestAnimationFrame(() => document.querySelector<HTMLInputElement>(".search input")?.focus());
       } else if (key === "j" && !e.shiftKey) {
         e.preventDefault();
         onAsk();
@@ -367,6 +423,13 @@ function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk }: { onSetting
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [onSettings, onStart, canStart, onAsk]);
+  }, [onSettings, onStart, canStart, onAsk, onSearch]);
   return null;
+}
+
+/** Leaving Settings unmounts a focused field without a blur, so its save-on-blur would never
+ * run (React ignores events during a commit). Blur it first, while its handlers still work. */
+function blurSettingsField() {
+  const focused = document.activeElement;
+  if (focused instanceof HTMLElement && focused.closest(".page-settings")) focused.blur();
 }

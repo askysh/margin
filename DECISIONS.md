@@ -10,7 +10,7 @@ Product and technical decisions made without asking. Each one lists the options 
   rename before the first release.
 
 ## D2. Shell: Tauri v2 + React + TypeScript (Vite)
-- See RESEARCH.md §2.
+- See docs/research.md §2.
 
 ## D3. Isolate our state from the upstream Minutes.app
 - Context: upstream Minutes.app is installed and running on this Mac. It owns `~/.minutes`
@@ -420,6 +420,8 @@ The full comparison is in `docs/parity/app.md`.
 ## 0.0.4: transcribe during the meeting
 
 ### D46. A minutes-core fork with one patch
+- **Superseded by D48 (0.0.5).** Upstream merged the patch, and Margin no longer uses the
+  fork.
 - Rolling transcription needs core to take transcript work from the host. Core v0.32.1
   always transcribes the whole recording after Stop (UPSTREAM-PATCHES.md #11).
 - Options: (a) wait for upstream; (b) a `[patch]` on the tagged core; (c) a fork with the
@@ -430,7 +432,7 @@ The full comparison is in `docs/parity/app.md`.
   `silverstein/minutes`.
 - The fork changes no dependency, so `Cargo.lock` is still seeded from upstream's lock at
   the tag, and the `ort` pin stays. `scripts/bump-upstream.sh <tag> <commit>` moves to a new
-  tag once the patch is rebased in the fork (README, "Updating minutes-core").
+  tag once the patch is rebased in the fork (docs/development.md, "Updating minutes-core").
 - When upstream ships the patch, `scripts/bump-upstream.sh <tag>` goes back to upstream by
   tag. If upstream declines it, Margin keeps rebasing one commit per core release.
 - What the patch adds (core API):
@@ -469,3 +471,24 @@ The full comparison is in `docs/parity/app.md`.
   - Core accepted every piece (20 of 20, 63 of 63).
 - Not measured yet: GPU, battery and heat during a real call, with the live transcript
   running at the same time.
+
+## 0.0.5: no fork
+
+### D48. Back on upstream minutes-core
+- Upstream merged the transcript checkpoint patch (UPSTREAM-PATCHES.md #11) as
+  silverstein/minutes PR #1316, merge commit `209265f` on main. No tag has it yet. The
+  latest tag is v0.32.1.
+- Options: (a) stay on the fork until upstream ships a tag; (b) pin upstream main by
+  commit.
+- Pick: **(b)**. `minutes-core` comes from `silverstein/minutes`, pinned by
+  `rev = "209265fac94763d45171acb284c258eff6718690"`: v0.32.1 plus 6 commits. The core
+  code at that commit is the same as the fork commit that 0.0.4 used, so rolling
+  transcription needs no change.
+- `Cargo.lock` is seeded from upstream's lock at that commit. It still has ort
+  2.0.0-rc.10, so the `ort` pin stays.
+- `scripts/bump-upstream.sh <ref>` takes a tag or a full commit SHA. For a commit, it
+  makes sure that the commit is on upstream main and after the latest tag.
+- Settings shows the core as "v0.32.1 + 209265f", not as a tag that does not have the
+  patch.
+- When a tag with the patch ships, run `scripts/bump-upstream.sh <tag>` to go back to a
+  tag pin. The askysh/minutes fork is no longer used.

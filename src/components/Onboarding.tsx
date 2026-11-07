@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, errorText, type Backends, type Permissions, type Settings } from "../api";
 import { tildify } from "../util";
+import { Logo } from "./Logo";
 import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { MicIcon, PermissionRow, SpeakerIcon } from "./PermissionRow";
 import { SummaryChoice } from "./SummaryChoice";
@@ -104,6 +105,7 @@ function StepYou({ s, onNext, saving }: { s: Settings; onNext: (name: string) =>
   const [name, setName] = useState(s.user_name);
   return (
     <>
+      <div className="ob-logo"><Logo size={88} /></div>
       <h1 className="ob-title">Notes in your words.<br />Transcripts on the side.</h1>
       <p className="ob-body">
         Margin records your meetings and transcribes them on this Mac. Each one is a Markdown file you own.

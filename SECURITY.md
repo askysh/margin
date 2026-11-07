@@ -28,3 +28,28 @@ when you are not sure it is exploitable:
 - **Data leaving the Mac.** Margin sends meeting text only to the summary engine and the
   Ask engine you chose (the `claude` CLI or a local Ollama). Anything else that sends
   audio, transcripts or notes off the Mac counts.
+- **Updates and releases.** A way to make the in-app updater install a file that Margin's
+  updater key did not sign, or a way to make a release download or the Homebrew cask run
+  code it should not.
+- **Other programs.** A way for another local program or a web page to drive Margin's
+  backend. `margin --dev serve`, the test bridge, listens on `127.0.0.1` only, and runs
+  only when someone starts it from Terminal.
+
+## What Margin does not protect
+
+- **Meetings are plain files.** Meetings, transcripts and audio are Markdown and WAV files
+  in the folder you chose, readable by any program that runs as your user. Margin does
+  not encrypt them. A sync service such as iCloud Drive copies them where it is set to.
+- **Shared voice profiles.** minutes-core keeps voice profiles in `~/.minutes/voices.db`,
+  which the upstream Minutes app also uses.
+- **The System Audio permission check** uses private macOS calls (`TCCAccessPreflight` and
+  `TCCAccessRequest`). This affects only how Margin shows the permission state.
+
+Not a vulnerability in Margin: a problem in minutes-core itself (report it to
+[silverstein/minutes](https://github.com/silverstein/minutes/security)), in the `claude`
+CLI or in Ollama.
+
+## Supported versions
+
+Only the latest release gets security fixes. Update first (Settings → Updates, or
+`brew upgrade --cask margin`), then report.

@@ -1,0 +1,47 @@
+name: Feature request
+description: An idea for Margin or its docs.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check DECISIONS.md first: the idea may be there, with the reason it was or was not done.
+        Early ideas and open questions fit Discussions, Ideas, better than an issue.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would like
+      description: The change in the app. A sketch or a screenshot helps.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Recording and transcription
+        - Notes and the meeting view
+        - Library and search
+        - Summaries and Ask
+        - Settings and setup
+        - The docs
+        - Not sure
+    validations:
+      required: true
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Help
+      options:
+        - label: I would like to build this myself, with some pointers.
