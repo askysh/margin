@@ -5,7 +5,7 @@
 # Three ways start a release:
 #   - A merge into main whose version (src-tauri/tauri.conf.json) has no tag yet. The plan
 #     job checks that the versions agree and CHANGELOG.md has the section, then tags the
-#     merge commit v<version>. This is the normal way: merge the release branch.
+#     merge commit v<version>. This is the normal way: merge next-release into main.
 #   - A v* tag pushed by hand.
 #   - Run workflow (workflow_dispatch) with a version.
 # A merge into main whose version already has a tag, or a version that already has a

@@ -5,7 +5,16 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
-## [0.0.6] - Unreleased
+## [0.0.7] - Unreleased
+
+### Development
+
+- Every change goes into the `next-release` branch, Dependabot's updates too. Merging
+  `next-release` into `main` tags the version and drafts the release.
+- `scripts/bump-version.sh` runs on Linux too, and dates the section of the version that
+  is released.
+
+## [0.0.6] - 2026-11-07
 
 ### Development
 

@@ -18,8 +18,8 @@ jobs:
       - run: bunx tsc --noEmit
       - run: bun run build
 
-  # Every file that holds the version must agree (scripts/bump-version.sh sets them). A
-  # release pull request (release/X.Y.Z into main) must also have a new version and a
+  # Every file that holds the version must agree (scripts/bump-version.sh sets them). The
+  # release pull request (next-release into main) must also have a new version and a
   # CHANGELOG.md section with text, because merging it tags and drafts the release.
   version:
     runs-on: ubuntu-latest
@@ -34,11 +34,8 @@ jobs:
             || { echo "::error file=src-tauri/Cargo.lock::margin is not $version. Run scripts/bump-version.sh $version."; exit 1; }
           echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Release pull request
-        if: github.event_name == 'pull_request' && github.base_ref == 'main' && startsWith(github.head_ref, 'release/')
-        env:
-          HEAD_REF: ${{ github.head_ref }}
+        if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'next-release'
         run: |
-          [[ "$HEAD_REF" == "release/$VERSION" ]] || { echo "::error::the branch is $HEAD_REF, but the version is $VERSION"; exit 1; }
           if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
             echo "::error::v$VERSION is already tagged. Run scripts/bump-version.sh with the next version."; exit 1
           fi

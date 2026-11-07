@@ -36,39 +36,36 @@ The script reads its settings from the environment, or from `~/keys/margin-signi
 
 ## Branches
 
-- `main` holds the released code. A merge into `main` releases its version, if that
-  version has no tag yet.
-- `release/X.Y.Z` is the next release. Work for that release goes into this branch. Its
-  pull request into `main` stays open until the release is ready.
-- Dependabot opens its pull requests on `main`. They do not start a release, because the
-  version on `main` already has a tag. To take them into the release branch, merge `main`
-  into it (the **Update branch** button on the release pull request).
+- `next-release` is the next release. Every change goes into this branch, Dependabot's
+  pull requests too.
+- `main` holds the released code. Only `next-release` merges into it.
+- The pull request from `next-release` into `main` stays open. Merging it releases the
+  version that `next-release` has.
 
 ## Cut a release
 
-1. Start the next release branch from `main`, and set its version:
+1. Set the version on `next-release`, once per release, before or with the first change:
    ```bash
-   git switch -c release/0.0.7 origin/main
-   scripts/bump-version.sh 0.0.7
-   git commit -am "Version 0.0.7"
-   git push -u origin release/0.0.7
+   git switch next-release
+   scripts/bump-version.sh 0.0.8
+   git commit -am "Version 0.0.8"
+   git push
    ```
    `scripts/bump-version.sh` sets the version in `package.json`,
    `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and Margin's entry in
-   `src-tauri/Cargo.lock`. It also adds a `## [0.0.7] - Unreleased` section to
-   [CHANGELOG.md](../CHANGELOG.md).
-2. Open a pull request from `release/0.0.7` into `main`. CI checks that the versions agree
-   and that the branch name matches the version.
-3. Add the work for the release to the branch. Each change a user can see gets a line in
-   the CHANGELOG section. CI requires text in that section, because it becomes the release
-   notes.
-4. When the release is ready, replace `Unreleased` with the date, and merge the pull
-   request.
-5. Wait for `.github/workflows/release.yml`. Its plan job tags the merge commit `v0.0.7`.
-   Then it builds, signs and notarizes the app on a macOS 26 runner, and drafts a GitHub
-   release with the CHANGELOG section as its notes.
-6. Open the draft on the Releases page, check the files and publish it.
-7. Start the branch for the release after it (step 1).
+   `src-tauri/Cargo.lock`. It adds a `## [0.0.8] - Unreleased` section to
+   [CHANGELOG.md](../CHANGELOG.md), and dates the section of the version before it.
+2. Each change a user can see gets a line in that CHANGELOG section. The section becomes
+   the release notes.
+3. When the release is ready, put the date in place of `Unreleased`, and merge the pull
+   request from `next-release` into `main`. Use a merge commit, not squash, so that
+   `next-release` and `main` keep the same history. CI blocks the merge when the version
+   already has a tag, the version files do not agree, or the CHANGELOG section is empty.
+4. The merge starts `.github/workflows/release.yml`. Its plan job tags the merge commit
+   `v0.0.8`. Then it builds, signs and notarizes the app on a macOS 26 runner, and drafts
+   a GitHub release on that tag with all its files and the CHANGELOG section as notes.
+5. Open the draft on the Releases page, check the files and publish it.
+6. Set the next version on `next-release` (step 1).
 
 The secrets of each workflow are listed at the top of its file.
 
