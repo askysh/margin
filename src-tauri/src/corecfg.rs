@@ -2,7 +2,7 @@
 //!
 //! We always write keys explicitly instead of relying on core defaults. One reason: if
 //! `summarization.engine` is missing, core silently forces it to "auto", which runs
-//! whatever agent CLI is installed (RESEARCH.md §1.6).
+//! whatever agent CLI is installed (docs/research.md §1.6).
 
 use crate::paths;
 use minutes_core::config::Config;

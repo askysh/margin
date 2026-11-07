@@ -1,5 +1,8 @@
 # Brief: build v1 of a polished Mac meeting-notes app on top of `minutes-core`
 
+> The original brief from 2026-11-06, kept as written. `RESEARCH.md` and `PROGRESS.md` are
+> now [docs/research.md](research.md) and [docs/progress.md](progress.md).
+
 ## Who / why
 Akash wants the functionality of Minutes (https://github.com/silverstein/minutes, MIT, Rust core + Tauri shell)
 with the UI polish and ease of use of Granola. He tried Minutes in July 2026 and hated its UI, in particular

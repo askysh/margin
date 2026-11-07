@@ -1,0 +1,23 @@
+# Weekly version updates for the Actions in .github/workflows and the UI's
+# packages (bun).
+#
+# The Rust crates get security updates only (open-pull-requests-limit: 0 turns
+# off version updates). src-tauri/Cargo.lock is seeded from upstream
+# minutes-core's lock by scripts/bump-upstream.sh, and newer native crates
+# (ort, pyannote-rs) can break the build. CI does not build the Rust side, so
+# a crate update must be built and tested on a Mac before it merges.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
