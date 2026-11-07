@@ -108,6 +108,13 @@ Margin, never during a recording. Settings → Updates turns the automatic check
 - **Crash safety.** Notes typed during a recording are saved as you type. If Margin stops
   unexpectedly, the next launch shows them and resumes unfinished processing.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/settings-dark.png">
+    <img src="docs/images/settings-light.png" width="720" alt="Settings in Margin: a list of sections on the left, and the Recording section with the microphone, stop after silence and call suggestions">
+  </picture>
+</p>
+
 ## Where your data lives
 
 | What | Where |
