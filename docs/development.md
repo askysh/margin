@@ -78,11 +78,22 @@ Run the Rust tests and the end-to-end pass locally.
   flow (record, live transcript, stop, process) runs without permissions.
 - It writes screenshots and `report.json` to `$E2E_OUT`.
 
+`scripts/e2e/make-fixtures.sh <out-dir>` makes the test audio with the macOS voices (`say`
+and `afconvert`). The same command makes the same files on each Mac:
+
+- `meeting.wav`: 29 s, two voices. It says "legal review", which the search check finds.
+- `call.wav`: a 65 s call with `call.voice.wav`, `call.system.wav` and `call.live.jsonl`.
+  The speech stops after 25 s. The silence after it lets the test press Stop.
+- `models/`: links to `ggml-small.bin`, `ggml-silero-v6.2.0.bin` and `diarization/` in
+  your Margin install, if they exist. Links use no disk space. Give this folder to
+  `--seed-models` to skip the download.
+
 ```bash
 bun run build && (cd src-tauri && cargo build)     # build what the e2e run uses
-node scripts/e2e/run.mjs --audio meeting.wav \
-  --seed-models ~/Library/Application\ Support/Margin/state/models \
-  --summaries fake-ollama --simulate call.wav [--download]
+scripts/e2e/make-fixtures.sh /tmp/margin-fixtures
+F=/tmp/margin-fixtures
+node scripts/e2e/run.mjs --audio $F/meeting.wav --seed-models $F/models \
+  --summaries fake-ollama --simulate $F/call.wav [--download]
 ```
 
 Add `--dark` to run the pass in dark mode. `scripts/e2e/fake-ollama.py` and
@@ -90,6 +101,22 @@ Add `--dark` to run the pass in dark mode. `scripts/e2e/fake-ollama.py` and
 `/tmp/margin-e2e/out` by default. `E2E_BRIDGE_PORT`, `E2E_UI_PORT`, `E2E_OLLAMA_PORT` and
 `CARGO_TARGET_DIR` move a run off the default ports and build folder. The comment at the
 top of `run.mjs` lists every option.
+
+### README screenshots
+
+`scripts/e2e/screenshots.mjs` makes the images in `docs/images/`. It uses the same sandbox
+and bridge as the end-to-end pass, adds a demo library (`scripts/e2e/demo-meetings.mjs`)
+and takes each image at the default window size (1180 × 760, at 2×), in light and dark:
+
+- `screenshot-light.png` and `screenshot-dark.png`: an open meeting with notes and a
+  transcript with two named speakers.
+- `settings-light.png` and `settings-dark.png`: Settings → Recording.
+
+```bash
+node scripts/e2e/screenshots.mjs --seed-models /tmp/margin-fixtures/models
+```
+
+If `pngquant` is installed, the script makes the images smaller.
 
 ## The developer CLI
 

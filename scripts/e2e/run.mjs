@@ -3,8 +3,15 @@
 // real settings, meetings or voices, and no macOS permission prompt can appear.
 //
 //   bun run build && (cd src-tauri && cargo build)
-//   node scripts/e2e/run.mjs --audio meeting.wav [--seed-models DIR] [--summaries claude|ollama|none] [--download]
+//   scripts/e2e/make-fixtures.sh /tmp/margin-fixtures
+//   node scripts/e2e/run.mjs --audio /tmp/margin-fixtures/meeting.wav \
+//     --seed-models /tmp/margin-fixtures/models --summaries fake-ollama \
+//     --simulate /tmp/margin-fixtures/call.wav [--dark] [--download]
 //
+// make-fixtures.sh makes the audio this pass expects with the macOS voices: meeting.wav
+// (two voices, says "legal review" for the search check) and call.wav with its stems and
+// live transcript (long enough that the test, not the file, stops the call). It also links
+// the small models from your Margin install into models/.
 // --seed-models copies model files into the sandbox (skips a ~520 MB download).
 // --summaries fake-ollama runs a stand-in Ollama (scripts/e2e/fake-ollama.py) so the whole
 // summary flow is tested without a real model. "claude" needs your real HOME, so it is not
