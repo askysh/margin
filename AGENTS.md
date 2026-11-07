@@ -18,7 +18,7 @@ same rules ([CONTRIBUTING.md](CONTRIBUTING.md)).
 | `src-tauri/src/reset.rs`, `paths.rs`, `corecfg.rs` | Reset, every path Margin uses, and the minutes-core config. |
 | `src-tauri/src/devcli.rs`, `devserve.rs` | The `margin --dev` CLI and the QA bridge for the e2e pass. |
 | `src-tauri/Cargo.toml`, `Cargo.lock` | The minutes-core pin and the lock seeded from upstream. |
-| `scripts/` | `build-app.sh`, `release.sh`, `bump-upstream.sh`, the Homebrew renderer and `e2e/`. |
+| `scripts/` | `build-app.sh`, `release.sh`, `bump-version.sh`, `bump-upstream.sh`, the Homebrew renderer and `e2e/`. |
 | `docs/` | Development, releasing, research and parity notes. [docs/README.md](docs/README.md) is the map. |
 | `DECISIONS.md` | Every product and technical decision, numbered `D1`, `D2` and so on. |
 | `UPSTREAM-PATCHES.md` | minutes-core changes that Margin needs, sent or to send upstream. |
@@ -66,6 +66,8 @@ The owner uses Margin every day. Their meetings, settings and voices are real.
 - **Match the code around you.** A Rust module starts with a `//!` comment that says what
   it does and why. Comments explain the reason, not the code.
 - **Commits** are small and logical, with an imperative subject and a body that says why.
+- **Branches.** Work goes into the next release branch, `release/X.Y.Z`. A merge into
+  `main` tags and drafts a release (docs/releasing.md).
 - **CHANGELOG.md** gets a line in its top section, the one marked Unreleased, for each
   change a user can see.
 

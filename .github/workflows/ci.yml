@@ -12,8 +12,35 @@ jobs:
   ui:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bunx tsc --noEmit
       - run: bun run build
+
+  # Every file that holds the version must agree (scripts/bump-version.sh sets them). A
+  # release pull request (release/X.Y.Z into main) must also have a new version and a
+  # CHANGELOG.md section with text, because merging it tags and drafts the release.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Versions agree
+        run: |
+          version="$(jq -r .version src-tauri/tauri.conf.json)"
+          [[ "$(jq -r .version package.json)" == "$version" ]] || { echo "::error file=package.json::version is not $version"; exit 1; }
+          grep -q "^version = \"$version\"$" src-tauri/Cargo.toml || { echo "::error file=src-tauri/Cargo.toml::version is not $version"; exit 1; }
+          grep -A1 '^name = "margin"$' src-tauri/Cargo.lock | grep -q "^version = \"$version\"$" \
+            || { echo "::error file=src-tauri/Cargo.lock::margin is not $version. Run scripts/bump-version.sh $version."; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Release pull request
+        if: github.event_name == 'pull_request' && github.base_ref == 'main' && startsWith(github.head_ref, 'release/')
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          [[ "$HEAD_REF" == "release/$VERSION" ]] || { echo "::error::the branch is $HEAD_REF, but the version is $VERSION"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::v$VERSION is already tagged. Run scripts/bump-version.sh with the next version."; exit 1
+          fi
+          section="$(awk -v v="$VERSION" 'index($0, "## [" v "]") == 1 { on = 1; next } on && /^## \[/ { exit } on { print }' CHANGELOG.md | tr -d '[:space:]')"
+          [[ -n "$section" ]] || { echo "::error file=CHANGELOG.md::the ## [$VERSION] section is empty. It becomes the release notes."; exit 1; }

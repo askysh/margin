@@ -1,21 +1,48 @@
 # Weekly version updates for the Actions in .github/workflows and the UI's
-# packages (bun).
+# packages (bun), grouped so that one week makes few pull requests:
+#   - all Actions updates in one pull request
+#   - all bun minor and patch updates in one pull request
+#   - each bun major update in its own pull request, because a major can break the build
+#
+# React, React DOM and their types move together and only on purpose: react and react-dom
+# must have the same major, and Dependabot updates them one at a time. TypeScript majors
+# are also left to a deliberate upgrade. So Dependabot opens no major for these.
 #
 # The Rust crates get security updates only (open-pull-requests-limit: 0 turns
 # off version updates). src-tauri/Cargo.lock is seeded from upstream
 # minutes-core's lock by scripts/bump-upstream.sh, and newer native crates
 # (ort, pyannote-rs) can break the build. CI does not build the Rust side, so
 # a crate update must be built and tested on a Mac before it merges.
+#
+# The pull requests go to main. The next release branch takes them with a merge of main
+# (docs/releasing.md).
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
   - package-ecosystem: bun
     directory: /
     schedule:
       interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: cargo
     directory: /src-tauri
     schedule:

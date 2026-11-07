@@ -5,7 +5,21 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
-## [0.0.5] - Unreleased
+## [0.0.6] - Unreleased
+
+### Development
+
+- Vite 8 and @vitejs/plugin-react 6 build the UI. Playwright 1.64 runs the e2e pass.
+- A merge into `main` releases its version: the release workflow tags the merge commit,
+  builds and notarizes the app, and drafts the release with the version's CHANGELOG
+  section as its notes. Work for a release goes into a `release/X.Y.Z` branch.
+- `scripts/bump-version.sh X.Y.Z` sets the version in every file that holds it.
+- CI checks that the versions agree, and that a release pull request has a new version
+  and release notes.
+- Dependabot groups its updates, and opens no major update for React or TypeScript.
+- The workflows use actions/checkout v7 and actions/cache v6.
+
+## [0.0.5] - 2026-11-07
 
 ### Added
 
