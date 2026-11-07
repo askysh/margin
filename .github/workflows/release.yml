@@ -1,7 +1,15 @@
-# Release: on a v* tag, build Margin.app on Apple silicon, sign it with the
-# Developer ID, notarize and staple it, and attach the zip and DMG to a draft
-# GitHub release. scripts/release.sh does the work; this file only sets up
-# the keychain and the API key.
+# Release: build Margin.app on Apple silicon, sign it with the Developer ID, notarize and
+# staple it, and attach the zip and DMG to a draft GitHub release. scripts/release.sh does
+# the work; this file only decides what to build and sets up the keychain and the API key.
+#
+# Three ways start a release:
+#   - A merge into main whose version (src-tauri/tauri.conf.json) has no tag yet. The plan
+#     job checks that the versions agree and CHANGELOG.md has the section, then tags the
+#     merge commit v<version>. This is the normal way: merge the release branch.
+#   - A v* tag pushed by hand.
+#   - Run workflow (workflow_dispatch) with a version.
+# A merge into main whose version already has a tag, or a version that already has a
+# release (one uploaded by hand), builds nothing.
 #
 # Repository secrets (the same values benchbar uses):
 #   MACOS_CERTIFICATE_P12       base64 of the Developer ID Application .p12
@@ -13,13 +21,14 @@
 #   TAURI_SIGNING_PRIVATE_KEY           the in-app updater's private key (~/keys/margin-updater.key)
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password
 #
-# The release is a draft. Publishing it makes it "latest", which is when the app's
-# updater sees it (it reads releases/latest/download/latest.json) and when
-# homebrew-tap.yml updates the cask.
+# The release is a draft, with the version's CHANGELOG.md section as its notes. Publishing
+# it makes it "latest", which is when the app's updater sees it (it reads
+# releases/latest/download/latest.json) and when homebrew-tap.yml updates the cask.
 name: release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -30,48 +39,109 @@ on:
 permissions:
   contents: write
 
+# One release at a time, and never a cancelled one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      build: ${{ steps.plan.outputs.build }}
+      ref: ${{ steps.plan.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide what to build
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            version="${INPUT_VERSION#v}"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(jq -r .version src-tauri/tauri.conf.json)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # A release built and uploaded by hand (scripts/release.sh) already has its files.
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice title=Release exists::v$version already has a release. Nothing to build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+              echo "::notice title=No new version::v$version is already tagged. Nothing to release."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # The same checks as ci.yml, so a bad merge stops here and not after the build.
+            for f in package.json src-tauri/tauri.conf.json; do
+              [[ "$(jq -r .version "$f")" == "$version" ]] || { echo "::error file=$f::version is not $version"; exit 1; }
+            done
+            grep -q "^version = \"$version\"$" src-tauri/Cargo.toml || { echo "::error file=src-tauri/Cargo.toml::version is not $version"; exit 1; }
+            grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error file=CHANGELOG.md::no ## [$version] section"; exit 1; }
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "v$version" -m "Margin $version" "$GITHUB_SHA"
+            # A tag pushed with the workflow token starts no workflow, so this run is the only build.
+            git push origin "v$version"
+            echo "::notice title=Tagged::v$version on $GITHUB_SHA"
+          fi
+          # Build the tag when there is one. A manual run for an untagged version builds this
+          # commit, and the release creates the tag when it is published.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "ref=v$version" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
   release:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     # minutes-core uses the macOS 26 Speech APIs, which need Xcode 26 or later.
     runs-on: macos-26
     timeout-minutes: 90
     env:
-      VERSION: ${{ github.event.inputs.version || github.ref_name }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
 
-      - name: Version without the v
-        run: echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
-
-      # A release built and uploaded by hand (scripts/release.sh) already has its files.
-      - name: Skip when the release exists
-        id: exists
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # The version's CHANGELOG.md section is the release notes. When the section is empty,
+      # GitHub writes notes from the pull requests.
+      - name: Release notes from CHANGELOG.md
         run: |
-          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::notice title=Release exists::v$VERSION already has a release; nothing to build."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
 
       - name: Use the newest Xcode
-        if: steps.exists.outputs.skip != 'true'
         run: |
           xcode="$(find /Applications -maxdepth 1 -name 'Xcode_*.app' | sort -V | tail -n 1)"
           sudo xcode-select -s "$xcode"
           xcodebuild -version
 
       - uses: oven-sh/setup-bun@v2
-        if: steps.exists.outputs.skip != 'true'
 
       - name: Rust toolchain
-        if: steps.exists.outputs.skip != 'true'
         run: |
           rustup toolchain install stable --profile minimal
           brew list cmake >/dev/null 2>&1 || brew install cmake
 
       - uses: actions/cache@v4
-        if: steps.exists.outputs.skip != 'true'
         with:
           path: |
             ~/.cargo/registry
@@ -81,7 +151,6 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Import the Developer ID certificate
-        if: steps.exists.outputs.skip != 'true'
         env:
           CERT: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -100,7 +169,6 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12"
 
       - name: Write the notary and updater keys
-        if: steps.exists.outputs.skip != 'true'
         env:
           KEY: ${{ secrets.NOTARY_API_KEY_P8 }}
           UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -117,7 +185,6 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build, sign, notarize, package
-        if: steps.exists.outputs.skip != 'true'
         env:
           MARGIN_SIGNING_ENV: /dev/null
           MARGIN_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
@@ -126,13 +193,13 @@ jobs:
         run: scripts/release.sh "$VERSION"
 
       - name: Draft the GitHub release
-        if: steps.exists.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [[ -s "$RUNNER_TEMP/notes.md" ]]; then notes=(--notes-file "$RUNNER_TEMP/notes.md"); else notes=(--generate-notes); fi
           gh release create "v$VERSION" release/Margin-"$VERSION".dmg release/Margin-"$VERSION".zip \
             release/Margin.app.tar.gz release/Margin.app.tar.gz.sig release/latest.json release/SHA256SUMS \
-            --draft --title "Margin $VERSION" --generate-notes --target "$GITHUB_SHA"
+            --draft --title "Margin $VERSION" --target "$(git rev-parse HEAD)" "${notes[@]}"
 
       - name: Remove the keys
         if: always()
