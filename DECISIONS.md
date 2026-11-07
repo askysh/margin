@@ -10,7 +10,7 @@ Product and technical decisions made without asking. Each one lists the options 
   rename before the first release.
 
 ## D2. Shell: Tauri v2 + React + TypeScript (Vite)
-- See RESEARCH.md §2.
+- See docs/research.md §2.
 
 ## D3. Isolate our state from the upstream Minutes.app
 - Context: upstream Minutes.app is installed and running on this Mac. It owns `~/.minutes`
@@ -432,7 +432,7 @@ The full comparison is in `docs/parity/app.md`.
   `silverstein/minutes`.
 - The fork changes no dependency, so `Cargo.lock` is still seeded from upstream's lock at
   the tag, and the `ort` pin stays. `scripts/bump-upstream.sh <tag> <commit>` moves to a new
-  tag once the patch is rebased in the fork (README, "Updating minutes-core").
+  tag once the patch is rebased in the fork (docs/development.md, "Updating minutes-core").
 - When upstream ships the patch, `scripts/bump-upstream.sh <tag>` goes back to upstream by
   tag. If upstream declines it, Margin keeps rebasing one commit per core release.
 - What the patch adds (core API):

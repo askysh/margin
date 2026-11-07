@@ -17,7 +17,7 @@ tauri-build = { version = "2", features = [] }
 # minutes-core from upstream: a tag, or a commit on main when Margin needs a change that no
 # tag has yet (DECISIONS.md, "Back on upstream minutes-core").
 # Now: v0.32.1 + 209265f.
-# Bump with scripts/bump-upstream.sh <tag|commit> (re-seeds Cargo.lock; see README "Updating minutes-core").
+# Bump with scripts/bump-upstream.sh <tag|commit> (re-seeds Cargo.lock; see docs/development.md "Updating minutes-core").
 minutes-core = { git = "https://github.com/silverstein/minutes", rev = "209265fac94763d45171acb284c258eff6718690", default-features = false, features = ["whisper", "streaming", "diarize", "metal"] }
 # minutes-core asks for ort "2.0.0-rc.10" (caret); later rcs break pyannote-rs. Upstream's CLI pins it too.
 ort = { version = "=2.0.0-rc.10", default-features = false }
