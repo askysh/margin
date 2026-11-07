@@ -5,7 +5,9 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
-## [0.0.5] - Unreleased
+## [0.0.6] - Unreleased
+
+## [0.0.5] - 2026-11-07
 
 ### Added
 
