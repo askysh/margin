@@ -8,9 +8,9 @@
 # CHANGELOG.md gets a "## [X.Y.Z] - Unreleased" section on top, if it has none. The section
 # of the version before it, which is released now, gets today's date if it has none.
 #
-# A release branch starts with this script (docs/releasing.md). When the branch merges into
-# main, .github/workflows/release.yml tags the version, drafts the release and starts the
-# next branch with this script. It runs on macOS and on Linux.
+# Run it on next-release once per release (docs/releasing.md). When next-release merges
+# into main, .github/workflows/release.yml tags the version and drafts the release.
+# It runs on macOS and on Linux.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

@@ -83,8 +83,8 @@ would ask "why not the obvious way?", the answer is a decision.
 
 ## What a pull request needs
 
-- **The right branch.** A change goes into the next release branch, `release/X.Y.Z`, not
-  into `main`. A merge into `main` releases the app ([docs/releasing.md](docs/releasing.md)).
+- **The right branch.** Open the pull request against `next-release`, not `main`. A merge
+  into `main` releases the app ([docs/releasing.md](docs/releasing.md)).
 
 - **One topic.** A fix and a refactor are two pull requests.
 - **A line in [CHANGELOG.md](CHANGELOG.md)**, in the top section, the one marked
