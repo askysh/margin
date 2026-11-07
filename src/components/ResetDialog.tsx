@@ -5,7 +5,7 @@ import { bytes, tildify } from "../util";
 type Notify = (t: string, tone?: "info" | "error") => void;
 
 /** Settings → Start over. Keeps meetings, models and voices unless you untick them. */
-export function ResetDialog({ onCancel, onDone, notify }: { onCancel: () => void; onDone: () => void; notify: Notify }) {
+export function ResetDialog({ onCancel, onDone, onBusy, notify }: { onCancel: () => void; onDone: () => void; onBusy: (busy: boolean) => void; notify: Notify }) {
   const [preview, setPreview] = useState<ResetPreview | null>(null);
   const [deleteMeetings, setDeleteMeetings] = useState(false);
   const [deleteModels, setDeleteModels] = useState(false);
@@ -19,6 +19,7 @@ export function ResetDialog({ onCancel, onDone, notify }: { onCancel: () => void
 
   const run = async () => {
     setBusy(true);
+    onBusy(true);
     try {
       const r = await api.reset({ delete_meetings: deleteMeetings, delete_models: deleteModels, forget_voices: forgetVoices });
       notify(r.meetings_trashed ? `Margin was reset. ${r.meetings_trashed} meetings moved to the Trash.` : "Margin was reset. Your meetings are untouched.");
@@ -26,6 +27,7 @@ export function ResetDialog({ onCancel, onDone, notify }: { onCancel: () => void
     } catch (e) {
       notify(errorText(e), "error");
       setBusy(false);
+      onBusy(false);
     }
   };
 

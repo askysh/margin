@@ -19,11 +19,12 @@ interface Props {
   onBack: () => void;
   onSaved: (s: Settings) => void;
   onReset: () => void;
+  onResetBusy: (busy: boolean) => void;
   notify: Notify;
 }
 
 /** The Settings page: one section at a time, all sharing one settings state and save queue. */
-export function SettingsPage({ boot, section, onBack, onSaved, onReset, notify }: Props) {
+export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetBusy, notify }: Props) {
   const ctx = useSettingsState(boot, onSaved, notify);
   const [resetOpen, setResetOpen] = useState(false);
   // WebKit doesn't focus a clicked button, so the opener comes from the click itself.
@@ -58,7 +59,7 @@ export function SettingsPage({ boot, section, onBack, onSaved, onReset, notify }
           {section === "reset" && <ResetSection {...view} />}
         </div>
       )}
-      {resetOpen && <ResetDialog onCancel={cancelReset} onDone={onReset} notify={notify} />}
+      {resetOpen && <ResetDialog onCancel={cancelReset} onDone={onReset} onBusy={onResetBusy} notify={notify} />}
     </div>
   );
 }

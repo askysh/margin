@@ -37,6 +37,13 @@ export default function App() {
   const [settings, setSettings] = useState<SectionId | null>(null);
   const lastSection = useRef<SectionId>("general");
   if (settings) lastSection.current = settings;
+  // While Reset runs, nothing may leave Settings or start a recording: reset deletes the
+  // state a new recording writes (drafts/current.md) and then runs setup again.
+  const [resetting, setResetting] = useState(false);
+  const resettingRef = useRef(false);
+  resettingRef.current = resetting;
+  const onboardedRef = useRef(false);
+  onboardedRef.current = !!boot?.onboarded;
   const [toast, setToast] = useState<{ text: string; tone: "info" | "error" } | null>(null);
   const [busy, setBusy] = useState(false);
   const [callApp, setCallApp] = useState<string | null>(null);
@@ -93,8 +100,10 @@ export default function App() {
         if (v.recording && !recorderRef.current?.recording) {
           setLines(v.lines);
           setSelection({ type: "live" });
-          blurSettingsField();
-          setSettings(null);
+          if (!resettingRef.current) {
+            blurSettingsField();
+            setSettings(null);
+          }
         }
         recorderRef.current = v;
         setRecorder(v);
@@ -120,12 +129,14 @@ export default function App() {
       on<string | null>("call-detected", (a) => setCallApp(a)),
       // The menu bar's recent meetings and a click on a "meeting ready" notification.
       on<string>("open-meeting", (path) => {
+        if (resettingRef.current) return;
         setSelection({ type: "meeting", path });
         blurSettingsField();
         setSettings(null);
       }),
       // The menu bar's "Settings…": the same as ⌘,.
-      on<null>("open-settings", () => setSettings((now) => now ?? lastSection.current)),
+      // Setup has no Settings yet, so the item waits until it is done.
+      on<null>("open-settings", () => onboardedRef.current && setSettings((now) => now ?? lastSection.current)),
       on<AppPrefs>("app-prefs", (prefs) => setBoot((b) => b && { ...b, prefs })),
       // However a recording ended (Stop here, the menu bar, auto-stop), follow it to its
       // processing view if you were looking at it.
@@ -163,6 +174,7 @@ export default function App() {
   // permission error, say) picks one.
   const openSettings = useCallback((section?: SectionId) => setSettings((now) => section ?? now ?? lastSection.current), []);
   const closeSettings = useCallback(() => {
+    if (resettingRef.current) return;
     blurSettingsField();
     setSettings(null);
   }, []);
@@ -270,8 +282,9 @@ export default function App() {
                 boot={boot}
                 section={settings}
                 onBack={closeSettings}
-                onSaved={(s) => { setBoot({ ...boot, settings: s }); refreshMeetings(); }}
-                onReset={() => { setSettings(null); setAsk(null); setSelection({ type: "home" }); lastList.current = ""; setMeetings([]); reboot(); }}
+                onSaved={(s) => { setBoot((b) => b && { ...b, settings: s }); refreshMeetings(); }}
+                onResetBusy={setResetting}
+                onReset={() => { setResetting(false); lastSection.current = "general"; setSettings(null); setAsk(null); setSelection({ type: "home" }); lastList.current = ""; setMeetings([]); reboot(); }}
                 notify={notify}
               />
             </Suspense>
@@ -335,8 +348,9 @@ export default function App() {
       <KeyboardShortcuts
         onSettings={openSettings}
         onStart={start}
-        canStart={!recording && !busy}
+        canStart={!recording && !busy && !resetting}
         onAsk={() => {
+          if (resettingRef.current) return;
           // From Settings, ⌘J goes back and opens Ask rather than toggling it out of sight.
           setAsk((a) => (a && !settings ? null : a ?? (openMeeting ? "meeting" : "all")));
           closeSettings();

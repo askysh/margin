@@ -29,7 +29,8 @@ if git ls-remote --exit-code --tags --refs "$repo" "refs/tags/${ref}" >/dev/null
   source_spec="git = \"${repo}\", tag = \"${ref}\""
   label="$ref"
 elif [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-  latest="$(git ls-remote --tags --refs --sort=-v:refname "$repo" 'v*' | head -1 | sed 's#.*refs/tags/##')"
+  # The newest release tag; pre-releases such as v0.33.0-rc1 don't count.
+  latest="$(git ls-remote --tags --refs --sort=-v:refname "$repo" 'v*' | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
   # GitHub also serves commits from forks and open pull requests: insist on main.
   read -r status _ _ <<<"$(compare "$ref" main)"
   if [[ "$status" != "ahead" && "$status" != "identical" ]]; then
@@ -60,7 +61,11 @@ sed -i '' -E "s#upstream_tag: \"[^\"]+\"#upstream_tag: \"${label}\"#" "$root/src
 grep '^minutes-core' "$manifest"
 
 # The ort pin in Cargo.toml must match the version in upstream's lock.
-ort="$(grep -A1 '^name = "ort"$' "$lock" | sed -nE 's/^version = "([^"]+)"/\1/p')"
+ort="$(grep -A1 '^name = "ort"$' "$lock" | sed -nE 's/^version = "([^"]+)"/\1/p' || true)"
+if [[ -z "$ort" ]]; then
+  echo "Upstream's lock has no ort crate. Check the ort pin in src-tauri/Cargo.toml, then build." >&2
+  exit 1
+fi
 if ! grep -q "^ort = { version = \"=${ort}\"" "$manifest"; then
   echo "Upstream's lock has ort ${ort}. Update the ort pin in src-tauri/Cargo.toml to \"=${ort}\", then build." >&2
   exit 1
