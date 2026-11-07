@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "icons": "swift scripts/make-icons.swift"
   },
   "dependencies": {
     "@fontsource-variable/recursive": "^5.3.0",

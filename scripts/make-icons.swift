@@ -1,47 +1,398 @@
-// Draws the Margin app icon (1024px) and the menu-bar template icon (36px @2x).
-// Usage: swift scripts/make-icons.swift <out-dir>
+// The one source for Margin's brand images. It draws every icon and logo file from the
+// same geometry, so they always match.
+//
+//   swift scripts/make-icons.swift            (from the repo root; or: bun run icons)
+//
+// It writes:
+//   src-tauri/icons/  app-icon.png (1024), icon.png (512), 32x32.png, 128x128.png,
+//                     128x128@2x.png, icon.icns (all 10 sizes, through iconutil),
+//                     tray-template.png and tray-recording.png (menu bar, 36 px = 18 pt @2x)
+//   docs/images/      app-icon-light.png, app-icon-dark.png (256), social-preview.png (1280x640)
+//   src/components/logoMark.ts   the mark as SVG path data, for <Logo />
+//
+// The mark: a sound line in the margin crosses the green margin rule and turns into
+// handwriting on the page. The recording goes in the margin; your words go on the page.
 import AppKit
+import CoreText
 
-let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "."
+let root = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "."
+let iconsDir = "\(root)/src-tauri/icons"
+let docsDir = "\(root)/docs/images"
+let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
 
-func png(_ size: CGFloat, _ path: String, _ draw: (CGRect) -> Void) {
-    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size), pixelsHigh: Int(size),
-                               bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                               colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
-    NSGraphicsContext.saveGraphicsState()
-    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-    draw(CGRect(x: 0, y: 0, width: size, height: size))
-    NSGraphicsContext.restoreGraphicsState()
-    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+func rgb(_ hex: UInt32, _ a: CGFloat = 1) -> CGColor {
+    CGColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255, green: CGFloat((hex >> 8) & 0xff) / 255,
+            blue: CGFloat(hex & 0xff) / 255, alpha: a)
 }
 
-// App icon: steno-pad paper, the green margin rule, three ink lines.
-png(1024, "\(out)/app-icon.png") { r in
-    let inset = r.insetBy(dx: 100, dy: 100)
-    let shape = NSBezierPath(roundedRect: inset, xRadius: 185, yRadius: 185)
-    NSGradient(starting: NSColor(calibratedRed: 0.95, green: 0.96, blue: 0.94, alpha: 1),
-               ending: NSColor(calibratedRed: 0.87, green: 0.91, blue: 0.86, alpha: 1))!
-        .draw(in: shape, angle: -90)
-    NSColor(calibratedWhite: 0, alpha: 0.08).setStroke(); shape.lineWidth = 4; shape.stroke()
-    let rule = NSBezierPath(roundedRect: CGRect(x: 330, y: 230, width: 26, height: 564), xRadius: 13, yRadius: 13)
-    NSColor(calibratedRed: 0.37, green: 0.58, blue: 0.50, alpha: 1).setFill(); rule.fill()
-    NSColor(calibratedRed: 0.11, green: 0.14, blue: 0.19, alpha: 1).setFill()
-    for (i, w) in [300.0, 250.0, 180.0].enumerated() {
-        NSBezierPath(roundedRect: CGRect(x: 410, y: 640 - Double(i) * 130, width: w, height: 44),
-                     xRadius: 22, yRadius: 22).fill()
+// MARK: - Palette (from src/styles.css)
+
+struct Palette {
+    let paperTop, paperBottom, ruling, rule, ink: CGColor
+    let rim: CGFloat
+}
+let light = Palette(paperTop: rgb(0xf7f9f3), paperBottom: rgb(0xe1e8db), ruling: rgb(0xc6d2c3),
+                    rule: rgb(0x4e8a73), ink: rgb(0x1c2430), rim: 0.9)
+let dark = Palette(paperTop: rgb(0x29323a), paperBottom: rgb(0x161b20), ruling: rgb(0xffffff, 0.07),
+                   rule: rgb(0x6fa893), ink: rgb(0xe3e8e1), rim: 0.32)
+
+// MARK: - Geometry (1024 design units, top-left origin)
+
+/// The macOS 26 icon grid: an 824 body centred on the 1024 canvas.
+let body = CGRect(x: 100, y: 100, width: 824, height: 824)
+let bodyRadius: CGFloat = 185.4
+
+/// Apple's continuous-corner rounded rect.
+func squircle(_ r: CGRect, _ radius: CGFloat) -> CGPath {
+    let p = CGMutablePath()
+    let k = min(radius, min(r.width, r.height) / 2 / 1.52866483)
+    func tl(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: r.minX + x * k, y: r.minY + y * k) }
+    func tr(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: r.maxX - x * k, y: r.minY + y * k) }
+    func br(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: r.maxX - x * k, y: r.maxY - y * k) }
+    func bl(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: r.minX + x * k, y: r.maxY - y * k) }
+    func inward(_ f: (CGFloat, CGFloat) -> CGPoint) {
+        p.addCurve(to: f(0.66993427, 0.06549600), control1: f(1.08849323, 0), control2: f(0.86840689, 0))
+        p.addLine(to: f(0.63149399, 0.07491100))
+        p.addCurve(to: f(0.07491176, 0.63149399), control1: f(0.37282392, 0.16905899), control2: f(0.16906013, 0.37282401))
+        p.addCurve(to: f(0, 1.52866483), control1: f(0, 0.86840701), control2: f(0, 1.08849299))
+    }
+    func outward(_ f: (CGFloat, CGFloat) -> CGPoint) {
+        p.addCurve(to: f(0.07491176, 0.63149399), control1: f(0, 1.08849299), control2: f(0, 0.86840701))
+        p.addCurve(to: f(0.63149399, 0.07491100), control1: f(0.16906013, 0.37282401), control2: f(0.37282392, 0.16905899))
+        p.addLine(to: f(0.66993427, 0.06549600))
+        p.addCurve(to: f(1.52866483, 0), control1: f(0.86840689, 0), control2: f(1.08849323, 0))
+    }
+    p.move(to: tl(1.52866483, 0))
+    p.addLine(to: tr(1.52866483, 0)); inward(tr)
+    p.addLine(to: br(0, 1.52866483)); outward(br)
+    p.addLine(to: bl(1.52866483, 0)); inward(bl)
+    p.addLine(to: tl(0, 1.52866483)); outward(tl)
+    p.closeSubpath()
+    return p
+}
+
+/// How much detail the mark keeps. Each size gets the most it can show cleanly.
+enum Level {
+    case full    // 128 px and up: two and a half waves, three loops, the ruling
+    case small   // 64 px: one and a half waves, two loops
+    case tiny    // 32 px and the menu bar: one wave, one loop, heavy lines
+    case micro   // 16 px: one wave and a straight line
+
+    static func forIcon(_ px: Int) -> Level { px <= 16 ? .micro : px <= 32 ? .tiny : px <= 64 ? .small : .full }
+}
+
+/// The mark: the line runs along the baseline, crossing the margin rule at ruleX.
+struct Mark {
+    let level: Level
+    /// Path pieces: straight runs of sampled points, and cubic curves.
+    enum Seg { case to(CGPoint); case curve(CGPoint, CGPoint, CGPoint) }
+
+    struct Params { let x0, periods, amp, loops, r, d, k, decay, stroke, ruleWidth: CGFloat }
+    var baseline: CGFloat { 560 }
+    /// 16 px moves the rule right so the wave gets room enough to show.
+    var ruleX: CGFloat { level == .micro ? 470 : 392 }
+    var stroke: CGFloat { [.full: 32, .small: 58, .tiny: 70, .micro: 84][level]! }
+    var ruleWidth: CGFloat { [.full: 26, .small: 44, .tiny: 50, .micro: 64][level]! }
+    var showsRuling: Bool { level == .full }
+
+    func segments() -> [Seg] {
+        let base = baseline
+        func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x, y: y) }
+        // Small sizes are drawn by hand on a 32 px grid (32 units a pixel): one 3 px wave of
+        // sound in the margin, a short flat run past the rule, then, in `tiny`, one upright
+        // loop whose counter stays about 2 px wide; `micro` goes straight on instead.
+        let wave: [Seg] = [
+            .to(pt(170, base)),
+            .curve(pt(192, base - 200), pt(248, base - 200), pt(270, base)),
+            .curve(pt(292, base + 200), pt(348, base + 200), pt(370, base)),
+        ]
+        switch level {
+        case .micro:
+            return [
+                .to(pt(160, base)),
+                .curve(pt(190, base - 250), pt(285, base - 250), pt(315, base)),
+                .curve(pt(345, base + 250), pt(440, base + 250), pt(470, base)),
+                .curve(pt(600, base), pt(740, base - 10), pt(860, base - 24)),
+            ]
+        case .tiny:
+            return wave + [
+                .curve(pt(400, base), pt(440, base), pt(470, base)),
+                .curve(pt(560, base), pt(640, base - 120), pt(640, base - 250)),
+                .curve(pt(640, base - 365), pt(500, base - 365), pt(500, base - 250)),
+                .curve(pt(500, base - 110), pt(510, base + 6), pt(590, base + 4)),
+                .curve(pt(680, base + 2), pt(770, base - 10), pt(850, base - 30)),
+            ]
+        default: break
+        }
+        let q = level == .full
+            ? Params(x0: 160, periods: 2.5, amp: 165, loops: 3, r: 20, d: 50, k: 92, decay: 0.55, stroke: 32, ruleWidth: 26)
+            : Params(x0: 175, periods: 1.5, amp: 150, loops: 2, r: 27, d: 50, k: 100, decay: 0.55, stroke: 58, ruleWidth: 44)
+        var segs: [Seg] = []
+        // Sound: a sine under a swelling envelope, from the page edge to the rule.
+        for i in 0...300 {
+            let f = CGFloat(i) / 300
+            let env = q.amp * pow(sin(.pi * f), 0.9)
+            segs.append(.to(pt(q.x0 + f * (ruleX - q.x0), base - env * sin(2 * .pi * q.periods * f))))
+        }
+        // Pen: a prolate cycloid, loops like a cursive "l", getting smaller as it goes.
+        var e = CGPoint.zero
+        for i in 1...600 {
+            let f = CGFloat(i) / 600
+            let t = CGFloat.pi + f * q.loops * 2 * .pi
+            let decay = 1 - f * q.decay
+            e = pt(ruleX + q.r * (t - .pi) - q.d * decay * sin(t), base - q.k * decay * (1 + cos(t)))
+            segs.append(.to(e))
+        }
+        segs.append(.curve(pt(e.x + 40, base + 2), pt(e.x + 70, base - 12), pt(e.x + 100, base - 24)))
+        return segs
+    }
+
+    var path: CGPath {
+        let p = CGMutablePath()
+        for (i, s) in segments().enumerated() {
+            switch s {
+            case .to(let q): i == 0 ? p.move(to: q) : p.addLine(to: q)
+            case .curve(let c1, let c2, let q): p.addCurve(to: q, control1: c1, control2: c2)
+            }
+        }
+        return p
+    }
+
+    var strokedBounds: CGRect {
+        path.copy(strokingWithWidth: stroke, lineCap: .round, lineJoin: .round, miterLimit: 10).boundingBoxOfPath
+    }
+
+    /// SVG path data for the line, with the sampled runs thinned to every fourth point.
+    var svg: String {
+        func f(_ v: CGFloat) -> String { String(format: "%.1f", v) }
+        let segs = segments()
+        var out = ""
+        for (i, s) in segs.enumerated() {
+            switch s {
+            case .to(let q):
+                let last = i == segs.count - 1
+                // Keep the first point, every fourth, and any point a curve starts from.
+                var keep = i % 4 == 0 || last
+                if !last, case .curve = segs[i + 1] { keep = true }
+                if i == 0 { out += "M\(f(q.x)) \(f(q.y))" } else if keep { out += "L\(f(q.x)) \(f(q.y))" }
+            case .curve(let c1, let c2, let q):
+                out += "C\(f(c1.x)) \(f(c1.y)) \(f(c2.x)) \(f(c2.y)) \(f(q.x)) \(f(q.y))"
+            }
+        }
+        return out
     }
 }
 
-// Tray template icon: black glyph on transparent (macOS tints it).
-png(36, "\(out)/tray-template.png") { _ in
-    NSColor.black.setFill()
-    NSBezierPath(roundedRect: CGRect(x: 7, y: 6, width: 4, height: 24), xRadius: 2, yRadius: 2).fill()
-    for (i, w) in [17.0, 14.0, 10.0].enumerated() {
-        NSBezierPath(roundedRect: CGRect(x: 15, y: 24 - Double(i) * 8, width: w, height: 4), xRadius: 2, yRadius: 2).fill()
+// MARK: - Drawing
+
+func fillCapsule(_ c: CGContext, _ r: CGRect, _ color: CGColor) {
+    let rad = min(r.width, r.height) / 2
+    c.addPath(CGPath(roundedRect: r, cornerWidth: rad, cornerHeight: rad, transform: nil))
+    c.setFillColor(color); c.fillPath()
+}
+
+func strokeLine(_ c: CGContext, _ m: Mark, _ color: CGColor, widen: CGFloat = 0) {
+    c.addPath(m.path); c.setStrokeColor(color); c.setLineWidth(m.stroke + widen)
+    c.setLineCap(.round); c.setLineJoin(.round); c.strokePath()
+}
+
+/// The app icon: shadow, paper body, ruling, the margin rule, the line, a glassy rim.
+func drawIcon(_ c: CGContext, _ pal: Palette, level: Level) {
+    let m = Mark(level: level)
+    let shape = squircle(body, bodyRadius)
+    c.saveGState()
+    c.setShadow(offset: CGSize(width: 0, height: 12), blur: 28, color: rgb(0x000000, 0.3))
+    c.addPath(shape); c.setFillColor(pal.paperBottom); c.fillPath()
+    c.restoreGState()
+
+    c.saveGState()
+    c.addPath(shape); c.clip()
+    let paper = CGGradient(colorsSpace: srgb, colors: [pal.paperTop, pal.paperBottom] as CFArray, locations: [0, 1])!
+    c.drawLinearGradient(paper, start: CGPoint(x: 0, y: 100), end: CGPoint(x: 0, y: 924), options: [])
+    if m.showsRuling {
+        c.setFillColor(pal.ruling)
+        for i in 0..<7 { c.fill(CGRect(x: 100, y: 257.5 + CGFloat(i) * 100, width: 824, height: 5)) }
     }
+    fillCapsule(c, CGRect(x: m.ruleX - m.ruleWidth / 2, y: 60, width: m.ruleWidth, height: 1000), pal.rule)
+    c.setShadow(offset: CGSize(width: 0, height: 6), blur: 10, color: rgb(0x000000, 0.18))
+    strokeLine(c, m, pal.ink)
+    c.restoreGState()
+
+    // Rim: bright along the top edge, gone by the middle, a little dark at the bottom.
+    c.saveGState()
+    c.addPath(shape); c.clip()
+    c.addPath(squircle(body.insetBy(dx: 1.5, dy: 1.5), bodyRadius - 1.5)); c.setLineWidth(3)
+    c.replacePathWithStrokedPath(); c.clip()
+    let rim = CGGradient(colorsSpace: srgb, colors: [rgb(0xffffff, pal.rim), rgb(0xffffff, 0), rgb(0x000000, 0.12)] as CFArray,
+                         locations: [0, 0.5, 1])!
+    c.drawLinearGradient(rim, start: CGPoint(x: 0, y: 100), end: CGPoint(x: 0, y: 924), options: [])
+    c.restoreGState()
 }
-// Recording variant: filled dot.
-png(36, "\(out)/tray-recording.png") { _ in
-    NSColor.black.setFill()
-    NSBezierPath(ovalIn: CGRect(x: 8, y: 8, width: 20, height: 20)).fill()
+
+/// Menu-bar template: black on transparent; macOS tints it. Drawn on a 36 px canvas (18 pt @2x)
+/// with line widths set in pixels. A gap where the line crosses the rule keeps the two apart.
+/// `recording` swaps the sound wave for a solid dot on the rule, and the loop for a straight line.
+/// Both share one frame, so the rule stays put when a recording starts.
+func drawTray(_ c: CGContext, recording: Bool) {
+    let m = Mark(level: .tiny)
+    let b = m.strokedBounds
+    c.saveGState()
+    c.scaleBy(x: 1024 / 36, y: 1024 / 36)            // now in pixels
+    let s = 32 / b.width                              // pixels per design unit
+    c.translateBy(x: 18, y: 18); c.scaleBy(x: s, y: s); c.translateBy(x: -b.midX, y: -b.midY)
+    let px = 1 / s, line = 3.4 * px, gap = 1.6 * px
+    let black = rgb(0x000000)
+    fillCapsule(c, CGRect(x: m.ruleX - 1.5 * px, y: m.baseline - 15 * px, width: 3 * px, height: 30 * px), black)
+    func stroke(_ path: CGPath, _ w: CGFloat) {
+        c.addPath(path); c.setLineWidth(w); c.setLineCap(.round); c.setLineJoin(.round); c.setStrokeColor(black); c.strokePath()
+    }
+    if recording {
+        let dot = CGRect(x: m.ruleX - 6 * px, y: m.baseline - 6 * px, width: 12 * px, height: 12 * px)
+        c.setBlendMode(.clear)
+        c.addEllipse(in: dot.insetBy(dx: -gap, dy: -gap)); c.setFillColor(black); c.fillPath()
+        c.setBlendMode(.normal)
+        c.addEllipse(in: dot); c.setFillColor(black); c.fillPath()
+        let pen = CGMutablePath()
+        pen.move(to: CGPoint(x: dot.maxX + gap + line / 2 + 1.5 * px, y: m.baseline))
+        pen.addCurve(to: CGPoint(x: b.maxX - m.stroke / 2, y: m.baseline - 30), control1: CGPoint(x: dot.maxX + 200, y: m.baseline),
+                     control2: CGPoint(x: b.maxX - 200, y: m.baseline - 12))
+        stroke(pen, line)
+    } else {
+        c.setBlendMode(.clear); stroke(m.path, line + 2 * gap)
+        c.setBlendMode(.normal); stroke(m.path, line)
+    }
+    c.restoreGState()
 }
+
+/// Draws in 1024 units onto a canvas of `w`x`h` px, top-left origin.
+func render(_ w: Int, _ h: Int, _ path: String, unit: CGFloat = 1024, _ draw: (CGContext) -> Void) {
+    let c = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: srgb,
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    c.translateBy(x: 0, y: CGFloat(h))
+    c.scaleBy(x: CGFloat(min(w, h)) / unit, y: -CGFloat(min(w, h)) / unit)
+    draw(c)
+    let png = NSBitmapImageRep(cgImage: c.makeImage()!).representation(using: .png, properties: [:])!
+    try! png.write(to: URL(fileURLWithPath: path))
+}
+
+func icon(_ px: Int, _ path: String, _ pal: Palette = light) {
+    render(px, px, path) { drawIcon($0, pal, level: .forIcon(px)) }
+}
+
+// MARK: - Social preview
+
+func recursive(size: CGFloat, weight: CGFloat, casual: CGFloat) -> CTFont {
+    let url = URL(fileURLWithPath: "\(root)/node_modules/@fontsource-variable/recursive/files/recursive-latin-full-normal.woff2")
+    guard let descs = CTFontManagerCreateFontDescriptorsFromURL(url as CFURL) as? [CTFontDescriptor], let d = descs.first else {
+        fatalError("Recursive not found at \(url.path). Run bun install first.")
+    }
+    func tag(_ s: String) -> Int { s.unicodeScalars.reduce(0) { $0 << 8 | Int($1.value) } }
+    let axes = [tag("wght"): weight, tag("CASL"): casual, tag("MONO"): 0, tag("slnt"): 0, tag("CRSV"): 0.5] as [Int: CGFloat]
+    let v = CTFontDescriptorCreateCopyWithAttributes(d, [kCTFontVariationAttribute: axes] as CFDictionary)
+    return CTFontCreateWithFontDescriptor(v, size, nil)
+}
+
+func text(_ c: CGContext, _ s: String, _ font: CTFont, _ color: CGColor, x: CGFloat, baseline: CGFloat, tracking: CGFloat = 0) {
+    let attrs: [NSAttributedString.Key: Any] = [.init(kCTFontAttributeName as String): font,
+                                                .init(kCTForegroundColorAttributeName as String): color,
+                                                .init(kCTKernAttributeName as String): tracking]
+    let line = CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: attrs))
+    c.saveGState()
+    c.textMatrix = .identity
+    c.translateBy(x: x, y: baseline); c.scaleBy(x: 1, y: -1)
+    c.textPosition = .zero
+    CTLineDraw(line, c)
+    c.restoreGState()
+}
+
+/// 1280x640: a ruled page, the icon in the margin, the name and the tagline on the lines.
+func drawSocial(_ c: CGContext) {
+    let W: CGFloat = 1280, H: CGFloat = 640
+    let paper = CGGradient(colorsSpace: srgb, colors: [rgb(0xf3f6ef), rgb(0xe6ece1)] as CFArray, locations: [0, 1])!
+    c.drawLinearGradient(paper, start: .zero, end: CGPoint(x: 0, y: H), options: [])
+    // Ruling on the page side only, so the margin is a clean column for the icon.
+    let marginX: CGFloat = 476
+    c.setFillColor(rgb(0xd3dcd0))
+    var y: CGFloat = 12
+    while y < H { c.fill(CGRect(x: marginX, y: y, width: W - marginX, height: 2)); y += 56 }
+    c.setFillColor(rgb(0x5e9480, 0.55)); c.fill(CGRect(x: marginX, y: 0, width: 3, height: H))
+    // Icon, 360 px, centred in the margin.
+    c.saveGState()
+    c.translateBy(x: 238 - 180, y: H / 2 - 180); c.scaleBy(x: 360 / 1024, y: 360 / 1024)
+    drawIcon(c, light, level: .full)
+    c.restoreGState()
+    // Name and tagline sit on the ruling (lines at 12 + 56n).
+    let tagline = NSFont.systemFont(ofSize: 38, weight: .regular) as CTFont
+    text(c, "Margin", recursive(size: 150, weight: 680, casual: 1), rgb(0x1c2430), x: 534, baseline: 292, tracking: -3)
+    text(c, "Notes in your words.", tagline, rgb(0x445060), x: 540, baseline: 404)
+    text(c, "Transcripts on the side.", tagline, rgb(0x445060), x: 540, baseline: 460)
+}
+
+// MARK: - Output
+
+try! FileManager.default.createDirectory(atPath: docsDir, withIntermediateDirectories: true)
+
+icon(1024, "\(iconsDir)/app-icon.png")
+icon(512, "\(iconsDir)/icon.png")
+icon(32, "\(iconsDir)/32x32.png")
+icon(128, "\(iconsDir)/128x128.png")
+icon(256, "\(iconsDir)/128x128@2x.png")
+
+let iconset = NSTemporaryDirectory() + "margin-\(getpid()).iconset"
+try! FileManager.default.createDirectory(atPath: iconset, withIntermediateDirectories: true)
+for pt in [16, 32, 128, 256, 512] {
+    icon(pt, "\(iconset)/icon_\(pt)x\(pt).png")
+    icon(pt * 2, "\(iconset)/icon_\(pt)x\(pt)@2x.png")
+}
+let iconutil = Process()
+iconutil.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+iconutil.arguments = ["-c", "icns", iconset, "-o", "\(iconsDir)/icon.icns"]
+try! iconutil.run(); iconutil.waitUntilExit()
+precondition(iconutil.terminationStatus == 0, "iconutil failed")
+try? FileManager.default.removeItem(atPath: iconset)
+
+render(36, 36, "\(iconsDir)/tray-template.png") { drawTray($0, recording: false) }
+render(36, 36, "\(iconsDir)/tray-recording.png") { drawTray($0, recording: true) }
+
+icon(256, "\(docsDir)/app-icon-light.png", light)
+icon(256, "\(docsDir)/app-icon-dark.png", dark)
+render(1280, 640, "\(docsDir)/social-preview.png", unit: 640, drawSocial)
+
+// The bare mark for the UI: the icon without its tile, drawn straight on the app's paper.
+func markSource(_ m: Mark) -> String {
+    // A square 790 units wide around the line; the rule runs its full height, as in the icon.
+    let b = m.strokedBounds
+    let box = CGRect(x: 510 - 395, y: b.midY - 395, width: 790, height: 790)
+    let rule = CGRect(x: m.ruleX - m.ruleWidth / 2, y: box.minY, width: m.ruleWidth, height: box.height)
+    func f(_ v: CGFloat) -> String { String(format: "%.1f", v) }
+    return """
+      {
+        viewBox: "\(f(box.minX)) \(f(box.minY)) \(f(box.width)) \(f(box.height))",
+        rule: { x: \(f(rule.minX)), y: \(f(rule.minY)), width: \(f(rule.width)), height: \(f(rule.height)) },
+        stroke: \(f(m.stroke)),
+        line: "\(m.svg)",
+      }
+    """
+}
+let ts = """
+// Generated by scripts/make-icons.swift. Do not edit: change the script and run `bun run icons`.
+// The Margin mark in the app icon's 1024 units: the margin rule and the sound-to-pen line.
+
+export type MarkGeometry = {
+  viewBox: string;
+  rule: { x: number; y: number; width: number; height: number };
+  stroke: number;
+  line: string;
+};
+
+/** For 40 px and up. */
+export const MARK: MarkGeometry =
+\(markSource(Mark(level: .full)));
+
+/** Under 40 px: one wave, one loop, heavier lines. */
+export const MARK_TINY: MarkGeometry =
+\(markSource(Mark(level: .tiny)));
+
+"""
+try! ts.write(toFile: "\(root)/src/components/logoMark.ts", atomically: true, encoding: .utf8)
+print("Wrote icons to \(iconsDir), images to \(docsDir), and src/components/logoMark.ts")
