@@ -7,18 +7,36 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ## [0.0.5] - Unreleased
 
+### Added
+
+- A menu bar item, **Settings…**.
+- A permission error has an **Open Permissions** button that opens Settings → Permissions.
+- Settings → About shows the Margin version and the minutes-core version.
+- `scripts/make-icons.swift` (`bun run icons`) draws every icon from one source.
+
 ### Changed
 
-- Settings is a page with sections, in place of a sheet.
-- A new app icon, and the Margin logo in the app.
+- Settings is a page in the main window, in place of a sheet. A list of sections is on the
+  left: General, Recording, Transcription, Summaries, Voices, Permissions, Integrations,
+  Updates, About and Start over. *Back* or Esc returns to the meeting, search and scroll
+  position you left, and ⌘, opens the section you used last.
+- ⌘⇧R and ⌘⇧I start a recording from Settings, and ⌘J and ⌘F work there too.
+- A new app icon: a sound line in the margin crosses the rule and becomes handwriting. The
+  menu bar icons match it, and the logo shows in setup, on Home and in the sidebar.
 - minutes-core comes from upstream `silverstein/minutes` again. Upstream merged Margin's
   transcript checkpoint patch
   ([silverstein/minutes#1316](https://github.com/silverstein/minutes/pull/1316)), so
   Margin no longer uses the `askysh/minutes` fork. minutes-core is pinned by commit
-  `209265f` until upstream tags a release that contains the patch.
+  `209265f` until upstream tags a release that contains the patch (D48).
+- `scripts/bump-upstream.sh` takes an upstream tag or commit.
 - The repository docs: a new README, CONTRIBUTING.md, CODE_OF_CONDUCT.md, AGENTS.md,
   this changelog, issue and pull request templates, and a docs map in
   [docs/README.md](docs/README.md).
+
+### Fixed
+
+- A name or word list typed just before you leave Settings is saved.
+- In the Reset dialog, Esc closes only the dialog, and focus returns to *Reset Margin…*.
 
 ## [0.0.4] - 2026-11-06
 

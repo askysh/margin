@@ -6,3 +6,4 @@ dist/
 src-tauri/gen/
 src-tauri/target/
 /release/
+*.tsbuildinfo

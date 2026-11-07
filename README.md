@@ -63,7 +63,7 @@ Margin, never during a recording. Settings → Updates turns the automatic check
   - The notepad opens with a live transcript beside it. In calls, live lines are marked
     You / Them.
   - With Fast or Balanced, Margin transcribes the meeting in 2-minute pieces while it
-    records. After *Stop*, only the last piece or two is left. Settings → Recording →
+    records. After *Stop*, only the last piece or two is left. Settings → Transcription →
     "Transcribe during the meeting" turns this off.
   - After *Stop*, the meeting opens as soon as its transcript is ready. Speaker names and
     the summary fill in when they are done. Your notes stay editable the whole time.
@@ -89,10 +89,15 @@ Margin, never during a recording. Settings → Updates turns the automatic check
 - **Menu bar.** The menu bar shows the elapsed time of a recording and the five newest
   meetings. An optional global shortcut, ⌃⌥⌘R, starts and stops a recording from any
   app. A banner offers to record when a call app such as Zoom starts.
-- **Settings.** Your name, folder and model. Microphone, stop after silence, and open at
-  login. Meeting language, speaker separation, and names and words to spell right.
-  Summary engine, language and instructions. How long to keep audio. Recognised voices.
-  An MCP snippet, so Claude can read your meetings.
+- **Settings.** A page in the main window, opened with ⌘, the gear or the menu bar. A
+  list of sections is on the left, and *Back* (or Esc) returns to where you were:
+  - **General:** your name, the meetings folder, how long to keep audio, open at login.
+  - **Recording:** the microphone, stop after silence, call suggestions, the global
+    shortcut and sounds.
+  - **Transcription:** the model, transcribing during the meeting, the meeting language,
+    speaker separation, and names and words to spell right.
+  - **Summaries**, **Voices**, **Permissions**, **Integrations** (an MCP snippet, so
+    Claude can read your meetings), **Updates** and **About**.
 - **Reset.** *Reset Margin…* under *Start over* clears settings, the processing queue,
   logs and state, then runs setup again.
   - "Keep my meetings", "Keep downloaded speech models" and "Keep recognised voices" are

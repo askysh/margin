@@ -17,7 +17,7 @@ Status:
 
 | Upstream setting | What it does | Margin | Reason for a skip / notes |
 |---|---|---|---|
-| Your name (`identity.name`) | Labels you in transcripts and summaries. | has | Settings → You. |
+| Your name (`identity.name`) | Labels you in transcripts and summaries. | has | Settings → General. |
 | Your email addresses (`identity.emails`) | Folds calendar attendees onto you. | skipped | Margin has no calendar (D9). |
 | Name variants (`identity.aliases`) | Other forms of your name, for hints and matching. | skipped | "Names and words to spell right" covers the transcription use. |
 | Display language (`ui.language`) | Language of the app's menus and text. | skipped | Margin is English only in v1. |

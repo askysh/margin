@@ -40,6 +40,9 @@ measured: that needs the app window. The bridge figures stand in for it.
 | CSS | 21.0 KB | 24.5 KB (new onboarding styles) |
 | Fonts | 682 KB in 4 subsets | unchanged |
 
+In 0.0.5, Settings became a page with a section nav, and its chunk grew to about 22 KB
+(7.5 KB gzip). It is still loaded on first use.
+
 Note: with the old profile, the new code gave a 39.37 MiB app. The smaller app comes from
 the release profile (DECISIONS.md D36).
 
