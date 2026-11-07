@@ -66,7 +66,8 @@ The owner uses Margin every day. Their meetings, settings and voices are real.
 - **Match the code around you.** A Rust module starts with a `//!` comment that says what
   it does and why. Comments explain the reason, not the code.
 - **Commits** are small and logical, with an imperative subject and a body that says why.
-- **CHANGELOG.md** gets a line in its top section, the one marked Unreleased, for each change a user can see.
+- **CHANGELOG.md** gets a line in its top section, the one marked Unreleased, for each
+  change a user can see.
 
 ## Docs
 

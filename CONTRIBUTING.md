@@ -84,8 +84,8 @@ would ask "why not the obvious way?", the answer is a decision.
 ## What a pull request needs
 
 - **One topic.** A fix and a refactor are two pull requests.
-- **A line in [CHANGELOG.md](CHANGELOG.md)** in the top section, the one marked Unreleased, for a change that
-  people who use Margin can see.
+- **A line in [CHANGELOG.md](CHANGELOG.md)**, in the top section, the one marked
+  Unreleased, for a change that people who use Margin can see.
 - **A decision in DECISIONS.md** for each choice that is not obvious, or none.
 - **Tested on:** the macOS version, and whether you ran it in the real app or only in
   the end-to-end pass.
