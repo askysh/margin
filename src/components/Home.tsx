@@ -1,5 +1,6 @@
 import type { Kind } from "../api";
 import { copyText, tildify } from "../util";
+import { Logo } from "./Logo";
 import { DownloadProgress } from "./Models";
 
 interface Props {
@@ -25,6 +26,7 @@ export function Home({ count, outputDir, orphanedDraft, onDismissDraft, onStart,
             </div>
           </div>
         )}
+        <div className="home-logo"><Logo size={56} /></div>
         <h1 className="home-title">{count === 0 ? "Your first meeting starts here." : "Ready when you are."}</h1>
         <p className="home-body">
           Start recording when the meeting begins and type notes in your own words. Margin writes the transcript,
