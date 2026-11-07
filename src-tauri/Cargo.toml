@@ -1,6 +1,6 @@
 [package]
 name = "margin"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 license = "MIT"
 description = "Margin: a calm, local-first meeting notepad built on minutes-core"
@@ -14,10 +14,11 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# minutes-core v0.32.1 plus one patch (transcript checkpoints, for rolling transcription),
-# from the askysh/minutes fork, pinned by commit while upstream reviews it (DECISIONS.md, "A minutes-core fork with one patch").
-# Bump with scripts/bump-upstream.sh (re-seeds Cargo.lock; see README "Updating minutes-core").
-minutes-core = { git = "https://github.com/askysh/minutes", rev = "d3b724ed7fa8656e344f885956eda71724eee628", default-features = false, features = ["whisper", "streaming", "diarize", "metal"] }
+# minutes-core from upstream: a tag, or a commit on main when Margin needs a change that no
+# tag has yet (DECISIONS.md, "Back on upstream minutes-core").
+# Now: v0.32.1 + 209265f.
+# Bump with scripts/bump-upstream.sh <tag|commit> (re-seeds Cargo.lock; see README "Updating minutes-core").
+minutes-core = { git = "https://github.com/silverstein/minutes", rev = "209265fac94763d45171acb284c258eff6718690", default-features = false, features = ["whisper", "streaming", "diarize", "metal"] }
 # minutes-core asks for ort "2.0.0-rc.10" (caret); later rcs break pyannote-rs. Upstream's CLI pins it too.
 ort = { version = "=2.0.0-rc.10", default-features = false }
 

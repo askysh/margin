@@ -31,7 +31,7 @@ pub mod ops {
             prefs: prefs::load().app(),
             recorder: recorder().view(),
             orphaned_draft: crate::recorder::orphaned_draft(),
-            upstream_tag: "v0.32.1",
+            upstream_tag: "v0.32.1 + 209265f",
             version: env!("CARGO_PKG_VERSION"),
         })
     }

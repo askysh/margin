@@ -420,6 +420,8 @@ The full comparison is in `docs/parity/app.md`.
 ## 0.0.4: transcribe during the meeting
 
 ### D46. A minutes-core fork with one patch
+- **Superseded by D48 (0.0.5).** Upstream merged the patch, and Margin no longer uses the
+  fork.
 - Rolling transcription needs core to take transcript work from the host. Core v0.32.1
   always transcribes the whole recording after Stop (UPSTREAM-PATCHES.md #11).
 - Options: (a) wait for upstream; (b) a `[patch]` on the tagged core; (c) a fork with the
@@ -469,3 +471,24 @@ The full comparison is in `docs/parity/app.md`.
   - Core accepted every piece (20 of 20, 63 of 63).
 - Not measured yet: GPU, battery and heat during a real call, with the live transcript
   running at the same time.
+
+## 0.0.5: no fork
+
+### D48. Back on upstream minutes-core
+- Upstream merged the transcript checkpoint patch (UPSTREAM-PATCHES.md #11) as
+  silverstein/minutes PR #1316, merge commit `209265f` on main. No tag has it yet. The
+  latest tag is v0.32.1.
+- Options: (a) stay on the fork until upstream ships a tag; (b) pin upstream main by
+  commit.
+- Pick: **(b)**. `minutes-core` comes from `silverstein/minutes`, pinned by
+  `rev = "209265fac94763d45171acb284c258eff6718690"`: v0.32.1 plus 6 commits. The core
+  code at that commit is the same as the fork commit that 0.0.4 used, so rolling
+  transcription needs no change.
+- `Cargo.lock` is seeded from upstream's lock at that commit. It still has ort
+  2.0.0-rc.10, so the `ort` pin stays.
+- `scripts/bump-upstream.sh <ref>` takes a tag or a full commit SHA. For a commit, it
+  makes sure that the commit is on upstream main and after the latest tag.
+- Settings shows the core as "v0.32.1 + 209265f", not as a tag that does not have the
+  patch.
+- When a tag with the patch ships, run `scripts/bump-upstream.sh <tag>` to go back to a
+  tag pin. The askysh/minutes fork is no longer used.
