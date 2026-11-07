@@ -1,6 +1,6 @@
 //! The meeting library: plain Markdown files with YAML frontmatter in the user's folder.
 //! We read them directly (no index), and edit only the `## Notes` section in place. The
-//! frontmatter bytes and every other section are kept exactly (RESEARCH.md §1.5).
+//! frontmatter bytes and every other section are kept exactly (docs/research.md §1.5).
 
 use crate::corecfg;
 use minutes_core::markdown::split_frontmatter;

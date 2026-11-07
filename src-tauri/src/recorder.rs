@@ -1,6 +1,6 @@
 //! Recording. This is the same sequence as upstream's `minutes record`, run in-process on a
-//! worker thread (RESEARCH.md §1.2), plus live-transcript tailing with "You / Them"
-//! guesses (RESEARCH.md §1.3, DECISIONS.md D8).
+//! worker thread (docs/research.md §1.2), plus live-transcript tailing with "You / Them"
+//! guesses (docs/research.md §1.3, DECISIONS.md D8).
 //!
 //! A recording stays "active" from Start until its audio is queued for processing,
 //! including the seconds spent finalizing after Stop. Quit and Reset look at that state,

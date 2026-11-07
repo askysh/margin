@@ -2,14 +2,14 @@
 
 Upstream: `silverstein/minutes` at tag **v0.32.1** (commit `b92ef348`, 2026-11-05).
 Surveyed from the reference clone at `~/dev/minutes-upstream`. The detailed notes, with
-file:line references and signatures, are in `docs/research/`:
+file:line references and signatures, are in [research/](research/):
 
 | File | Covers |
 |---|---|
-| `survey-recording.md` | Start/stop, system audio, live transcript, permissions, call detection |
-| `survey-storage.md` | Diarization, speaker rename, voice profiles, Markdown format, search, notes, vault |
-| `survey-config.md` | Config, state-path inventory, model downloads, summaries, MCP, CLI JSON |
-| `survey-build.md` | Native deps, build flags, the Tauri app's packaging, release workflow, cask |
+| [survey-recording.md](research/survey-recording.md) | Start/stop, system audio, live transcript, permissions, call detection |
+| [survey-storage.md](research/survey-storage.md) | Diarization, speaker rename, voice profiles, Markdown format, search, notes, vault |
+| [survey-config.md](research/survey-config.md) | Config, state-path inventory, model downloads, summaries, MCP, CLI JSON |
+| [survey-build.md](research/survey-build.md) | Native deps, build flags, the Tauri app's packaging, release workflow, cask |
 
 ## TL;DR
 
@@ -142,7 +142,7 @@ file:line references and signatures, are in `docs/research/`:
   `memos/`, `archive/`, `failed-captures/` and `daily/`, and dot-dirs are ignored. Files
   are mode 0600.
 - The frontmatter is YAML. The fields we use are title, type, date, duration, attendees,
-  speaker_map, tags and status. The full table is in `survey-storage.md`.
+  speaker_map, tags and status. The full table is in [survey-storage.md](research/survey-storage.md).
   - **Unknown keys are dropped** whenever core re-writes the YAML.
   - `schema/meeting.schema.json` is out of date; `minutes schema` gives the current one.
 - Body order: `## Summary`, Decisions / Action Items / Open Questions, `## Notes`, then
