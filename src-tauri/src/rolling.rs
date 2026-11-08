@@ -3,10 +3,12 @@
 //! While a meeting records, a background thread transcribes each source in pieces of
 //! about two minutes: the mic and call stems for a call, the recording itself in person.
 //! Each piece goes through core's `transcript_checkpoint::transcribe_span`, which uses the
-//! same chunking, model and settings as the final pass. At Stop, the finished pieces go to
-//! the job as a transcript checkpoint, and core transcribes only what they don't cover,
-//! usually the last minute or two. Core checks every piece against the final audio and
-//! settings, and transcribes again any range whose piece does not match.
+//! same chunking, model and settings as the final pass. A piece ends where core's chunker
+//! resets (piece_cut.rs), so its chunks, and so its words, are those of the final pass.
+//! At Stop, the finished pieces go to the job as a transcript checkpoint, and core
+//! transcribes only what they don't cover, usually the last minute or two. Core checks
+//! every piece against the final audio and settings, and transcribes again any range whose
+//! piece does not match.
 //!
 //! The thread only reads the growing capture files and never blocks the capture. It runs
 //! at utility priority. A failed piece is dropped (the final pass covers that range). If
@@ -17,7 +19,7 @@
 //! `margin --dev rolling <wav> [segment-secs] [out.md]` is the research prototype that
 //! measured this design. It is kept below `Session`.
 
-use crate::{corecfg, events, prefs};
+use crate::{corecfg, events, piece_cut, prefs};
 use minutes_core::config::Config;
 use minutes_core::transcript_checkpoint::{self as checkpoint, CheckpointSource, TranscriptCheckpoint};
 use std::path::{Path, PathBuf};
@@ -28,8 +30,8 @@ use std::time::{Duration, Instant};
 
 /// Audio per piece. Shorter pieces leave less at Stop but load the model more often.
 const PIECE_SECS: usize = 120;
-/// A piece ends at the quietest 100 ms of its last 15 s, so no word is cut in two.
-const LOOK_BACK_SECS: usize = 15;
+/// How often the thread reads the growing files.
+const READ_EVERY: Duration = Duration::from_secs(2);
 /// More untranscribed audio than this on one source means the thread can't keep up.
 const MAX_BACKLOG_PIECES: usize = 4;
 /// Stop waits this long for a piece that is being transcribed. Redoing it after Stop
@@ -182,19 +184,18 @@ impl Worker {
                 self.give_up(reason);
                 return;
             }
-            // The source whose next piece ends first.
+            // The earliest piece that can end now.
             let ready = self
                 .sources
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| t.pending.len() >= self.piece)
-                .min_by_key(|(_, t)| t.next_start)
-                .map(|(i, _)| i);
-            let Some(i) = ready else {
-                self.sleep(Duration::from_secs(2));
+                .filter_map(|(i, t)| Some((t.next_start, i, piece_cut::cut(&t.pending, self.piece)?)))
+                .min();
+            let Some((_, i, cut)) = ready else {
+                self.sleep(READ_EVERY);
                 continue;
             };
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.transcribe_next(i)));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.transcribe_next(i, cut)));
             if outcome.is_err() {
                 self.give_up("a piece crashed the transcriber".into());
                 return;
@@ -202,9 +203,9 @@ impl Worker {
         }
     }
 
-    fn transcribe_next(&mut self, i: usize) {
+    /// Transcribes the first `cut` pending samples of source `i`.
+    fn transcribe_next(&mut self, i: usize, cut: usize) {
         let tail = &mut self.sources[i];
-        let cut = quiet_cut(&tail.pending, self.piece);
         let samples: Vec<f32> = tail.pending.drain(..cut).collect();
         let start = tail.next_start;
         tail.next_start += cut as u64;
@@ -265,7 +266,9 @@ fn lower_priority() {
 
 /// Reads the samples a growing 16 kHz mono 16-bit WAV has gained since the last read.
 /// The header's sizes aren't final while recording, so it reads the raw data after the
-/// `data` chunk id, as recorder.rs does for the live labels.
+/// `data` chunk id, as recorder.rs does for the live labels. `pending` holds every sample
+/// from the stem's first one on, as `s / 32768`, the canonical samples that core reads
+/// from the final file. So sample counts are on the stem's clock and grid.
 struct Tail {
     source: CheckpointSource,
     path: PathBuf,
@@ -335,23 +338,6 @@ fn wav_data_offset(file: &mut std::fs::File) -> Result<Option<u64>, String> {
         return Err(format!("not 16 kHz mono 16-bit PCM ({format}, {channels} ch, {rate} Hz, {bits} bit)"));
     }
     Ok(Some(data as u64 + 8))
-}
-
-/// Where to end a piece of `samples` that is at least `target` long: the middle of the
-/// quietest 100 ms window in the `LOOK_BACK_SECS` before `target`.
-fn quiet_cut(samples: &[f32], target: usize) -> usize {
-    let win = SR / 10;
-    let look_back = (LOOK_BACK_SECS * SR).min(target / 2);
-    let mut best = (f64::MAX, target);
-    let mut w = target - look_back;
-    while w + win <= target {
-        let e: f64 = samples[w..w + win].iter().map(|&x| (x as f64).powi(2)).sum();
-        if e < best.0 {
-            best = (e, w + win / 2);
-        }
-        w += win;
-    }
-    best.1
 }
 
 // ---------------------------------------------------------------- research prototype
@@ -434,29 +420,10 @@ pub fn bench(cfg: &Config, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Segment boundaries: every `target` samples, moved back to the quietest 100 ms window
-/// in the 15 s before the boundary.
+/// Segment boundaries, as the rolling thread cuts them (piece_cut.rs).
 fn cut_points(samples: &[i16], target: usize) -> Vec<(usize, usize)> {
-    let win = SR / 10;
-    let look_back = 15 * SR;
-    let mut out = Vec::new();
-    let mut start = 0;
-    while samples.len() - start > target + look_back {
-        let nominal = start + target;
-        let mut best = (f64::MAX, nominal);
-        let mut w = nominal - look_back.min(target / 2);
-        while w + win <= nominal {
-            let e: f64 = samples[w..w + win].iter().map(|&x| (x as f64).powi(2)).sum();
-            if e < best.0 {
-                best = (e, w + win / 2);
-            }
-            w += win;
-        }
-        out.push((start, best.1));
-        start = best.1;
-    }
-    out.push((start, samples.len()));
-    out
+    let samples: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+    piece_cut::pieces(&samples, target, READ_EVERY.as_secs() as usize * SR)
 }
 
 /// `[m:ss] text` → (seconds + offset, text).
@@ -648,21 +615,6 @@ mod tests {
         tail.read_new();
         assert_eq!(tail.pending.len(), 2);
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn a_piece_ends_in_the_quietest_moment_before_its_target() {
-        let target = 20 * SR;
-        let mut samples = vec![0.3f32; target + SR];
-        // A pause 3 s before the target.
-        let pause = target - 3 * SR;
-        samples[pause..pause + SR / 10].iter_mut().for_each(|s| *s = 0.0);
-        let cut = quiet_cut(&samples, target);
-        assert!((pause..pause + SR / 10).contains(&cut), "cut {cut}, pause {pause}");
-        // Never past the target, never before the look-back window.
-        let flat = vec![0.3f32; target];
-        let cut = quiet_cut(&flat, target);
-        assert!(cut <= target && cut >= target - (LOOK_BACK_SECS * SR).min(target / 2));
     }
 
     #[test]

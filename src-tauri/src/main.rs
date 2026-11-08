@@ -15,6 +15,7 @@ mod models;
 mod notify;
 mod paths;
 mod permissions;
+mod piece_cut;
 mod prefs;
 mod processing;
 mod recorder;
