@@ -7,6 +7,12 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ## [0.0.7] - Unreleased
 
+### Fixed
+
+- Transcribe during the meeting gives the same transcript as transcription after Stop.
+  Each piece now ends where core's chunker starts a new chunk. Before, about 12% of the
+  words on a long call were different, and words at the cuts were lost (D49).
+
 ### Development
 
 - Every change goes into the `next-release` branch, Dependabot's updates too. Merging

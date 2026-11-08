@@ -445,9 +445,9 @@ The full comparison is in `docs/parity/app.md`.
 
 ### D47. Rolling transcription
 - While a meeting records, `rolling.rs` transcribes each source (the mic and call stems,
-  or the in-person recording) in pieces of about 2 minutes. Each piece ends at the
-  quietest 100 ms of its last 15 s. At Stop, the pieces go to the job, and core
-  transcribes only the rest.
+  or the in-person recording) in pieces of about 2 minutes. At first each piece ended at
+  the quietest 100 ms of its last 15 s. D49 replaces that cut. At Stop, the pieces go to
+  the job, and core transcribes only the rest.
 - Fast and Balanced only. Best (large-v3-turbo) needs about 4× the compute of Balanced,
   and cannot keep up on a MacBook Air (docs/research/live-transcription.md).
 - Settings → Recording → "Transcribe during the meeting", on by default. With Best it is
@@ -492,3 +492,53 @@ The full comparison is in `docs/parity/app.md`.
   patch.
 - When a tag with the patch ships, run `scripts/bump-upstream.sh <tag>` to go back to a
   tag pin. The askysh/minutes fork is no longer used.
+
+## 0.0.7: pieces that match the final pass
+
+### D49. A rolling piece ends where core's chunker resets
+- New fact: on the owner's real 80-minute call, the transcript from rolling pieces was
+  different from the whole-file pass in about 12% of the words. Whisper on this Mac gives
+  the same words for the same audio: two whole-file passes gave the same transcript. So
+  the cut caused the difference.
+  - Core's chunker reads 100 ms windows, counted from the first sample of the audio it
+    gets. Its noise floor changes with the audio.
+  - A piece that starts at any sample moves that grid and starts the noise floor again.
+    The chunks move by up to 0.1 s, and whisper gets other audio. Words at the cuts were
+    lost, and words changed in every piece.
+- Options: (a) keep the quietest-100 ms cut; (b) cut only where the chunker resets, with
+  Margin's own copy of the chunker's rules; (c) wait until core makes its chunker or a cut
+  helper public.
+- Pick: **(b)** now, and **(c)** when upstream ships it (UPSTREAM-PATCHES.md #16).
+  `piece_cut.rs` cuts on the stem's 100 ms grid, at a point where the chunker is back in
+  its first state:
+  - after a chunk of 1 s to 45 s, when 800 ms of silence closes it: the chunk's end plus
+    12,800 samples;
+  - at the end of a 45 s chunk, which the chunker splits without a pause.
+- Which reset point:
+  1. the longest pause that ends at most 15 s before the target length (2 minutes), or
+     later;
+  2. else the first 45 s split in that range;
+  3. else wait for more audio, up to 1.5 × the target, and then take the latest reset
+     point in the piece;
+  4. with no reset point at all, the quietest 100 ms of the last 15 s, on the grid.
+  With no speech at all, the cut is at the target.
+- Pieces start at sample 0, and every cut is a reset point. So each piece, and the audio
+  after the last piece, gets the same chunks as the whole stem.
+- Measured:
+  - Core's own capture checkpoint with the same rule (silverstein/minutes#1319 plus this
+    fix), on the real call: the same transcript as the whole-file pass, word for word
+    (5,106 of 5,106 and 4,402 of 4,402 words). The transcript was ready 9 s after Stop,
+    against 29 minutes.
+  - Margin's rule on the same two stems, with core's chunker: 40 and 42 pieces. Every
+    chunk is the same as in the whole-stem pass (286 and 431 chunks).
+- Risk: if core changes its chunker, Margin's copy cuts in the wrong place. Then pieces
+  are still accepted, but their words differ from the final pass. The test
+  `margin_chunker_is_cores_chunker` compiles core's `detect_meeting_vad_chunks` from the
+  pinned source and compares it with Margin's copy. It fails when the two differ.
+  `scripts/bump-upstream.sh` runs the tests, so a new core with another chunker fails
+  there. The test reads core's code from Cargo's checkout. That code is not copied into
+  this repository.
+- Limits: two cuts are not reset points. In a long silence, the next piece starts with
+  the first noise floor, and the whole stem has the floor that the silence gave it. The
+  two come close within seconds of silence, and in digital silence they become equal.
+  The quietest-100 ms fallback can move the chunks near it. Both are rare in a call.
