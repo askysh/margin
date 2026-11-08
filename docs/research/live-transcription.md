@@ -411,6 +411,11 @@ Run it on a stem with
 `MARGIN_REAL_STEM=<stem.wav> cargo test real_stem -- --ignored --nocapture`. It runs no
 model and takes about 10 s.
 
+A whisper check with `margin --dev rolling-job` on 10 minutes of the same call (20:00 to
+30:00, both stems), Balanced, a debug build: the job with rolling at 2× real time and the
+job with `--off` gave the same transcript, word for word (1,072 words). Core accepted all
+7 pieces. The transcript was ready 31 s after Stop with rolling, against 270 s without.
+
 The same rule in core's own capture checkpoint (silverstein/minutes#1319 plus the fix)
 gave the same transcript as the whole-file pass on this call, word for word: 5,106 of
 5,106 and 4,402 of 4,402 words. The transcript was ready 9 s after Stop, against 29
