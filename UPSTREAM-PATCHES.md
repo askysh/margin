@@ -183,3 +183,19 @@ here has been applied to upstream, and we work around each of the others locally
 - **Patch:** if the resolved model is missing, use `transcription.model` when it is
   `base` or `small`. Report the failure through the live status once, not per utterance.
 - **Workaround:** Margin sets `live_transcript.model` itself.
+
+## 16. A public cut helper for transcript checkpoint spans
+- **Where:** `crates/core/src/transcribe.rs` `detect_meeting_vad_chunks` (~line 2387 at
+  `209265f`) is `pub(crate)`. The doc of `transcript_checkpoint::transcribe_span` says to
+  cut a span in a pause, but core gives no way to find a good cut.
+- **Why:** a span gets the same chunks as the final pass only when it starts where the
+  chunker resets, on its 100 ms grid from the start of the source. A span that starts
+  anywhere else gets other chunks, and whisper gives other words. On a real 80-minute
+  call, about 12% of the words were different. To cut in the right place, a host must
+  copy the chunker's rules.
+- **Patch:** make a cut helper public, for example `transcript_checkpoint::span_cut(pending:
+  &[f32], target: usize) -> Option<usize>`, as `capture_checkpoint::span_cut` in
+  silverstein/minutes#1319. At least, make `detect_meeting_vad_chunks` public.
+- **Workaround:** `src-tauri/src/piece_cut.rs` has Margin's copy of the chunker's rules
+  (DECISIONS.md D49). A test compiles core's own chunker from the pinned source and
+  compares the two.

@@ -5,7 +5,22 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
-## [0.0.6] - Unreleased
+## [0.0.7] - 2026-11-08
+
+### Fixed
+
+- Transcribe during the meeting gives the same transcript as transcription after Stop.
+  Each piece now ends where core's chunker starts a new chunk. Before, about 12% of the
+  words on a long call were different, and words at the cuts were lost (D49).
+
+### Development
+
+- Every change goes into the `next-release` branch, Dependabot's updates too. Merging
+  `next-release` into `main` tags the version and drafts the release.
+- `scripts/bump-version.sh` runs on Linux too, and dates the section of the version that
+  is released.
+
+## [0.0.6] - 2026-11-07
 
 ### Development
 

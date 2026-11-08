@@ -14,12 +14,12 @@
 # (ort, pyannote-rs) can break the build. CI does not build the Rust side, so
 # a crate update must be built and tested on a Mac before it merges.
 #
-# The pull requests go to main. The next release branch takes them with a merge of main
-# (docs/releasing.md).
+# The pull requests go to next-release, like every other change (docs/releasing.md).
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    target-branch: next-release
     schedule:
       interval: weekly
     groups:
@@ -27,6 +27,7 @@ updates:
         patterns: ["*"]
   - package-ecosystem: bun
     directory: /
+    target-branch: next-release
     schedule:
       interval: weekly
     groups:

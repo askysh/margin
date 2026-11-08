@@ -139,9 +139,11 @@ Whisper settings that config cannot change: `best_of 5`, temperature fallback, t
 ### 2. Rolling transcription during the recording
 
 - **What:** a background thread transcribes each stem in pieces while the meeting runs.
-  A piece closes every N seconds of audio, at the quietest 100 ms of its last 15 s. Each
-  piece uses core's public `transcribe::transcribe_meeting`, so the chunking and whisper
-  settings are those of the final pass. At Stop, only the open piece of each stem is left.
+  A piece closes every N seconds of audio. The prototype cut each piece at the quietest
+  100 ms of its last 15 s. That cut changes the chunks, so the app now cuts where core's
+  chunker resets (see "Where a piece ends" below). Each piece uses core's public
+  `transcribe::transcribe_meeting`, so the whisper settings are those of the final pass.
+  At Stop, only the open piece of each stem is left.
 - **Measured** (`margin --dev rolling`, 60-minute call, 120 s pieces, load 2.5–3.0):
 
   | | Batch after Stop | Rolling |
@@ -342,6 +344,7 @@ If upstream does not take patch 11, Margin can carry it as a `[patch]` on the ta
 ## Files
 
 - `src-tauri/src/rolling.rs`: the rolling prototype.
+- `src-tauri/src/piece_cut.rs`: where a piece ends.
 - `src-tauri/src/devcli.rs`: `live-replay`, `rolling`, and stems plus stage times in
   `process`.
 - `docs/research/patches/minutes-core-whisper-chunks.prototype.diff`: the prototype core
@@ -380,3 +383,40 @@ off, a fresh sandbox for each run, load 2.4–3.3 (a debug build and the unit te
   each meeting minute). So on a real call, expect a piece in progress at Stop more often
   (Stop waits up to 20 s for it) and a tail of about 25–50 s.
 
+## Where a piece ends
+
+Measured on 2026-11-08 (DECISIONS.md D49).
+
+On the owner's real 80-minute call, the transcript from the pieces was different from the
+whole-file pass in about 12% of the words. Two whole-file passes gave the same words, so
+whisper is not the cause. The cut is:
+
+- Core's chunker (`detect_meeting_vad_chunks`) reads 100 ms windows (1,600 samples),
+  counted from the first sample it gets. Its noise floor changes with the audio, and goes
+  back to 0.001 each time it closes a chunk.
+- The quietest-100 ms cut starts a piece at any sample. So each chunk boundary in the
+  piece moves by up to 0.1 s, and the floor starts again. Whisper gets other audio.
+
+`piece_cut.rs` cuts only on the stem's 100 ms grid, where the chunker resets: 800 ms after
+the end of a chunk of 1 s to 45 s that silence closes, or at the end of a 45 s chunk.
+`margin_chunker_is_cores_chunker` compiles core's chunker from the pinned source and
+checks that Margin's copy gives the same chunks.
+
+| Stem (80 min) | Pieces | Chunks, whole stem | Chunks that differ, pieces against whole stem |
+|---|---|---|---|
+| Microphone | 40 | 286 | 0 |
+| Call | 42 | 431 | 0 |
+
+Run it on a stem with
+`MARGIN_REAL_STEM=<stem.wav> cargo test real_stem -- --ignored --nocapture`. It runs no
+model and takes about 10 s.
+
+A whisper check with `margin --dev rolling-job` on 10 minutes of the same call (20:00 to
+30:00, both stems), Balanced, a debug build: the job with rolling at 2× real time and the
+job with `--off` gave the same transcript, word for word (1,072 words). Core accepted all
+7 pieces. The transcript was ready 31 s after Stop with rolling, against 270 s without.
+
+The same rule in core's own capture checkpoint (silverstein/minutes#1319 plus the fix)
+gave the same transcript as the whole-file pass on this call, word for word: 5,106 of
+5,106 and 4,402 of 4,402 words. The transcript was ready 9 s after Stop, against 29
+minutes.
