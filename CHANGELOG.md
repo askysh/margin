@@ -5,7 +5,7 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
-## [Unreleased]
+## [0.0.8] - 2026-11-09
 
 ### Changed
 
@@ -20,6 +20,11 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 - In a window under 900 px wide, the home page text no longer gets squeezed into a narrow
   column.
+
+### Development
+
+- TypeScript 5.9 checks the UI.
+- The e2e pass opens Ask from its bar, and checks a narrow window and the sidebar toggle.
 
 ## [0.0.7] - 2026-11-08
 
