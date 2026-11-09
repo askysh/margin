@@ -368,6 +368,8 @@ The full comparison is in `docs/parity/app.md`.
   still names them in later meetings.
 
 ### D41. The live transcript uses the chosen model
+- **The Best part is superseded by D52.** With Best, the live transcript uses Balanced
+  (`small`), not `base`.
 - Core's live sidecar defaults to the dictation model ("base"), which Margin never
   downloads. With "small" chosen, the live sidecar found no model and wrote no lines: an
   80-minute meeting had an empty live transcript.
@@ -445,6 +447,8 @@ The full comparison is in `docs/parity/app.md`.
     the final file and settings. Otherwise it transcribes that range again.
 
 ### D47. Rolling transcription
+- **"Fast and Balanced only" is superseded by D52.** Rolling transcription now works with
+  Best too. The 4× estimate below was not a measurement.
 - While a meeting records, `rolling.rs` transcribes each source (the mic and call stems,
   or the in-person recording) in pieces of about 2 minutes. At first each piece ended at
   the quietest 100 ms of its last 15 s. D49 replaces that cut. At Stop, the pieces go to
@@ -581,3 +585,91 @@ The full comparison is in `docs/parity/app.md`.
     removed, so the caret, the scroll and the audio player stay.
   - Settings in a narrow window shows its sections as icons only.
 - The page rule that gave the home page three columns is fixed.
+
+## Rolling transcription with Best
+
+### D52. Rolling transcription works with Best, and Best's live transcript uses Balanced
+- New fact: D47 kept Best out because of an RTF of about 1.7. That number came from "4.2×
+  the compute of `small`" on synthetic audio. It was not measured on real audio. On
+  2026-11-09 the owner measured it on a MacBook Air M4 (16 GB, debug build) with
+  `margin --dev rolling <wav> 120`. The input was 11 minutes of a real call, both stems,
+  with Hindi and English mixed:
+
+  | Model | RTF | Work left after Stop | Lines | Garbled non-Latin lines |
+  |---|---|---|---|---|
+  | `small` | 0.463 | 50.8 s | 148 | 9 |
+  | `large-v3-turbo` | 0.729 | 58.5 s | 224 | 0 |
+  | `large-v3-turbo-q5_0` | 0.735 | 59.2 s | — | — |
+
+  Turbo keeps up. `small` writes garbled Devanagari on this call and drops content.
+  The q5_0 model is not faster, so Margin does not add it.
+- Options:
+  - Rolling with Best: (a) keep it off, (b) turn it on.
+  - The live model for Best: (a) keep `base`, (b) `small`, (c) turbo.
+- Pick: **rolling on with Best**, and **`small` (Balanced) live**.
+  - Rolling with Best was checked at real time with the live transcript running at the
+    same time (below). It kept up, and it did not change the live transcript.
+  - `small` live has 2.4 points less WER than `base` live (9.3% against 11.7%), and it
+    costs 390 MB more memory. On the Hindi and English call, `small` still garbles some
+    Hindi lines. `base` was not measured on that call. Turbo live lagged and lost lines at 3× (docs/research/live-transcription.md),
+    and it would share the GPU with rolling turbo.
+- Measured at 1× real time, the same 11 minutes (41:00 to 52:00 of the call), debug
+  build, on AC power. `margin --dev rolling-job` with Best and `margin --dev live-replay`
+  with `small` ran at the same time, in two sandboxes:
+
+  | | Best, rolling off | Best, rolling on |
+  |---|---|---|
+  | Stop to transcript ready | 428.4 s | **50.6 s** |
+  | Stop to Complete | 457.4 s | 77.6 s |
+  | Pieces made / failed / accepted by core | — | 10 / 0 / 10 |
+  | Stop waited for a piece | — | 0.2 s |
+  | Rolling compute during the meeting | — | 298 s for 660 s |
+  | Rolling stopped itself (8 minutes behind) | — | no |
+  | Transcript against rolling off | — | the same, word for word (1,629 words) |
+
+  | Live transcript (`small`) | Alone | With rolling Best |
+  |---|---|---|
+  | Lines | 54 | 54 |
+  | Text | — | the same, word for word (1,575 words) |
+  | Extra time before a line shows (median, p90, max) | — | 0 s, 6.6 s, 8.1 s |
+  | Peak memory | 798 MB | 806 MB |
+  | GPU busy (median of 5 s samples, 27% with nothing running) | 12% | 95% |
+
+  The rolling process used 4% CPU on average and up to 2.0 GB of memory during the
+  meeting. No thermal warning was recorded.
+- Measured on battery on 2026-11-09, the same Mac, debug build, screen on, no other work.
+  The input was the whole 80-minute call (4,832 s, both stems) at 1× real time, with
+  rolling and the live transcript (`small`) at the same time. Balanced ran on 15 minutes
+  of the same call (41:00 to 56:00) after an 18-minute rest. The "matched" column is Best
+  on the same 15 minutes. A sampler read `ioreg` (battery charge in mAh, system power,
+  GPU) and `ProcessInfo.thermalState` every 10 s:
+
+  | | Best, 80 min | Best, matched 15 min | Balanced, 15 min |
+  |---|---|---|---|
+  | Battery per hour (of 4,061 mAh) | 26% | 25% | 24% |
+  | System power (mean; 3.8 W with nothing running) | 13.4 W | 13.0 W | 15.0 W |
+  | GPU busy (median) | 98% | 99% | 67% |
+  | Thermal state | "fair" for 82% of the samples, from minute 4 | "fair" | nominal |
+  | Peak memory of the processes | 2.6 GB | 2.6 GB | 1.7 GB |
+  | Pieces made / failed | 76 / 0 | — | 14 / 0 |
+  | Stop to transcript ready | 156 s | — | 21 s |
+  | Stop to Complete | 351 s | — | 58 s |
+
+  - Best uses about the same charge as Balanced. The GPU runs at full power with both
+    models. Best keeps it busy for longer, at lower clocks.
+  - The thermal state never went past "fair", and rolling did not fall behind.
+  - The final transcript of the whole call had 11,784 words and no garbled lines. The
+    saved Balanced transcript of the same call had 9,667 words and 9 garbled lines.
+  - The live transcript (`small`) stayed 3 to 7 s behind the audio for the whole call.
+    It garbled 35 of its 456 lines on the Hindi parts.
+- Upgrade: a Best user from 0.0.8 has `base` but not `small`. Margin downloads `small` at
+  launch in the background. Recording does not wait for the live model
+  (`models::ready_to_record`). Until `small` is there, the live transcript uses `base`.
+- Costs and risks:
+  - The GPU is busy for most of the meeting. That costs battery, and on a fanless MacBook
+    Air it adds heat. Measured on battery (below): Best uses about the same charge per
+    hour as Balanced, and the Mac stays at the "fair" thermal state.
+  - In the app, both models are in one process: about 2.7 GB at peak, plus the app.
+  - A slower Mac than the M4 can fall behind. Then rolling stops itself (D47), and Best
+    transcribes the rest after Stop, as before.
+  - The switch "Transcribe during the meeting" can turn it off.

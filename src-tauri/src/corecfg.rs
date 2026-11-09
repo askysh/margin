@@ -103,9 +103,11 @@ pub fn load() -> Config {
 
 /// The model for the live transcript while recording. Core's default is the dictation
 /// model ("base"), which Margin never downloads, so the live transcript stayed empty.
-/// Use the chosen model, except the large one, which is too slow to keep up live.
+/// Use the chosen model, except the large one. Large lags and loses lines live, and rolling
+/// transcription (D52) needs the GPU too. Balanced is the next best model: 9.3% WER live,
+/// against 11.7% for Fast (docs/research/live-transcription.md).
 pub fn live_model(model: &str) -> String {
-    if model.starts_with("large") { "base".into() } else { model.into() }
+    if model.starts_with("large") { "small".into() } else { model.into() }
 }
 
 pub fn exists() -> bool {
@@ -314,6 +316,13 @@ mod tests {
         cfg.summarization.engine = "none".into();
         let s = settings(&cfg);
         (cfg, s)
+    }
+
+    #[test]
+    fn live_model_is_balanced_for_best() {
+        assert_eq!(live_model("base"), "base");
+        assert_eq!(live_model("small"), "small");
+        assert_eq!(live_model("large-v3-turbo"), "small");
     }
 
     #[test]

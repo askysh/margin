@@ -5,6 +5,17 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [Unreleased]
+
+### Changed
+
+- "Transcribe during the meeting" works with the Best model too. An 80-minute meeting with
+  Best is ready about 3 minutes after Stop, not about an hour. On a MacBook Air M4 it uses
+  about the same battery as Balanced (D52).
+- With Best, the live transcript uses Balanced in place of Fast, which is more accurate.
+  Margin downloads Balanced (488 MB) in the background after the update. Until it is
+  there, the live transcript uses Fast, and recording does not wait for it (D52).
+
 ## [0.0.8] - 2026-11-09
 
 ### Changed

@@ -164,20 +164,13 @@ export function TranscriptionSection({ s, save, options }: SettingsView) {
   );
 }
 
-/** Rolling transcription (rolling.rs). Best is too slow to keep up during a meeting, so the
- * switch sits under the model choice it depends on. */
+/** Rolling transcription (rolling.rs). It works with every model (DECISIONS.md D52). */
 function RollingToggle({ s, save }: { s: Settings; save: Save }) {
-  const supported = s.model === "base" || s.model === "small";
   return (
     <ToggleRow
       title="Transcribe during the meeting"
-      help={
-        supported
-          ? "Most of the transcript is done by the time you press Stop, so a long meeting is ready in seconds. Uses more battery while recording."
-          : "Not with the Best model, which is too slow to keep up. Best transcribes after Stop."
-      }
-      checked={supported && (s.rolling_transcription ?? true)}
-      disabled={!supported}
+      help="Most of the transcript is done by the time you press Stop, so a long meeting is ready in a few minutes, not an hour. Uses more battery while recording."
+      checked={s.rolling_transcription ?? true}
       onChange={(on) => save({ rolling_transcription: on })}
     />
   );

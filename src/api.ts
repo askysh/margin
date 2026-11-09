@@ -21,7 +21,7 @@ export interface Settings {
   vocabulary?: string[];
   summary_instructions?: string;
   open_at_login?: boolean;
-  /** Transcribe during the meeting (Fast and Balanced only). */
+  /** Transcribe during the meeting. On by default, for every model. */
   rolling_transcription?: boolean;
 }
 
@@ -144,6 +144,8 @@ export interface ModelFile {
   url: string;
   approx_bytes: number;
   installed: boolean;
+  /** The live transcript model. Recording does not wait for it. */
+  live: boolean;
 }
 
 export interface ModelProgress {

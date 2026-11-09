@@ -77,6 +77,13 @@ fn main() {
             notify::init(&handle);
             shortcut::refresh(&handle);
             processing::spawn_watcher();
+            // A model that this version needs and an earlier one did not, such as the live
+            // transcript model for Best (D52), downloads in the background.
+            if prefs::load().onboarding_complete && !models::all_installed(&corecfg::load()) {
+                if let Err(error) = models::download_missing() {
+                    tracing::warn!(%error, "could not start the model download");
+                }
+            }
             calldetect::spawn();
             updater::spawn(&handle);
             Ok(())

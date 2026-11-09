@@ -64,8 +64,8 @@ Margin, never during a recording. Settings → Updates turns the automatic check
     You / Them.
   - Make the window narrow to keep it beside the call. The sidebar becomes a drawer
     (⌘\ hides it in a wide window), and a switch picks Notes or Transcript.
-  - With Fast or Balanced, Margin transcribes the meeting in 2-minute pieces while it
-    records. After *Stop*, only the last piece or two is left. Settings → Transcription →
+  - Margin transcribes the meeting in 2-minute pieces while it records, with every model.
+    After *Stop*, only the last piece or two is left. Settings → Transcription →
     "Transcribe during the meeting" turns this off.
   - After *Stop*, the meeting opens as soon as its transcript is ready. Speaker names and
     the summary fill in when they are done. Your notes stay editable the whole time.
