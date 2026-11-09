@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { api, type LiveLine, type RecorderView } from "../api";
+import { api, on, type LiveLine, type RecorderView } from "../api";
 import { clock, useDebounced } from "../util";
 import { NotesEditor } from "./NotesEditor";
 import { SideSwitch, useOneColumn, type Side } from "./Compact";
@@ -28,6 +28,25 @@ export function LiveView({ recorder, lines, level }: Props) {
   useDebounced(title, 350, (v) => api.setRecordingTitle(v));
   liveDraft.notes = notes;
   liveDraft.title = title;
+  // The window can hide during the meeting (the recording chip, ⌘H, close). Save at once,
+  // so a Stop from the chip or the menu bar gets the last words too.
+  useEffect(() => {
+    const flush = () => {
+      if (document.visibilityState !== "hidden" || liveDraft.session !== recorder.started_at) return;
+      if (liveDraft.notes !== null) api.setDraftNotes(liveDraft.notes).catch(() => {});
+      if (liveDraft.title !== null) api.setRecordingTitle(liveDraft.title).catch(() => {});
+    };
+    document.addEventListener("visibilitychange", flush);
+    const sub = on<null>("shrink-to-chip", () => {
+      if (liveDraft.session !== recorder.started_at) return;
+      if (liveDraft.notes !== null) api.setDraftNotes(liveDraft.notes).catch(() => {});
+      if (liveDraft.title !== null) api.setRecordingTitle(liveDraft.title).catch(() => {});
+    });
+    return () => {
+      document.removeEventListener("visibilitychange", flush);
+      sub.then((u) => u());
+    };
+  }, [recorder.started_at]);
 
   const startedLabel = useMemo(
     () => (recorder.started_at ? new Date(recorder.started_at) : new Date()).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }),

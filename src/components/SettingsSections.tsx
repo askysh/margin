@@ -114,6 +114,14 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
           onChange={(on) => changePrefs({ ...prefs, sound_cues: on })}
         />
       </Card>
+      <Card title="During a recording">
+        <ToggleRow
+          title="Show the recording chip"
+          help="When a recording starts, the Margin window hides and a small chip shows the time at the right edge of the screen. Click the chip to open your notes. Drag it up or down to move it."
+          checked={prefs.recording_chip}
+          onChange={(on) => changePrefs({ ...prefs, recording_chip: on })}
+        />
+      </Card>
     </>
   );
 }
