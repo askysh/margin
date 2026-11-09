@@ -150,23 +150,39 @@ fn apply(app: &AppHandle, state: &MenuState) {
 }
 
 pub fn show_main(app: &AppHandle) {
+    // Margin hides itself when the recording chip takes over (chip.rs).
+    let _ = app.show();
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+    crate::chip::sync(app);
+}
+
+/// Start from outside the window: the menu bar, the global shortcut or a notification.
+/// With the recording chip on, the window stays away and the chip shows. Otherwise the
+/// notepad comes forward, as before. An error always brings the window, so you see it.
+pub fn start_outside(app: &AppHandle, kind: Kind) {
+    let chip = crate::prefs::load().recording_chip();
+    if !chip {
+        show_main(app);
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = ops::start_recording(kind, None) {
+            if chip {
+                show_main(&app);
+            }
+            events::emit("error-toast", error);
+        }
+    });
 }
 
 fn handle(app: &AppHandle, id: &str) {
     match id {
         "start-call" | "start-in-person" => {
-            let kind = if id == "start-call" { Kind::Call } else { Kind::InPerson };
-            show_main(app);
-            std::thread::spawn(move || {
-                if let Err(error) = ops::start_recording(kind, None) {
-                    events::emit("error-toast", error);
-                }
-            });
+            start_outside(app, if id == "start-call" { Kind::Call } else { Kind::InPerson });
         }
         "stop" => {
             std::thread::spawn(|| {

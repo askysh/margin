@@ -3,6 +3,7 @@
 mod audio;
 mod calldetect;
 mod chat;
+mod chip;
 mod commands;
 mod corecfg;
 mod devcli;
@@ -89,10 +90,20 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the window keeps Margin in the menu bar (and any recording going).
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            if window.label() != "main" {
+                return;
+            }
+            match event {
+                // Closing the window keeps Margin in the menu bar (and any recording going).
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    chip::sync(window.app_handle());
+                }
+                // Minimize, restore and focus changes can show or hide the window. The
+                // recorder's tick also checks, for changes with no event, such as ⌘H.
+                WindowEvent::Focused(_) | WindowEvent::Resized(_) => chip::sync(window.app_handle()),
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -111,6 +122,16 @@ fn main() {
             commands::tauri_cmds::start_recording,
             commands::tauri_cmds::stop_recording,
             commands::tauri_cmds::recorder_view,
+            commands::tauri_cmds::shrink_to_chip,
+            commands::tauri_cmds::chip_open_notes,
+            commands::tauri_cmds::chip_stop,
+            chip::chip_hello,
+            chip::chip_width,
+            chip::chip_drag_start,
+            chip::chip_drag,
+            chip::chip_drag_end,
+            chip::chip_nudge,
+            chip::chip_release_focus,
             commands::tauri_cmds::set_draft_notes,
             commands::tauri_cmds::set_recording_title,
             commands::tauri_cmds::discard_orphaned_draft,
@@ -193,8 +214,15 @@ fn route(app: &tauri::AppHandle, name: &str, payload: serde_json::Value) {
             }
         }
         _ => {
-            if name == "recorder-tick" {
-                tray::tick(app, payload["elapsed_secs"].as_u64().unwrap_or(0));
+            match name {
+                events::SHRINK_TO_CHIP => chip::shrink(app),
+                events::OPEN_LIVE => tray::show_main(app),
+                "recorder" => chip::sync(app),
+                "recorder-tick" => {
+                    tray::tick(app, payload["elapsed_secs"].as_u64().unwrap_or(0));
+                    chip::sync(app);
+                }
+                _ => {}
             }
             let _ = app.emit(name, payload);
         }

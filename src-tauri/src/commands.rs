@@ -117,6 +117,7 @@ pub mod ops {
         p.mute_cues = !prefs.sound_cues;
         p.record_shortcut = prefs.record_shortcut;
         p.no_auto_update = !prefs.auto_update;
+        p.no_recording_chip = !prefs.recording_chip;
         prefs::save(&p)?;
         crate::events::emit(crate::events::SHORTCUT_REFRESH, ());
         crate::events::emit("app-prefs", p.app());
@@ -197,7 +198,45 @@ pub mod ops {
         if !models::ready_to_record(&corecfg::load()) {
             return Err("The speech models aren't downloaded yet. Open Settings → Transcription.".into());
         }
-        recorder().start(kind, title)
+        let view = recorder().start(kind, title)?;
+        // However the recording started, the window makes room for the call (D53).
+        if prefs::load().recording_chip() {
+            crate::events::emit(crate::events::SHRINK_TO_CHIP, ());
+        }
+        Ok(view)
+    }
+
+    /// The live view's control: hide the window, so only the chip shows.
+    pub fn shrink_to_chip() -> Res<()> {
+        crate::events::emit(crate::events::SHRINK_TO_CHIP, ());
+        Ok(())
+    }
+
+    /// A click on the chip: the window comes back on the live notes.
+    pub fn chip_open_notes() -> Res<()> {
+        crate::events::emit(crate::events::OPEN_LIVE, ());
+        Ok(())
+    }
+
+    /// Stop from the chip. The window is hidden, so a failure also goes out as a system
+    /// notification. The notes are the ones the live view saved last; it saves them when
+    /// the window hides.
+    pub fn chip_stop() -> Res<()> {
+        match recorder().stop(None, None) {
+            Ok(_) => Ok(()),
+            // A second click, the menu bar or auto-stop got there first.
+            Err(e) if e == crate::recorder::ALREADY_STOPPING || e == "Not recording." => Ok(()),
+            Err(e) => {
+                crate::events::emit("error-toast", &e);
+                crate::events::notify(crate::events::Notice {
+                    title: "The recording was not saved".into(),
+                    body: e.clone(),
+                    meeting: None,
+                    call_app: None,
+                });
+                Err(e)
+            }
+        }
     }
 
     pub fn stop_recording(notes: Option<String>, title: Option<String>) -> Res<Stopped> {
@@ -441,6 +480,13 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "start_recording" => out(ops::start_recording(arg(a, "kind")?, arg(a, "title")?)),
         "stop_recording" => out(ops::stop_recording(arg(a, "notes")?, arg(a, "title")?)),
         "recorder_view" => out(ops::recorder_view()),
+        "shrink_to_chip" => out(ops::shrink_to_chip()),
+        "chip_open_notes" => out(ops::chip_open_notes()),
+        "chip_stop" => out(ops::chip_stop()),
+        // The chip window's own geometry and focus. The bridge has no window: it reports
+        // the chip as shown while a recording runs.
+        "chip_hello" => Ok(serde_json::Value::Bool(recorder().is_recording())),
+        "chip_width" | "chip_drag_start" | "chip_drag" | "chip_drag_end" | "chip_nudge" | "chip_release_focus" => Ok(serde_json::Value::Null),
         "set_draft_notes" => out(ops::set_draft_notes(arg(a, "text")?)),
         "set_recording_title" => out(ops::set_recording_title(arg(a, "title")?)),
         "discard_orphaned_draft" => out(ops::discard_orphaned_draft()),
@@ -505,6 +551,9 @@ pub mod tauri_cmds {
     cmd!(start_recording(kind: Kind, title: Option<String>) -> RecorderView);
     cmd!(stop_recording(notes: Option<String>, title: Option<String>) -> Stopped);
     cmd!(recorder_view() -> RecorderView);
+    cmd!(shrink_to_chip() -> ());
+    cmd!(chip_open_notes() -> ());
+    cmd!(chip_stop() -> ());
     cmd!(set_draft_notes(text: String) -> ());
     cmd!(set_recording_title(title: Option<String>) -> ());
     cmd!(discard_orphaned_draft() -> ());
