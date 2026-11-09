@@ -169,7 +169,7 @@ function RollingToggle({ s, save }: { s: Settings; save: Save }) {
   return (
     <ToggleRow
       title="Transcribe during the meeting"
-      help="Most of the transcript is done by the time you press Stop, so a long meeting is ready in seconds. Uses more battery while recording, most with Best."
+      help="Most of the transcript is done by the time you press Stop, so a long meeting is ready in a few minutes, not an hour. Uses more battery while recording."
       checked={s.rolling_transcription ?? true}
       onChange={(on) => save({ rolling_transcription: on })}
     />
