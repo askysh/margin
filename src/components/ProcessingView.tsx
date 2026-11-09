@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, type Job, type LiveLine } from "../api";
 import { LiveTranscript, Rule } from "./LiveView";
+import { SideSwitch, useOneColumn, type Side } from "./Compact";
 
 const STEPS: { state: Job["state"][]; label: string }[] = [
   { state: ["queued"], label: "Queued" },
@@ -24,10 +25,14 @@ export function ProcessingView({ jobId, job, notes, title, onOpen, onRetry }: Pr
   const done = job && ["complete", "needs-review"].includes(job.state);
   const failed = job?.state === "failed";
   const lines = useLiveDraft(jobId);
+  const oneColumn = useOneColumn();
+  const [side, setSide] = useState<Side>("notes");
+  const split = oneColumn && lines.length > 0;
 
   return (
-    <div className={`page page-processing ${lines.length ? "has-draft" : ""}`}>
-      <div className="notes-col">
+    <div className={`page page-processing ${lines.length ? "has-draft" : ""}${split ? " page-compact" : ""}`}>
+      {split && <SideSwitch side={side} onSide={setSide} transcriptLabel="Draft transcript" />}
+      <div className={`notes-col${split && side !== "notes" ? " is-hidden" : ""}`}>
         <h1 className="title">{title || job?.title || "New meeting"}</h1>
         {failed ? (
           <div className="callout callout-error">
@@ -61,11 +66,9 @@ export function ProcessingView({ jobId, job, notes, title, onOpen, onRetry }: Pr
           </section>
         )}
       </div>
-      {lines.length > 0 && (
-        <>
-          <Rule level={0} live={false} />
-          <LiveTranscript lines={lines} call={lines.some((l) => !!l.speaker)} draft />
-        </>
+      {lines.length > 0 && !oneColumn && <Rule level={0} live={false} />}
+      {lines.length > 0 && (!oneColumn || side === "transcript") && (
+        <LiveTranscript lines={lines} call={lines.some((l) => !!l.speaker)} draft />
       )}
     </div>
   );

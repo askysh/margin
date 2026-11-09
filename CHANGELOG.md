@@ -5,6 +5,22 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [Unreleased]
+
+### Changed
+
+- Ask is a bar at the bottom of the window. Click it or press ⌘J, and it opens upward. An
+  answer keeps going when you close it (D50).
+- The window can be as narrow as 440 px, to sit beside a call or a browser. A narrow
+  window shows the sidebar as a drawer, and a meeting shows Notes or Transcript, picked
+  with a switch (D51).
+- ⌘\ hides and shows the sidebar.
+
+### Fixed
+
+- In a window under 900 px wide, the home page text no longer gets squeezed into a narrow
+  column.
+
 ## [0.0.7] - 2026-11-08
 
 ### Fixed

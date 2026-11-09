@@ -256,6 +256,7 @@ The full comparison is in `docs/parity/app.md`.
   meetings") or from a meeting ("Ask about this meeting"). A switch in the panel picks
   "This meeting" or "All meetings". Source links open a meeting and keep the panel open,
   so you can read the answer and the meeting together.
+- Replaced by D50: Ask is now a bar at the bottom.
 
 ### D30. Calm states
 - Not installed, not signed in and too old each show one sentence that says how to fix
@@ -542,3 +543,41 @@ The full comparison is in `docs/parity/app.md`.
   the first noise floor, and the whole stem has the floor that the silence gave it. The
   two come close within seconds of silence, and in digital silence they become equal.
   The quietest-100 ms fallback can move the chunks near it. Both are rare in a call.
+
+## Window layout
+
+### D50. Ask is a bar at the bottom that opens upward
+- New fact: the owner uses Margin in a narrow window beside the browser. There, the panel
+  of D29 covered most of the notes, and the owner asked for a bar at the bottom that
+  opens when you click it.
+- Options: (a) keep the docked panel; (b) a page of its own; (c) a bar at the bottom.
+- Pick: **(c)**. Closed, Ask is a bar at the bottom of the meeting and the home page. A
+  click or ⌘J opens it upward into a sheet, with the question field where the bar was.
+  Esc, the chevron or a click outside the sheet closes it.
+- With a transcript column, the bar and the sheet sit over the notes column, so the
+  transcript stays in view. Source links still open a meeting and keep the sheet open,
+  as in D29.
+- The sheet stays mounted when it is closed. An answer keeps streaming, the bar shows
+  that Claude is working, and a question you started to type waits in the bar.
+- The bar is not shown while you record or while a meeting is processed, so nothing
+  covers your notes. ⌘J still opens Ask there.
+- The sidebar row "Ask about your meetings" and the meeting's "Ask about this meeting"
+  link are removed. The bar replaces both.
+- Ask checks the `claude` CLI only when you first open it, not at startup.
+
+### D51. A narrow window is a notepad
+- New fact: the same use, beside the browser. The window could not go below 820 px, and
+  under 900 px a page rule gave the home page three columns. The home page text then got
+  about 250 px.
+- Options: (a) keep 820 px and fix the rule; (b) a smaller window with a layout for it,
+  as other meeting notepads do.
+- Pick: **(b)**. The window can go down to 440 px.
+  - ⌘\ or the button right of the traffic lights hides and shows the sidebar. Margin
+    remembers the choice.
+  - Under 760 px, the sidebar is a drawer over the notes. A meeting picked in the drawer
+    closes it.
+  - When the page is under 820 px, a meeting, a recording and a processing view show one
+    column. A switch above it picks Notes or Transcript. The notes column is hidden, not
+    removed, so the caret, the scroll and the audio player stay.
+  - Settings in a narrow window shows its sections as icons only.
+- The page rule that gave the home page three columns is fixed.

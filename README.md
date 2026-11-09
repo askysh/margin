@@ -62,6 +62,8 @@ Margin, never during a recording. Settings → Updates turns the automatic check
   in person* (⌘⇧I) records the microphone only.
   - The notepad opens with a live transcript beside it. In calls, live lines are marked
     You / Them.
+  - Make the window narrow to keep it beside the call. The sidebar becomes a drawer
+    (⌘\ hides it in a wide window), and a switch picks Notes or Transcript.
   - With Fast or Balanced, Margin transcribes the meeting in 2-minute pieces while it
     records. After *Stop*, only the last piece or two is left. Settings → Transcription →
     "Transcribe during the meeting" turns this off.
@@ -83,9 +85,9 @@ Margin, never during a recording. Settings → Updates turns the automatic check
 - **Library and search.** Meetings are grouped by Today, Yesterday, This week and month.
   Search covers titles, notes and transcripts. Click an attendee to list only the meetings
   with that person.
-- **Ask.** Press ⌘J to ask Claude about one meeting or all of them. Ask uses your own
-  `claude` CLI and can only read the meetings folder. Answers link to the meetings they
-  used. Each meeting keeps its own conversation.
+- **Ask.** Click the bar at the bottom or press ⌘J to ask Claude about one meeting or all
+  of them. Ask uses your own `claude` CLI and can only read the meetings folder. Answers
+  link to the meetings they used. Each meeting keeps its own conversation.
 - **Menu bar.** The menu bar shows the elapsed time of a recording and the five newest
   meetings. An optional global shortcut, ⌃⌥⌘R, starts and stops a recording from any
   app. A banner offers to record when a call app such as Zoom starts.

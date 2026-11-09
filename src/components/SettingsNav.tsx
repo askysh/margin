@@ -32,7 +32,7 @@ export function SettingsNav({ section, onSection, onBack }: Props) {
   return (
     <aside className="sidebar set-nav">
       <div className="sidebar-top" data-tauri-drag-region />
-      <button className="set-nav-back" onClick={onBack} title="Back (Esc)" aria-keyshortcuts="Escape">
+      <button className="set-nav-back" onClick={onBack} title="Back (Esc)" aria-label="Back" aria-keyshortcuts="Escape">
         <span className="set-nav-icon">{SettingsIcons.back()}</span>
         <span className="set-nav-label">Back</span>
         <kbd className="row-kbd" aria-hidden>esc</kbd>
@@ -45,6 +45,9 @@ export function SettingsNav({ section, onSection, onBack }: Props) {
                 className={`set-nav-item${s.id === "reset" ? " danger" : ""}`}
                 aria-current={s.id === section ? "page" : undefined}
                 tabIndex={s.id === section ? 0 : -1}
+                // A narrow window hides the label and shows only the icon.
+                aria-label={s.label}
+                title={s.label}
                 onClick={() => onSection(s.id)}
               >
                 <span className="set-nav-icon">{SettingsIcons[s.id]()}</span>

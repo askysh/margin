@@ -11,7 +11,12 @@ interface Props {
   scope: AskScope;
   onScope: (s: AskScope) => void;
   onOpenMeeting: (path: string) => void;
+  /** Open: the sheet. Closed: the bar at the bottom, or nothing when `bar` is false. */
+  open: boolean;
+  onOpen: () => void;
   onClose: () => void;
+  /** Show the closed bar. Off while you record, so nothing sits on top of your notes. */
+  bar: boolean;
 }
 
 const SUGGESTIONS: Record<AskScope, string[]> = {
@@ -19,9 +24,11 @@ const SUGGESTIONS: Record<AskScope, string[]> = {
   all: ["What did I commit to this week?", "What decisions did we make recently?", "What's still open across my meetings?"],
 };
 
-/** Ask: a chat with Claude about the open meeting or about all meetings, docked on the
- * right of the window. Answers stream in; follow-ups continue the same conversation. */
-export function AskPanel({ meeting, scope, onScope, onOpenMeeting, onClose }: Props) {
+/** Ask: a chat with Claude about the open meeting or about all meetings (D50). Closed, it
+ * is a bar at the bottom of the window. A click or ⌘J opens it upward into a sheet, with
+ * the question field where the bar was. It stays mounted while closed, so an answer keeps
+ * streaming and a half-typed question waits for you. */
+export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen, onClose, bar }: Props) {
   const about = scope === "meeting" && meeting ? meeting : null;
   const path = about?.path ?? null;
   const [thread, setThread] = useState<ChatThread | null>(null);
@@ -38,6 +45,8 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, onClose }: Pr
   const streamSeq = useRef(0);
   const input = useRef<HTMLTextAreaElement>(null);
   const body = useRef<HTMLDivElement>(null);
+  const sheet = useRef<HTMLElement>(null);
+  const barBtn = useRef<HTMLButtonElement>(null);
 
   const show = useCallback((t: ChatThread) => {
     keyRef.current = t.key;
@@ -47,15 +56,37 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, onClose }: Pr
     setStartedAt(Date.now() - t.elapsed_secs * 1000);
   }, []);
 
+  // The check runs the claude CLI, so it waits until you first open Ask.
   const checkReady = useCallback(() => api.chatStatus().then(setReady).catch(() => setReady(null)), []);
-  useEffect(() => { checkReady(); }, [checkReady]);
+  const checked = useRef(false);
+  useEffect(() => {
+    if (!open || checked.current) return;
+    checked.current = true;
+    checkReady();
+  }, [open, checkReady]);
 
   useEffect(() => {
     setThread(null);
     setSendError(null);
     api.chatThread(path).then(show).catch((e) => setSendError(errorText(e)));
-    input.current?.focus();
   }, [path, show]);
+
+  useEffect(() => {
+    if (open) input.current?.focus();
+  }, [open, path]);
+
+  // A click outside the sheet closes it, as a popover does. The sidebar and the toolbar
+  // don't count: opening another meeting keeps the answer in view (D29).
+  useEffect(() => {
+    if (!open) return;
+    const down = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (sheet.current?.contains(t) || barBtn.current?.contains(t)) return;
+      if ((t as Element).closest?.(".content")) onClose();
+    };
+    window.addEventListener("mousedown", down);
+    return () => window.removeEventListener("mousedown", down);
+  }, [open, onClose]);
 
   useEffect(() => {
     const mine = (key: string) => key === keyRef.current;
@@ -84,7 +115,7 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, onClose }: Pr
   useEffect(() => {
     const el = body.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length, partial, running]);
+  }, [messages.length, partial, running, open]);
 
   const send = async (text: string) => {
     if (!text.trim() || running) return;
@@ -111,13 +142,34 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, onClose }: Pr
   };
 
   const notReady = ready && !ready.ready ? ready : null;
+  const placeholder = about ? "Ask about this meeting" : "Ask about your meetings";
+
+  const close = () => {
+    onClose();
+    requestAnimationFrame(() => barBtn.current?.focus());
+  };
+
+  if (!open) {
+    if (!bar) return null;
+    return (
+      <button ref={barBtn} className="ask-bar" onClick={onOpen} title="Ask Claude about your meetings (⌘J)">
+        <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" fill="none" /></svg>
+        {running ? (
+          <span className="ask-bar-text is-busy"><span className="spinner" aria-hidden />{partial.trim() ? "Writing an answer…" : "Thinking…"}</span>
+        ) : (
+          <span className={`ask-bar-text${draft.trim() ? " has-draft" : ""}`}>{draft.trim() || placeholder}</span>
+        )}
+        <kbd className="row-kbd">⌘J</kbd>
+      </button>
+    );
+  }
 
   return (
-    <aside className="ask" aria-label="Ask" onKeyDown={(e) => e.key === "Escape" && onClose()}>
+    <aside ref={sheet} className="ask" aria-label="Ask" onKeyDown={(e) => e.key === "Escape" && close()}>
       <header className="ask-head">
         <span className="ask-title">Ask</span>
         {meeting && (
-          <div className="ask-scope" role="radiogroup" aria-label="Ask about">
+          <div className="pill-switch ask-scope" role="radiogroup" aria-label="Ask about">
             <button role="radio" aria-checked={scope === "meeting"} onClick={() => onScope("meeting")}>This meeting</button>
             <button role="radio" aria-checked={scope === "all"} onClick={() => onScope("all")}>All meetings</button>
           </div>
@@ -126,7 +178,9 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, onClose }: Pr
         {messages.length > 0 && !running && (
           <button className="link-btn" onClick={clear} title="Clear this conversation">Clear</button>
         )}
-        <button className="icon-btn small" aria-label="Close Ask" title="Close (Esc)" onClick={onClose}>×</button>
+        <button className="icon-btn small" aria-label="Close Ask" title="Close (Esc)" onClick={close}>
+          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden><path d="M2.5 4.5L6 8l3.5-3.5" stroke="currentColor" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" /></svg>
+        </button>
       </header>
 
       <div className="ask-body" ref={body}>
@@ -157,7 +211,7 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, onClose }: Pr
           rows={1}
           value={draft}
           aria-label="Ask a question"
-          placeholder={about ? "Ask about this meeting" : "Ask about your meetings"}
+          placeholder={placeholder}
           onChange={(e) => {
             setDraft(e.target.value);
             e.target.style.height = "auto";

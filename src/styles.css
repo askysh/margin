@@ -71,7 +71,7 @@ button { cursor: default; }
 .sidebar { background: var(--sidebar); border-right: 1px solid var(--hair); display: flex; flex-direction: column; min-height: 0; }
 .sidebar-top { height: 52px; flex: none; }
 .pane { background: var(--paper); display: grid; grid-template-rows: 52px minmax(0, 1fr); min-width: 0; min-height: 0; }
-.toolbar { display: flex; align-items: center; gap: 10px; padding: 0 16px 0 24px; }
+.toolbar { display: flex; align-items: center; gap: 10px; padding: 0 16px 0 24px; min-width: 0; }
 .toolbar-spacer { flex: 1; align-self: stretch; }
 .content { min-height: 0; position: relative; }
 /* Each view fills the content area exactly. A percentage height here resolved against the
@@ -109,7 +109,7 @@ button { cursor: default; }
 .rec-dot.small { width: 7px; height: 7px; margin-right: 7px; }
 @keyframes breathe { 50% { opacity: 0.35; } }
 
-.call-banner { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--ink-2); background: var(--rule-wash); border: 1px solid color-mix(in srgb, var(--rule) 35%, transparent); padding: 3px 4px 3px 12px; border-radius: 8px; }
+.call-banner { display: flex; align-items: center; gap: 10px; min-width: 0; font-size: 12.5px; color: var(--ink-2); background: var(--rule-wash); border: 1px solid color-mix(in srgb, var(--rule) 35%, transparent); padding: 3px 4px 3px 12px; border-radius: 8px; }
 .icon-btn.small { width: 22px; height: 22px; font-size: 15px; }
 
 /* ---------------------------------------------------------------- sidebar */
@@ -135,10 +135,11 @@ button { cursor: default; }
   /* One row, as tall as the pane: without it the row grows with a long transcript and the
      columns never scroll. */
   grid-template-rows: minmax(0, 1fr); }
-.page-processing:not(.has-draft), .page-home, .page-empty, .page-meeting.no-transcript { grid-template-columns: minmax(0, 1fr); }
+/* Two classes, so the narrow-window rule below can't give these pages a transcript column. */
+.page.page-processing:not(.has-draft), .page.page-home, .page.page-empty, .page.page-meeting.no-transcript { grid-template-columns: minmax(0, 1fr); }
 .notes-col { overflow-y: auto; min-height: 0; padding: 8px 40px 80px 56px; min-width: 0; user-select: text; -webkit-user-select: text; }
 .notes-col > * { max-width: 680px; }
-.transcript-col { overflow-y: auto; min-height: 0; padding: 8px 22px 60px 10px; min-width: 0; user-select: text; -webkit-user-select: text; }
+.transcript-col { overflow-y: auto; min-height: 0; padding: 8px 22px 80px 10px; min-width: 0; user-select: text; -webkit-user-select: text; }
 
 .title, .title-input {
   font-family: var(--f-note); font-variation-settings: "CASL" 1, "MONO" 0; font-weight: 640;
@@ -239,7 +240,7 @@ button { cursor: default; }
 .row-actions { display: flex; gap: 8px; }
 
 .page-home { overflow-y: auto; }
-.home-inner { max-width: 620px; margin: 0 auto; padding: 8vh 32px 60px; }
+.home-inner { max-width: 620px; margin: 0 auto; padding: 8vh 32px 84px; }
 .page-home .download { margin: 0 0 22px; }
 .home-title { font-family: var(--f-note); font-variation-settings: "CASL" 1; font-weight: 640; font-size: 30px; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 12px; }
 .home-body { font-size: 14.5px; line-height: 1.6; color: var(--ink-2); margin: 0 0 28px; }
@@ -371,6 +372,20 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
   .options-row { grid-template-columns: 1fr; }
 }
 
+/* ---------------------------------------------------------------- narrow window (D51) */
+/* One column at a time, with a switch above it. The notes column is hidden, not removed,
+   so its caret, scroll and audio player stay. */
+.page.page-compact { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+.page-compact > .is-hidden { display: none; }
+.side-switch { justify-self: start; margin: 4px 0 0 28px; }
+.page-compact > .notes-col, .page-compact > .transcript-col { padding: 8px 24px 88px 28px; }
+.is-compact .home-inner { padding: 5vh 24px 88px; }
+.is-compact .set-inner { padding-left: 22px; padding-right: 22px; }
+.is-compact .set-row { flex-wrap: wrap; gap: 10px 24px; }
+.is-compact .set-row-text { min-width: 200px; }
+@media (max-width: 559px) { .home-choices { grid-template-columns: 1fr; } }
+.call-banner > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ---------------------------------------------------------------- app parity: copy, action items, playback, people */
 .copy-wrap { position: relative; }
 .menu-left { left: 0; right: auto; top: calc(100% + 4px); width: 250px; }
@@ -404,13 +419,13 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
 /* ---------------------------------------------------------------- ask */
 /* Docked on the right of the content, over the transcript. Its left edge is the steno
    pad's green rule. */
-.ask { position: absolute; top: 0; right: 0; bottom: 0; width: min(410px, 100%); background: var(--paper); border-left: 1.5px solid var(--rule-soft); box-shadow: -10px 0 30px -18px rgba(28, 36, 48, 0.35); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; z-index: 15; animation: fadein 160ms ease-out; }
-.ask-head { display: flex; align-items: center; gap: 10px; padding: 8px 12px 8px 18px; border-bottom: 1px solid var(--hair); min-height: 44px; }
+.ask-head { display: flex; align-items: center; gap: 10px; padding: 8px 10px 8px 18px; border-bottom: 1px solid var(--hair); min-height: 44px; flex: none; }
 .ask-title { font-family: var(--f-note); font-variation-settings: "CASL" 1; font-weight: 640; font-size: 15px; }
-.ask-scope { display: flex; background: color-mix(in srgb, var(--ink) 6%, transparent); border-radius: 7px; padding: 2px; }
-.ask-scope button { border: none; background: none; font-size: 11.5px; padding: 2px 9px; border-radius: 5px; color: var(--pencil); }
-.ask-scope button[aria-checked="true"] { background: var(--sheet); color: var(--ink); box-shadow: 0 1px 2px rgba(28, 36, 48, 0.08); }
-.ask-body { overflow-y: auto; padding: 14px 18px 20px; user-select: text; -webkit-user-select: text; }
+.pill-switch { display: flex; background: color-mix(in srgb, var(--ink) 6%, transparent); border-radius: 7px; padding: 2px; }
+.pill-switch button { border: none; background: none; font-size: 11.5px; padding: 2px 9px; border-radius: 5px; color: var(--pencil); white-space: nowrap; }
+.pill-switch button:hover { color: var(--ink-2); }
+.pill-switch button[aria-checked="true"] { background: var(--sheet); color: var(--ink); box-shadow: 0 1px 2px rgba(28, 36, 48, 0.08); }
+.ask-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 14px 18px 20px; user-select: text; -webkit-user-select: text; }
 .ask-about { color: var(--pencil); font-size: 12px; margin: 0 0 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ask-suggest { display: grid; gap: 6px; justify-items: start; }
 .ask-chip { border: 1px solid var(--hair-strong); background: var(--sheet); border-radius: 999px; padding: 4px 12px; font-size: 12.5px; color: var(--ink-2); text-align: left; }
@@ -426,13 +441,10 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
 .ask-sources { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin-top: 6px; font-size: 12px; color: var(--pencil); }
 .ask-error { color: var(--danger); font-size: 12.5px; margin: 4px 0; }
 .ask-setup { margin: 0 0 12px; }
-.ask-compose { display: flex; align-items: flex-end; gap: 8px; padding: 10px 12px 12px 18px; border-top: 1px solid var(--hair); }
+.ask-compose { display: flex; align-items: flex-end; gap: 8px; padding: 10px 10px 10px 14px; border-top: 1px solid var(--hair); flex: none; }
 .ask-compose textarea { flex: 1; resize: none; border: 1px solid var(--hair-strong); border-radius: 8px; padding: 6px 10px; background: var(--sheet); outline: none; line-height: 18px; max-height: 140px; min-height: 32px; }
 .ask-compose textarea:focus { border-color: var(--rule); box-shadow: 0 0 0 3px var(--rule-wash); }
 .ask-compose .btn { height: 32px; }
-.row-ask { display: flex; justify-content: space-between; align-items: center; width: calc(100% - 16px); margin: 0 8px 4px; color: var(--ink-2); }
-.row-ask .row-title { gap: 7px; font-weight: 500; }
-.row-ask svg { color: var(--rule); flex: none; }
 .row-kbd { font: 11px var(--f-ui); color: var(--pencil); }
 .md blockquote { margin: 0 0 10px; padding-left: 10px; border-left: 2px solid var(--hair-strong); color: var(--ink-2); }
 .md-link-btn { border: none; background: none; padding: 0; color: inherit; font: inherit; text-underline-offset: 3px; text-decoration-color: var(--rule); }
@@ -453,6 +465,60 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
 .shell > .pane { grid-area: 1 / 2; }
 .shell.is-settings > .sidebar:not(.set-nav), .shell.is-settings .content > :not(.page-settings) { visibility: hidden; }
 .icon-btn[aria-pressed="true"] { background: color-mix(in srgb, var(--rule) 20%, transparent); color: var(--ink); }
+
+/* ---------------------------------------------------------------- sidebar: docked, hidden, drawer (D51) */
+/* One place for the toggle, right of the traffic lights, whether the sidebar shows or not. */
+.sidebar-toggle { position: fixed; top: 12px; left: 84px; z-index: 45; }
+.shell.sidebar-hidden { grid-template-columns: minmax(0, 1fr); }
+.shell.sidebar-hidden > .sidebar { display: none; }
+.shell.sidebar-hidden > .pane { grid-area: 1 / 1; }
+.shell.sidebar-hidden .toolbar { padding-left: 124px; }
+/* A narrow window: the sidebar opens over the notes and closes when you pick a meeting. */
+.shell.drawer-open > .sidebar:not(.set-nav) {
+  display: flex; position: fixed; top: 0; bottom: 0; left: 0; width: min(280px, 86vw); z-index: 40;
+  background: var(--paper-2); box-shadow: 12px 0 40px -16px rgba(20, 26, 32, 0.45); animation: drawer-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.drawer-scrim { position: fixed; inset: 0; z-index: 39; background: rgba(20, 26, 32, 0.18); animation: fadein 160ms ease-out; }
+@keyframes drawer-in { from { transform: translateX(-24px); opacity: 0; } }
+/* Settings in a narrow window: its nav shows icons only. */
+.shell.is-compact.is-settings { grid-template-columns: 52px minmax(0, 1fr); }
+.shell.is-compact.is-settings .toolbar { padding-left: 44px; }
+.is-compact .set-nav .set-nav-label, .is-compact .set-nav .row-kbd { display: none; }
+.is-compact .set-nav-back, .is-compact .set-nav-item { justify-content: center; padding: 6px 0; }
+.is-compact .set-nav-back { width: calc(100% - 12px); margin: 0 6px 10px; }
+.is-compact .set-nav-list { padding: 0 6px 14px; }
+
+/* ---------------------------------------------------------------- Ask: a bar that opens upward (D50) */
+/* With a transcript column, the bar and the sheet sit over the notes, so the transcript stays
+   in view. --ask-right is that column plus the rule. */
+.content:has(> .page-meeting:not(.no-transcript):not(.page-compact), > .page-live:not(.page-compact), > .page-processing.has-draft:not(.page-compact)) { --ask-right: 388px; }
+@media (max-width: 900px) {
+  .content:has(> .page-meeting:not(.no-transcript):not(.page-compact), > .page-live:not(.page-compact), > .page-processing.has-draft:not(.page-compact)) { --ask-right: 320px; }
+}
+.ask-bar {
+  position: absolute; left: 0; right: var(--ask-right, 0px); bottom: 14px; margin: 0 auto; z-index: 14;
+  width: min(520px, calc(100% - var(--ask-right, 0px) - 32px)); height: 38px; display: flex; align-items: center; gap: 9px; padding: 0 14px 0 15px;
+  border: 1px solid var(--hair-strong); border-radius: 19px; text-align: left; color: var(--pencil);
+  background: color-mix(in srgb, var(--sheet) 88%, transparent); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+  box-shadow: var(--shadow); transition: border-color 120ms, color 120ms;
+}
+.ask-bar:hover { border-color: color-mix(in srgb, var(--rule) 60%, var(--hair-strong)); color: var(--ink-2); }
+.ask-bar > svg { color: var(--rule); flex: none; }
+.ask-bar-text { flex: 1; min-width: 0; display: flex; align-items: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.ask-bar-text.has-draft { display: block; color: var(--ink); }
+.ask-bar-text.is-busy { color: var(--ink-2); }
+.ask {
+  position: absolute; left: 0; right: var(--ask-right, 0px); bottom: 12px; margin: 0 auto; z-index: 15;
+  width: min(640px, calc(100% - var(--ask-right, 0px) - 24px)); max-height: calc(100% - 24px); min-height: min(280px, calc(100% - 24px));
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--paper); border: 1px solid var(--hair-strong); border-radius: 16px;
+  box-shadow: var(--shadow), 0 28px 60px -24px rgba(20, 26, 32, 0.4);
+  transform-origin: 50% 100%; animation: ask-rise 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes ask-rise { from { opacity: 0; transform: translateY(12px) scaleY(0.96); } }
+@media (prefers-reduced-motion: reduce) { .ask, .shell.drawer-open > .sidebar:not(.set-nav) { animation: none; } }
+/* The toast clears the bar. */
+.shell.has-ask-bar .toast { bottom: 66px; }
 
 .set-nav { z-index: 1; }
 .set-nav-back, .set-nav-item { display: flex; align-items: center; gap: 9px; width: 100%; border: none; background: none; padding: 6px 8px; border-radius: 7px; text-align: left; font-weight: 500; color: var(--ink-2); }

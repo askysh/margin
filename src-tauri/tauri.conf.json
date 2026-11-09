@@ -17,7 +17,7 @@
         "title": "Margin",
         "width": 1180,
         "height": 760,
-        "minWidth": 820,
+        "minWidth": 440,
         "minHeight": 520,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,

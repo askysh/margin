@@ -6,6 +6,7 @@ import { MeetingView } from "./components/MeetingView";
 import { ProcessingView } from "./components/ProcessingView";
 import { Home } from "./components/Home";
 import { AskPanel, type AskScope } from "./components/AskPanel";
+import { COMPACT_QUERY, OneColumnContext, oneColumnQuery, useMediaQuery } from "./components/Compact";
 import { UpdateBanner } from "./components/Updates";
 import { clock, meetingFileReady } from "./util";
 import { useCues } from "./cues";
@@ -48,7 +49,16 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [callApp, setCallApp] = useState<string | null>(null);
   const [person, setPerson] = useState<string | null>(null);
-  const [ask, setAsk] = useState<AskScope | null>(null);
+  const [askOpen, setAskOpen] = useState(false);
+  const [askScope, setAskScope] = useState<AskScope>("meeting");
+  // A wide window docks the sidebar, and ⌘\ hides it. A narrow one shows it as a drawer
+  // over the notes (D51).
+  const compact = useMediaQuery(COMPACT_QUERY);
+  const [sidebarShown, setSidebarShown] = useState(() => readPref(SIDEBAR_PREF) !== "hidden");
+  const [drawer, setDrawer] = useState(false);
+  useEffect(() => writePref(SIDEBAR_PREF, sidebarShown ? null : "hidden"), [sidebarShown]);
+  useEffect(() => { if (!compact) setDrawer(false); }, [compact]);
+  const oneColumn = useMediaQuery(oneColumnQuery(!compact && sidebarShown));
   useCues(boot?.prefs.sound_cues ?? false);
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
@@ -167,12 +177,23 @@ export default function App() {
     setSelection({ type: "home" });
     refreshMeetings();
   }, [refreshMeetings]);
-  // Stable, because Sidebar and MeetingView are memoised against the ticking clock.
-  const askAll = useCallback(() => setAsk((a) => (a === "all" ? null : "all")), []);
-  const askMeeting = useCallback(() => setAsk("meeting"), []);
+  // Stable, because Sidebar is memoised against the ticking clock. In a narrow window a
+  // pick in the drawer also closes it, so the meeting shows.
+  const select = useCallback((s: Selection) => {
+    setSelection(s);
+    setDrawer(false);
+  }, []);
+  // The width is read at the click, not from state: just after a resize, state can lag.
+  const toggleSidebar = useCallback(() => (narrowNow() ? setDrawer((d) => !d) : setSidebarShown((v) => !v)), []);
+  const showSidebar = useCallback(() => (narrowNow() ? setDrawer(true) : setSidebarShown(true)), []);
+  const openAsk = useCallback(() => setAskOpen(true), []);
+  const closeAsk = useCallback(() => setAskOpen(false), []);
   // ⌘, opens the section you were on last, as System Settings does; a deep link (a
   // permission error, say) picks one.
-  const openSettings = useCallback((section?: SectionId) => setSettings((now) => section ?? now ?? lastSection.current), []);
+  const openSettings = useCallback((section?: SectionId) => {
+    setDrawer(false);
+    setSettings((now) => section ?? now ?? lastSection.current);
+  }, []);
   const closeSettings = useCallback(() => {
     if (resettingRef.current) return;
     blurSettingsField();
@@ -227,9 +248,37 @@ export default function App() {
   const openMeeting = selection.type === "meeting" ? meetings.find((m) => m.path === selection.path) : undefined;
   const active = jobs.filter((j) => !DONE.includes(j.state));
   const finishing = selection.type === "meeting" ? active.find((j) => j.output_path === selection.path) ?? null : null;
+  // Settings brings its own nav, so the sidebar state applies only outside it.
+  const sidebarHidden = !settings && (compact || !sidebarShown);
+  const drawerOpen = !settings && compact && drawer;
+  // The Ask bar sits under the meeting and the home page. While you record or wait for
+  // processing, nothing covers the notes; ⌘J still opens Ask.
+  const askBar = !settings && (selection.type === "meeting" || selection.type === "home" || (selection.type === "live" && !recording));
+  const shellClass = [
+    "shell",
+    recording && "is-recording",
+    settings && "is-settings",
+    compact && "is-compact",
+    sidebarHidden && "sidebar-hidden",
+    drawerOpen && "drawer-open",
+    askBar && "has-ask-bar",
+  ].filter(Boolean).join(" ");
 
   return (
-    <div className={`shell${recording ? " is-recording" : ""}${settings ? " is-settings" : ""}`}>
+    <OneColumnContext.Provider value={oneColumn}>
+    <div className={shellClass}>
+      {!settings && (
+        <button
+          className="icon-btn sidebar-toggle"
+          aria-label={sidebarHidden && !drawerOpen ? "Show sidebar" : "Hide sidebar"}
+          aria-expanded={!sidebarHidden || drawerOpen}
+          title={`${sidebarHidden && !drawerOpen ? "Show" : "Hide"} sidebar (⌘\\)`}
+          onClick={toggleSidebar}
+        >
+          <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><rect x="2.5" y="3.5" width="15" height="13" rx="2.5" stroke="currentColor" strokeWidth="1.5" fill="none" /><path d="M7.5 3.5v13" stroke="currentColor" strokeWidth="1.5" /></svg>
+        </button>
+      )}
+      {drawerOpen && <div className="drawer-scrim" onClick={() => setDrawer(false)} aria-hidden />}
       {settings && (
         <Suspense fallback={<aside className="sidebar set-nav" />}>
           <SettingsNav section={settings} onSection={setSettings} onBack={closeSettings} />
@@ -243,11 +292,9 @@ export default function App() {
         recording={recording}
         recordingTitle={recorder?.title ?? null}
         elapsed={tick.elapsed_secs}
-        onSelect={setSelection}
+        onSelect={select}
         person={person}
         onPerson={setPerson}
-        askOpen={ask === "all"}
-        onAsk={askAll}
       />
       <main className="pane">
         <header className="toolbar" data-tauri-drag-region>
@@ -284,7 +331,7 @@ export default function App() {
                 onBack={closeSettings}
                 onSaved={(s) => { setBoot((b) => b && { ...b, settings: s }); refreshMeetings(); }}
                 onResetBusy={setResetting}
-                onReset={() => { setResetting(false); lastSection.current = "general"; setSettings(null); setAsk(null); setSelection({ type: "home" }); lastList.current = ""; setMeetings([]); reboot(); }}
+                onReset={() => { setResetting(false); lastSection.current = "general"; setSettings(null); setAskOpen(false); setSelection({ type: "home" }); lastList.current = ""; setMeetings([]); reboot(); }}
                 notify={notify}
               />
             </Suspense>
@@ -312,7 +359,6 @@ export default function App() {
               onDeleted={goHome}
               job={finishing}
               onPerson={setPerson}
-              onAsk={askMeeting}
             />
           )}
           {(selection.type === "home" || (selection.type === "live" && !recorder?.recording)) && (
@@ -325,15 +371,16 @@ export default function App() {
               busy={busy}
             />
           )}
-          {ask && (
-            <AskPanel
-              meeting={openMeeting ? { path: openMeeting.path, title: openMeeting.title } : null}
-              scope={ask}
-              onScope={setAsk}
-              onOpenMeeting={(path) => setSelection({ type: "meeting", path })}
-              onClose={() => setAsk(null)}
-            />
-          )}
+          <AskPanel
+            meeting={openMeeting ? { path: openMeeting.path, title: openMeeting.title } : null}
+            scope={askScope}
+            onScope={setAskScope}
+            onOpenMeeting={(path) => setSelection({ type: "meeting", path })}
+            open={askOpen}
+            onOpen={openAsk}
+            onClose={closeAsk}
+            bar={askBar}
+          />
         </section>
       </main>
       {toast && (
@@ -352,13 +399,39 @@ export default function App() {
         onAsk={() => {
           if (resettingRef.current) return;
           // From Settings, ⌘J goes back and opens Ask rather than toggling it out of sight.
-          setAsk((a) => (a && !settings ? null : a ?? (openMeeting ? "meeting" : "all")));
+          setAskOpen((o) => !o || !!settings);
           closeSettings();
         }}
-        onSearch={closeSettings}
+        onSearch={() => {
+          closeSettings();
+          showSidebar();
+        }}
+        onSidebar={() => !settings && toggleSidebar()}
       />
     </div>
+    </OneColumnContext.Provider>
   );
+}
+
+const SIDEBAR_PREF = "margin.sidebar";
+const narrowNow = () => window.matchMedia(COMPACT_QUERY).matches;
+
+/** A per-window view preference. Storage can fail (a private profile, say); then the
+ * default applies. */
+function readPref(key: string) {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function writePref(key: string, value: string | null) {
+  try {
+    if (value === null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    // Not saved: the next launch shows the sidebar.
+  }
 }
 
 function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => void }) {
@@ -399,8 +472,9 @@ function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => 
   );
 }
 
-/** In-window shortcuts: ⌘, settings, ⌘F search, ⌘J Ask, ⌘⇧R record a call, ⌘⇧I record in person. */
-function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk, onSearch }: { onSettings: () => void; onStart: (k: Kind) => void; canStart: boolean; onAsk: () => void; onSearch: () => void }) {
+/** In-window shortcuts: ⌘, settings, ⌘F search, ⌘J Ask, ⌘\ sidebar, ⌘⇧R record a call,
+ * ⌘⇧I record in person. */
+function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk, onSearch, onSidebar }: { onSettings: () => void; onStart: (k: Kind) => void; canStart: boolean; onAsk: () => void; onSearch: () => void; onSidebar: () => void }) {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (!e.metaKey) return;
@@ -416,6 +490,9 @@ function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk, onSearch }: {
       } else if (key === "j" && !e.shiftKey) {
         e.preventDefault();
         onAsk();
+      } else if (key === "\\" && !e.shiftKey) {
+        e.preventDefault();
+        onSidebar();
       } else if (e.shiftKey && (key === "r" || key === "i") && canStart) {
         e.preventDefault();
         onStart(key === "r" ? "call" : "in-person");
@@ -423,7 +500,7 @@ function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk, onSearch }: {
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [onSettings, onStart, canStart, onAsk, onSearch]);
+  }, [onSettings, onStart, canStart, onAsk, onSearch, onSidebar]);
   return null;
 }
 
