@@ -5,6 +5,16 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [Unreleased]
+
+### Changed
+
+- "Transcribe during the meeting" works with the Best model too. A long meeting with Best
+  is ready seconds after Stop, not minutes (D52).
+- With Best, the live transcript uses Balanced in place of Fast, which is more accurate.
+  Margin downloads Balanced (488 MB) in the background after the update. Until it is there, the live transcript uses Fast, and recording does
+  not wait for it (D52).
+
 ## [0.0.8] - 2026-11-09
 
 ### Changed
