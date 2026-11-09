@@ -479,7 +479,9 @@ await check("action items from the frontmatter can be ticked and copied", async 
     "attendees:", "- Priya", "action_items:",
     "- assignee: Priya", "  task: send the deck", "  due: Friday", "  status: open",
     "- assignee: unassigned", "  task: book the room", "  status: open", "---", "",
-    "## Summary", "", "- We planned the launch.", "", "## Action Items", "", "- [ ] @Priya: send the deck", "- [ ] book the room", "",
+    "## Summary", "", "- We planned the launch.", "",
+    "> Agent input coverage: complete. 1/1 source chunks; 29 transcript bytes and 0 user-note bytes. All source chunks were processed in 1 model calls.", "",
+    "## Action Items", "", "- [ ] @Priya: send the deck", "- [ ] book the room", "",
     "## Transcript", "", "[Priya 0:00] Let's plan the launch.", "",
   ].join("\n"), { mode: 0o600 });
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
@@ -490,12 +492,15 @@ await check("action items from the frontmatter can be ticked and copied", async 
   assert((await items.first().innerText()).includes("Priya · due Friday"), await items.first().innerText());
   const plain = await page.locator(".summary-block > .eyebrow").allInnerTexts();
   assert(!plain.some((h) => /^action items$/i.test(h.trim())), `checklist shown twice: ${plain.join(", ")}`);
+  // Core's delivery report after a summary is a debug record: hidden in the view, kept in the file.
+  assert(!(await page.locator(".page-meeting").innerText()).includes("Agent input coverage"), "the coverage report shows");
   await page.getByRole("checkbox", { name: "send the deck" }).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="send the deck"]')?.getAttribute("aria-checked") === "true");
   await page.waitForTimeout(600);
   const md = fs.readFileSync(fixture, "utf8");
   assert(/task: send the deck\n  due: Friday\n  status: done/.test(md), "frontmatter status not done");
   assert(md.includes("- [x] @Priya: send the deck") && md.includes("- [ ] book the room"), "body checkbox not ticked");
+  assert(md.includes("> Agent input coverage: complete."), "the coverage report was dropped from the file");
   await page.locator(".action-items").getByRole("button", { name: "Copy" }).click();
   assert((await copied()) === "- [x] @Priya: send the deck (due Friday)\n- [ ] book the room", `copied: ${await copied()}`);
 });
