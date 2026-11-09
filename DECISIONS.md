@@ -712,7 +712,8 @@ The full comparison is in `docs/parity/app.md`.
     capability (`core:event:default` only). It draws its states from the recorder's
     events, as the main window does.
   - Transparent, with no frame and no shadow (the page draws the shadow). The level is
-    the status bar level, so it stays over full-screen apps. It joins all Spaces, stays
+    the status bar level, so it stays over other windows. It joins all Spaces (but not
+    another app's full-screen Space, see the real-app check below), stays
     out of ⌘` and Mission Control, and does not hide when Margin hides.
   - It is shown without becoming the key window, so the call app keeps the keyboard
     when the chip appears. At Start, Margin hides itself if it is the active app, so
@@ -738,3 +739,22 @@ The full comparison is in `docs/parity/app.md`.
     window is only as tall as the pill, so it has no room for the track.
   - A display that goes away while the chip shows keeps the chip where macOS puts it.
     The next time the chip shows, it uses the saved place.
+- Real-app check on 2026-11-10 (debug build in a sandbox, a MacBook Air M4, TextEdit as
+  the call app, clicks and keys sent with CGEvent):
+  - Passed: Start from the window and from ⌃⌥⌘R hides the window and gives the keyboard
+    back to TextEdit. Hover opens the chip while TextEdit is active. The window shrinks
+    back after a hover. Two-click Stop arms and resets. A click opens the notes. ⌘W, ⌘M
+    and ⌘H bring the chip back. A drag moves y only and stops at the menu bar and the
+    Dock. The place survives a restart. Stop from the chip saves, keeps the window away
+    and keeps the notes. "No sound comes in" shows. With the chip off, Start keeps the
+    window.
+  - Fixed: a click on the chip left Margin as the active app with no window. The chip
+    asked for the focus back only when its page had focus, which a borderless window
+    never has. A right-click opened the web view's menu.
+  - **Open: the chip does not show over a full-screen app.** The collection behaviour
+    `FullScreenAuxiliary` lets a window join the full-screen Space of its own app only.
+    A window of a regular app shows over another app's full-screen Space only as a
+    non-activating panel, or when the app is an accessory app. The options are
+    `tauri-nspanel` (a new crate), or the accessory activation policy while the chip
+    shows (no Dock icon during a recording). This needs a decision.
+  - Not checked: VoiceOver, reduced motion, a second display, a real call app.
