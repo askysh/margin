@@ -224,7 +224,7 @@ if (simulate) {
     await page.locator(".draft-transcript .live-line").nth(3).waitFor({ timeout: 3000 });
     const waited = Date.now() - stoppedAt;
     assert(await page.locator(".steps").isVisible(), "processing steps not shown next to the draft");
-    await page.getByText("Draft from the live transcript; the final transcript replaces it.").waitFor();
+    await page.getByText("Draft from the live transcript. The final transcript replaces it.").waitFor();
     const first = await page.locator(".draft-transcript .live-line").first().innerText();
     assert(first.includes("launch plan"), `first draft line: ${first}`);
     const who = await page.locator(".draft-transcript .live-speaker").allInnerTexts();
