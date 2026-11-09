@@ -60,7 +60,10 @@ Margin, never during a recording. Settings → Updates turns the automatic check
   5. The three ways to start a recording.
 - **Recording.** *Record call* (⌘⇧R) records your microphone and the call audio. *Record
   in person* (⌘⇧I) records the microphone only.
-  - The notepad opens with a live transcript beside it. In calls, live lines are marked
+  - The window hides, and a small recording chip shows the time at the right edge of the
+    screen. Point at it for Stop and Notes. Stop needs two clicks. Click the chip to open
+    the notes, and drag it up or down to move it. Settings → Recording turns the chip off.
+  - The notepad has a live transcript beside it. In calls, live lines are marked
     You / Them.
   - Make the window narrow to keep it beside the call. The sidebar becomes a drawer
     (⌘\ hides it in a wide window), and a switch picks Notes or Transcript.
@@ -95,7 +98,7 @@ Margin, never during a recording. Settings → Updates turns the automatic check
   list of sections is on the left, and *Back* (or Esc) returns to where you were:
   - **General:** your name, the meetings folder, how long to keep audio, open at login.
   - **Recording:** the microphone, stop after silence, call suggestions, the global
-    shortcut and sounds.
+    shortcut, sounds and the recording chip.
   - **Transcription:** the model, transcribing during the meeting, the meeting language,
     speaker separation, and names and words to spell right.
   - **Summaries**, **Voices**, **Permissions**, **Integrations** (an MCP snippet, so

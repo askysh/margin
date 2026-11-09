@@ -9,6 +9,12 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Changed
 
+- During a recording, the Margin window hides and a small recording chip shows the time at
+  the right edge of the screen. Point at it for Stop and Notes. Stop needs two clicks.
+  Click the chip to go back to your notes, and drag it up or down to move it. Settings →
+  Recording → "Show the recording chip" turns it off (D53).
+- With the recording chip on, a recording started from the menu bar, the global shortcut
+  or a notification does not bring the window forward (D53).
 - "Transcribe during the meeting" works with the Best model too. An 80-minute meeting with
   Best is ready about 3 minutes after Stop, not about an hour. On a MacBook Air M4 it uses
   about the same battery as Balanced (D52).
