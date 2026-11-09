@@ -132,8 +132,10 @@ export function Chip() {
     }
     const t = window.setTimeout(() => {
       setOpen(false);
-      // A click made Margin the active app. Give the keyboard back to the call.
-      if (open && !keyboard.current && document.hasFocus()) {
+      // A click made Margin the active app. Give the keyboard back to the call. Do not ask
+      // document.hasFocus(): the chip is a borderless window, which never becomes the key
+      // window, so the page never has focus. chip_release_focus checks that Margin is active.
+      if (open && !keyboard.current) {
         (document.activeElement as HTMLElement | null)?.blur();
         chipApi.releaseFocus().catch(() => {});
       }
@@ -257,7 +259,8 @@ export function Chip() {
     : `Margin is recording, ${spoken(minutes)}${silent ? ". No sound comes in" : ""}. Open notes`;
 
   return (
-    <div className="chip-stage">
+    // A right-click must not open the web view's menu (Reload, Inspect Element) on the chip.
+    <div className="chip-stage" onContextMenu={(e) => e.preventDefault()}>
       <div
         ref={pill}
         className={classes}
