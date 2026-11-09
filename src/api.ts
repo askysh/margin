@@ -21,7 +21,7 @@ export interface Settings {
   vocabulary?: string[];
   summary_instructions?: string;
   open_at_login?: boolean;
-  /** Transcribe during the meeting (Fast and Balanced only). */
+  /** Transcribe during the meeting. On by default, for every model. */
   rolling_transcription?: boolean;
 }
 
