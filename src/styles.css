@@ -1,49 +1,7 @@
 /* Margin: a steno pad. Pale green-grey paper, blue-black ink, one green vertical rule.
    Red appears only while recording, so red always means "live". */
 
-:root {
-  --paper: #eef2ea;
-  --paper-2: #e3e9df;
-  --sheet: #f6f8f3;
-  --ink: #1c2430;
-  --ink-2: #445060;
-  --pencil: #67717c;
-  --hair: #d5ddd2;
-  --hair-strong: #c3cdc0;
-  --rule: #5e9480;
-  --rule-soft: rgba(94, 148, 128, 0.42);
-  --rule-wash: rgba(94, 148, 128, 0.12);
-  --tally: #d63f2a;
-  --danger: #a5402e;
-  --sidebar: rgba(226, 233, 222, 0.72);
-  --shadow: 0 1px 2px rgba(28, 36, 48, 0.06), 0 8px 28px rgba(28, 36, 48, 0.1);
-
-  --f-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
-  --f-note: "Recursive Variable", ui-rounded, -apple-system, sans-serif;
-  --line: 28px;
-
-  color-scheme: light dark;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --paper: #161b20;
-    --paper-2: #1f262c;
-    --sheet: #1b2127;
-    --ink: #e3e8e1;
-    --ink-2: #b7bfb5;
-    --pencil: #8b959c;
-    --hair: #2a3238;
-    --hair-strong: #364047;
-    --rule: #6fa893;
-    --rule-soft: rgba(111, 168, 147, 0.4);
-    --rule-wash: rgba(111, 168, 147, 0.12);
-    --tally: #f05a43;
-    --danger: #e07a64;
-    --sidebar: rgba(24, 30, 35, 0.66);
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 32px rgba(0, 0, 0, 0.4);
-  }
-}
+@import "./tokens.css";
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
