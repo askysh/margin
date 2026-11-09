@@ -637,12 +637,38 @@ The full comparison is in `docs/parity/app.md`.
 
   The rolling process used 4% CPU on average and up to 2.0 GB of memory during the
   meeting. No thermal warning was recorded.
+- Measured on battery on 2026-11-09, the same Mac, debug build, screen on, no other work.
+  The input was the whole 80-minute call (4,832 s, both stems) at 1× real time, with
+  rolling and the live transcript (`small`) at the same time. Balanced ran on 15 minutes
+  of the same call (41:00 to 56:00) after an 18-minute rest. The "matched" column is Best
+  on the same 15 minutes. A sampler read `ioreg` (battery charge in mAh, system power,
+  GPU) and `ProcessInfo.thermalState` every 10 s:
+
+  | | Best, 80 min | Best, matched 15 min | Balanced, 15 min |
+  |---|---|---|---|
+  | Battery per hour (of 4,061 mAh) | 26% | 25% | 24% |
+  | System power (mean; 3.8 W with nothing running) | 13.4 W | 13.0 W | 15.0 W |
+  | GPU busy (median) | 98% | 99% | 67% |
+  | Thermal state | "fair" for 82% of the samples, from minute 4 | "fair" | nominal |
+  | Peak memory of the processes | 2.6 GB | 2.6 GB | 1.7 GB |
+  | Pieces made / failed | 76 / 0 | — | 14 / 0 |
+  | Stop to transcript ready | 156 s | — | 21 s |
+  | Stop to Complete | 351 s | — | 58 s |
+
+  - Best uses about the same charge as Balanced. The GPU runs at full power with both
+    models. Best keeps it busy for longer, at lower clocks.
+  - The thermal state never went past "fair", and rolling did not fall behind.
+  - The final transcript of the whole call had 11,784 words and no garbled lines. The
+    saved Balanced transcript of the same call had 9,667 words and 9 garbled lines.
+  - The live transcript (`small`) stayed 3 to 7 s behind the audio for the whole call.
+    It garbled 35 of its 456 lines on the Hindi parts.
 - Upgrade: a Best user from 0.0.8 has `base` but not `small`. Margin downloads `small` at
   launch in the background. Recording does not wait for the live model
   (`models::ready_to_record`). Until `small` is there, the live transcript uses `base`.
 - Costs and risks:
   - The GPU is busy for most of the meeting. That costs battery, and on a fanless MacBook
-    Air it adds heat. Battery and a long call on battery were not measured.
+    Air it adds heat. Measured on battery (below): Best uses about the same charge per
+    hour as Balanced, and the Mac stays at the "fair" thermal state.
   - In the app, both models are in one process: about 2.7 GB at peak, plus the app.
   - A slower Mac than the M4 can fall behind. Then rolling stops itself (D47), and Best
     transcribes the rest after Stop, as before.

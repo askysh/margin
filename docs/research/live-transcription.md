@@ -476,7 +476,40 @@ every 5 s. The GPU shows about 27% with nothing running, for the display.
 - The live times are compared line by line between the two runs. Each run starts its own
   clock, so the times are good to about 1 s. Core stamps a live line when it is written,
   so the JSONL offsets do not give the lag by themselves.
-- No thermal warning was recorded. Battery was not measured: the Mac was on AC power.
-- The GPU is busy for most of the meeting with rolling Best. On battery, that costs
-  charge, and on a fanless MacBook Air it adds heat. A long call on battery is the next
-  thing to measure.
+- No thermal warning was recorded. This run was on AC power. The battery run is below.
+
+### On battery, the whole call
+
+The same Mac on battery, debug build, screen on, no other work. The input was the whole
+80-minute call (4,832 s, both stems) at 1× real time, with `rolling-job` (Best) and
+`live-replay` (`small`) at the same time. Balanced ran on 15 minutes of the same call
+(41:00 to 56:00) after an 18-minute rest. The "matched" column is Best on those 15
+minutes. A sampler read `ioreg -rn AppleSmartBattery` (`AppleRawCurrentCapacity`,
+`SystemLoad`), the GPU's "Device Utilization %" and `ProcessInfo.thermalState` every 10 s.
+
+| | Best, 80 min | Best, matched 15 min | Balanced, 15 min |
+|---|---|---|---|
+| Battery per hour (of 4,061 mAh) | 26% (1,061 mAh) | 25% | 24% (985 mAh) |
+| System power, mean | 13.4 W | 13.0 W | 15.0 W |
+| GPU busy, median | 98% | 99% | 67% |
+| Thermal state | "fair" in 82% of the samples, from minute 4 | "fair" | nominal |
+| Peak memory of the processes | 2.6 GB | 2.6 GB | 1.7 GB |
+| Pieces made / failed | 76 / 0 | — | 14 / 0 |
+| Stop waited for a piece | 12.4 s | — | 0.2 s |
+| Stop to transcript ready | 156 s | — | 21 s |
+| Stop to Complete | 351 s | — | 58 s |
+
+With nothing running and the screen on, the system used 3.8 W.
+
+- Best uses about the same charge per hour as Balanced. The GPU runs at full power with
+  both models. Best keeps it busy for longer, at lower clocks. A full charge gives about
+  4 hours of meetings with Best.
+- The thermal state went to "fair" after about 4 minutes and never went past it. Rolling
+  did not fall behind.
+- Final transcript of the whole call: 1,059 lines, 11,784 words, no garbled lines. The
+  saved Balanced transcript of the same call: 960 lines, 9,667 words, 9 garbled lines.
+- The live transcript (`small`): 456 lines, 3 to 7 s behind the audio for the whole call,
+  with no drift. It garbled 35 lines on the Hindi parts. Balanced live garbled 9 of 77
+  lines on its 15 minutes.
+- Limits: one call, one Mac and a debug build. Balanced ran on a cooler Mac, after the
+  rest.
