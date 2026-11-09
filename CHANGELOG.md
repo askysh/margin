@@ -15,6 +15,22 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - With Best, the live transcript uses Balanced in place of Fast, which is more accurate.
   Margin downloads Balanced (488 MB) in the background after the update. Until it is
   there, the live transcript uses Fast, and recording does not wait for it (D52).
+- Settings → Transcription says what to do for meetings that mix two languages, such as
+  Hindi and English: keep Auto-detect and use the Best model.
+- When the speech models are ready, Settings shows their size on this Mac without a full
+  progress bar.
+
+### Fixed
+
+- A summary by Claude no longer shows the line "Agent input coverage: …" at its end. The
+  meeting file keeps it. When part of the meeting did not reach the summarizer, the
+  meeting shows a short note instead.
+- Text that scrolls under the Ask bar fades out, so no words show between the bar and the
+  bottom of the window.
+- The red recording dot sits next to the timer.
+- A finished transcript no longer fades in each time you open the meeting. Only new live
+  lines do.
+- A long folder path wraps as a whole and does not break in the middle of a word.
 
 ## [0.0.8] - 2026-11-09
 

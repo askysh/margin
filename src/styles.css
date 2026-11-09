@@ -61,7 +61,7 @@ button { cursor: default; }
 :focus-visible { outline: 2px solid var(--rule); outline-offset: 2px; border-radius: 6px; }
 .mono { font-family: var(--f-note); font-variation-settings: "MONO" 1, "CASL" 0; font-size: 0.92em; letter-spacing: -0.01em; }
 .quiet { color: var(--pencil); }
-.path { font-family: var(--f-note); font-variation-settings: "MONO" 1, "CASL" 0; font-size: 12px; color: var(--ink-2); user-select: text; -webkit-user-select: text; word-break: break-all; }
+.path { font-family: var(--f-note); font-variation-settings: "MONO" 1, "CASL" 0; font-size: 12px; color: var(--ink-2); user-select: text; -webkit-user-select: text; overflow-wrap: anywhere; }
 
 .splash { height: 100%; background: var(--paper); }
 .fatal { height: 100%; display: grid; place-items: center; background: var(--paper); padding: 40px; }
@@ -104,7 +104,7 @@ button { cursor: default; }
 .menu span { color: var(--pencil); font-size: 12px; }
 
 .rec-control { display: flex; align-items: center; gap: 10px; }
-.rec-time { font-size: 13px; min-width: 52px; text-align: right; color: var(--ink); }
+.rec-time { font-size: 13px; min-width: 52px; margin-left: -4px; text-align: left; color: var(--ink); }
 .rec-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--tally); display: inline-block; animation: breathe 1.8s ease-in-out infinite; flex: none; }
 .rec-dot.small { width: 7px; height: 7px; margin-right: 7px; }
 @keyframes breathe { 50% { opacity: 0.35; } }
@@ -201,7 +201,8 @@ button { cursor: default; }
 .draft-note { color: var(--pencil); font-size: 12px; margin: -4px 0 14px; }
 .draft-transcript .live-line { color: var(--pencil); }
 .draft-transcript .live-speaker { color: var(--ink-2); }
-.live-line, .turn { font-size: 13px; line-height: 1.5; margin: 0 0 8px; color: var(--ink-2); animation: fadein 300ms ease-out; }
+.live-line, .turn { font-size: 13px; line-height: 1.5; margin: 0 0 8px; color: var(--ink-2); }
+.live-line { animation: fadein 300ms ease-out; }
 .live-line .ts, .turn .ts { color: var(--pencil); font-size: 11px; margin-right: 7px; }
 .live-speaker, .turn-speaker { display: block; font-size: 11.5px; font-weight: 600; margin: 14px 0 3px; color: var(--ink); }
 .live-line.you .live-speaker { color: var(--rule); }
@@ -209,7 +210,7 @@ button { cursor: default; }
 .turn-speaker:hover { text-decoration: underline; text-underline-offset: 3px; }
 .turn-speaker.unnamed { color: var(--rule); }
 @keyframes fadein { from { opacity: 0; transform: translateY(3px); } }
-@media (prefers-reduced-motion: reduce) { .live-line, .turn { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .live-line { animation: none; } }
 
 .speakers { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; position: relative; }
 .chip-wrap { position: static; }
@@ -346,6 +347,7 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
 .download-head { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink-2); }
 .bar { height: 4px; background: var(--hair); border-radius: 2px; overflow: hidden; }
 .bar-fill { height: 100%; background: var(--rule); border-radius: 2px; transition: width 200ms linear; }
+.download.is-ready .bar { display: none; }
 .download-error { color: var(--danger); font-size: 12.5px; margin: 0; }
 .download-note { color: var(--pencil); font-size: 12px; margin: 0; }
 
@@ -519,6 +521,11 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
 @media (prefers-reduced-motion: reduce) { .ask, .shell.drawer-open > .sidebar:not(.set-nav) { animation: none; } }
 /* The toast clears the bar. */
 .shell.has-ask-bar .toast { bottom: 66px; }
+.shell.has-ask-bar .notes-col, .shell.has-ask-bar .page-compact .transcript-col, .shell.has-ask-bar .page-home {
+  padding-bottom: 96px;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 72px), transparent calc(100% - 10px));
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 72px), transparent calc(100% - 10px));
+}
 
 .set-nav { z-index: 1; }
 .set-nav-back, .set-nav-item { display: flex; align-items: center; gap: 9px; width: 100%; border: none; background: none; padding: 6px 8px; border-radius: 7px; text-align: left; font-weight: 500; color: var(--ink-2); }

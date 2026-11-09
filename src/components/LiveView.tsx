@@ -100,7 +100,7 @@ export const LiveTranscript = memo(function LiveTranscript({ lines, call, draft 
         {draft ? "Draft transcript" : "Live transcript"}
         {call && <span className="hint" title="Guessed from which side was louder. Real speaker names come after the meeting.">You / Them are approximate</span>}
       </div>
-      {draft && <p className="draft-note">Draft from the live transcript; the final transcript replaces it.</p>}
+      {draft && <p className="draft-note">Draft from the live transcript. The final transcript replaces it.</p>}
       {lines.length === 0 ? (
         <p className="transcript-empty">Listening… Lines appear here a few seconds after they're spoken.</p>
       ) : (
