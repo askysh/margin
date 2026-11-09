@@ -980,7 +980,8 @@ await check("ask about one meeting puts that meeting in context", async () => {
 await check("ask: history survives a reload", async () => {
   await page.reload();
   await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
-  await button("Ask about this meeting").click();
+  // Closed, Ask is the bar at the bottom of the meeting; a click opens it.
+  await page.locator(".ask-bar", { hasText: "Ask about this meeting" }).click();
   await page.locator(".ask-q", { hasText: "What decisions were made?" }).waitFor({ timeout: 8000 });
   await page.locator(".ask").getByRole("radio", { name: "All meetings" }).click();
   await page.locator(".ask-q", { hasText: "And who owns it?" }).waitFor();
@@ -993,6 +994,32 @@ await check("ask: Clear removes a conversation", async () => {
   assert(fs.readdirSync(path.join(marginHome, "state/chat")).length === 1, "the meeting chat should remain");
   await page.getByLabel("Ask a question").press("Escape");
   await page.locator(".ask").waitFor({ state: "detached" });
+});
+
+// ---------------------------------------------------------------- narrow window (D51)
+await check("a narrow window shows one column and the sidebar as a drawer", async () => {
+  await page.setViewportSize({ width: 520, height: 760 });
+  try {
+    await page.locator(".sidebar").first().waitFor({ state: "hidden" });
+    await page.getByRole("button", { name: "Show sidebar" }).click();
+    await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
+    await page.locator(".drawer-scrim").waitFor({ state: "detached" });
+    await page.getByLabel("Meeting title").waitFor();
+    assert((await page.locator(".transcript-col").count()) === 0, "a transcript column in a narrow window");
+    await page.getByRole("radio", { name: "Transcript" }).click();
+    await page.locator(".turn").first().waitFor();
+    assert(!(await page.getByLabel("Meeting title").isVisible()), "the notes still show with Transcript picked");
+    await page.screenshot({ path: path.join(out, "narrow-transcript.png") });
+    await page.getByRole("radio", { name: "Notes" }).click();
+    await page.getByLabel("Meeting title").waitFor();
+  } finally {
+    await page.setViewportSize({ width: 1180, height: 760 });
+  }
+  // ⌘\ hides and shows the docked sidebar.
+  await page.keyboard.press("Meta+\\");
+  await page.locator(".sidebar").first().waitFor({ state: "hidden" });
+  await page.keyboard.press("Meta+\\");
+  await page.locator(".sidebar").first().waitFor();
 });
 
 // ---------------------------------------------------------------- settings: model switch

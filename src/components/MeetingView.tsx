@@ -9,6 +9,7 @@ import { ActionItems } from "./ActionItems";
 import { AudioPlayer, type AudioHandle } from "./AudioPlayer";
 import { MoreMenu } from "./MoreMenu";
 import { CopyMenu } from "./CopyMenu";
+import { SideSwitch, useOneColumn, type Side } from "./Compact";
 import { ACTION_HEADING, meetingMarkdown, summaryMarkdown, transcriptMarkdown, tsSeconds } from "../meetingMarkdown";
 
 interface Props {
@@ -21,20 +22,22 @@ interface Props {
   job: Job | null;
   /** Show the meetings this person was in. */
   onPerson?: (name: string) => void;
-  /** Open Ask about this meeting. */
-  onAsk?: () => void;
 }
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
 // Memoised so a recording's clock, ticking in App, doesn't re-render a long transcript.
-export const MeetingView = memo(function MeetingView({ path, notify, onChanged, onDeleted, job, onPerson, onAsk }: Props) {
+export const MeetingView = memo(function MeetingView({ path, notify, onChanged, onDeleted, job, onPerson }: Props) {
   const processing = !!job;
   const [m, setM] = useState<MeetingDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [save, setSave] = useState<SaveState>("idle");
   const [showTranscript, setShowTranscript] = useState(true);
+  // A narrow window shows one column. The audio player lives in the notes column, so that
+  // column is hidden, not removed, while the transcript shows: a timestamp still plays.
+  const oneColumn = useOneColumn();
+  const [side, setSide] = useState<Side>("notes");
   const [summarizing, setSummarizing] = useState(false);
   // Margin writes the summary after processing (D40); this follows that run.
   const [writing, setWriting] = useState(false);
@@ -177,9 +180,14 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
     }
   };
 
+  const hasTranscript = m.transcript.length > 0;
+  const split = oneColumn && hasTranscript;
+  const transcriptShown = hasTranscript && (oneColumn ? side === "transcript" : showTranscript);
+
   return (
-    <div className={`page page-meeting ${showTranscript && m.transcript.length ? "" : "no-transcript"}`}>
-      <div className="notes-col">
+    <div className={`page page-meeting ${split || transcriptShown ? "" : "no-transcript"}${split ? " page-compact" : ""}`}>
+      {split && <SideSwitch side={side} onSide={setSide} />}
+      <div className={`notes-col${split && side !== "notes" ? " is-hidden" : ""}`}>
         <TitleField
           value={m.title}
           disabled={processing}
@@ -211,14 +219,13 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
           )}
         </div>
         <div className="actions">
-          {onAsk && <button className="link-btn" onClick={onAsk} title="Ask Claude about this meeting (⌘J)">Ask about this meeting</button>}
           <CopyMenu choices={copyChoices} notify={notify} />
           {m.transcript.length > 0 && (
             <button className="link-btn" onClick={summarize} disabled={summarizing || writing || processing}>
               {summarizing || writing ? "Summarizing…" : hasSummary ? "Summarize again" : "Summarize"}
             </button>
           )}
-          {m.transcript.length > 0 && (
+          {hasTranscript && !oneColumn && (
             <button className="link-btn" onClick={() => setShowTranscript((s) => !s)}>{showTranscript ? "Hide transcript" : "Show transcript"}</button>
           )}
           <MoreMenu
@@ -278,9 +285,9 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
           />
         </section>
       </div>
-      {showTranscript && m.transcript.length > 0 && (
+      {transcriptShown && (
         <>
-          <Rule level={0} live={false} />
+          {!oneColumn && <Rule level={0} live={false} />}
           <Transcript
             meeting={m}
             names={names}

@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { api, type LiveLine, type RecorderView } from "../api";
 import { clock, useDebounced } from "../util";
 import { NotesEditor } from "./NotesEditor";
+import { SideSwitch, useOneColumn, type Side } from "./Compact";
 
 interface Props {
   recorder: RecorderView;
@@ -14,7 +15,8 @@ interface Props {
 export const liveDraft: { session: string | null; notes: string | null; title: string | null } = { session: null, notes: null, title: null };
 
 /** The notepad during a meeting: your notes on the left and the live transcript on the
- * right. The rule between them is the recording light and level meter. */
+ * right. The rule between them is the recording light and level meter. A narrow window
+ * shows one of the two, picked with a switch. */
 export function LiveView({ recorder, lines, level }: Props) {
   // Coming back to the live view mid-recording: what you typed lives in liveDraft, which is
   // newer than the recorder snapshot App holds.
@@ -32,10 +34,15 @@ export function LiveView({ recorder, lines, level }: Props) {
     [recorder.started_at],
   );
   const kindLabel = recorder.kind === "call" ? "Call" : "In person";
+  const oneColumn = useOneColumn();
+  const [side, setSide] = useState<Side>("notes");
+  const notesHidden = oneColumn && side !== "notes";
 
   return (
-    <div className="page page-live">
-      <div className="notes-col">
+    <div className={`page page-live${oneColumn ? " page-compact" : ""}`}>
+      {oneColumn && <SideSwitch side={side} onSide={setSide} transcriptLabel="Live transcript" />}
+      {/* Hidden, not removed, so the caret and the scroll stay where you left them. */}
+      <div className={`notes-col${notesHidden ? " is-hidden" : ""}`}>
         <input
           className="title-input"
           placeholder="Untitled meeting"
@@ -55,8 +62,8 @@ export function LiveView({ recorder, lines, level }: Props) {
           placeholder={"Type notes as you go.\nThe transcript is taken for you, so write only what matters."}
         />
       </div>
-      <Rule level={level} live />
-      <LiveTranscript lines={lines} call={recorder.kind === "call"} />
+      {!oneColumn && <Rule level={level} live />}
+      {(!oneColumn || side === "transcript") && <LiveTranscript lines={lines} call={recorder.kind === "call"} />}
     </div>
   );
 }
