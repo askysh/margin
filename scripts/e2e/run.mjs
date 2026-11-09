@@ -1078,8 +1078,14 @@ if (simulate) {
     await page.getByLabel("Meeting title").fill("QA from settings");
     await page.waitForTimeout(3000);
     await page.getByRole("button", { name: "Stop" }).click();
-    await page.locator(".row-job").first().waitFor({ state: "detached", timeout: 180000 });
     await page.locator(".row").filter({ hasText: "QA from settings" }).first().waitFor({ timeout: 20000 });
+    // Wait for the file and the end of the job. The job row can go before the file is
+    // written, and a file written later changes the meeting count that reset checks.
+    const deadline = Date.now() + 180000;
+    while (!meetingFiles().some((f) => f.includes("qa-from-settings")) || (await page.locator(".row-job").count()) > 0) {
+      assert(Date.now() < deadline, "the meeting recorded from Settings did not finish");
+      await page.waitForTimeout(500);
+    }
   });
 }
 
