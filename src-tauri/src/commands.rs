@@ -194,7 +194,7 @@ pub mod ops {
     }
 
     pub fn start_recording(kind: Kind, title: Option<String>) -> Res<RecorderView> {
-        if !models::all_installed(&corecfg::load()) {
+        if !models::ready_to_record(&corecfg::load()) {
             return Err("The speech models aren't downloaded yet. Open Settings → Transcription.".into());
         }
         recorder().start(kind, title)

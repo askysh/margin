@@ -411,6 +411,7 @@ fn ensure_permissions(kind: Kind) -> Result<(), String> {
 
 pub fn session_config(kind: Kind) -> Config {
     let mut cfg = corecfg::load();
+    cfg.live_transcript.model = crate::models::live_model_on_disk(&cfg);
     cfg.recording.device = available_device(cfg.recording.device.take());
     session_sources(&mut cfg, kind);
     cfg

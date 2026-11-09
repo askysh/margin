@@ -144,6 +144,8 @@ export interface ModelFile {
   url: string;
   approx_bytes: number;
   installed: boolean;
+  /** The live transcript model. Recording does not wait for it. */
+  live: boolean;
 }
 
 export interface ModelProgress {
