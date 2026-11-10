@@ -7,6 +7,12 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ## [Unreleased]
 
+### Added
+
+- Settings → General → Privacy → "Hide Margin from screen sharing". People on a call do
+  not see Margin when you share your screen, and screenshots leave Margin out. It is on
+  by default, as in minutes-core. Turn it off to take a screenshot of Margin (D54).
+
 ### Changed
 
 - During a recording, the Margin window hides and a small recording chip shows the time at

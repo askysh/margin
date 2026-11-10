@@ -96,7 +96,8 @@ Margin, never during a recording. Settings → Updates turns the automatic check
   app. A banner offers to record when a call app such as Zoom starts.
 - **Settings.** A page in the main window, opened with ⌘, the gear or the menu bar. A
   list of sections is on the left, and *Back* (or Esc) returns to where you were:
-  - **General:** your name, the meetings folder, how long to keep audio, open at login.
+  - **General:** your name, the meetings folder, how long to keep audio, hiding Margin
+    from screen sharing, open at login.
   - **Recording:** the microphone, stop after silence, call suggestions, the global
     shortcut, sounds and the recording chip.
   - **Transcription:** the model, transcribing during the meeting, the meeting language,
