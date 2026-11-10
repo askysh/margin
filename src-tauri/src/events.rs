@@ -14,6 +14,9 @@ pub const TRAY_REFRESH: &str = "__tray-refresh";
 /// Pseudo-event asking the host to register or drop the global shortcut.
 pub const SHORTCUT_REFRESH: &str = "__shortcut-refresh";
 
+/// Pseudo-event asking the host to apply "Hide Margin from screen sharing" to its windows.
+pub const SCREEN_SHARE_REFRESH: &str = "__screen-share-refresh";
+
 /// Hide the main window and show the recording chip (chip.rs). The app does this at Start
 /// when the chip is on, and when you ask for it in the live view.
 pub const SHRINK_TO_CHIP: &str = "shrink-to-chip";

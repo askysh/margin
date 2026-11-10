@@ -41,7 +41,7 @@ pub mod ops {
         let _one_at_a_time = SAVING.lock().unwrap_or_else(|e| e.into_inner());
         let first_save = !corecfg::exists();
         let mut cfg = corecfg::load();
-        let keep_audio_before = corecfg::settings(&cfg).keep_audio_days;
+        let before = corecfg::settings(&cfg);
         corecfg::apply(&mut cfg, &settings)?;
         // Onboarding saves your name before you choose a folder. Don't create the default
         // folder until it has actually been chosen.
@@ -50,8 +50,11 @@ pub mod ops {
         }
         corecfg::save(&mut cfg)?;
         extras::apply(&settings)?;
-        if settings.keep_audio_days.is_some() && settings.keep_audio_days != keep_audio_before {
+        if settings.keep_audio_days.is_some() && settings.keep_audio_days != before.keep_audio_days {
             corecfg::audio_cleanup(&cfg);
+        }
+        if settings.hide_from_screen_share.is_some() && settings.hide_from_screen_share != before.hide_from_screen_share {
+            crate::events::emit(crate::events::SCREEN_SHARE_REFRESH, settings.hide_from_screen_share);
         }
         Ok(current_settings())
     }

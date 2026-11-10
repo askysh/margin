@@ -22,6 +22,7 @@ mod processing;
 mod recorder;
 mod reset;
 mod rolling;
+mod screenshare;
 mod shortcut;
 mod speakers;
 mod summaries;
@@ -72,6 +73,7 @@ fn main() {
                     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
                     let _ = apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None);
                 }
+                let _ = window.set_content_protected(screenshare::hidden());
                 let _ = if at_login { window.hide() } else { window.show() };
             }
             tray::init(&handle)?;
@@ -208,6 +210,7 @@ fn route(app: &tauri::AppHandle, name: &str, payload: serde_json::Value) {
     match name {
         events::TRAY_REFRESH => tray::refresh(app),
         events::SHORTCUT_REFRESH => shortcut::refresh(app),
+        events::SCREEN_SHARE_REFRESH => screenshare::apply(app),
         events::NOTIFY => {
             if let Ok(notice) = serde_json::from_value(payload) {
                 notify::show(app, notice);

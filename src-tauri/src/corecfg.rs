@@ -46,6 +46,9 @@ pub struct AppSettings {
     pub keep_audio_days: Option<u32>,
     #[serde(default)]
     pub call_detection: Option<bool>,
+    /// Leave Margin's windows out of screen sharing and screenshots (screenshare.rs).
+    #[serde(default)]
+    pub hide_from_screen_share: Option<bool>,
     // Kept outside config.toml (see extras.rs).
     #[serde(default)]
     pub vocabulary: Option<Vec<String>>,
@@ -175,6 +178,7 @@ pub fn settings(cfg: &Config) -> AppSettings {
         silence_stop_minutes: Some(cfg.recording.silence_auto_stop_secs / 60),
         keep_audio_days: Some(if cfg.retention.auto_cleanup { cfg.retention.successful_audio_days } else { 0 }),
         call_detection: Some(cfg.call_detection.enabled),
+        hide_from_screen_share: Some(cfg.privacy.hide_from_screen_share),
         vocabulary: None,
         summary_instructions: None,
         open_at_login: None,
@@ -222,6 +226,9 @@ pub fn apply(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
     }
     if let Some(on) = s.call_detection {
         cfg.call_detection.enabled = on;
+    }
+    if let Some(on) = s.hide_from_screen_share {
+        cfg.privacy.hide_from_screen_share = on;
     }
     Ok(())
 }
@@ -335,6 +342,7 @@ mod tests {
         s.silence_stop_minutes = Some(0);
         s.keep_audio_days = Some(7);
         s.call_detection = Some(false);
+        s.hide_from_screen_share = Some(false);
         apply(&mut cfg, &s).unwrap();
         assert_eq!(cfg.transcription.language.as_deref(), Some("de"));
         assert_eq!(cfg.recording.device.as_deref(), Some("USB Mic"));
@@ -346,6 +354,19 @@ mod tests {
         assert_eq!(back.keep_audio_days, Some(7));
         assert_eq!(back.call_detection, Some(false));
         assert_eq!(back.speaker_separation, Some(false));
+        assert!(!cfg.privacy.hide_from_screen_share);
+        assert_eq!(back.hide_from_screen_share, Some(false));
+    }
+
+    /// Core's default hides the windows. Margin keeps it, so a new config hides them too.
+    #[test]
+    fn screen_share_hiding_is_on_by_default() {
+        let (mut cfg, mut s) = base();
+        assert_eq!(s.hide_from_screen_share, Some(true));
+        s.hide_from_screen_share = None;
+        cfg.privacy.hide_from_screen_share = false;
+        apply(&mut cfg, &s).unwrap();
+        assert!(!cfg.privacy.hide_from_screen_share, "a save without the field changed it");
     }
 
     #[test]
