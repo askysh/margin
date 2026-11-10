@@ -55,7 +55,7 @@ export function ProcessingView({ jobId, job, notes, title, onOpen, onRetry }: Pr
           </ol>
         )}
         <p className="quiet-note">
-          Everything runs on this Mac. The meeting opens here when its transcript is ready. You can close the window;
+          Everything runs on this Mac. The meeting opens here when its transcript is ready. You can close the window.
           Margin keeps working from the menu bar.
         </p>
         {notes.trim() && (

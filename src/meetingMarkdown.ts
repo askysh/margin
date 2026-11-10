@@ -8,9 +8,35 @@ export const ACTION_HEADING = "Action Items";
 
 export function summaryMarkdown(m: MeetingDetail): string {
   return m.sections
+    .map((s) => ({ ...s, body: withoutCoverage(s.body).body }))
     .filter((s) => s.body.trim())
     .map((s) => `## ${s.heading}\n\n${s.body.trim()}`)
     .join("\n\n");
+}
+
+/** Core ends a summary by the claude agent with a delivery report, "> Agent input coverage:
+ * complete. 1/1 source chunks; …" (summarize.rs, SummaryCoverage). It is a debug record, so
+ * the meeting view and Copy leave it out. The meeting file keeps it. `incomplete` is true
+ * when part of the meeting did not reach the summarizer. */
+const COVERAGE = /^>\s*Agent input coverage: (complete|incomplete)\./;
+
+export function withoutCoverage(body: string): { body: string; incomplete: boolean } {
+  let incomplete = false;
+  let inReport = false;
+  const kept: string[] = [];
+  for (const line of body.split("\n")) {
+    const report = COVERAGE.exec(line);
+    if (report) {
+      incomplete ||= report[1] === "incomplete";
+      inReport = true;
+      continue;
+    }
+    // A long report can wrap onto more quoted lines.
+    if (inReport && line.startsWith(">")) continue;
+    inReport = false;
+    kept.push(line);
+  }
+  return { body: kept.join("\n").trimEnd(), incomplete };
 }
 
 export function actionItemsMarkdown(items: ActionItem[]): string {

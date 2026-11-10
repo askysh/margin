@@ -673,3 +673,88 @@ The full comparison is in `docs/parity/app.md`.
   - A slower Mac than the M4 can fall behind. Then rolling stops itself (D47), and Best
     transcribes the rest after Stop, as before.
   - The switch "Transcribe during the meeting" can turn it off.
+
+## The recording chip
+
+### D53. A recording chip takes the place of the window during a recording
+- New fact: after a real meeting, a user said the full Margin window during a recording
+  is "too invasive". They asked for a small recording sign at the edge of the screen,
+  with the notes one click away.
+- Options:
+  - What shows during a recording: (a) the window, as before; (b) a small chip, and the
+    window only when you ask for it.
+  - The design: three prototypes. A, "Quiet pill": a dot and the time, with Stop and
+    Notes on hover. B, "Edge tab": a narrow tab with a level rule. C, "Proof of life":
+    two level lanes, the latest line and a quick-note field.
+  - The window at Stop: (a) it comes back on the processing view; (b) it stays away.
+- Pick: **(b), design A**, with two parts from C.
+  - When a recording starts, the window hides and the chip slides in at the right edge
+    of the screen, about a third of the way down. Settings → Recording → "Show the
+    recording chip" turns it off. It is on by default. Off keeps the window as before.
+  - The chip shows while a recording runs and the main window is not visible: hidden,
+    minimized, or closed to the menu bar. When the window shows, the chip goes. A
+    click on the chip brings the window back on the live notes, with the caret at the
+    end. The live view has a control that shrinks the window to the chip.
+  - From C: Stop needs two clicks. The first click arms it ("Stop?") for 3 s. The dot
+    stays red while Margin records, also when no sound comes in.
+  - Left out: pause (Margin has no pause), the you and them levels (the recorder sends
+    one mixed level) and the quick note (a click opens the notes).
+  - A Start from the menu bar, the global shortcut or a notification no longer brings
+    the window forward when the chip is on. If the Start fails, the window comes
+    forward with the error.
+- Pick for Stop: **the window stays away**. At Stop the chip says "Saving", then slides
+  out. The window goes to the processing view and then the meeting, as before, but it
+  does not come forward. The call can still be on when you press Stop, and a window that
+  jumps forward takes the keyboard from it. The "meeting ready" notification opens the
+  meeting, and so does the menu bar. If the Stop fails, a notification says why.
+- The window:
+  - A second webview window, `chip`, from its own page `chip.html` and its own
+    capability (`core:event:default` only). It draws its states from the recorder's
+    events, as the main window does.
+  - Transparent, with no frame and no shadow (the page draws the shadow). The level is
+    the status bar level, so it stays over other windows. It joins all Spaces (but not
+    another app's full-screen Space, see the real-app check below), stays
+    out of ⌘` and Mission Control, and does not hide when Margin hides.
+  - It is shown without becoming the key window, so the call app keeps the keyboard
+    when the chip appears. At Start, Margin hides itself if it is the active app, so
+    macOS gives the keyboard back to the app you were in.
+  - It is a plain window, not a non-activating panel. tao's window class has its own
+    state, so it cannot become an NSPanel after it is made, and `tauri-nspanel` is a new
+    crate. So a click on the chip makes Margin the active app. The chip gives the
+    keyboard back when the pointer leaves it, after a click, and on Escape.
+  - The window follows the size of the pill, so no empty part of it takes clicks meant
+    for the app behind. WebKit can send no hover events to a window of an app that is
+    not active, so Margin also checks where the pointer is, 10 times a second, while the
+    chip shows.
+  - A drag moves the chip up and down only, inside the visible part of the screen. The
+    arrow keys move it too. Margin keeps the place as a fraction of the screen height, so
+    it suits a different display.
+- Silence: the recorder does not report a silent mic. The chip says "No sound comes in"
+  for 8 s when the level stays at zero for 20 s of recording, then keeps a mic mark.
+  Quiet room noise is above zero, so a quiet moment does not set it off.
+- Costs and risks:
+  - A click on the chip activates Margin for a moment, which a non-activating panel
+    would not do.
+  - The design's green track along the screen edge during a drag is left out. The
+    window is only as tall as the pill, so it has no room for the track.
+  - A display that goes away while the chip shows keeps the chip where macOS puts it.
+    The next time the chip shows, it uses the saved place.
+- Real-app check on 2026-11-10 (debug build in a sandbox, a MacBook Air M4, TextEdit as
+  the call app, clicks and keys sent with CGEvent):
+  - Passed: Start from the window and from ⌃⌥⌘R hides the window and gives the keyboard
+    back to TextEdit. Hover opens the chip while TextEdit is active. The window shrinks
+    back after a hover. Two-click Stop arms and resets. A click opens the notes. ⌘W, ⌘M
+    and ⌘H bring the chip back. A drag moves y only and stops at the menu bar and the
+    Dock. The place survives a restart. Stop from the chip saves, keeps the window away
+    and keeps the notes. "No sound comes in" shows. With the chip off, Start keeps the
+    window.
+  - Fixed: a click on the chip left Margin as the active app with no window. The chip
+    asked for the focus back only when its page had focus, which a borderless window
+    never has. A right-click opened the web view's menu.
+  - **Open: the chip does not show over a full-screen app.** The collection behaviour
+    `FullScreenAuxiliary` lets a window join the full-screen Space of its own app only.
+    A window of a regular app shows over another app's full-screen Space only as a
+    non-activating panel, or when the app is an accessory app. The options are
+    `tauri-nspanel` (a new crate), or the accessory activation policy while the chip
+    shows (no Dock icon during a recording). This needs a decision.
+  - Not checked: VoiceOver, reduced motion, a second display, a real call app.

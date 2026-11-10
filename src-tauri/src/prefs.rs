@@ -17,6 +17,11 @@ pub struct Prefs {
     pub no_auto_update: bool,
     /// Transcribe during the meeting (rolling.rs). Stored inverted so a missing key is on.
     pub no_rolling_transcription: bool,
+    /// The recording chip (chip.rs). Stored inverted so a missing key is on.
+    pub no_recording_chip: bool,
+    /// Where the chip sits on the right edge: the middle of the chip as a fraction of the
+    /// visible screen height, from the top. None means the default place.
+    pub chip_place: Option<f64>,
 }
 
 /// The preferences the UI can change.
@@ -26,6 +31,9 @@ pub struct AppPrefs {
     pub record_shortcut: bool,
     #[serde(default = "yes")]
     pub auto_update: bool,
+    /// Hide the window and show the recording chip while Margin records.
+    #[serde(default = "yes")]
+    pub recording_chip: bool,
 }
 
 fn yes() -> bool {
@@ -33,8 +41,17 @@ fn yes() -> bool {
 }
 
 impl Prefs {
+    pub fn recording_chip(&self) -> bool {
+        !self.no_recording_chip
+    }
+
     pub fn app(&self) -> AppPrefs {
-        AppPrefs { sound_cues: !self.mute_cues, record_shortcut: self.record_shortcut, auto_update: !self.no_auto_update }
+        AppPrefs {
+            sound_cues: !self.mute_cues,
+            record_shortcut: self.record_shortcut,
+            auto_update: !self.no_auto_update,
+            recording_chip: !self.no_recording_chip,
+        }
     }
 }
 

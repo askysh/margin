@@ -56,6 +56,8 @@ export interface AppPrefs {
   sound_cues: boolean;
   record_shortcut: boolean;
   auto_update: boolean;
+  /** Hide the window and show the recording chip while Margin records (D53). */
+  recording_chip: boolean;
 }
 
 /** The updater's state. `ready` is a newer version that is downloaded. */
@@ -236,6 +238,8 @@ export const api = {
   stopRecording: (notes: string | null, title: string | null) =>
     invoke<{ job_id: string; title: string | null }>("stop_recording", { notes, title }),
   recorderView: () => invoke<RecorderView>("recorder_view"),
+  /** Hide the window during a recording, so only the recording chip shows. */
+  shrinkToChip: () => invoke<void>("shrink_to_chip"),
   setDraftNotes: (text: string) => invoke<void>("set_draft_notes", { text }),
   setRecordingTitle: (title: string) => invoke<void>("set_recording_title", { title }),
   discardOrphanedDraft: () => invoke<void>("discard_orphaned_draft"),
@@ -268,6 +272,22 @@ export const api = {
   chatSend: (meeting: string | null, text: string) => invoke<ChatThread>("chat_send", { meeting, text }),
   chatStop: (meeting: string | null) => invoke<void>("chat_stop", { meeting }),
   chatClear: (meeting: string | null) => invoke<void>("chat_clear", { meeting }),
+};
+
+/** The recording chip's window (src/chip, src-tauri/src/chip.rs). */
+export const chipApi = {
+  /** Does the chip show now? Asked once the page listens for changes. */
+  hello: () => invoke<boolean>("chip_hello"),
+  /** Fit the window to the pill, in points. The window stays on the right edge. */
+  width: (width: number) => invoke<void>("chip_width", { width }),
+  dragStart: () => invoke<void>("chip_drag_start"),
+  /** Points the pointer moved down since the drag started. */
+  drag: (dy: number) => invoke<void>("chip_drag", { dy }),
+  dragEnd: () => invoke<void>("chip_drag_end"),
+  nudge: (dy: number) => invoke<void>("chip_nudge", { dy }),
+  releaseFocus: () => invoke<void>("chip_release_focus"),
+  stop: () => invoke<void>("chip_stop"),
+  openNotes: () => invoke<void>("chip_open_notes"),
 };
 
 export function on<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn> {

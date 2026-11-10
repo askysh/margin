@@ -10,7 +10,7 @@ import { AudioPlayer, type AudioHandle } from "./AudioPlayer";
 import { MoreMenu } from "./MoreMenu";
 import { CopyMenu } from "./CopyMenu";
 import { SideSwitch, useOneColumn, type Side } from "./Compact";
-import { ACTION_HEADING, meetingMarkdown, summaryMarkdown, transcriptMarkdown, tsSeconds } from "../meetingMarkdown";
+import { ACTION_HEADING, meetingMarkdown, summaryMarkdown, transcriptMarkdown, tsSeconds, withoutCoverage } from "../meetingMarkdown";
 
 interface Props {
   path: string;
@@ -131,7 +131,9 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
 
   const hasActions = m.action_items.length > 0;
   // The action items block replaces core's plain checklist section.
-  const summary = m.sections.filter((s) => s.body.trim() && !(hasActions && s.heading === ACTION_HEADING));
+  const sections = m.sections.map((s) => ({ ...s, ...withoutCoverage(s.body) }));
+  const summaryIncomplete = sections.some((s) => s.incomplete);
+  const summary = sections.filter((s) => s.body.trim() && !(hasActions && s.heading === ACTION_HEADING));
   const hasSummary = summary.some((s) => s.heading === "Summary");
   const copyChoices = [
     hasSummary && { label: "Summary", hint: "The summary sections, as Markdown", done: "Summary copied.", text: () => summaryMarkdown(m) },
@@ -269,6 +271,9 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
             )}
           </div>
         ))}
+        {summaryIncomplete && (
+          <p className="quiet-note">Part of the meeting did not reach the summarizer, so this summary can miss things. Summarize again to try once more.</p>
+        )}
         {hasActions && summary.length === 0 && (
           <ActionItems path={path} items={m.action_items} names={names} locked={processing} notify={notify} onChanged={() => { load(); onChanged(); }} />
         )}

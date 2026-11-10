@@ -94,6 +94,11 @@ impl Recorder {
         self.active.lock().unwrap().is_some()
     }
 
+    /// (recording, stopping), without a copy of the live lines.
+    pub fn status(&self) -> (bool, bool) {
+        self.active.lock().unwrap().as_ref().map_or((false, false), |a| (true, a.stopping))
+    }
+
     pub fn view(&self) -> RecorderView {
         let guard = self.active.lock().unwrap();
         match guard.as_ref() {

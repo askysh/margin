@@ -224,7 +224,7 @@ if (simulate) {
     await page.locator(".draft-transcript .live-line").nth(3).waitFor({ timeout: 3000 });
     const waited = Date.now() - stoppedAt;
     assert(await page.locator(".steps").isVisible(), "processing steps not shown next to the draft");
-    await page.getByText("Draft from the live transcript; the final transcript replaces it.").waitFor();
+    await page.getByText("Draft from the live transcript. The final transcript replaces it.").waitFor();
     const first = await page.locator(".draft-transcript .live-line").first().innerText();
     assert(first.includes("launch plan"), `first draft line: ${first}`);
     const who = await page.locator(".draft-transcript .live-speaker").allInnerTexts();
@@ -479,7 +479,9 @@ await check("action items from the frontmatter can be ticked and copied", async 
     "attendees:", "- Priya", "action_items:",
     "- assignee: Priya", "  task: send the deck", "  due: Friday", "  status: open",
     "- assignee: unassigned", "  task: book the room", "  status: open", "---", "",
-    "## Summary", "", "- We planned the launch.", "", "## Action Items", "", "- [ ] @Priya: send the deck", "- [ ] book the room", "",
+    "## Summary", "", "- We planned the launch.", "",
+    "> Agent input coverage: complete. 1/1 source chunks; 29 transcript bytes and 0 user-note bytes. All source chunks were processed in 1 model calls.", "",
+    "## Action Items", "", "- [ ] @Priya: send the deck", "- [ ] book the room", "",
     "## Transcript", "", "[Priya 0:00] Let's plan the launch.", "",
   ].join("\n"), { mode: 0o600 });
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
@@ -490,12 +492,15 @@ await check("action items from the frontmatter can be ticked and copied", async 
   assert((await items.first().innerText()).includes("Priya · due Friday"), await items.first().innerText());
   const plain = await page.locator(".summary-block > .eyebrow").allInnerTexts();
   assert(!plain.some((h) => /^action items$/i.test(h.trim())), `checklist shown twice: ${plain.join(", ")}`);
+  // Core's delivery report after a summary is a debug record: hidden in the view, kept in the file.
+  assert(!(await page.locator(".page-meeting").innerText()).includes("Agent input coverage"), "the coverage report shows");
   await page.getByRole("checkbox", { name: "send the deck" }).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="send the deck"]')?.getAttribute("aria-checked") === "true");
   await page.waitForTimeout(600);
   const md = fs.readFileSync(fixture, "utf8");
   assert(/task: send the deck\n  due: Friday\n  status: done/.test(md), "frontmatter status not done");
   assert(md.includes("- [x] @Priya: send the deck") && md.includes("- [ ] book the room"), "body checkbox not ticked");
+  assert(md.includes("> Agent input coverage: complete."), "the coverage report was dropped from the file");
   await page.locator(".action-items").getByRole("button", { name: "Copy" }).click();
   assert((await copied()) === "- [x] @Priya: send the deck (due Friday)\n- [ ] book the room", `copied: ${await copied()}`);
 });
@@ -1064,6 +1069,181 @@ await check("settings: automatic updates switch is saved", async () => {
   await settingsPage().getByRole("button", { name: "Check now" }).waitFor();
   await closeSettings();
 });
+// ---------------------------------------------------------------- the recording chip (D53)
+// The chip is its own page (chip.html) in its own window. Here it runs in a second page with
+// the same bridge. The window itself (level, Spaces, size, place) needs the real app.
+const openChip = async () => {
+  const p = await ctx.newPage();
+  p.on("pageerror", (e) => consoleErrors.push(`chip: ${e.message}`));
+  p.on("console", (m) => m.type() === "error" && consoleErrors.push(`chip: ${m.text()}`));
+  await p.addInitScript(`window.__E2E_BRIDGE__ = "http://127.0.0.1:${port.bridge}";`);
+  await p.addInitScript({ path: path.join(root, "scripts/e2e/bridge-shim.js") });
+  await p.setViewportSize({ width: 260, height: 52 });
+  await p.goto(`http://localhost:${port.ui}/chip.html`);
+  // The window is transparent. A backdrop makes the screenshots readable.
+  await p.addStyleTag({ content: `html { background: ${flag("--dark") ? "#05070a" : "#c7d9e8"} }` });
+  await p.locator(".chip").waitFor({ state: "attached" });
+  return p;
+};
+const chipCalls = (p) => p.evaluate(() => window.__E2E__.calls);
+const shootChip = (p, name) => p.screenshot({ path: path.join(out, `chip-${name}.png`) }).catch(() => {});
+const latestSeq = async () => Number(await (await fetch(`http://127.0.0.1:${port.bridge}/latest`)).text());
+const eventSince = async (name, since, timeout = 10000) => {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const found = (await bridgeEvents()).find((e) => e.seq > since && e.event === name);
+    if (found) return found;
+    assert(Date.now() < deadline, `no "${name}" event`);
+    await page.waitForTimeout(200);
+  }
+};
+
+await check("settings: the recording chip is on by default and is saved", async () => {
+  await openSettings("Recording");
+  const sw = toggle(/Show the recording chip/);
+  assert(await sw.isChecked(), "the recording chip is not on by default");
+  const prefs = () => JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8"));
+  await sw.setChecked(false);
+  await page.waitForTimeout(400);
+  assert(prefs().no_recording_chip === true, `switch off not saved: ${JSON.stringify(prefs())}`);
+  await sw.setChecked(true);
+  await page.waitForTimeout(400);
+  assert(prefs().no_recording_chip === false, `switch on not saved: ${JSON.stringify(prefs())}`);
+  await closeSettings();
+});
+await check("chip: draws the time, the level and silence from the recorder events", async () => {
+  const c = await openChip();
+  assert(await c.locator(".chip.off").count(), "the chip shows with no recording");
+  const emit = (event, payload) => c.evaluate(([e, p]) => window.__E2E__.emit(e, p), [event, payload]);
+  await emit("recorder", { recording: true, stopping: false });
+  await emit("chip-visible", true);
+  await emit("recorder-tick", { elapsed_secs: 754, level: 30 });
+  await c.locator(".chip:not(.off)").waitFor();
+  assert((await c.locator(".time").innerText()) === "12:34", `time: ${await c.locator(".time").innerText()}`);
+  await c.getByRole("button", { name: /^Margin is recording, 12 minutes\. Open notes$/ }).waitFor();
+  const face = c.locator(".face");
+  assert(Number(await c.locator(".chip").evaluate((el) => el.style.getPropertyValue("--lv"))) > 0.5, "no level halo");
+  await c.waitForTimeout(500);
+  await shootChip(c, "rest");
+  // 21 s with no sound: the chip says so once, and the dot stays red.
+  for (let t = 760; t <= 781; t += 3) await emit("recorder-tick", { elapsed_secs: t, level: 0 });
+  await c.getByText("No sound comes in").waitFor();
+  assert(await c.locator(".chip.silent .warn").isVisible(), "no mic mark");
+  assert((await c.locator(".dot").evaluate((el) => getComputedStyle(el).backgroundColor)) !== "rgba(0, 0, 0, 0)", "the dot lost its red");
+  await c.getByRole("status").getByText(/hears no sound/).waitFor();
+  await c.waitForTimeout(300);
+  await shootChip(c, "silent");
+  await emit("recorder-tick", { elapsed_secs: 790, level: 0 });
+  await c.locator(".chip.silent:not(.has-msg)").waitFor();
+  await emit("recorder-tick", { elapsed_secs: 791, level: 12 });
+  await c.locator(".chip:not(.silent)").waitFor();
+  // VoiceOver hears the time once a minute, not each second.
+  await c.getByRole("button", { name: /^Margin is recording, 13 minutes\. Open notes$/ }).waitFor();
+  // Hover: Stop and Notes slide out. The window grows first.
+  await face.hover();
+  await c.locator(".chip.open").waitFor();
+  await c.getByRole("button", { name: "Stop recording", exact: true }).waitFor();
+  await c.getByRole("button", { name: "Open notes", exact: true }).waitFor();
+  assert((await chipCalls(c)).includes("chip_width"), "the window was not resized for the controls");
+  await c.waitForTimeout(300);
+  await shootChip(c, "open");
+  // Stop needs two clicks. The first arms it, and it disarms after 3 s.
+  await c.getByRole("button", { name: "Stop recording", exact: true }).click();
+  await c.getByRole("button", { name: "Click again to stop recording" }).waitFor();
+  assert((await c.locator(".cbtn.stop").innerText()) === "Stop?", "the armed Stop does not say Stop?");
+  await c.getByRole("status").getByText(/Click Stop again/).waitFor();
+  await shootChip(c, "armed");
+  await c.waitForTimeout(3300);
+  await c.getByRole("button", { name: "Stop recording", exact: true }).waitFor({ timeout: 1000 });
+  assert(!(await chipCalls(c)).includes("chip_stop"), "one click stopped the recording");
+  // Leaving closes the controls.
+  await c.mouse.move(2, 2);
+  await c.locator(".chip:not(.open)").waitFor();
+  // Keyboard: Tab opens the controls, arrows move the chip, Escape gives the focus back.
+  await c.keyboard.press("Tab");
+  await c.locator(".chip.open").waitFor();
+  await c.keyboard.press("ArrowDown");
+  await c.keyboard.press("Shift+ArrowUp");
+  await c.keyboard.press("Escape");
+  await c.locator(".chip:not(.open)").waitFor();
+  const keys = await chipCalls(c);
+  assert(keys.filter((x) => x === "chip_nudge").length === 2 && keys.includes("chip_release_focus"), `calls: ${keys.join(", ")}`);
+  // A drag moves the window and saves the place. It is not a click.
+  const box = await face.boundingBox();
+  await c.mouse.move(box.x + 20, box.y + 10);
+  await c.mouse.down();
+  await c.mouse.move(box.x + 20, box.y + 30, { steps: 5 });
+  assert(await c.locator(".chip.dragging").count(), "no drag state");
+  await shootChip(c, "drag");
+  await c.mouse.up();
+  await c.waitForTimeout(200);
+  const drag = await chipCalls(c);
+  for (const cmd of ["chip_drag_start", "chip_drag", "chip_drag_end"]) assert(drag.includes(cmd), `${cmd} not called`);
+  assert(!drag.includes("chip_open_notes"), "a drag opened the notes");
+  // After Stop: red goes, and the chip says Saving until it slides out.
+  await emit("recorder", { recording: true, stopping: true });
+  await c.locator(".chip.saving").getByText("Saving", { exact: true }).waitFor();
+  await c.getByRole("button", { name: "Saving the recording" }).waitFor();
+  await c.waitForTimeout(300);
+  await shootChip(c, "saving");
+  await emit("chip-visible", false);
+  await c.locator(".chip.off").waitFor();
+  await c.close();
+});
+// The chip follows a real (simulated) recording.
+if (simulate) {
+await check("chip: Start hides the window, and the live view can shrink to the chip", async () => {
+  const since = await latestSeq();
+  await page.keyboard.press("Meta+Shift+I");
+  await page.locator(".page-live").waitFor({ timeout: 10000 });
+  await eventSince("shrink-to-chip", since);
+  const again = await latestSeq();
+  await page.getByRole("button", { name: "Shrink to the recording chip" }).click();
+  await eventSince("shrink-to-chip", again);
+});
+let chip = null;
+await check("chip: follows the recording, and Notes brings back the live notes", async () => {
+  chip = await openChip();
+  await chip.locator(".chip:not(.off)").waitFor({ timeout: 5000 });
+  const t0 = await chip.locator(".time").innerText();
+  await chip.waitForFunction((t) => document.querySelector(".time").textContent !== t, t0, { timeout: 5000 });
+  await page.getByLabel("Meeting title").fill("QA chip");
+  await page.getByLabel("Your notes").click();
+  await page.keyboard.type("- typed before the chip");
+  // Away from the live notes, as if the window had been used for something else.
+  await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
+  await page.locator(".page-live").waitFor({ state: "detached" });
+  const since = await latestSeq();
+  await chip.locator(".face").hover();
+  await chip.getByRole("button", { name: "Open notes", exact: true }).click();
+  await eventSince("open-live", since);
+  await page.locator(".page-live").waitFor({ timeout: 5000 });
+  await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Your notes", null, { timeout: 3000 });
+  assert(await page.evaluate(() => document.activeElement.selectionStart === document.activeElement.value.length), "the caret is not at the end of the notes");
+  await page.keyboard.type("\nthe last line"); // Return continues the list with "- "
+  await page.waitForTimeout(800); // the live view saves the draft after 350 ms
+});
+await check("chip: Stop needs two clicks, says Saving, and keeps the notes", async () => {
+  const stopBtn = () => chip.getByRole("button", { name: /stop recording/i });
+  await chip.locator(".face").hover();
+  await stopBtn().click();
+  await chip.getByRole("button", { name: "Click again to stop recording" }).waitFor();
+  const view = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke("recorder_view"));
+  assert(view.recording && !view.stopping, "the first click stopped the recording");
+  await stopBtn().click();
+  await chip.locator(".chip.saving").waitFor({ timeout: 3000 });
+  await page.getByText(/Transcribing|Queued|Telling speakers apart|Saving/).first().waitFor({ timeout: 15000 });
+  const deadline = Date.now() + 180000;
+  while (!meetingFiles().some((f) => f.includes("qa-chip")) || (await page.locator(".row-job").count()) > 0) {
+    assert(Date.now() < deadline, "the meeting stopped from the chip did not finish");
+    await page.waitForTimeout(500);
+  }
+  const md = fs.readFileSync(path.join(meetingsDir, meetingFiles().find((f) => f.includes("qa-chip"))), "utf8");
+  assert(md.includes("- typed before the chip\n- the last line"), "notes typed before the chip Stop are missing");
+  await chip.close();
+});
+}
+
 if (simulate) {
   await check("a recording started from Settings takes over the window", async () => {
     await openSettings("Recording");
@@ -1073,8 +1253,14 @@ if (simulate) {
     await page.getByLabel("Meeting title").fill("QA from settings");
     await page.waitForTimeout(3000);
     await page.getByRole("button", { name: "Stop" }).click();
-    await page.locator(".row-job").first().waitFor({ state: "detached", timeout: 180000 });
     await page.locator(".row").filter({ hasText: "QA from settings" }).first().waitFor({ timeout: 20000 });
+    // Wait for the file and the end of the job. The job row can go before the file is
+    // written, and a file written later changes the meeting count that reset checks.
+    const deadline = Date.now() + 180000;
+    while (!meetingFiles().some((f) => f.includes("qa-from-settings")) || (await page.locator(".row-job").count()) > 0) {
+      assert(Date.now() < deadline, "the meeting recorded from Settings did not finish");
+      await page.waitForTimeout(500);
+    }
   });
 }
 

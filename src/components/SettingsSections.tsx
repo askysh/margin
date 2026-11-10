@@ -114,6 +114,14 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
           onChange={(on) => changePrefs({ ...prefs, sound_cues: on })}
         />
       </Card>
+      <Card title="During a recording">
+        <ToggleRow
+          title="Show the recording chip"
+          help="When a recording starts, the Margin window hides and a small chip shows the time at the right edge of the screen. Click the chip to open your notes. Drag it up or down to move it."
+          checked={prefs.recording_chip}
+          onChange={(on) => changePrefs({ ...prefs, recording_chip: on })}
+        />
+      </Card>
     </>
   );
 }
@@ -140,7 +148,7 @@ export function TranscriptionSection({ s, save, options }: SettingsView) {
         <SelectRow
           id="set-language"
           label="Language spoken in meetings"
-          help="Choose one only if auto-detect gets your meetings wrong."
+          help="Choose one only if auto-detect gets your meetings wrong. For meetings that mix two languages, such as Hindi and English, keep Auto-detect and use the Best model."
           value={s.transcription_language ?? "auto"}
           choices={[{ value: "auto", label: "Auto-detect" }, ...(options?.languages ?? []).map((l) => ({ value: l.code, label: l.name }))]}
           onChange={(code) => save({ transcription_language: code })}

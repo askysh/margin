@@ -14,6 +14,13 @@ pub const TRAY_REFRESH: &str = "__tray-refresh";
 /// Pseudo-event asking the host to register or drop the global shortcut.
 pub const SHORTCUT_REFRESH: &str = "__shortcut-refresh";
 
+/// Hide the main window and show the recording chip (chip.rs). The app does this at Start
+/// when the chip is on, and when you ask for it in the live view.
+pub const SHRINK_TO_CHIP: &str = "shrink-to-chip";
+
+/// Bring the main window back on the live notes. The chip sends it when you click it.
+pub const OPEN_LIVE: &str = "open-live";
+
 /// A system notification for the host to show (the QA bridge only queues it).
 pub const NOTIFY: &str = "notify";
 

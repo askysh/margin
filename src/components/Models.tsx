@@ -53,7 +53,7 @@ export function DownloadProgress({ compact, hideWhenReady, pendingNote }: Props)
     <div className={`download ${compact ? "compact" : ""} ${all ? "is-ready" : ""}`}>
       <div className="download-head">
         <span>{all ? "Speech models ready" : error ? "Download stopped" : "Downloading speech models"}</span>
-        <span className="mono">{all ? bytes(total) : `${bytes(done)} of ${bytes(total)}`}</span>
+        <span className="mono">{all ? `${bytes(total)} on this Mac` : `${bytes(done)} of ${bytes(total)}`}</span>
       </div>
       <div className="bar" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
         <div className="bar-fill" style={{ width: `${pct}%` }} />
