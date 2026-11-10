@@ -14,7 +14,8 @@
 //! at utility priority. A failed piece is dropped (the final pass covers that range). If
 //! the thread falls behind, or a piece panics, it stops for the rest of the meeting.
 //!
-//! Fast and Balanced only: the Best model cannot keep up on a MacBook Air.
+//! It runs with every model. Best (large-v3-turbo) keeps up on a MacBook Air M4 with the
+//! live transcript running at the same time (DECISIONS.md D52).
 //!
 //! `margin --dev rolling <wav> [segment-secs] [out.md]` is the research prototype that
 //! measured this design. It is kept below `Session`.
@@ -38,16 +39,7 @@ const MAX_BACKLOG_PIECES: usize = 4;
 /// would take longer than waiting.
 pub const STOP_WAIT: Duration = Duration::from_secs(20);
 
-/// Is rolling transcription on for this model? On by default for Fast and Balanced.
-pub fn enabled(cfg: &Config) -> bool {
-    supported_model(&cfg.transcription.model) && !prefs::load().no_rolling_transcription
-}
-
-pub fn supported_model(model: &str) -> bool {
-    matches!(model, "base" | "small")
-}
-
-/// The Settings switch "Transcribe during the meeting".
+/// The Settings switch "Transcribe during the meeting". On by default, for every model.
 pub fn pref() -> bool {
     !prefs::load().no_rolling_transcription
 }
@@ -89,7 +81,7 @@ pub fn start(call: bool, wav: &Path, title: Option<String>) -> Option<Session> {
     // The worker transcribes with this same config (processing.rs changes only the
     // summary engine), so the pieces match the final pass.
     let cfg = corecfg::load();
-    if !enabled(&cfg) {
+    if !pref() {
         return None;
     }
     let model = crate::paths::models_dir().join(format!("ggml-{}.bin", cfg.transcription.model));
@@ -615,11 +607,5 @@ mod tests {
         tail.read_new();
         assert_eq!(tail.pending.len(), 2);
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn only_fast_and_balanced_roll() {
-        assert!(supported_model("base") && supported_model("small"));
-        assert!(!supported_model("large-v3-turbo"));
     }
 }

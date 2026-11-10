@@ -3,7 +3,7 @@
 //! other app.
 
 use crate::recorder::{recorder, Kind};
-use crate::{commands::ops, events, prefs, tray};
+use crate::{events, prefs, tray};
 use tauri::{AppHandle, Wry};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
@@ -38,22 +38,17 @@ pub fn refresh(app: &AppHandle) {
 }
 
 fn toggle(app: &AppHandle) {
-    let recording = recorder().is_recording();
-    if !recording {
-        // The notepad is where a meeting starts.
-        tray::show_main(app);
+    if !recorder().is_recording() {
+        // The notepad, or the recording chip when it is on, is where a meeting starts.
+        let kind = match prefs::load().default_kind.as_deref() {
+            Some("in-person") => Kind::InPerson,
+            _ => Kind::Call,
+        };
+        tray::start_outside(app, kind);
+        return;
     }
     std::thread::spawn(move || {
-        let result = if recording {
-            recorder().stop(None, None).map(|_| ())
-        } else {
-            let kind = match prefs::load().default_kind.as_deref() {
-                Some("in-person") => Kind::InPerson,
-                _ => Kind::Call,
-            };
-            ops::start_recording(kind, None).map(|_| ())
-        };
-        if let Err(error) = result {
+        if let Err(error) = recorder().stop(None, None) {
             if error != crate::recorder::ALREADY_STOPPING {
                 events::emit("error-toast", error);
             }

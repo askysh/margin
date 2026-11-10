@@ -10,6 +10,8 @@
   <string>Margin saves each meeting as a Markdown file in the folder you chose.</string>
   <key>NSDesktopFolderUsageDescription</key>
   <string>Margin saves each meeting as a Markdown file in the folder you chose.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>With Apple Speech chosen for the live transcript, Margin turns speech into text on this Mac. Nothing is uploaded.</string>
   <key>NSCalendarsFullAccessUsageDescription</key>
   <string>Margin can name meetings and list attendees from the calendar event happening while you record.</string>
   <key>LSUIElement</key>

@@ -5,6 +5,53 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [0.0.9] - 2026-11-10
+
+### Added
+
+- Settings → General → Privacy → "Hide Margin from screen sharing". When it is on, people
+  on a call do not see Margin when you share your screen, and screenshots leave Margin
+  out. It is off by default (D54).
+
+### Changed
+
+- Settings → Recording → "Live transcript" can use Apple Speech in place of Whisper:
+  Hindi and English, English (India) or English (US). Apple Speech runs on the Neural
+  Engine, so the live transcript no longer drops lines while Margin transcribes an earlier
+  meeting. Hindi and English writes the Hindi in Latin letters. It needs macOS 26.
+  Whisper stays the default, and the final transcript does not change (D56).
+- During a recording, the Margin window hides and a small recording chip shows the time at
+  the right edge of the screen. Point at it for Stop and Notes. Stop needs two clicks.
+  Click the chip to go back to your notes, and drag it up or down to move it. Settings →
+  Recording → "Show the recording chip" turns it off (D53).
+- With the recording chip on, a recording started from the menu bar, the global shortcut
+  or a notification does not bring the window forward (D53).
+- "Transcribe during the meeting" works with the Best model too. An 80-minute meeting with
+  Best is ready about 3 minutes after Stop, not about an hour. On a MacBook Air M4 it uses
+  about the same battery as Balanced (D52).
+- With Best, the live transcript uses Balanced in place of Fast, which is more accurate.
+  Margin downloads Balanced (488 MB) in the background after the update. Until it is
+  there, the live transcript uses Fast, and recording does not wait for it (D52).
+- Settings → Transcription says what to do for meetings that mix two languages, such as
+  Hindi and English: keep Auto-detect and use the Best model.
+- When the speech models are ready, Settings shows their size on this Mac without a full
+  progress bar.
+
+### Fixed
+
+- Quit asks first while a meeting is still being transcribed, and names the meeting. Keep
+  Running is the default. Before, a Quit could stop the transcription, and Margin started
+  it again from the beginning (D55).
+- A summary by Claude no longer shows the line "Agent input coverage: …" at its end. The
+  meeting file keeps it. When part of the meeting did not reach the summarizer, the
+  meeting shows a short note instead.
+- Text that scrolls under the Ask bar fades out, so no words show between the bar and the
+  bottom of the window.
+- The red recording dot sits next to the timer.
+- A finished transcript no longer fades in each time you open the meeting. Only new live
+  lines do.
+- A long folder path wraps as a whole and does not break in the middle of a word.
+
 ## [0.0.8] - 2026-11-09
 
 ### Changed

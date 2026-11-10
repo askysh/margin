@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod applespeech;
 mod audio;
 mod calldetect;
 mod chat;
+mod chip;
 mod commands;
 mod corecfg;
 mod devcli;
@@ -21,6 +23,7 @@ mod processing;
 mod recorder;
 mod reset;
 mod rolling;
+mod screenshare;
 mod shortcut;
 mod speakers;
 mod summaries;
@@ -71,21 +74,39 @@ fn main() {
                     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
                     let _ = apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None);
                 }
+                let _ = window.set_content_protected(screenshare::hidden());
                 let _ = if at_login { window.hide() } else { window.show() };
             }
             tray::init(&handle)?;
             notify::init(&handle);
             shortcut::refresh(&handle);
             processing::spawn_watcher();
+            // A model that this version needs and an earlier one did not, such as the live
+            // transcript model for Best (D52), downloads in the background.
+            if prefs::load().onboarding_complete && !models::all_installed(&corecfg::load()) {
+                if let Err(error) = models::download_missing() {
+                    tracing::warn!(%error, "could not start the model download");
+                }
+            }
             calldetect::spawn();
             updater::spawn(&handle);
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the window keeps Margin in the menu bar (and any recording going).
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            if window.label() != "main" {
+                return;
+            }
+            match event {
+                // Closing the window keeps Margin in the menu bar (and any recording going).
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    chip::sync(window.app_handle());
+                }
+                // Minimize, restore and focus changes can show or hide the window. The
+                // recorder's tick also checks, for changes with no event, such as ⌘H.
+                WindowEvent::Focused(_) | WindowEvent::Resized(_) => chip::sync(window.app_handle()),
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -104,6 +125,16 @@ fn main() {
             commands::tauri_cmds::start_recording,
             commands::tauri_cmds::stop_recording,
             commands::tauri_cmds::recorder_view,
+            commands::tauri_cmds::shrink_to_chip,
+            commands::tauri_cmds::chip_open_notes,
+            commands::tauri_cmds::chip_stop,
+            chip::chip_hello,
+            chip::chip_width,
+            chip::chip_drag_start,
+            chip::chip_drag,
+            chip::chip_drag_end,
+            chip::chip_nudge,
+            chip::chip_release_focus,
             commands::tauri_cmds::set_draft_notes,
             commands::tauri_cmds::set_recording_title,
             commands::tauri_cmds::discard_orphaned_draft,
@@ -141,16 +172,13 @@ fn main() {
 
     app.run(|app, event| match event {
         RunEvent::Reopen { .. } => tray::show_main(app),
-        RunEvent::ExitRequested { api, .. } => {
-            // Cmd-Q while recording (or while a stop is finishing): save the meeting first,
-            // off the main thread, then quit for real.
-            if recorder::recorder().is_recording() {
+        RunEvent::ExitRequested { api, code, .. } => {
+            // Cmd-Q while recording or processing: save the meeting and ask first, off the
+            // main thread (tray::quit). `code` is set when tray::quit itself exits.
+            if code.is_none() && (recorder::recorder().is_recording() || processing::busy()) {
                 api.prevent_exit();
                 let app = app.clone();
-                std::thread::spawn(move || {
-                    recorder::recorder().finish_before_exit(std::time::Duration::from_secs(120));
-                    app.exit(0);
-                });
+                std::thread::spawn(move || tray::quit(&app));
             }
         }
         // Quitting with an update downloaded installs it (not during a recording).
@@ -180,14 +208,22 @@ fn route(app: &tauri::AppHandle, name: &str, payload: serde_json::Value) {
     match name {
         events::TRAY_REFRESH => tray::refresh(app),
         events::SHORTCUT_REFRESH => shortcut::refresh(app),
+        events::SCREEN_SHARE_REFRESH => screenshare::apply(app),
         events::NOTIFY => {
             if let Ok(notice) = serde_json::from_value(payload) {
                 notify::show(app, notice);
             }
         }
         _ => {
-            if name == "recorder-tick" {
-                tray::tick(app, payload["elapsed_secs"].as_u64().unwrap_or(0));
+            match name {
+                events::SHRINK_TO_CHIP => chip::shrink(app),
+                events::OPEN_LIVE => tray::show_main(app),
+                "recorder" => chip::sync(app),
+                "recorder-tick" => {
+                    tray::tick(app, payload["elapsed_secs"].as_u64().unwrap_or(0));
+                    chip::sync(app);
+                }
+                _ => {}
             }
             let _ = app.emit(name, payload);
         }

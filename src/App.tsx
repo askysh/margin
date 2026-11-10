@@ -148,6 +148,14 @@ export default function App() {
       // Setup has no Settings yet, so the item waits until it is done.
       on<null>("open-settings", () => onboardedRef.current && setSettings((now) => now ?? lastSection.current)),
       on<AppPrefs>("app-prefs", (prefs) => setBoot((b) => b && { ...b, prefs })),
+      // A click on the recording chip: back to the live notes, with the caret in them.
+      on<null>("open-live", () => {
+        if (resettingRef.current || !recorderRef.current?.recording) return;
+        setSelection({ type: "live" });
+        blurSettingsField();
+        setSettings(null);
+        requestAnimationFrame(() => requestAnimationFrame(() => focusNotesEnd()));
+      }),
       // However a recording ended (Stop here, the menu bar, auto-stop), follow it to its
       // processing view if you were looking at it.
       on<{ job_id: string; title: string | null; notes: string }>("recording-stopped", ({ job_id, title, notes }) => {
@@ -311,6 +319,16 @@ export default function App() {
             <div className="rec-control">
               <span className="rec-dot" aria-hidden />
               <span className="rec-time mono">{clock(tick.elapsed_secs)}</span>
+              {boot.prefs.recording_chip && !recorder?.stopping && (
+                <button
+                  className="icon-btn shrink-btn"
+                  aria-label="Shrink to the recording chip"
+                  title="Shrink to the recording chip. Margin keeps recording."
+                  onClick={() => api.shrinkToChip().catch((e) => notify(errorText(e), "error"))}
+                >
+                  <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><rect x="2.5" y="3.5" width="15" height="13" rx="2.5" stroke="currentColor" strokeWidth="1.5" fill="none" /><rect x="11" y="8.5" width="6.5" height="3.5" rx="1.75" fill="currentColor" /></svg>
+                </button>
+              )}
               <button className="btn btn-stop" onClick={stop} disabled={busy || recorder?.stopping}>
                 {busy || recorder?.stopping ? "Saving…" : "Stop"}
               </button>
@@ -502,6 +520,14 @@ function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk, onSearch, onS
     return () => window.removeEventListener("keydown", h);
   }, [onSettings, onStart, canStart, onAsk, onSearch, onSidebar]);
   return null;
+}
+
+/** The caret at the end of the live notes, as if you had clicked after the last word. */
+function focusNotesEnd() {
+  const el = document.querySelector<HTMLTextAreaElement>(".page-live textarea[aria-label='Your notes']");
+  if (!el) return;
+  el.focus();
+  el.setSelectionRange(el.value.length, el.value.length);
 }
 
 /** Leaving Settings unmounts a focused field without a blur, so its save-on-blur would never

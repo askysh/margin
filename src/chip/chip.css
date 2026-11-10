@@ -1,0 +1,128 @@
+/* The recording chip (D53), from design A, "Quiet pill". A pill docked to the right edge of
+   the screen: a red dot and the elapsed time at rest, Stop and Notes on hover or focus. The
+   window is the pill plus room for its shadow, and its right edge is the screen edge. */
+
+:root {
+  /* The outer ring keeps the edge readable on a pale wallpaper. */
+  --chip-ring: rgba(28, 36, 48, 0.22);
+  --chip-inner: rgba(255, 255, 255, 0.7);
+  --chip-shadow: 0 1px 2px rgba(28, 36, 48, 0.14), -3px 6px 18px rgba(28, 36, 48, 0.18);
+  --chip-lift: 0 2px 4px rgba(28, 36, 48, 0.16), -6px 14px 32px rgba(28, 36, 48, 0.26);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --chip-ring: rgba(0, 0, 0, 0.7);
+    --chip-inner: rgba(255, 255, 255, 0.1);
+    --chip-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), -3px 6px 20px rgba(0, 0, 0, 0.45);
+    --chip-lift: 0 2px 4px rgba(0, 0, 0, 0.45), -6px 14px 34px rgba(0, 0, 0, 0.6);
+  }
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: transparent;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+.chip-stage { position: fixed; inset: 0; overflow: hidden; }
+
+.chip {
+  --lv: 0;
+  position: absolute;
+  top: 11px; /* PAD_Y in chip.rs */
+  /* 16 points of the pill sit past the screen edge, so the right side reads as part of the
+     edge, and no hairline or shadow shows there. */
+  right: -16px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  border-radius: 15px 0 0 15px;
+  background: color-mix(in srgb, var(--sheet) 96%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(1.3);
+  backdrop-filter: blur(16px) saturate(1.3);
+  box-shadow: inset 0 1px 0 var(--chip-inner), 0 0 0 0.5px var(--chip-ring), var(--chip-shadow);
+  color: var(--ink);
+  font: 500 12px/1 var(--f-ui);
+  touch-action: none;
+  transition: transform 340ms cubic-bezier(0.2, 0.9, 0.25, 1), box-shadow 160ms, opacity 200ms;
+}
+.chip.off { transform: translateX(105%); transition-duration: 240ms; transition-timing-function: cubic-bezier(0.5, 0, 0.75, 0); }
+.chip.dragging {
+  box-shadow: inset 0 1px 0 var(--chip-inner), 0 0 0 0.5px var(--chip-ring), var(--chip-lift);
+  transform: translateX(-4px);
+  transition: box-shadow 160ms, transform 160ms;
+}
+
+/* The reveal: a grid track from 0fr to 1fr, so the width animates without measuring. */
+.reveal { display: grid; grid-template-columns: 0fr; transition: grid-template-columns 200ms cubic-bezier(0.2, 0.8, 0.2, 1); height: 100%; }
+.reveal > div { overflow: hidden; min-width: 0; display: flex; align-items: center; height: 100%; }
+.chip.open .ctrls, .chip.has-msg .msg { grid-template-columns: 1fr; }
+.chip.saving .ctrls { grid-template-columns: 0fr; }
+
+.ctrls > div { gap: 3px; padding-left: 3px; }
+.cbtn {
+  flex: none; width: 24px; height: 24px; border-radius: 12px; border: 0; padding: 0;
+  display: grid; place-items: center; background: transparent; color: var(--ink-2); font: inherit;
+}
+.cbtn:hover { background: var(--paper-2); color: var(--ink); }
+.cbtn.stop { background: var(--tally); }
+.cbtn.stop:hover { background: color-mix(in srgb, var(--tally) 86%, #000); }
+.cbtn.stop i { width: 8px; height: 8px; border-radius: 1.5px; background: #fff; display: block; }
+/* The first click arms Stop. The button says what the second click does. */
+.cbtn.stop.armed { width: auto; padding: 0 10px; color: #fff; font: 600 11.5px/1 var(--f-ui); white-space: nowrap; }
+.cbtn.stop.armed:hover { background: var(--tally); }
+.ctrls .sep { width: 1px; height: 14px; background: var(--hair-strong); margin: 0 2px 0 4px; flex: none; }
+
+.msg > div { white-space: nowrap; font: 500 11.5px/1 var(--f-ui); }
+.msg span { padding-left: 10px; }
+.chip.silent .msg > div { color: var(--danger); }
+.chip.saving .msg > div { color: var(--ink-2); }
+
+.face {
+  height: 30px; border: 0; background: transparent; color: inherit; display: flex; align-items: center; gap: 6px;
+  padding: 0 27px 0 10px; /* 27 = 11 on the screen + 16 past the edge */
+  border-radius: 15px 0 0 15px; font: inherit;
+}
+.chip.open .face, .chip.has-msg .face { padding-left: 8px; border-radius: 0; }
+.time {
+  font-family: var(--f-note); font-variation-settings: "MONO" 1, "CASL" 0; font-weight: 500; font-size: 12.5px;
+  letter-spacing: -0.01em; font-variant-numeric: tabular-nums; min-width: 34px;
+}
+
+/* The dot breathes between full and 60 %, never lower, so it never looks off. It stays red
+   while Margin records, also when no sound comes in. A soft halo follows the sound level:
+   proof that sound goes in. */
+.dot { position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--tally); flex: none; animation: chip-breathe 2.4s ease-in-out infinite; }
+.dot::after {
+  content: ""; position: absolute; inset: -4px; border-radius: 50%; background: var(--tally);
+  opacity: calc(var(--lv) * 0.32); transform: scale(calc(0.6 + var(--lv) * 0.55)); transition: opacity 120ms, transform 120ms;
+}
+@keyframes chip-breathe { 50% { opacity: 0.6; } }
+.warn { display: none; color: var(--danger); width: 13px; height: 13px; flex: none; }
+.chip.silent .warn { display: block; }
+/* Saving: the red goes as soon as the mic closes. The green rule turns into a spinner. */
+.chip.saving .dot { background: transparent; border: 1.5px solid var(--hair-strong); border-top-color: var(--rule); width: 10px; height: 10px; animation: chip-spin 0.9s linear infinite; }
+.chip.saving .dot::after { display: none; }
+.chip.saving .time, .chip.saving .warn { display: none; }
+@keyframes chip-spin { to { transform: rotate(360deg); } }
+.chip.entering .dot { animation: chip-pop 260ms 240ms cubic-bezier(0.3, 1.6, 0.5, 1) both, chip-breathe 2.4s 500ms ease-in-out infinite; }
+@keyframes chip-pop { from { transform: scale(0); } }
+
+.chip :focus { outline: none; }
+.chip :focus-visible { outline: 2px solid var(--rule); outline-offset: -1px; }
+.chip .face:focus-visible { outline-offset: -3px; border-radius: 12px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  .chip, .chip.off { transition: opacity 150ms; }
+  .chip.off { transform: none; opacity: 0; }
+  .chip.dragging { transform: none; }
+  .reveal { transition: none; }
+  .dot, .chip.entering .dot { animation: none; }
+  .dot::after { display: none; }
+  .chip.saving .dot { animation: none; border-color: var(--rule); }
+}

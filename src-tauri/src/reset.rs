@@ -126,6 +126,8 @@ pub fn run(recorder: &Recorder, opts: &ResetOptions) -> Result<ResetReport, Stri
     let _ = std::fs::remove_dir_all(paths::drafts_dir());
     paths::ensure_dirs();
     crate::events::refresh_tray();
+    // With no config, the windows go back to core's default: hidden from screen sharing.
+    crate::events::emit(crate::events::SCREEN_SHARE_REFRESH, true);
     Ok(report)
 }
 

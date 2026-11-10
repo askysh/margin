@@ -60,12 +60,15 @@ Margin, never during a recording. Settings → Updates turns the automatic check
   5. The three ways to start a recording.
 - **Recording.** *Record call* (⌘⇧R) records your microphone and the call audio. *Record
   in person* (⌘⇧I) records the microphone only.
-  - The notepad opens with a live transcript beside it. In calls, live lines are marked
+  - The window hides, and a small recording chip shows the time at the right edge of the
+    screen. Point at it for Stop and Notes. Stop needs two clicks. Click the chip to open
+    the notes, and drag it up or down to move it. Settings → Recording turns the chip off.
+  - The notepad has a live transcript beside it. In calls, live lines are marked
     You / Them.
   - Make the window narrow to keep it beside the call. The sidebar becomes a drawer
     (⌘\ hides it in a wide window), and a switch picks Notes or Transcript.
-  - With Fast or Balanced, Margin transcribes the meeting in 2-minute pieces while it
-    records. After *Stop*, only the last piece or two is left. Settings → Transcription →
+  - Margin transcribes the meeting in 2-minute pieces while it records, with every model.
+    After *Stop*, only the last piece or two is left. Settings → Transcription →
     "Transcribe during the meeting" turns this off.
   - After *Stop*, the meeting opens as soon as its transcript is ready. Speaker names and
     the summary fill in when they are done. Your notes stay editable the whole time.
@@ -93,9 +96,10 @@ Margin, never during a recording. Settings → Updates turns the automatic check
   app. A banner offers to record when a call app such as Zoom starts.
 - **Settings.** A page in the main window, opened with ⌘, the gear or the menu bar. A
   list of sections is on the left, and *Back* (or Esc) returns to where you were:
-  - **General:** your name, the meetings folder, how long to keep audio, open at login.
+  - **General:** your name, the meetings folder, how long to keep audio, hiding Margin
+    from screen sharing, open at login.
   - **Recording:** the microphone, stop after silence, call suggestions, the global
-    shortcut and sounds.
+    shortcut, sounds and the recording chip.
   - **Transcription:** the model, transcribing during the meeting, the meeting language,
     speaker separation, and names and words to spell right.
   - **Summaries**, **Voices**, **Permissions**, **Integrations** (an MCP snippet, so

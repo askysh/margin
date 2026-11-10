@@ -184,6 +184,42 @@ pub fn save_notes(path: &Path, notes: &str) -> Result<(), String> {
     library::replace_notes(path, notes)
 }
 
+/// A meeting is queued or being processed.
+pub fn busy() -> bool {
+    !jobs::active_jobs().is_empty()
+}
+
+/// Asks before Quit while a meeting is still processing. True means quit.
+///
+/// The worker runs in its own process and should outlive Margin. On 2026-11-10 it stopped
+/// 10 s after a Quit, cause unknown, and the retry transcribed the call again from the
+/// start: 100 minutes of work lost (D55). Until a retry can resume, Quit asks first.
+pub fn confirm_quit(app: &tauri::AppHandle) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let active = jobs::active_jobs();
+    if active.is_empty() {
+        return true;
+    }
+    let keep = app
+        .dialog()
+        .message(quit_message(&active.iter().map(|j| j.title.clone()).collect::<Vec<_>>()))
+        .title("Margin is still transcribing")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom("Keep Running".into(), "Quit Anyway".into()))
+        .blocking_show();
+    !keep
+}
+
+fn quit_message(titles: &[Option<String>]) -> String {
+    let first = titles.iter().flatten().next().map_or("Your meeting".to_string(), |t| format!("“{t}”"));
+    let what = match titles.len() {
+        0 | 1 => format!("{first} is not ready yet."),
+        2 => format!("{first} and 1 more meeting are not ready yet."),
+        n => format!("{first} and {} more meetings are not ready yet.", n - 1),
+    };
+    format!("{what} If you quit now, transcription can stop and start again from the beginning when you open Margin.")
+}
+
 pub fn job_views() -> Vec<JobView> {
     jobs::display_jobs(Some(30), true)
         .into_iter()
@@ -338,6 +374,17 @@ fn core_wrote_these_notes(written: &str, queued: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quit_message_names_the_meeting() {
+        let one = super::quit_message(&[Some("Weekly".into())]);
+        assert!(one.starts_with("“Weekly” is not ready yet. If you quit now"), "{one}");
+        assert!(super::quit_message(&[None]).starts_with("Your meeting is not ready yet."));
+        let two = super::quit_message(&[None, Some("Weekly".into())]);
+        assert!(two.starts_with("“Weekly” and 1 more meeting are not ready yet."), "{two}");
+        let three = super::quit_message(&[Some("A".into()), None, None]);
+        assert!(three.starts_with("“A” and 2 more meetings are not ready yet."), "{three}");
+    }
+
     use super::*;
 
     #[test]

@@ -162,9 +162,9 @@ Whisper settings that config cannot change: `best_of 5`, temperature fallback, t
   is the open piece:
   - 120 s pieces: 1 minute on average, which is about 24 s (48 s at most).
   - 60 s pieces: about 12 s (24 s at most), with more model loads.
-- **Best model:** large-v3-turbo needs 4.2× the compute of `small`. On real audio that is
-  an RTF of about 1.7, so the thread falls behind. Rolling works with Fast and Balanced
-  only, unless the core patch in option 5 and the fallback cap make turbo fast enough.
+- **Best model:** large-v3-turbo needs 4.2× the compute of `small` on synthetic audio.
+  From that, the estimate for real audio was an RTF of about 1.7. A measurement on real
+  audio gave 0.73, so the thread keeps up. See "Rolling with Best" below (D52).
 - **Effort:** medium. The prototype is about 150 lines. The app needs:
   - the thread to tail the growing stems (`recorder.rs` already reads them for the live
     "You / Them" labels),
@@ -289,9 +289,10 @@ The coordinator's fix sets `live_transcript.model` to the user's chosen model.
 - **Best chosen: do not use large-v3-turbo live.** It fell behind at 3× (22 s to catch up,
   30% of the lines lost), and used 1.9 GB. At real time it may keep up, with about 5–10 s
   of lag. Download `small` (488 MB) as the live model for these users, or `base` (148 MB)
-  if download size matters more than live quality.
-- If rolling transcription ships (Phase 2), the live sidecar shares the GPU with it. The
-  measurements above did not include that. Measure both together before Phase 2 ships.
+  if download size matters more than live quality. Margin used `base` until D52, and now
+  uses `small`.
+- If rolling transcription ships (Phase 2), the live sidecar shares the GPU with it. See
+  "Rolling with Best" below for both together at real time.
 
 ## Recommended plan
 
@@ -323,8 +324,7 @@ the speaker passes.
 
 1. Send patch 11 upstream: a job input for per-stem transcript checkpoints.
 2. A recorder thread that transcribes 120 s pieces of each stem while recording. It
-   writes the checkpoint next to the job. Fast and Balanced only. Best uses the batch
-   pass.
+   writes the checkpoint next to the job. All three models (D52).
 3. At Stop, queue the job with the checkpoint. Core transcribes only the tail.
 4. Measure the GPU and battery cost during a real call, with the live sidecar running.
    If it is too high, use larger pieces, or start rolling only after 10 minutes.
@@ -420,3 +420,96 @@ The same rule in core's own capture checkpoint (silverstein/minutes#1319 plus th
 gave the same transcript as the whole-file pass on this call, word for word: 5,106 of
 5,106 and 4,402 of 4,402 words. The transcript was ready 9 s after Stop, against 29
 minutes.
+
+## Rolling with Best
+
+Measured on 2026-11-09 on a MacBook Air M4 (Mac16,12, 16 GB), debug build (DECISIONS.md
+D52). The input is 11 minutes (41:00 to 52:00) of the owner's real call, with both
+stems. The speech is Hindi and English mixed.
+
+**Each model alone** (`margin --dev rolling <wav> 120`, by the owner):
+
+| Model | RTF | Work left after Stop | Lines | Garbled non-Latin lines |
+|---|---|---|---|---|
+| `small` | 0.463 | 50.8 s | 148 | 9 |
+| `large-v3-turbo` | 0.729 | 58.5 s | 224 | 0 |
+| `large-v3-turbo-q5_0` | 0.735 | 59.2 s | — | — |
+
+- The real RTF of turbo is 0.73, not the 1.7 that the synthetic ratio gave. Turbo keeps up.
+- `small` writes garbled Devanagari on this call and drops content. Turbo does not.
+- The q5_0 quantization is not faster on this Mac.
+
+**Rolling turbo and the live sidecar at the same time, at 1× real time.**
+`margin --dev rolling-job call.wav 1` (Best) and `margin --dev live-replay call.wav 1
+small` ran together, each in its own sandbox. The rolling job is the app's rolling thread,
+Stop and the job. The live replay is the app's live sidecar on the mixed signal. On AC
+power. A sampler read `ioreg` (GPU "Device Utilization %"), `ps` and `pmset -g therm`
+every 5 s. The GPU shows about 27% with nothing running, for the display.
+
+| Rolling, Best | Rolling off | Rolling on |
+|---|---|---|
+| Stop to transcript ready | 428.4 s | **50.6 s** |
+| Stop to Complete | 457.4 s | 77.6 s |
+| Pieces made / failed / accepted by core | — | 10 / 0 / 10 |
+| Stop waited for a piece | — | 0.2 s |
+| Compute during the meeting | — | 298 s for 660 s of audio |
+| Rolling stopped itself (8 minutes behind) | — | no |
+| Transcript against rolling off | — | the same, word for word (1,629 words) |
+| Peak memory of the process | 2.18 GB | 2.16 GB (2.0 GB during the meeting) |
+| CPU during the meeting (mean) | — | 4% |
+
+| Live sidecar, `small` | Alone | With rolling Best |
+|---|---|---|
+| Lines | 54 | 54 |
+| Words | 1,575 | 1,575, the same text |
+| Extra time before a line shows (median, mean, p90, max) | — | 0 s, 1.4 s, 6.6 s, 8.1 s |
+| Lines more than 3 s later | — | 11 of 54 |
+| Peak memory | 798 MB | 806 MB |
+| CPU (mean) | 27% | 26% |
+| GPU busy (median, mean of the samples) | 12%, 41% | 95%, 67% |
+| Samples with the GPU at 90% or more | — | 57% |
+
+- The rolling thread kept up. At Stop, only the open piece of each stem was left. Core
+  accepted all 10 pieces.
+- The live transcript did not change. A line shows up to 8 s later while a rolling piece
+  runs on the GPU, and at the same time otherwise.
+- The live times are compared line by line between the two runs. Each run starts its own
+  clock, so the times are good to about 1 s. Core stamps a live line when it is written,
+  so the JSONL offsets do not give the lag by themselves.
+- No thermal warning was recorded. This run was on AC power. The battery run is below.
+
+### On battery, the whole call
+
+The same Mac on battery, debug build, screen on, no other work. The input was the whole
+80-minute call (4,832 s, both stems) at 1× real time, with `rolling-job` (Best) and
+`live-replay` (`small`) at the same time. Balanced ran on 15 minutes of the same call
+(41:00 to 56:00) after an 18-minute rest. The "matched" column is Best on those 15
+minutes. A sampler read `ioreg -rn AppleSmartBattery` (`AppleRawCurrentCapacity`,
+`SystemLoad`), the GPU's "Device Utilization %" and `ProcessInfo.thermalState` every 10 s.
+
+| | Best, 80 min | Best, matched 15 min | Balanced, 15 min |
+|---|---|---|---|
+| Battery per hour (of 4,061 mAh) | 26% (1,061 mAh) | 25% | 24% (985 mAh) |
+| System power, mean | 13.4 W | 13.0 W | 15.0 W |
+| GPU busy, median | 98% | 99% | 67% |
+| Thermal state | "fair" in 82% of the samples, from minute 4 | "fair" | nominal |
+| Peak memory of the processes | 2.6 GB | 2.6 GB | 1.7 GB |
+| Pieces made / failed | 76 / 0 | — | 14 / 0 |
+| Stop waited for a piece | 12.4 s | — | 0.2 s |
+| Stop to transcript ready | 156 s | — | 21 s |
+| Stop to Complete | 351 s | — | 58 s |
+
+With nothing running and the screen on, the system used 3.8 W.
+
+- Best uses about the same charge per hour as Balanced. The GPU runs at full power with
+  both models. Best keeps it busy for longer, at lower clocks. A full charge gives about
+  4 hours of meetings with Best.
+- The thermal state went to "fair" after about 4 minutes and never went past it. Rolling
+  did not fall behind.
+- Final transcript of the whole call: 1,059 lines, 11,784 words, no garbled lines. The
+  saved Balanced transcript of the same call: 960 lines, 9,667 words, 9 garbled lines.
+- The live transcript (`small`): 456 lines, 3 to 7 s behind the audio for the whole call,
+  with no drift. It garbled 35 lines on the Hindi parts. Balanced live garbled 9 of 77
+  lines on its 15 minutes.
+- Limits: one call, one Mac and a debug build. Balanced ran on a cooler Mac, after the
+  rest.

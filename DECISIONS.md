@@ -368,6 +368,8 @@ The full comparison is in `docs/parity/app.md`.
   still names them in later meetings.
 
 ### D41. The live transcript uses the chosen model
+- **The Best part is superseded by D52.** With Best, the live transcript uses Balanced
+  (`small`), not `base`.
 - Core's live sidecar defaults to the dictation model ("base"), which Margin never
   downloads. With "small" chosen, the live sidecar found no model and wrote no lines: an
   80-minute meeting had an empty live transcript.
@@ -445,6 +447,8 @@ The full comparison is in `docs/parity/app.md`.
     the final file and settings. Otherwise it transcribes that range again.
 
 ### D47. Rolling transcription
+- **"Fast and Balanced only" is superseded by D52.** Rolling transcription now works with
+  Best too. The 4× estimate below was not a measurement.
 - While a meeting records, `rolling.rs` transcribes each source (the mic and call stems,
   or the in-person recording) in pieces of about 2 minutes. At first each piece ended at
   the quietest 100 ms of its last 15 s. D49 replaces that cut. At Stop, the pieces go to
@@ -581,3 +585,297 @@ The full comparison is in `docs/parity/app.md`.
     removed, so the caret, the scroll and the audio player stay.
   - Settings in a narrow window shows its sections as icons only.
 - The page rule that gave the home page three columns is fixed.
+
+## Rolling transcription with Best
+
+### D52. Rolling transcription works with Best, and Best's live transcript uses Balanced
+- New fact: D47 kept Best out because of an RTF of about 1.7. That number came from "4.2×
+  the compute of `small`" on synthetic audio. It was not measured on real audio. On
+  2026-11-09 the owner measured it on a MacBook Air M4 (16 GB, debug build) with
+  `margin --dev rolling <wav> 120`. The input was 11 minutes of a real call, both stems,
+  with Hindi and English mixed:
+
+  | Model | RTF | Work left after Stop | Lines | Garbled non-Latin lines |
+  |---|---|---|---|---|
+  | `small` | 0.463 | 50.8 s | 148 | 9 |
+  | `large-v3-turbo` | 0.729 | 58.5 s | 224 | 0 |
+  | `large-v3-turbo-q5_0` | 0.735 | 59.2 s | — | — |
+
+  Turbo keeps up. `small` writes garbled Devanagari on this call and drops content.
+  The q5_0 model is not faster, so Margin does not add it.
+- Options:
+  - Rolling with Best: (a) keep it off, (b) turn it on.
+  - The live model for Best: (a) keep `base`, (b) `small`, (c) turbo.
+- Pick: **rolling on with Best**, and **`small` (Balanced) live**.
+  - Rolling with Best was checked at real time with the live transcript running at the
+    same time (below). It kept up, and it did not change the live transcript.
+  - `small` live has 2.4 points less WER than `base` live (9.3% against 11.7%), and it
+    costs 390 MB more memory. On the Hindi and English call, `small` still garbles some
+    Hindi lines. `base` was not measured on that call. Turbo live lagged and lost lines at 3× (docs/research/live-transcription.md),
+    and it would share the GPU with rolling turbo.
+- Measured at 1× real time, the same 11 minutes (41:00 to 52:00 of the call), debug
+  build, on AC power. `margin --dev rolling-job` with Best and `margin --dev live-replay`
+  with `small` ran at the same time, in two sandboxes:
+
+  | | Best, rolling off | Best, rolling on |
+  |---|---|---|
+  | Stop to transcript ready | 428.4 s | **50.6 s** |
+  | Stop to Complete | 457.4 s | 77.6 s |
+  | Pieces made / failed / accepted by core | — | 10 / 0 / 10 |
+  | Stop waited for a piece | — | 0.2 s |
+  | Rolling compute during the meeting | — | 298 s for 660 s |
+  | Rolling stopped itself (8 minutes behind) | — | no |
+  | Transcript against rolling off | — | the same, word for word (1,629 words) |
+
+  | Live transcript (`small`) | Alone | With rolling Best |
+  |---|---|---|
+  | Lines | 54 | 54 |
+  | Text | — | the same, word for word (1,575 words) |
+  | Extra time before a line shows (median, p90, max) | — | 0 s, 6.6 s, 8.1 s |
+  | Peak memory | 798 MB | 806 MB |
+  | GPU busy (median of 5 s samples, 27% with nothing running) | 12% | 95% |
+
+  The rolling process used 4% CPU on average and up to 2.0 GB of memory during the
+  meeting. No thermal warning was recorded.
+- Measured on battery on 2026-11-09, the same Mac, debug build, screen on, no other work.
+  The input was the whole 80-minute call (4,832 s, both stems) at 1× real time, with
+  rolling and the live transcript (`small`) at the same time. Balanced ran on 15 minutes
+  of the same call (41:00 to 56:00) after an 18-minute rest. The "matched" column is Best
+  on the same 15 minutes. A sampler read `ioreg` (battery charge in mAh, system power,
+  GPU) and `ProcessInfo.thermalState` every 10 s:
+
+  | | Best, 80 min | Best, matched 15 min | Balanced, 15 min |
+  |---|---|---|---|
+  | Battery per hour (of 4,061 mAh) | 26% | 25% | 24% |
+  | System power (mean; 3.8 W with nothing running) | 13.4 W | 13.0 W | 15.0 W |
+  | GPU busy (median) | 98% | 99% | 67% |
+  | Thermal state | "fair" for 82% of the samples, from minute 4 | "fair" | nominal |
+  | Peak memory of the processes | 2.6 GB | 2.6 GB | 1.7 GB |
+  | Pieces made / failed | 76 / 0 | — | 14 / 0 |
+  | Stop to transcript ready | 156 s | — | 21 s |
+  | Stop to Complete | 351 s | — | 58 s |
+
+  - Best uses about the same charge as Balanced. The GPU runs at full power with both
+    models. Best keeps it busy for longer, at lower clocks.
+  - The thermal state never went past "fair", and rolling did not fall behind.
+  - The final transcript of the whole call had 11,784 words and no garbled lines. The
+    saved Balanced transcript of the same call had 9,667 words and 9 garbled lines.
+  - The live transcript (`small`) stayed 3 to 7 s behind the audio for the whole call.
+    It garbled 35 of its 456 lines on the Hindi parts.
+- Upgrade: a Best user from 0.0.8 has `base` but not `small`. Margin downloads `small` at
+  launch in the background. Recording does not wait for the live model
+  (`models::ready_to_record`). Until `small` is there, the live transcript uses `base`.
+- Costs and risks:
+  - The GPU is busy for most of the meeting. That costs battery, and on a fanless MacBook
+    Air it adds heat. Measured on battery (below): Best uses about the same charge per
+    hour as Balanced, and the Mac stays at the "fair" thermal state.
+  - In the app, both models are in one process: about 2.7 GB at peak, plus the app.
+  - A slower Mac than the M4 can fall behind. Then rolling stops itself (D47), and Best
+    transcribes the rest after Stop, as before.
+  - The switch "Transcribe during the meeting" can turn it off.
+
+## The recording chip
+
+### D53. A recording chip takes the place of the window during a recording
+- New fact: after a real meeting, a user said the full Margin window during a recording
+  is "too invasive". They asked for a small recording sign at the edge of the screen,
+  with the notes one click away.
+- Options:
+  - What shows during a recording: (a) the window, as before; (b) a small chip, and the
+    window only when you ask for it.
+  - The design: three prototypes. A, "Quiet pill": a dot and the time, with Stop and
+    Notes on hover. B, "Edge tab": a narrow tab with a level rule. C, "Proof of life":
+    two level lanes, the latest line and a quick-note field.
+  - The window at Stop: (a) it comes back on the processing view; (b) it stays away.
+- Pick: **(b), design A**, with two parts from C.
+  - When a recording starts, the window hides and the chip slides in at the right edge
+    of the screen, about a third of the way down. Settings → Recording → "Show the
+    recording chip" turns it off. It is on by default. Off keeps the window as before.
+  - The chip shows while a recording runs and the main window is not visible: hidden,
+    minimized, or closed to the menu bar. When the window shows, the chip goes. A
+    click on the chip brings the window back on the live notes, with the caret at the
+    end. The live view has a control that shrinks the window to the chip.
+  - From C: Stop needs two clicks. The first click arms it ("Stop?") for 3 s. The dot
+    stays red while Margin records, also when no sound comes in.
+  - Left out: pause (Margin has no pause), the you and them levels (the recorder sends
+    one mixed level) and the quick note (a click opens the notes).
+  - A Start from the menu bar, the global shortcut or a notification no longer brings
+    the window forward when the chip is on. If the Start fails, the window comes
+    forward with the error.
+- Pick for Stop: **the window stays away**. At Stop the chip says "Saving", then slides
+  out. The window goes to the processing view and then the meeting, as before, but it
+  does not come forward. The call can still be on when you press Stop, and a window that
+  jumps forward takes the keyboard from it. The "meeting ready" notification opens the
+  meeting, and so does the menu bar. If the Stop fails, a notification says why.
+- The window:
+  - A second webview window, `chip`, from its own page `chip.html` and its own
+    capability (`core:event:default` only). It draws its states from the recorder's
+    events, as the main window does.
+  - Transparent, with no frame and no shadow (the page draws the shadow). The level is
+    the status bar level, so it stays over other windows. It joins all Spaces (but not
+    another app's full-screen Space, see the real-app check below), stays
+    out of ⌘` and Mission Control, and does not hide when Margin hides.
+  - It is shown without becoming the key window, so the call app keeps the keyboard
+    when the chip appears. At Start, Margin hides itself if it is the active app, so
+    macOS gives the keyboard back to the app you were in.
+  - It is a plain window, not a non-activating panel. tao's window class has its own
+    state, so it cannot become an NSPanel after it is made, and `tauri-nspanel` is a new
+    crate. So a click on the chip makes Margin the active app. The chip gives the
+    keyboard back when the pointer leaves it, after a click, and on Escape.
+  - The window follows the size of the pill, so no empty part of it takes clicks meant
+    for the app behind. WebKit can send no hover events to a window of an app that is
+    not active, so Margin also checks where the pointer is, 10 times a second, while the
+    chip shows.
+  - A drag moves the chip up and down only, inside the visible part of the screen. The
+    arrow keys move it too. Margin keeps the place as a fraction of the screen height, so
+    it suits a different display.
+- Silence: the recorder does not report a silent mic. The chip says "No sound comes in"
+  for 8 s when the level stays at zero for 20 s of recording, then keeps a mic mark.
+  Quiet room noise is above zero, so a quiet moment does not set it off.
+- Costs and risks:
+  - A click on the chip activates Margin for a moment, which a non-activating panel
+    would not do.
+  - The design's green track along the screen edge during a drag is left out. The
+    window is only as tall as the pill, so it has no room for the track.
+  - A display that goes away while the chip shows keeps the chip where macOS puts it.
+    The next time the chip shows, it uses the saved place.
+- Real-app check on 2026-11-10 (debug build in a sandbox, a MacBook Air M4, TextEdit as
+  the call app, clicks and keys sent with CGEvent):
+  - Passed: Start from the window and from ⌃⌥⌘R hides the window and gives the keyboard
+    back to TextEdit. Hover opens the chip while TextEdit is active. The window shrinks
+    back after a hover. Two-click Stop arms and resets. A click opens the notes. ⌘W, ⌘M
+    and ⌘H bring the chip back. A drag moves y only and stops at the menu bar and the
+    Dock. The place survives a restart. Stop from the chip saves, keeps the window away
+    and keeps the notes. "No sound comes in" shows. With the chip off, Start keeps the
+    window.
+  - Fixed: a click on the chip left Margin as the active app with no window. The chip
+    asked for the focus back only when its page had focus, which a borderless window
+    never has. A right-click opened the web view's menu.
+  - **Open: the chip does not show over a full-screen app.** The collection behaviour
+    `FullScreenAuxiliary` lets a window join the full-screen Space of its own app only.
+    A window of a regular app shows over another app's full-screen Space only as a
+    non-activating panel, or when the app is an accessory app. The options are
+    `tauri-nspanel` (a new crate), or the accessory activation policy while the chip
+    shows (no Dock icon during a recording). This needs a decision.
+  - Not checked: VoiceOver, reduced motion, a second display, a real call app.
+
+## minutes-core options at 209265f
+
+### D54. Show "Hide Margin from screen sharing", and leave the other core options out
+- New facts:
+  - minutes-core's `privacy.hide_from_screen_share` defaults to `true`, and Margin writes
+    that value into every `config.toml`. No Margin window applied it, so the file said
+    that Margin was hidden from screen sharing, and it was not. Core only stores the key.
+    The app that owns the windows must apply it.
+  - docs/parity/settings.md skipped the setting because Margin shows no live coaching.
+    But Margin shows your notes and the live transcript during a call, and they are
+    private too.
+  - Reports say that macOS 15 ScreenCaptureKit ignores `NSWindow.sharingType = none`.
+    A check on this Mac (macOS 27.2) says that it works here (see below).
+- Options for the screen sharing key:
+  - (a) Keep it unused.
+  - (b) Apply it, with a switch that is off by default.
+  - (c) Apply it, with a switch that is on by default, as core and upstream do.
+- Pick: **(b)**. Settings → General → Privacy → "Hide Margin from screen sharing". It is
+  off by default. When it is on, people on a call do not see your notes when you share
+  your screen.
+  - It uses Tauri's content protection on the main window and on the recording chip.
+    A change applies at once to the open windows (`screenshare.rs`).
+  - Why off: screenshots leave Margin out too, and so does a screen share that is meant
+    to show Margin. The owner takes screenshots of Margin to report problems. A setting
+    that hides the app from them must be a choice, not a surprise after an update.
+  - Margin keeps the switch in its own prefs (`hide_from_screen_share`) and copies it
+    into `privacy.hide_from_screen_share` on every load and save. Every config that Margin
+    wrote before says `true`, so the file cannot tell a choice from a default.
+- Real-app check on 2026-11-10 (debug build in a sandbox, macOS 27.2): a ScreenCaptureKit
+  capture of the display, with and without the Margin window. With the key on,
+  0 of 361 sampled pixels in the window changed, so the capture had already left the
+  window out. With the switch off in `config.toml`, 361 of 361 changed. Not checked: the
+  recording chip, macOS 14 and 15, a real call app. The e2e pass checks that the switch
+  writes the key and asks the windows to change.
+- Left out, with the reason:
+  - `transcription.engine = "parakeet"`: core marks it a "dormant subprocess contract".
+    At 209265f every platform resolves it to Whisper.
+  - `transcription.engine = "sherpa"` (Parakeet v3): it needs the `engine-sherpa`
+    feature, a separate sherpa plugin library from upstream built and signed with
+    Margin, and a model of about 665 MB. Parakeet v3 covers 25 European languages, not
+    Hindi and not most of the languages in Margin's language list. Without all of these,
+    core falls back to Whisper.
+  - `transcription.engine = "apple-speech"`: live transcript only. Batch transcription
+    falls back to Whisper.
+  - `transcription.noise_reduction`: it needs the `denoise` feature, which Margin does
+    not compile. It does nothing.
+  - `transcription.vad_engine = "ort-silero"`: it needs the `vad-ort` feature and an
+    ONNX model. Upstream found regressions on real meetings and does not use it by
+    default.
+  - `transcription.name_correction = "conservative"`: it works, but upstream keeps it off
+    "until a real-audio evaluation", and it can change a name to a wrong one. Not tried on
+    mixed-language meetings.
+  - `transcription.apple_speech_shadow`: measurement only. It never changes a transcript.
+  - `diarization.model = "community-1"` and `diarization.embedding_model = "cam++-lm"`:
+    opt-in in core, not in upstream's own Settings, and not measured on Margin's audio.
+    A new embedding model changes voice match scores, so saved voices can stop matching.
+  - `diarization.stem_correlation_threshold`: a number to tune, not a choice. If the
+    laptop-mic case needs a change, Margin should change the default after a measurement.
+  - `call_detection.stop_when_call_ends`: core does not read it. Upstream's app
+    implements it. Core's check finds a running call app, not a call, so Margin cannot
+    tell when a call ends.
+  - `call_detection.auto_record`, `consent.*`, `calendar.*`, the API-key summary engines,
+    `summarization.ollama_url`: no new fact since D9 and D13.
+  - `recording.max_duration_secs`, `retention.keep_pinned_audio`, `identity.aliases`,
+    `transcription.partial_max_secs`, `live_transcript.backend`: core defaults are good,
+    Margin has no pins or calendar, or the option is for developers.
+
+### D55. Ask before Quit while a meeting is processing
+- New fact: on 2026-11-10 the owner quit Margin from the menu bar while a 62-minute call
+  was 82% through transcription with Best. The worker runs in its own process group and
+  should outlive Margin, and it did outlive an earlier Quit that day. This time it
+  stopped 10 s after the Quit, with no crash report and no log line. The next worker
+  found the job "crashed while transcribing" and transcribed both stems again from the
+  start. About 100 minutes of work were lost, and the meeting was ready 2 h 47 min after
+  Stop. The cause of the stop is not known.
+- Options:
+  - (a) Keep Quit as it is, and fix the cause when it is found.
+  - (b) Ask before Quit while a job is queued or processing.
+  - (c) Make a retry resume where it stopped. That is a change in minutes-core, sent
+    upstream as an issue first.
+- Pick: **(b)** now, and (c) upstream. Quit from the menu bar or with ⌘Q asks "Margin is
+  still transcribing" and names the meeting. **Keep Running** is the default button.
+  **Quit Anyway** quits as before. A recording is saved before the question, as before.
+  `processing::confirm_quit`, `tray::quit`.
+- The question says that transcription "can" start again from the beginning, because a
+  Quit does not always stop the worker.
+
+### D56. An Apple Speech live transcript, in Margin's own code
+- New facts (2026-11-10):
+  - During a call, Margin was still transcribing the previous call with Best on the GPU.
+    Core's Whisper live transcript shares the GPU, and it dropped 103 utterances.
+  - The owner's meetings mix Hindi and English. On the 11-09 meeting, the Whisper live
+    transcript (Balanced) wrote garbled Devanagari for the Hindi parts. Apple Speech with
+    `hi-IN` wrote them as Hinglish in Latin letters ("Granola ka jaise nahin hai ab side
+    mein ek chota sa icon bas dikhta hai") and kept the English. `en-IN` dropped most of
+    the Hindi. Both took under 2 s for 91 s of audio.
+  - Streamed at real time, an Apple Speech line arrived 1 to 4 s after its utterance
+    ended. Apple Speech closes a line at a pause, so a line can cover up to 30 s.
+  - minutes-core has Apple Speech code, but at 209265f a recording's live transcript
+    always uses Whisper ("Apple Speech runs only in standalone live transcript"), and it
+    needs a signed XPC service that Margin does not ship.
+- Options:
+  - (a) Wait for upstream.
+  - (b) Margin's own helper, and core's live transcript off while it runs.
+- Pick: **(b)**. Settings → Recording → "Live transcript": Whisper (the default), or
+  Apple Speech in Hindi and English (`hi-IN`), English (India) or English (US).
+  - `src-tauri/speech/margin-speech.swift` uses SpeechAnalyzer with SpeechTranscriber
+    (macOS 26). `build.rs` compiles it, and Tauri bundles and signs it
+    (`bundle.externalBin`). It reads float32 samples on stdin and writes final results as
+    JSON lines.
+  - `applespeech.rs` runs one helper for each source: the microphone and the call audio
+    in a call, the microphone in person. It reads the growing WAV files and writes core's
+    live transcript lines. The source gives "You" and "Them" exactly, in place of the
+    loudness guess.
+  - At Start, Margin checks that the locale is ready. If not, the live transcript uses
+    Whisper and a message says so. Choosing a locale in Settings downloads its assets.
+  - The final transcript does not change. It still uses the speech model.
+- Cost: Margin maintains a Swift helper, and the build needs Xcode 26 or later, as
+  minutes-core already does. The upstream route stays open: when core allows Apple Speech
+  during a recording, Margin can drop the helper.

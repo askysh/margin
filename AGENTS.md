@@ -13,6 +13,8 @@ same rules ([CONTRIBUTING.md](CONTRIBUTING.md)).
 | `src/` | The React UI. `App.tsx` is the shell, `api.ts` the backend commands and their types, `components/` one file per view. |
 | `src-tauri/src/` | The Rust backend, one module per area. `main.rs` registers the commands. `commands.rs` is the command surface the UI calls. |
 | `src-tauri/src/recorder.rs`, `rolling.rs`, `processing.rs` | Recording, rolling transcription, and the processing worker. |
+| `src-tauri/src/chip.rs`, `src/chip/` | The recording chip: its window, and its page (`chip.html`). |
+| `src-tauri/src/applespeech.rs`, `src-tauri/speech/` | The Apple Speech live transcript and its Swift helper, `margin-speech` (D56). |
 | `src-tauri/src/library.rs`, `speakers.rs` | Meeting files: read, edit notes and titles, rename speakers. |
 | `src-tauri/src/chat.rs` | Ask: runs the `claude` CLI with read-only tools. |
 | `src-tauri/src/reset.rs`, `paths.rs`, `corecfg.rs` | Reset, every path Margin uses, and the minutes-core config. |

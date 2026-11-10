@@ -5,7 +5,7 @@
 //! showing anything.
 
 use crate::events::Notice;
-use crate::{commands::ops, events, recorder::Kind, tray};
+use crate::{events, recorder::Kind, tray};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
@@ -49,16 +49,12 @@ fn clicked(app: &AppHandle, performed: &ActionPerformed) {
     let notice = performed
         .notification()
         .and_then(|n| SHOWN.lock().unwrap().as_mut()?.remove(&n.id()));
-    tray::show_main(app);
     match notice {
-        Some(Notice { call_app: Some(_), .. }) if performed.action_id() == RECORD => {
-            std::thread::spawn(|| {
-                if let Err(error) = ops::start_recording(Kind::Call, None) {
-                    events::emit("error-toast", error);
-                }
-            });
+        Some(Notice { call_app: Some(_), .. }) if performed.action_id() == RECORD => tray::start_outside(app, Kind::Call),
+        Some(Notice { meeting: Some(path), .. }) => {
+            tray::show_main(app);
+            events::emit("open-meeting", path);
         }
-        Some(Notice { meeting: Some(path), .. }) => events::emit("open-meeting", path),
-        _ => {}
+        _ => tray::show_main(app),
     }
 }

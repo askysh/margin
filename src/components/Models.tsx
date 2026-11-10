@@ -5,7 +5,7 @@ import { bytes } from "../util";
 export const MODEL_CHOICES = [
   { id: "base", title: "Fast", size: "148 MB", body: "Quick and light. Fine for clear audio." },
   { id: "small", title: "Balanced", size: "488 MB", body: "Recommended. Handles accents and crosstalk well." },
-  { id: "large-v3-turbo", title: "Best", size: "1.6 GB", body: "Most accurate. Takes longer to download." },
+  { id: "large-v3-turbo", title: "Best", size: "2.1 GB", body: "Most accurate. Takes longer to download." },
 ];
 
 interface Props {
@@ -45,6 +45,7 @@ export function DownloadProgress({ compact, hideWhenReady, pendingNote }: Props)
   const total = files.reduce((n, f) => n + (progress[f.id]?.total || f.approx_bytes), 0);
   const done = files.reduce((n, f) => n + (f.installed ? progress[f.id]?.total || f.approx_bytes : progress[f.id]?.downloaded ?? 0), 0);
   const all = files.every((f) => f.installed);
+  const recordingWaits = files.some((f) => !f.installed && !f.live);
   if (all && hideWhenReady) return null;
   const pct = all ? 100 : Math.min(99, Math.floor((done / Math.max(1, total)) * 100));
 
@@ -52,12 +53,12 @@ export function DownloadProgress({ compact, hideWhenReady, pendingNote }: Props)
     <div className={`download ${compact ? "compact" : ""} ${all ? "is-ready" : ""}`}>
       <div className="download-head">
         <span>{all ? "Speech models ready" : error ? "Download stopped" : "Downloading speech models"}</span>
-        <span className="mono">{all ? bytes(total) : `${bytes(done)} of ${bytes(total)}`}</span>
+        <span className="mono">{all ? `${bytes(total)} on this Mac` : `${bytes(done)} of ${bytes(total)}`}</span>
       </div>
       <div className="bar" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
         <div className="bar-fill" style={{ width: `${pct}%` }} />
       </div>
-      {!all && !error && pendingNote && <p className="download-note">{pendingNote}</p>}
+      {recordingWaits && !error && pendingNote && <p className="download-note">{pendingNote}</p>}
       {error && (
         <p className="download-error">
           {error} <button className="link-btn" onClick={() => { setError(null); api.downloadModels(); }}>Try again</button>

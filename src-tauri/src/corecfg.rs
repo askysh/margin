@@ -46,6 +46,9 @@ pub struct AppSettings {
     pub keep_audio_days: Option<u32>,
     #[serde(default)]
     pub call_detection: Option<bool>,
+    /// Leave Margin's windows out of screen sharing and screenshots (screenshare.rs).
+    #[serde(default)]
+    pub hide_from_screen_share: Option<bool>,
     // Kept outside config.toml (see extras.rs).
     #[serde(default)]
     pub vocabulary: Option<Vec<String>>,
@@ -103,9 +106,11 @@ pub fn load() -> Config {
 
 /// The model for the live transcript while recording. Core's default is the dictation
 /// model ("base"), which Margin never downloads, so the live transcript stayed empty.
-/// Use the chosen model, except the large one, which is too slow to keep up live.
+/// Use the chosen model, except the large one. Large lags and loses lines live, and rolling
+/// transcription (D52) needs the GPU too. Balanced is the next best model: 9.3% WER live,
+/// against 11.7% for Fast (docs/research/live-transcription.md).
 pub fn live_model(model: &str) -> String {
-    if model.starts_with("large") { "base".into() } else { model.into() }
+    if model.starts_with("large") { "small".into() } else { model.into() }
 }
 
 pub fn exists() -> bool {
@@ -128,9 +133,16 @@ pub fn fresh() -> Config {
     cfg
 }
 
-/// Keys Margin owns, re-asserted on every save so a hand edit cannot point core at the
-/// upstream app's directories.
+/// Keys Margin owns, re-asserted on every load and save so a hand edit cannot point core
+/// at the upstream app's directories.
 fn pin_owned_keys(cfg: &mut Config) {
+    pin_with(cfg, &crate::prefs::load());
+}
+
+fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
+    // Margin's switch, not core's default (D54). Every config that Margin wrote before
+    // says `true`, so the file cannot tell a choice from a default.
+    cfg.privacy.hide_from_screen_share = prefs.hide_from_screen_share;
     cfg.transcription.model_path = paths::models_dir();
     cfg.diarization.model_path = paths::diarization_models_dir();
     cfg.vault.enabled = false;
@@ -173,6 +185,7 @@ pub fn settings(cfg: &Config) -> AppSettings {
         silence_stop_minutes: Some(cfg.recording.silence_auto_stop_secs / 60),
         keep_audio_days: Some(if cfg.retention.auto_cleanup { cfg.retention.successful_audio_days } else { 0 }),
         call_detection: Some(cfg.call_detection.enabled),
+        hide_from_screen_share: Some(cfg.privacy.hide_from_screen_share),
         vocabulary: None,
         summary_instructions: None,
         open_at_login: None,
@@ -220,6 +233,9 @@ pub fn apply(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
     }
     if let Some(on) = s.call_detection {
         cfg.call_detection.enabled = on;
+    }
+    if let Some(on) = s.hide_from_screen_share {
+        cfg.privacy.hide_from_screen_share = on;
     }
     Ok(())
 }
@@ -317,6 +333,13 @@ mod tests {
     }
 
     #[test]
+    fn live_model_is_balanced_for_best() {
+        assert_eq!(live_model("base"), "base");
+        assert_eq!(live_model("small"), "small");
+        assert_eq!(live_model("large-v3-turbo"), "small");
+    }
+
+    #[test]
     fn new_settings_round_trip() {
         let (mut cfg, mut s) = base();
         s.transcription_language = Some("de".into());
@@ -326,6 +349,7 @@ mod tests {
         s.silence_stop_minutes = Some(0);
         s.keep_audio_days = Some(7);
         s.call_detection = Some(false);
+        s.hide_from_screen_share = Some(false);
         apply(&mut cfg, &s).unwrap();
         assert_eq!(cfg.transcription.language.as_deref(), Some("de"));
         assert_eq!(cfg.recording.device.as_deref(), Some("USB Mic"));
@@ -337,6 +361,22 @@ mod tests {
         assert_eq!(back.keep_audio_days, Some(7));
         assert_eq!(back.call_detection, Some(false));
         assert_eq!(back.speaker_separation, Some(false));
+        assert!(!cfg.privacy.hide_from_screen_share);
+        assert_eq!(back.hide_from_screen_share, Some(false));
+    }
+
+    /// Core's default hides the windows, and old configs say so. Margin's switch is off
+    /// until you turn it on, whatever the file says.
+    #[test]
+    fn screen_share_hiding_follows_margin_not_the_file() {
+        let mut cfg = Config::default();
+        assert!(cfg.privacy.hide_from_screen_share, "core's default changed");
+        pin_with(&mut cfg, &crate::prefs::Prefs::default());
+        assert!(!cfg.privacy.hide_from_screen_share);
+        assert_eq!(settings(&cfg).hide_from_screen_share, Some(false));
+        let on = crate::prefs::Prefs { hide_from_screen_share: true, ..Default::default() };
+        pin_with(&mut cfg, &on);
+        assert!(cfg.privacy.hide_from_screen_share);
     }
 
     #[test]

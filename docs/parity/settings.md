@@ -1,7 +1,8 @@
 # Settings parity with the upstream Minutes app
 
 This table lists every user-facing setting in the upstream Minutes desktop app at
-v0.32.1 and compares it with Margin.
+v0.32.1 and compares it with Margin. DECISIONS.md D54 adds the core options at commit
+209265f.
 
 Sources:
 - The upstream settings panel: `tauri/src/index.html`.
@@ -45,7 +46,7 @@ Status:
 
 | Upstream setting | What it does | Margin | Reason for a skip / notes |
 |---|---|---|---|
-| Engine (`transcription.engine`) | Whisper, Parakeet, Apple Speech. | skipped | Parakeet and Apple Speech resolve to whisper at v0.32.1. Margin pins whisper. |
+| Engine (`transcription.engine`) | Whisper, Parakeet, Apple Speech. | skipped | Parakeet and Apple Speech resolve to whisper at v0.32.1. At 209265f, Parakeet v3 through sherpa needs a plugin library and a build feature that Margin does not ship (D54). Margin pins whisper. |
 | Whisper model (`transcription.model`) | Model size. | has | Fast / Balanced / Best (base, small, large-v3-turbo). |
 | Parakeet model, sidecar, install | Parakeet engine options. | skipped | Developer feature. Gated off in core. |
 | Transcription language (`transcription.language`) | Forces a language, or auto-detects. | added | "Language spoken in meetings": Auto-detect or one of whisper's 100 languages. |
@@ -74,7 +75,7 @@ Status:
 | Calendar filters (`calendar.*`) | Which events are suggested and matched. | skipped | Calendar is off in v1 (D9). |
 | Call detection (`call_detection.enabled`) | Notices call apps. | added | "Suggest recording when a call starts". |
 | Call detection interval, cooldown, Meet and Teams web detection, auto-record, stop when call ends | Tuning and automation for call detection. | skipped | Browser detection needs an automation permission. Auto-record is a large product decision. Few choices. |
-| Hide windows from screen sharing (`privacy.hide_from_screen_share`) | Keeps the app out of shared screens. | skipped | Margin shows no live coaching, so the need is smaller. Candidate for later. |
+| Hide windows from screen sharing (`privacy.hide_from_screen_share`) | Keeps the app out of shared screens. | added | "Hide Margin from screen sharing", off by default (core defaults to on). Margin applies it to the main window and the recording chip (DECISIONS.md D54). |
 | Recording consent reminder (`consent.*`) | A disclosure before recording. | skipped | Margin leaves this to the user. Candidate for later. |
 | Desktop context, screen context (`desktop_context.*`, `screen_context.*`) | Window titles and screenshots during meetings. | skipped | Needs Accessibility and Screen Recording permissions. |
 | Vault sync (`vault.*`) | Symlinks or copies meetings into Obsidian. | skipped | Margin writes to the chosen folder directly (D4). |
@@ -98,6 +99,7 @@ Status:
 | Microphone | `config.toml` `recording.device` |
 | Stop after silence | `config.toml` `recording.silence_auto_stop_secs` |
 | Suggest recording when a call starts | `config.toml` `call_detection.enabled` |
+| Hide Margin from screen sharing | `config.toml` `privacy.hide_from_screen_share` |
 | Open Margin when you log in | `~/Library/LaunchAgents/com.akashmishra.margin.login.plist` |
 | Language spoken in meetings | `config.toml` `transcription.language` |
 | Tell speakers apart | `config.toml` `diarization.engine` |
