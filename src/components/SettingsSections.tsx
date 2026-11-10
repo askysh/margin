@@ -9,6 +9,14 @@ import type { SettingsView } from "./Settings";
 
 type Save = (patch: Partial<Settings>) => void;
 
+/** The live transcript engines (D56). The values match applespeech.rs `LOCALES`. */
+const LIVE_CHOICES: Choice<string>[] = [
+  { value: "whisper", label: "Whisper, with the speech model" },
+  { value: "hi-IN", label: "Apple Speech, Hindi and English" },
+  { value: "en-IN", label: "Apple Speech, English (India)" },
+  { value: "en-US", label: "Apple Speech, English (US)" },
+];
+
 export function GeneralSection({ s, save, options }: SettingsView) {
   const changeFolder = async () => {
     const chosen = await open({ directory: true, multiple: false, title: "Choose where to save meetings", defaultPath: s.output_dir });
@@ -16,7 +24,7 @@ export function GeneralSection({ s, save, options }: SettingsView) {
   };
   return (
     <>
-      <SectionHead title="General" about="Your name, where meetings are saved, and how Margin starts." />
+      <SectionHead title="General" about="Your name, where meetings are saved, privacy, and how Margin starts." />
       <Card>
         <NameRow s={s} save={save} />
       </Card>
@@ -32,6 +40,14 @@ export function GeneralSection({ s, save, options }: SettingsView) {
           value={s.keep_audio_days ?? 0}
           choices={(options?.keep_audio_days ?? [0]).map((d) => ({ value: d, label: d === 0 ? "Forever" : `For ${d} days` }))}
           onChange={(d) => save({ keep_audio_days: d })}
+        />
+      </Card>
+      <Card title="Privacy">
+        <ToggleRow
+          title="Hide Margin from screen sharing"
+          help="People on a call do not see Margin when you share your screen. Screenshots leave Margin out too."
+          checked={s.hide_from_screen_share ?? false}
+          onChange={(on) => save({ hide_from_screen_share: on })}
         />
       </Card>
       <Card title="Startup">
@@ -120,6 +136,14 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
           help="When a recording starts, the Margin window hides and a small chip shows the time at the right edge of the screen. Click the chip to open your notes. Drag it up or down to move it."
           checked={prefs.recording_chip}
           onChange={(on) => changePrefs({ ...prefs, recording_chip: on })}
+        />
+        <SelectRow
+          id="live-transcript"
+          label="Live transcript"
+          help="Apple Speech runs on the Neural Engine, so it does not slow down a meeting that Margin is still transcribing. Hindi and English writes the Hindi in Latin letters. It needs macOS 26. The final transcript always uses the speech model in Transcription."
+          value={prefs.live_transcript}
+          choices={LIVE_CHOICES}
+          onChange={(v) => changePrefs({ ...prefs, live_transcript: v })}
         />
       </Card>
     </>

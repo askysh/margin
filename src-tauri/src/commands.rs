@@ -41,8 +41,14 @@ pub mod ops {
         let _one_at_a_time = SAVING.lock().unwrap_or_else(|e| e.into_inner());
         let first_save = !corecfg::exists();
         let mut cfg = corecfg::load();
-        let keep_audio_before = corecfg::settings(&cfg).keep_audio_days;
+        let before = corecfg::settings(&cfg);
         corecfg::apply(&mut cfg, &settings)?;
+        // Margin keeps this switch in its own prefs (D54). `save` copies it into the config.
+        if let Some(on) = settings.hide_from_screen_share {
+            let mut p = prefs::load();
+            p.hide_from_screen_share = on;
+            prefs::save(&p)?;
+        }
         // Onboarding saves your name before you choose a folder. Don't create the default
         // folder until it has actually been chosen.
         if !(first_save && cfg.output_dir == paths::default_output_dir()) {
@@ -50,8 +56,11 @@ pub mod ops {
         }
         corecfg::save(&mut cfg)?;
         extras::apply(&settings)?;
-        if settings.keep_audio_days.is_some() && settings.keep_audio_days != keep_audio_before {
+        if settings.keep_audio_days.is_some() && settings.keep_audio_days != before.keep_audio_days {
             corecfg::audio_cleanup(&cfg);
+        }
+        if settings.hide_from_screen_share.is_some() && settings.hide_from_screen_share != before.hide_from_screen_share {
+            crate::events::emit(crate::events::SCREEN_SHARE_REFRESH, settings.hide_from_screen_share);
         }
         Ok(current_settings())
     }
@@ -118,7 +127,19 @@ pub mod ops {
         p.record_shortcut = prefs.record_shortcut;
         p.no_auto_update = !prefs.auto_update;
         p.no_recording_chip = !prefs.recording_chip;
+        let locale = Some(prefs.live_transcript.clone()).filter(|l| crate::applespeech::LOCALES.contains(&l.as_str()));
+        let new_locale = locale.is_some() && locale != p.live_transcript;
+        p.live_transcript = locale.clone();
         prefs::save(&p)?;
+        if let Some(locale) = locale.filter(|_| new_locale) {
+            // Get the speech assets now, so the first recording does not wait for them.
+            std::thread::spawn(move || {
+                if let Err(error) = crate::applespeech::install(&locale) {
+                    tracing::warn!(%locale, %error, "Apple Speech assets not installed");
+                    crate::events::emit("error-toast", format!("Apple Speech is not ready on this Mac, so the live transcript uses Whisper. {error}"));
+                }
+            });
+        }
         crate::events::emit(crate::events::SHORTCUT_REFRESH, ());
         crate::events::emit("app-prefs", p.app());
         Ok(p.app())

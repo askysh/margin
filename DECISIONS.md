@@ -758,3 +758,124 @@ The full comparison is in `docs/parity/app.md`.
     `tauri-nspanel` (a new crate), or the accessory activation policy while the chip
     shows (no Dock icon during a recording). This needs a decision.
   - Not checked: VoiceOver, reduced motion, a second display, a real call app.
+
+## minutes-core options at 209265f
+
+### D54. Show "Hide Margin from screen sharing", and leave the other core options out
+- New facts:
+  - minutes-core's `privacy.hide_from_screen_share` defaults to `true`, and Margin writes
+    that value into every `config.toml`. No Margin window applied it, so the file said
+    that Margin was hidden from screen sharing, and it was not. Core only stores the key.
+    The app that owns the windows must apply it.
+  - docs/parity/settings.md skipped the setting because Margin shows no live coaching.
+    But Margin shows your notes and the live transcript during a call, and they are
+    private too.
+  - Reports say that macOS 15 ScreenCaptureKit ignores `NSWindow.sharingType = none`.
+    A check on this Mac (macOS 27.2) says that it works here (see below).
+- Options for the screen sharing key:
+  - (a) Keep it unused.
+  - (b) Apply it, with a switch that is off by default.
+  - (c) Apply it, with a switch that is on by default, as core and upstream do.
+- Pick: **(b)**. Settings → General → Privacy → "Hide Margin from screen sharing". It is
+  off by default. When it is on, people on a call do not see your notes when you share
+  your screen.
+  - It uses Tauri's content protection on the main window and on the recording chip.
+    A change applies at once to the open windows (`screenshare.rs`).
+  - Why off: screenshots leave Margin out too, and so does a screen share that is meant
+    to show Margin. The owner takes screenshots of Margin to report problems. A setting
+    that hides the app from them must be a choice, not a surprise after an update.
+  - Margin keeps the switch in its own prefs (`hide_from_screen_share`) and copies it
+    into `privacy.hide_from_screen_share` on every load and save. Every config that Margin
+    wrote before says `true`, so the file cannot tell a choice from a default.
+- Real-app check on 2026-11-10 (debug build in a sandbox, macOS 27.2): a ScreenCaptureKit
+  capture of the display, with and without the Margin window. With the key on,
+  0 of 361 sampled pixels in the window changed, so the capture had already left the
+  window out. With the switch off in `config.toml`, 361 of 361 changed. Not checked: the
+  recording chip, macOS 14 and 15, a real call app. The e2e pass checks that the switch
+  writes the key and asks the windows to change.
+- Left out, with the reason:
+  - `transcription.engine = "parakeet"`: core marks it a "dormant subprocess contract".
+    At 209265f every platform resolves it to Whisper.
+  - `transcription.engine = "sherpa"` (Parakeet v3): it needs the `engine-sherpa`
+    feature, a separate sherpa plugin library from upstream built and signed with
+    Margin, and a model of about 665 MB. Parakeet v3 covers 25 European languages, not
+    Hindi and not most of the languages in Margin's language list. Without all of these,
+    core falls back to Whisper.
+  - `transcription.engine = "apple-speech"`: live transcript only. Batch transcription
+    falls back to Whisper.
+  - `transcription.noise_reduction`: it needs the `denoise` feature, which Margin does
+    not compile. It does nothing.
+  - `transcription.vad_engine = "ort-silero"`: it needs the `vad-ort` feature and an
+    ONNX model. Upstream found regressions on real meetings and does not use it by
+    default.
+  - `transcription.name_correction = "conservative"`: it works, but upstream keeps it off
+    "until a real-audio evaluation", and it can change a name to a wrong one. Not tried on
+    mixed-language meetings.
+  - `transcription.apple_speech_shadow`: measurement only. It never changes a transcript.
+  - `diarization.model = "community-1"` and `diarization.embedding_model = "cam++-lm"`:
+    opt-in in core, not in upstream's own Settings, and not measured on Margin's audio.
+    A new embedding model changes voice match scores, so saved voices can stop matching.
+  - `diarization.stem_correlation_threshold`: a number to tune, not a choice. If the
+    laptop-mic case needs a change, Margin should change the default after a measurement.
+  - `call_detection.stop_when_call_ends`: core does not read it. Upstream's app
+    implements it. Core's check finds a running call app, not a call, so Margin cannot
+    tell when a call ends.
+  - `call_detection.auto_record`, `consent.*`, `calendar.*`, the API-key summary engines,
+    `summarization.ollama_url`: no new fact since D9 and D13.
+  - `recording.max_duration_secs`, `retention.keep_pinned_audio`, `identity.aliases`,
+    `transcription.partial_max_secs`, `live_transcript.backend`: core defaults are good,
+    Margin has no pins or calendar, or the option is for developers.
+
+### D55. Ask before Quit while a meeting is processing
+- New fact: on 2026-11-10 the owner quit Margin from the menu bar while a 62-minute call
+  was 82% through transcription with Best. The worker runs in its own process group and
+  should outlive Margin, and it did outlive an earlier Quit that day. This time it
+  stopped 10 s after the Quit, with no crash report and no log line. The next worker
+  found the job "crashed while transcribing" and transcribed both stems again from the
+  start. About 100 minutes of work were lost, and the meeting was ready 2 h 47 min after
+  Stop. The cause of the stop is not known.
+- Options:
+  - (a) Keep Quit as it is, and fix the cause when it is found.
+  - (b) Ask before Quit while a job is queued or processing.
+  - (c) Make a retry resume where it stopped. That is a change in minutes-core, sent
+    upstream as an issue first.
+- Pick: **(b)** now, and (c) upstream. Quit from the menu bar or with ⌘Q asks "Margin is
+  still transcribing" and names the meeting. **Keep Running** is the default button.
+  **Quit Anyway** quits as before. A recording is saved before the question, as before.
+  `processing::confirm_quit`, `tray::quit`.
+- The question says that transcription "can" start again from the beginning, because a
+  Quit does not always stop the worker.
+
+### D56. An Apple Speech live transcript, in Margin's own code
+- New facts (2026-11-10):
+  - During a call, Margin was still transcribing the previous call with Best on the GPU.
+    Core's Whisper live transcript shares the GPU, and it dropped 103 utterances.
+  - The owner's meetings mix Hindi and English. On the 11-09 meeting, the Whisper live
+    transcript (Balanced) wrote garbled Devanagari for the Hindi parts. Apple Speech with
+    `hi-IN` wrote them as Hinglish in Latin letters ("Granola ka jaise nahin hai ab side
+    mein ek chota sa icon bas dikhta hai") and kept the English. `en-IN` dropped most of
+    the Hindi. Both took under 2 s for 91 s of audio.
+  - Streamed at real time, an Apple Speech line arrived 1 to 4 s after its utterance
+    ended. Apple Speech closes a line at a pause, so a line can cover up to 30 s.
+  - minutes-core has Apple Speech code, but at 209265f a recording's live transcript
+    always uses Whisper ("Apple Speech runs only in standalone live transcript"), and it
+    needs a signed XPC service that Margin does not ship.
+- Options:
+  - (a) Wait for upstream.
+  - (b) Margin's own helper, and core's live transcript off while it runs.
+- Pick: **(b)**. Settings → Recording → "Live transcript": Whisper (the default), or
+  Apple Speech in Hindi and English (`hi-IN`), English (India) or English (US).
+  - `src-tauri/speech/margin-speech.swift` uses SpeechAnalyzer with SpeechTranscriber
+    (macOS 26). `build.rs` compiles it, and Tauri bundles and signs it
+    (`bundle.externalBin`). It reads float32 samples on stdin and writes final results as
+    JSON lines.
+  - `applespeech.rs` runs one helper for each source: the microphone and the call audio
+    in a call, the microphone in person. It reads the growing WAV files and writes core's
+    live transcript lines. The source gives "You" and "Them" exactly, in place of the
+    loudness guess.
+  - At Start, Margin checks that the locale is ready. If not, the live transcript uses
+    Whisper and a message says so. Choosing a locale in Settings downloads its assets.
+  - The final transcript does not change. It still uses the speech model.
+- Cost: Margin maintains a Swift helper, and the build needs Xcode 26 or later, as
+  minutes-core already does. The upstream route stays open: when core allows Apple Speech
+  during a recording, Margin can drop the helper.

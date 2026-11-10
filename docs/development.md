@@ -7,6 +7,8 @@ releases, see [releasing.md](releasing.md).
 
 - An Apple Silicon Mac with macOS 14.4 or later.
 - Xcode 26 or later, for `swiftc` and the macOS 26 Speech APIs that minutes-core uses.
+  `build.rs` also compiles `src-tauri/speech/margin-speech.swift`, the Apple Speech live
+  transcript helper, into `src-tauri/binaries/` (D56).
 - cmake, bun and Rust from rustup.
 
 ```bash

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod applespeech;
 mod audio;
 mod calldetect;
 mod chat;
@@ -22,6 +23,7 @@ mod processing;
 mod recorder;
 mod reset;
 mod rolling;
+mod screenshare;
 mod shortcut;
 mod speakers;
 mod summaries;
@@ -72,6 +74,7 @@ fn main() {
                     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
                     let _ = apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None);
                 }
+                let _ = window.set_content_protected(screenshare::hidden());
                 let _ = if at_login { window.hide() } else { window.show() };
             }
             tray::init(&handle)?;
@@ -169,16 +172,13 @@ fn main() {
 
     app.run(|app, event| match event {
         RunEvent::Reopen { .. } => tray::show_main(app),
-        RunEvent::ExitRequested { api, .. } => {
-            // Cmd-Q while recording (or while a stop is finishing): save the meeting first,
-            // off the main thread, then quit for real.
-            if recorder::recorder().is_recording() {
+        RunEvent::ExitRequested { api, code, .. } => {
+            // Cmd-Q while recording or processing: save the meeting and ask first, off the
+            // main thread (tray::quit). `code` is set when tray::quit itself exits.
+            if code.is_none() && (recorder::recorder().is_recording() || processing::busy()) {
                 api.prevent_exit();
                 let app = app.clone();
-                std::thread::spawn(move || {
-                    recorder::recorder().finish_before_exit(std::time::Duration::from_secs(120));
-                    app.exit(0);
-                });
+                std::thread::spawn(move || tray::quit(&app));
             }
         }
         // Quitting with an update downloaded installs it (not during a recording).
@@ -208,6 +208,7 @@ fn route(app: &tauri::AppHandle, name: &str, payload: serde_json::Value) {
     match name {
         events::TRAY_REFRESH => tray::refresh(app),
         events::SHORTCUT_REFRESH => shortcut::refresh(app),
+        events::SCREEN_SHARE_REFRESH => screenshare::apply(app),
         events::NOTIFY => {
             if let Ok(notice) = serde_json::from_value(payload) {
                 notify::show(app, notice);

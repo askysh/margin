@@ -7,7 +7,19 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ## [Unreleased]
 
+### Added
+
+- Settings → General → Privacy → "Hide Margin from screen sharing". When it is on, people
+  on a call do not see Margin when you share your screen, and screenshots leave Margin
+  out. It is off by default (D54).
+
 ### Changed
+
+- Settings → Recording → "Live transcript" can use Apple Speech in place of Whisper:
+  Hindi and English, English (India) or English (US). Apple Speech runs on the Neural
+  Engine, so the live transcript no longer drops lines while Margin transcribes an earlier
+  meeting. Hindi and English writes the Hindi in Latin letters. It needs macOS 26.
+  Whisper stays the default, and the final transcript does not change (D56).
 
 - During a recording, the Margin window hides and a small recording chip shows the time at
   the right edge of the screen. Point at it for Stop and Notes. Stop needs two clicks.
@@ -28,6 +40,9 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Fixed
 
+- Quit asks first while a meeting is still being transcribed, and names the meeting. Keep
+  Running is the default. Before, a Quit could stop the transcription, and Margin started
+  it again from the beginning (D55).
 - A summary by Claude no longer shows the line "Agent input coverage: …" at its end. The
   meeting file keeps it. When part of the meeting did not reach the summarizer, the
   meeting shows a short note instead.

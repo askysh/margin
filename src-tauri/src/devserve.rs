@@ -24,6 +24,8 @@ fn queue() -> &'static Queue {
 
 pub fn serve(port: u16) -> Result<(), String> {
     events::set_sink(Box::new(|name, payload| {
+        // The bridge has no menu bar and no shortcut. It keeps the screen sharing
+        // pseudo-event, so the e2e pass sees that the windows would change.
         if name == events::TRAY_REFRESH || name == events::SHORTCUT_REFRESH {
             return;
         }

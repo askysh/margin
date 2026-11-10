@@ -69,6 +69,8 @@ struct Active {
     stopping: bool,
     /// Transcribes finished pieces while recording (rolling.rs).
     rolling: Option<crate::rolling::Session>,
+    /// The Apple Speech live transcript, in place of core's (applespeech.rs, D56).
+    apple: Option<crate::applespeech::Session>,
 }
 
 #[derive(Default)]
@@ -165,7 +167,20 @@ impl Recorder {
         if simulate.is_none() {
             ensure_permissions(kind)?;
         }
-        let cfg = session_config(kind);
+        // Apple Speech, when chosen and ready, replaces core's Whisper live transcript (D56).
+        let apple_locale = crate::applespeech::chosen_locale();
+        let apple_locale = match apple_locale {
+            Some(locale) if crate::applespeech::ready(&locale) => Some(locale),
+            Some(_) => {
+                events::emit("error-toast", "Apple Speech is not ready on this Mac, so this live transcript uses Whisper.");
+                None
+            }
+            None => None,
+        };
+        let mut cfg = session_config(kind);
+        if apple_locale.is_some() {
+            cfg.live_transcript.recording_sidecar = false;
+        }
         cfg.ensure_dirs().map_err(|e| format!("Couldn't create the meetings folder: {e}"))?;
         let intent = match kind {
             Kind::Call => RecordingIntent::Call,
@@ -214,13 +229,14 @@ impl Recorder {
 
         let stop = Arc::new(AtomicBool::new(false));
         let wav = pid::current_wav_path();
+        let sim_lines = apple_locale.is_none();
         let handle = {
             let (stop, wav) = (stop.clone(), wav.clone());
             std::thread::Builder::new()
                 .name("margin-capture".into())
                 .spawn(move || {
                     if let Some(source) = simulate {
-                        return simulate_capture(&source, &wav, &stop);
+                        return simulate_capture(&source, &wav, &stop, sim_lines);
                     }
                     capture::record_to_wav_with_lifecycle(
                         &wav,
@@ -247,6 +263,13 @@ impl Recorder {
         let session = self.sessions.fetch_add(1, Ordering::SeqCst) + 1;
         let title = title.filter(|t| !t.trim().is_empty());
         let rolling = crate::rolling::start(kind == Kind::Call, &wav, title.clone());
+        let apple = apple_locale.and_then(|locale| {
+            let sources = match (kind, capture::stem_paths_for(&wav)) {
+                (Kind::Call, Some(stems)) => vec![(stems.voice, Some("you")), (stems.system, Some("them"))],
+                _ => vec![(wav.clone(), None)],
+            };
+            crate::applespeech::start(&locale, sources)
+        });
         *guard = Some(Active {
             session,
             kind,
@@ -259,6 +282,7 @@ impl Recorder {
             notes: String::new(),
             stopping: false,
             rolling,
+            apple,
         });
         drop(guard);
         spawn_ticker(session);
@@ -275,7 +299,7 @@ impl Recorder {
     }
 
     fn stop_session(&self, session: Option<u64>, notes: Option<String>, title: Option<String>) -> Result<Stopped, String> {
-        let (handle, rolling) = {
+        let (handle, rolling, apple) = {
             let mut guard = self.active.lock().unwrap();
             let a = guard.as_mut().ok_or("Not recording.")?;
             if session.is_some_and(|s| s != a.session) {
@@ -292,13 +316,17 @@ impl Recorder {
                 a.title = Some(t).filter(|t| !t.trim().is_empty());
             }
             a.stop.store(true, Ordering::SeqCst);
-            (a.handle.take(), a.rolling.take())
+            (a.handle.take(), a.rolling.take(), a.apple.take())
         };
         events::emit("recorder", self.view());
         let capture_result = handle
             .map(|h| h.join().unwrap_or_else(|_| Err("The recorder crashed.".into())))
             .unwrap_or(Ok(()));
         let finished_at = Local::now();
+        // The last Apple Speech lines come once the helpers have the end of the audio.
+        if let Some(apple) = apple {
+            apple.finish(Duration::from_secs(10));
+        }
         // Pieces transcribed during the meeting; core transcribes the rest.
         let checkpoint = rolling.and_then(|r| r.finish(crate::rolling::STOP_WAIT));
         let (wav, title, started_at, draft, lines) = {
@@ -552,10 +580,11 @@ fn read_live_lines(kind: Kind, wav: &Path, since: usize) -> Vec<LiveLine> {
         .map(|l| LiveLine {
             line: l.line,
             offset_ms: l.offset_ms.saturating_sub(l.duration_ms),
-            speaker: match kind {
+            // Apple Speech knows the source of each line. Core's lines need a guess.
+            speaker: l.speaker.clone().or_else(|| match kind {
                 Kind::Call => guess_speaker(wav, l.ts, l.duration_ms).map(String::from),
                 Kind::InPerson => None,
-            },
+            }),
             text: l.text,
         })
         .collect()
@@ -629,7 +658,7 @@ fn simulated_source() -> Option<PathBuf> {
 /// `.voice.wav` and `.system.wav` stems alongside when present. Lines from
 /// `<source>.live.jsonl` (`{"offset_ms","duration_ms","text"}`) are written to the live
 /// transcript once their time has passed, as core's sidecar would write them.
-fn simulate_capture(source: &Path, dest: &Path, stop: &AtomicBool) -> Result<(), String> {
+fn simulate_capture(source: &Path, dest: &Path, stop: &AtomicBool, write_lines: bool) -> Result<(), String> {
     let spec = hound::WavSpec { channels: 1, sample_rate: 16_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
     let read = |p: &Path| -> Option<Vec<i16>> { hound::WavReader::open(p).ok()?.samples::<i16>().collect::<Result<_, _>>().ok() };
     let main = read(source).ok_or("simulated source unreadable")?;
@@ -644,11 +673,16 @@ fn simulate_capture(source: &Path, dest: &Path, stop: &AtomicBool) -> Result<(),
             }
         }
     }
-    let lines: Vec<serde_json::Value> = std::fs::read_to_string(source.with_extension("live.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+    // With Apple Speech on, the helper writes the live lines from the played audio.
+    let lines: Vec<serde_json::Value> = if write_lines {
+        std::fs::read_to_string(source.with_extension("live.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let started = Instant::now();
     let start_wall = Local::now();
     let mut written = 0usize;

@@ -158,6 +158,7 @@ fn build(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .skip_taskbar(true)
         .focused(false)
         .accept_first_mouse(true)
+        .content_protected(crate::screenshare::hidden())
         .visible(false)
         .build()?;
     if let Some(w) = ns(&window) {

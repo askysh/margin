@@ -22,6 +22,12 @@ pub struct Prefs {
     /// Where the chip sits on the right edge: the middle of the chip as a fraction of the
     /// visible screen height, from the top. None means the default place.
     pub chip_place: Option<f64>,
+    /// Leave Margin's windows out of screen sharing and screenshots (screenshare.rs). Off
+    /// unless you turn it on (D54). Core's `privacy.hide_from_screen_share` copies it.
+    pub hide_from_screen_share: bool,
+    /// The live transcript: an Apple Speech locale (applespeech.rs), or None for core's
+    /// Whisper live transcript (D56).
+    pub live_transcript: Option<String>,
 }
 
 /// The preferences the UI can change.
@@ -34,6 +40,13 @@ pub struct AppPrefs {
     /// Hide the window and show the recording chip while Margin records.
     #[serde(default = "yes")]
     pub recording_chip: bool,
+    /// "whisper", or the Apple Speech locale of the live transcript (D56).
+    #[serde(default = "whisper")]
+    pub live_transcript: String,
+}
+
+fn whisper() -> String {
+    crate::applespeech::WHISPER.into()
 }
 
 fn yes() -> bool {
@@ -51,6 +64,7 @@ impl Prefs {
             record_shortcut: self.record_shortcut,
             auto_update: !self.no_auto_update,
             recording_chip: !self.no_recording_chip,
+            live_transcript: self.live_transcript.clone().unwrap_or_else(whisper),
         }
     }
 }
