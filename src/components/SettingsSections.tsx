@@ -38,7 +38,7 @@ export function GeneralSection({ s, save, options }: SettingsView) {
         <ToggleRow
           title="Hide Margin from screen sharing"
           help="People on a call do not see Margin when you share your screen. Screenshots leave Margin out too."
-          checked={s.hide_from_screen_share ?? true}
+          checked={s.hide_from_screen_share ?? false}
           onChange={(on) => save({ hide_from_screen_share: on })}
         />
       </Card>

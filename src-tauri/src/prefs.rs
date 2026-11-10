@@ -22,6 +22,9 @@ pub struct Prefs {
     /// Where the chip sits on the right edge: the middle of the chip as a fraction of the
     /// visible screen height, from the top. None means the default place.
     pub chip_place: Option<f64>,
+    /// Leave Margin's windows out of screen sharing and screenshots (screenshare.rs). Off
+    /// unless you turn it on (D54). Core's `privacy.hide_from_screen_share` copies it.
+    pub hide_from_screen_share: bool,
 }
 
 /// The preferences the UI can change.

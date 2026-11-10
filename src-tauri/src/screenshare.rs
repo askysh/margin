@@ -9,7 +9,7 @@
 use crate::corecfg;
 use tauri::{AppHandle, Manager};
 
-/// The stored choice. Core's default, and so Margin's, is on.
+/// The stored choice, off by default. `corecfg` copies it from Margin's prefs (D54).
 pub fn hidden() -> bool {
     corecfg::load().privacy.hide_from_screen_share
 }

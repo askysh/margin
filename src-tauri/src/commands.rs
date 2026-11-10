@@ -43,6 +43,12 @@ pub mod ops {
         let mut cfg = corecfg::load();
         let before = corecfg::settings(&cfg);
         corecfg::apply(&mut cfg, &settings)?;
+        // Margin keeps this switch in its own prefs (D54). `save` copies it into the config.
+        if let Some(on) = settings.hide_from_screen_share {
+            let mut p = prefs::load();
+            p.hide_from_screen_share = on;
+            prefs::save(&p)?;
+        }
         // Onboarding saves your name before you choose a folder. Don't create the default
         // folder until it has actually been chosen.
         if !(first_save && cfg.output_dir == paths::default_output_dir()) {

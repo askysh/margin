@@ -776,15 +776,19 @@ The full comparison is in `docs/parity/app.md`.
   - (a) Keep it unused.
   - (b) Apply it, with a switch that is off by default.
   - (c) Apply it, with a switch that is on by default, as core and upstream do.
-- Pick: **(c)**. Settings → General → Privacy → "Hide Margin from screen sharing". It is
-  on by default. People on a call do not see your notes when you share your screen.
+- Pick: **(b)**. Settings → General → Privacy → "Hide Margin from screen sharing". It is
+  off by default. When it is on, people on a call do not see your notes when you share
+  your screen.
   - It uses Tauri's content protection on the main window and on the recording chip.
     A change applies at once to the open windows (`screenshare.rs`).
-  - Cost: screenshots leave Margin out too, so a screenshot of Margin needs the switch
-    off. The help line says so. Existing users get the new default, because their config
-    already says `true` and Margin cannot tell a default from a choice.
+  - Why off: screenshots leave Margin out too, and so does a screen share that is meant
+    to show Margin. The owner takes screenshots of Margin to report problems. A setting
+    that hides the app from them must be a choice, not a surprise after an update.
+  - Margin keeps the switch in its own prefs (`hide_from_screen_share`) and copies it
+    into `privacy.hide_from_screen_share` on every load and save. Every config that Margin
+    wrote before says `true`, so the file cannot tell a choice from a default.
 - Real-app check on 2026-11-10 (debug build in a sandbox, macOS 27.2): a ScreenCaptureKit
-  capture of the display, with and without the Margin window. With the default config,
+  capture of the display, with and without the Margin window. With the key on,
   0 of 361 sampled pixels in the window changed, so the capture had already left the
   window out. With the switch off in `config.toml`, 361 of 361 changed. Not checked: the
   recording chip, macOS 14 and 15, a real call app. The e2e pass checks that the switch

@@ -133,9 +133,16 @@ pub fn fresh() -> Config {
     cfg
 }
 
-/// Keys Margin owns, re-asserted on every save so a hand edit cannot point core at the
-/// upstream app's directories.
+/// Keys Margin owns, re-asserted on every load and save so a hand edit cannot point core
+/// at the upstream app's directories.
 fn pin_owned_keys(cfg: &mut Config) {
+    pin_with(cfg, &crate::prefs::load());
+}
+
+fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
+    // Margin's switch, not core's default (D54). Every config that Margin wrote before
+    // says `true`, so the file cannot tell a choice from a default.
+    cfg.privacy.hide_from_screen_share = prefs.hide_from_screen_share;
     cfg.transcription.model_path = paths::models_dir();
     cfg.diarization.model_path = paths::diarization_models_dir();
     cfg.vault.enabled = false;
@@ -358,15 +365,18 @@ mod tests {
         assert_eq!(back.hide_from_screen_share, Some(false));
     }
 
-    /// Core's default hides the windows. Margin keeps it, so a new config hides them too.
+    /// Core's default hides the windows, and old configs say so. Margin's switch is off
+    /// until you turn it on, whatever the file says.
     #[test]
-    fn screen_share_hiding_is_on_by_default() {
-        let (mut cfg, mut s) = base();
-        assert_eq!(s.hide_from_screen_share, Some(true));
-        s.hide_from_screen_share = None;
-        cfg.privacy.hide_from_screen_share = false;
-        apply(&mut cfg, &s).unwrap();
-        assert!(!cfg.privacy.hide_from_screen_share, "a save without the field changed it");
+    fn screen_share_hiding_follows_margin_not_the_file() {
+        let mut cfg = Config::default();
+        assert!(cfg.privacy.hide_from_screen_share, "core's default changed");
+        pin_with(&mut cfg, &crate::prefs::Prefs::default());
+        assert!(!cfg.privacy.hide_from_screen_share);
+        assert_eq!(settings(&cfg).hide_from_screen_share, Some(false));
+        let on = crate::prefs::Prefs { hide_from_screen_share: true, ..Default::default() };
+        pin_with(&mut cfg, &on);
+        assert!(cfg.privacy.hide_from_screen_share);
     }
 
     #[test]
