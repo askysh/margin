@@ -801,6 +801,26 @@ await check("settings: open at login adds and removes a login item", async () =>
   await sw.check(); // left on: Reset must turn it off
   await settled();
 });
+await check("settings: hiding from screen sharing is on, and the switch reaches the windows", async () => {
+  // The bridge has no windows. It queues the request that the app sends to its windows.
+  const asked = async () => (await bridgeEvents()).filter((e) => e.event === "__screen-share-refresh").map((e) => e.payload);
+  await goSection("General");
+  const sw = toggle(/Hide Margin from screen sharing/);
+  assert(await sw.isChecked(), "switch is off by default");
+  assert(inSection("privacy", "hide_from_screen_share = true"), "privacy.hide_from_screen_share not true by default");
+  const before = (await asked()).length;
+  await sw.uncheck();
+  await settled();
+  assert(inSection("privacy", "hide_from_screen_share = false"), "privacy.hide_from_screen_share not false");
+  await closeSettings();
+  await openSettings("General");
+  assert(!(await toggle(/Hide Margin from screen sharing/).isChecked()), "switch off not kept");
+  await toggle(/Hide Margin from screen sharing/).check();
+  await settled();
+  assert(inSection("privacy", "hide_from_screen_share = true"), "privacy.hide_from_screen_share not true again");
+  const sent = (await asked()).slice(before);
+  assert(JSON.stringify(sent) === "[false,true]", `windows not told: ${JSON.stringify(sent)}`);
+});
 await check("settings: call suggestions follow the switch", async () => {
   // A stand-in process named like Zoom's, which core's call detection looks for. (A
   // copy of /bin/sleep is killed by macOS; a symlink keeps its own name in `ps`.)
