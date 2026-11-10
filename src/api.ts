@@ -18,6 +18,8 @@ export interface Settings {
   silence_stop_minutes?: number;
   keep_audio_days?: number;
   call_detection?: boolean;
+  /** Leave Margin out of screen sharing and screenshots. On by default. */
+  hide_from_screen_share?: boolean;
   vocabulary?: string[];
   summary_instructions?: string;
   open_at_login?: boolean;

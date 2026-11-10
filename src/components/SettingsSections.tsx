@@ -16,7 +16,7 @@ export function GeneralSection({ s, save, options }: SettingsView) {
   };
   return (
     <>
-      <SectionHead title="General" about="Your name, where meetings are saved, and how Margin starts." />
+      <SectionHead title="General" about="Your name, where meetings are saved, privacy, and how Margin starts." />
       <Card>
         <NameRow s={s} save={save} />
       </Card>
@@ -32,6 +32,14 @@ export function GeneralSection({ s, save, options }: SettingsView) {
           value={s.keep_audio_days ?? 0}
           choices={(options?.keep_audio_days ?? [0]).map((d) => ({ value: d, label: d === 0 ? "Forever" : `For ${d} days` }))}
           onChange={(d) => save({ keep_audio_days: d })}
+        />
+      </Card>
+      <Card title="Privacy">
+        <ToggleRow
+          title="Hide Margin from screen sharing"
+          help="People on a call do not see Margin when you share your screen. Screenshots leave Margin out too."
+          checked={s.hide_from_screen_share ?? true}
+          onChange={(on) => save({ hide_from_screen_share: on })}
         />
       </Card>
       <Card title="Startup">
