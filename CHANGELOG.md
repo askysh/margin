@@ -34,6 +34,9 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Fixed
 
+- Quit asks first while a meeting is still being transcribed, and names the meeting. Keep
+  Running is the default. Before, a Quit could stop the transcription, and Margin started
+  it again from the beginning (D55).
 - A summary by Claude no longer shows the line "Agent input coverage: …" at its end. The
   meeting file keeps it. When part of the meeting did not reach the summarizer, the
   meeting shows a short note instead.

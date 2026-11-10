@@ -825,3 +825,23 @@ The full comparison is in `docs/parity/app.md`.
   - `recording.max_duration_secs`, `retention.keep_pinned_audio`, `identity.aliases`,
     `transcription.partial_max_secs`, `live_transcript.backend`: core defaults are good,
     Margin has no pins or calendar, or the option is for developers.
+
+### D55. Ask before Quit while a meeting is processing
+- New fact: on 2026-11-10 the owner quit Margin from the menu bar while a 62-minute call
+  was 82% through transcription with Best. The worker runs in its own process group and
+  should outlive Margin, and it did outlive an earlier Quit that day. This time it
+  stopped 10 s after the Quit, with no crash report and no log line. The next worker
+  found the job "crashed while transcribing" and transcribed both stems again from the
+  start. About 100 minutes of work were lost, and the meeting was ready 2 h 47 min after
+  Stop. The cause of the stop is not known.
+- Options:
+  - (a) Keep Quit as it is, and fix the cause when it is found.
+  - (b) Ask before Quit while a job is queued or processing.
+  - (c) Make a retry resume where it stopped. That is a change in minutes-core, sent
+    upstream as an issue first.
+- Pick: **(b)** now, and (c) upstream. Quit from the menu bar or with ⌘Q asks "Margin is
+  still transcribing" and names the meeting. **Keep Running** is the default button.
+  **Quit Anyway** quits as before. A recording is saved before the question, as before.
+  `processing::confirm_quit`, `tray::quit`.
+- The question says that transcription "can" start again from the beginning, because a
+  Quit does not always stop the worker.

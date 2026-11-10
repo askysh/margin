@@ -212,14 +212,20 @@ fn handle(app: &AppHandle, id: &str) {
             }
         }
         "quit" => {
-            // Never lose a recording to Quit: finish saving it first, off the main thread.
             let app = app.clone();
-            std::thread::spawn(move || {
-                recorder().finish_before_exit(Duration::from_secs(120));
-                app.exit(0);
-            });
+            std::thread::spawn(move || quit(&app));
         }
         _ => {}
+    }
+}
+
+/// Quit from the menu or with ⌘Q. Run it off the main thread: it waits for the recording
+/// to save, and the question about processing blocks until you answer.
+pub fn quit(app: &AppHandle) {
+    // Never lose a recording to Quit: finish saving it first.
+    recorder().finish_before_exit(Duration::from_secs(120));
+    if crate::processing::confirm_quit(app) {
+        app.exit(0);
     }
 }
 
