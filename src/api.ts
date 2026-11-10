@@ -60,6 +60,8 @@ export interface AppPrefs {
   auto_update: boolean;
   /** Hide the window and show the recording chip while Margin records (D53). */
   recording_chip: boolean;
+  /** "whisper", or the Apple Speech locale of the live transcript (D56). */
+  live_transcript: string;
 }
 
 /** The updater's state. `ready` is a newer version that is downloaded. */

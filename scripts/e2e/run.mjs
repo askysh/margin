@@ -1284,6 +1284,57 @@ if (simulate) {
   });
 }
 
+// ---------------------------------------------------------------- Apple Speech live transcript (D56)
+await check("settings: the live transcript is Whisper by default, and Apple Speech is saved", async () => {
+  await openSettings("Recording");
+  const sel = page.locator("#live-transcript");
+  assert((await sel.inputValue()) === "whisper", `default: ${await sel.inputValue()}`);
+  await sel.selectOption("en-US");
+  await page.waitForTimeout(400);
+  const prefs = JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8"));
+  assert(prefs.live_transcript === "en-US", `not saved: ${JSON.stringify(prefs)}`);
+});
+if (simulate) {
+  await check("Apple Speech writes the live transcript, with You and Them from the stems", async () => {
+    const helper = path.join(root, "src-tauri/target/debug/margin-speech");
+    const ready = (await import("node:child_process")).spawnSync(helper, ["check", "en-US"]).status === 0;
+    if (!ready) {
+      console.log("     skipped: Apple Speech is not ready on this Mac (macOS 26 and the en-US assets)");
+      return;
+    }
+    await page.keyboard.press("Meta+Shift+R");
+    await page.locator(".page-live").waitFor({ timeout: 10000 });
+    await page.getByLabel("Meeting title").fill("QA apple speech");
+    try {
+      // The call has 25 s of speech. Each source gets its own lines.
+      const until = Date.now() + 60000;
+      let who = [];
+      while (!(who.includes("You") && who.includes("Them")) && Date.now() < until) {
+        await page.waitForTimeout(500);
+        who = await page.locator(".live-speaker").allInnerTexts();
+      }
+      const lines = (await page.locator(".live-line").allInnerTexts()).join(" | ");
+      assert(who.includes("You") && who.includes("Them"), `speakers seen: ${who.join(",")}; lines: ${lines}`);
+      assert(/launch plan/i.test(lines), `Apple Speech lines: ${lines}`);
+    } finally {
+      await page.getByRole("button", { name: "Stop" }).click();
+    }
+    const deadline = Date.now() + 180000;
+    while (!meetingFiles().some((f) => f.includes("qa-apple-speech")) || (await page.locator(".row-job").count()) > 0) {
+      assert(Date.now() < deadline, "the Apple Speech meeting did not finish");
+      await page.waitForTimeout(500);
+    }
+  });
+}
+await check("settings: back to the Whisper live transcript", async () => {
+  await openSettings("Recording");
+  await page.locator("#live-transcript").selectOption("whisper");
+  await page.waitForTimeout(400);
+  const prefs = JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8"));
+  assert(!prefs.live_transcript, `still set: ${JSON.stringify(prefs)}`);
+  await closeSettings();
+});
+
 // ---------------------------------------------------------------- reset
 await check("a long meeting's transcript and notes scroll", async () => {
   // An 80-minute meeting: hundreds of turns. The columns must scroll, not grow past the window.

@@ -15,6 +15,12 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Changed
 
+- Settings → Recording → "Live transcript" can use Apple Speech in place of Whisper:
+  Hindi and English, English (India) or English (US). Apple Speech runs on the Neural
+  Engine, so the live transcript no longer drops lines while Margin transcribes an earlier
+  meeting. Hindi and English writes the Hindi in Latin letters. It needs macOS 26.
+  Whisper stays the default, and the final transcript does not change (D56).
+
 - During a recording, the Margin window hides and a small recording chip shows the time at
   the right edge of the screen. Point at it for Stop and Notes. Stop needs two clicks.
   Click the chip to go back to your notes, and drag it up or down to move it. Settings →

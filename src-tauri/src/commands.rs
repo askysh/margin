@@ -127,7 +127,19 @@ pub mod ops {
         p.record_shortcut = prefs.record_shortcut;
         p.no_auto_update = !prefs.auto_update;
         p.no_recording_chip = !prefs.recording_chip;
+        let locale = Some(prefs.live_transcript.clone()).filter(|l| crate::applespeech::LOCALES.contains(&l.as_str()));
+        let new_locale = locale.is_some() && locale != p.live_transcript;
+        p.live_transcript = locale.clone();
         prefs::save(&p)?;
+        if let Some(locale) = locale.filter(|_| new_locale) {
+            // Get the speech assets now, so the first recording does not wait for them.
+            std::thread::spawn(move || {
+                if let Err(error) = crate::applespeech::install(&locale) {
+                    tracing::warn!(%locale, %error, "Apple Speech assets not installed");
+                    crate::events::emit("error-toast", format!("Apple Speech is not ready on this Mac, so the live transcript uses Whisper. {error}"));
+                }
+            });
+        }
         crate::events::emit(crate::events::SHORTCUT_REFRESH, ());
         crate::events::emit("app-prefs", p.app());
         Ok(p.app())

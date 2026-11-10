@@ -845,3 +845,37 @@ The full comparison is in `docs/parity/app.md`.
   `processing::confirm_quit`, `tray::quit`.
 - The question says that transcription "can" start again from the beginning, because a
   Quit does not always stop the worker.
+
+### D56. An Apple Speech live transcript, in Margin's own code
+- New facts (2026-11-10):
+  - During a call, Margin was still transcribing the previous call with Best on the GPU.
+    Core's Whisper live transcript shares the GPU, and it dropped 103 utterances.
+  - The owner's meetings mix Hindi and English. On the 11-09 meeting, the Whisper live
+    transcript (Balanced) wrote garbled Devanagari for the Hindi parts. Apple Speech with
+    `hi-IN` wrote them as Hinglish in Latin letters ("Granola ka jaise nahin hai ab side
+    mein ek chota sa icon bas dikhta hai") and kept the English. `en-IN` dropped most of
+    the Hindi. Both took under 2 s for 91 s of audio.
+  - Streamed at real time, an Apple Speech line arrived 1 to 4 s after its utterance
+    ended. Apple Speech closes a line at a pause, so a line can cover up to 30 s.
+  - minutes-core has Apple Speech code, but at 209265f a recording's live transcript
+    always uses Whisper ("Apple Speech runs only in standalone live transcript"), and it
+    needs a signed XPC service that Margin does not ship.
+- Options:
+  - (a) Wait for upstream.
+  - (b) Margin's own helper, and core's live transcript off while it runs.
+- Pick: **(b)**. Settings → Recording → "Live transcript": Whisper (the default), or
+  Apple Speech in Hindi and English (`hi-IN`), English (India) or English (US).
+  - `src-tauri/speech/margin-speech.swift` uses SpeechAnalyzer with SpeechTranscriber
+    (macOS 26). `build.rs` compiles it, and Tauri bundles and signs it
+    (`bundle.externalBin`). It reads float32 samples on stdin and writes final results as
+    JSON lines.
+  - `applespeech.rs` runs one helper for each source: the microphone and the call audio
+    in a call, the microphone in person. It reads the growing WAV files and writes core's
+    live transcript lines. The source gives "You" and "Them" exactly, in place of the
+    loudness guess.
+  - At Start, Margin checks that the locale is ready. If not, the live transcript uses
+    Whisper and a message says so. Choosing a locale in Settings downloads its assets.
+  - The final transcript does not change. It still uses the speech model.
+- Cost: Margin maintains a Swift helper, and the build needs Xcode 26 or later, as
+  minutes-core already does. The upstream route stays open: when core allows Apple Speech
+  during a recording, Margin can drop the helper.

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod applespeech;
 mod audio;
 mod calldetect;
 mod chat;
