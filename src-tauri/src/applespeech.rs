@@ -76,12 +76,23 @@ pub fn install(locale: &str) -> Result<(), String> {
     run("install", locale, Duration::from_secs(600))
 }
 
-/// Apple Speech can transcribe `locale` now, without a download.
+/// Apple Speech can transcribe `locale` now. macOS keeps the speech assets for each app,
+/// so assets that another copy of the helper downloaded show as "not installed" until this
+/// helper asks for them. That takes about 0.1 s when the files are on the Mac. A real
+/// download keeps going in the background, and this recording uses Whisper.
 pub fn ready(locale: &str) -> bool {
-    match run("check", locale, Duration::from_secs(5)) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(%locale, %error, "Apple Speech is not ready; the live transcript uses Whisper");
+    if run("check", locale, Duration::from_secs(5)).is_ok() {
+        return true;
+    }
+    let (done, wait) = std::sync::mpsc::channel();
+    let owned = locale.to_string();
+    std::thread::spawn(move || {
+        let _ = done.send(install(&owned));
+    });
+    match wait.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) if run("check", locale, Duration::from_secs(5)).is_ok() => true,
+        outcome => {
+            tracing::warn!(%locale, ?outcome, "Apple Speech is not ready; the live transcript uses Whisper");
             false
         }
     }
