@@ -369,8 +369,13 @@ impl Recorder {
                 checkpoint.as_ref(),
             )
             .map_err(|e| {
-                recover_leftover_capture(&corecfg::load());
-                format!("Couldn't queue the recording for processing: {e}. The audio is in your meetings folder under failed-captures.")
+                // Core moves the audio back when queueing fails. Say where it is now.
+                let saved_in = match recover_leftover_capture(&corecfg::load()) {
+                    Some(moved) => moved.parent().unwrap_or(&moved).display().to_string(),
+                    None => jobs::jobs_dir().display().to_string(),
+                };
+                tracing::error!(error = %e, saved_in, "could not queue the recording");
+                format!("Couldn't queue the recording for processing: {e}. The audio is in {saved_in}.")
             })?;
             processing::save_draft(&job.id, &draft);
             processing::save_live_draft(&job.id, &lines);

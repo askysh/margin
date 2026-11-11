@@ -58,6 +58,9 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - A model download that stops receiving data fails after a minute with a message, in
   place of waiting for ever. A server that does not send the file size no longer makes
   a good download fail.
+- A failed save, for example on a full disk, no longer leaves a hidden `.margin-tmp`
+  file beside the meeting.
+- When Stop cannot queue a recording, the message names the folder that has the audio.
 
 ## [0.0.9] - 2026-11-10
 
