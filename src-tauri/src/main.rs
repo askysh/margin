@@ -47,8 +47,16 @@ fn main() {
     minutes_core::install_whisper_logging_hooks();
     init_logging();
     extend_path();
+    let worker = std::env::args().any(|a| a == processing::WORKER_FLAG);
+    let dev = std::env::args().nth(1).as_deref() == Some("--dev");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        role = if worker { "worker" } else if dev { "dev" } else { "app" },
+        "Margin started"
+    );
 
-    if std::env::args().any(|a| a == processing::WORKER_FLAG) {
+    if worker {
         extras::use_state_cwd();
         minutes_core::exit_without_cxx_teardown(processing::run_worker_mode());
     }
@@ -77,6 +85,11 @@ fn main() {
                 }
                 let _ = window.set_content_protected(screenshare::hidden());
                 let _ = if at_login { window.hide() } else { window.show() };
+                // The notepad view follows the width (D57). Log the first size, so a window
+                // that opens narrow can be explained.
+                if let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) {
+                    tracing::info!(width = size.width as f64 / scale, height = size.height as f64 / scale, "main window opened");
+                }
             }
             notepad::install_menu(&handle)?;
             tray::init(&handle)?;

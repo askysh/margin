@@ -82,15 +82,19 @@ pub fn start(call: bool, wav: &Path, title: Option<String>) -> Option<Session> {
     // summary engine), so the pieces match the final pass.
     let cfg = corecfg::load();
     if !pref() {
+        tracing::info!("rolling transcription off: \"Transcribe during the meeting\" is off in Settings");
         return None;
     }
     let model = crate::paths::models_dir().join(format!("ggml-{}.bin", cfg.transcription.model));
     if !model.exists() {
-        tracing::info!("rolling transcription off: the model is not installed yet");
+        tracing::info!(model = %cfg.transcription.model, "rolling transcription off: the model is not installed yet");
         return None;
     }
     let sources = if call {
-        let stems = minutes_core::capture::stem_paths_for(wav)?;
+        let Some(stems) = minutes_core::capture::stem_paths_for(wav) else {
+            tracing::info!("rolling transcription off: core gives no stem paths for this recording");
+            return None;
+        };
         vec![(CheckpointSource::Voice, stems.voice), (CheckpointSource::System, stems.system)]
     } else {
         vec![(CheckpointSource::Recording, wav.to_path_buf())]
@@ -106,6 +110,7 @@ pub fn start(call: bool, wav: &Path, title: Option<String>) -> Option<Session> {
         title: title.clone(),
         shared: shared.clone(),
     };
+    tracing::info!(model = %worker.cfg.transcription.model, call, "rolling transcription on");
     let handle = std::thread::Builder::new()
         .name("margin-rolling".into())
         .spawn(move || worker.run())

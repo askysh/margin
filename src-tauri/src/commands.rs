@@ -24,7 +24,8 @@ pub mod ops {
     }
 
     pub fn boot() -> Res<Boot> {
-        tracing::info!("ui connected (boot)");
+        // Each load of the window's page calls boot: a launch, a reload, a Reset.
+        tracing::info!("window page loaded (boot)");
         Ok(Boot {
             onboarded: prefs::load().onboarding_complete && corecfg::exists(),
             settings: current_settings(),

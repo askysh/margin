@@ -1,6 +1,6 @@
 // node startup.mjs <margin-bin> <dist-dir> <bridge-port> <ui-port> [runs]
 // HOME/MARGIN_HOME from env. Measures: process start -> bridge ready; page navigation -> first `boot`
-// invoke (as logged by the backend: "ui connected (boot)"); navigation -> library rows rendered.
+// invoke (as logged by the backend: "window page loaded (boot)"); navigation -> library rows rendered.
 import { webkit } from "playwright";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,7 +44,7 @@ for (let i = 0; i < runs; i++) {
   toFont.push(tf);
   toBoot.push(tb); toRows.push(nRows);
   const tail = fs.readFileSync(logFile).subarray(before).toString("utf8");
-  const m = tail.match(/^(\S+)\s+INFO.*ui connected \(boot\)/m);
+  const m = tail.match(/^(\S+)\s+INFO.*window page loaded \(boot\)/m);
   if (m) bootLog.push(new Date(m[1]).getTime() - n0);
   await ctx.close(); p.kill(); await new Promise((r) => setTimeout(r, 300));
 }
