@@ -49,6 +49,7 @@ on) point to [DECISIONS.md](DECISIONS.md).
   on transcript times.
 - The notes box grows when the window gets narrower, so the end of the notes is no
   longer cut off.
+- A long meeting title in the sidebar ends in "…" in place of a hard cut.
 
 ## [0.0.9] - 2026-11-10
 

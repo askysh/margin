@@ -76,10 +76,13 @@ button { cursor: default; }
 .search input::placeholder { color: var(--pencil); }
 .list { overflow-y: auto; padding: 0 8px 16px; flex: 1; }
 .group-label { font-size: 11px; font-weight: 600; color: var(--pencil); padding: 14px 8px 4px; }
-.row { display: grid; gap: 1px; width: 100%; text-align: left; border: none; background: none; padding: 6px 8px; border-radius: 7px; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; width: 100%; text-align: left; border: none; background: none; padding: 6px 8px; border-radius: 7px; }
 .row:hover { background: color-mix(in srgb, var(--ink) 5%, transparent); }
 .row.selected { background: color-mix(in srgb, var(--rule) 20%, transparent); }
-.row-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; }
+/* A block, not flex: text-overflow does not reach the text inside a flex container, so a
+   long title was cut with no ellipsis. */
+.row-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; min-width: 0; }
+.row-title .rec-dot { vertical-align: 1px; }
 .row-meta { font-size: 11.5px; color: var(--pencil); display: flex; align-items: center; gap: 2px; overflow: hidden; white-space: nowrap; }
 .row-hit { font-size: 11.5px; color: var(--ink-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-top: 2px; }
 .row-live .row-meta { color: var(--tally); }
