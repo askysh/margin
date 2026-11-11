@@ -230,6 +230,9 @@ if (simulate) {
     const who = await page.locator(".draft-transcript .live-speaker").allInnerTexts();
     assert(who.includes("You") && who.includes("Them"), `draft speakers: ${who.join(",")}`);
     assert(draftFiles().some((f) => f.endsWith(".live.json")), `live draft not kept with the job: ${draftFiles().join(", ")}`);
+    // When Stop happened, and the time since (D58).
+    const since = await page.locator(".since-stop").innerText();
+    assert(/^Stopped at \d{1,2}:\d\d[\s\S]*\d+s ago$/.test(since.trim()), `since Stop: ${since}`);
     console.log(`     draft shown ${waited} ms after Stop`);
   });
   let liveFile = null;
@@ -283,6 +286,18 @@ if (simulate) {
     const notes = liveMd.slice(liveMd.indexOf("## Notes"), liveMd.indexOf("## Transcript"));
     assert(notes === "## Notes\n\n- risk: download size\n- last words before stop\n- typed while finishing (just typed)\n\n", "notes not exact:\n" + notes);
     assert(draftFiles().every((f) => f === "current.md"), `drafts left: ${draftFiles().join(", ")}`);
+  });
+  await check("the meeting shows its Start and Stop times and when it was ready", async () => {
+    // The test call is under a minute, so its start and Stop show as one time (D58).
+    const when = await page.locator(".meta-parts").first().innerText();
+    assert(/\d:\d\d/.test(when) && !/(\d+:\d\d\s*[AP]?M?)\s*–\s*\1/.test(when), `start and Stop: ${when}`);
+    const ready = await page.locator(".meta-ready").innerText();
+    assert(/^Ready at [\s\S]+ after Stop$/.test(ready), `ready line: ${ready}`);
+    const job = (await page.evaluate(() => window.__TAURI_INTERNALS__.invoke("list_jobs"))).find((j) => j.title === "QA live call");
+    assert(job.recording_started_at && job.recording_finished_at && job.ready_at, `job times: ${JSON.stringify(job)}`);
+    const wait = (Date.parse(job.ready_at) - Date.parse(job.recording_finished_at)) / 1000;
+    assert(wait > 0 && wait < 600, `ready ${wait} s after Stop`);
+    console.log(`     ready ${wait.toFixed(1)} s after Stop`);
   });
   await check("sound cues play on start, stop and ready", async () => {
     const heard = await plays();

@@ -305,6 +305,7 @@ pub mod ops {
         let p = PathBuf::from(&path);
         let mut detail = library::read(&p)?;
         detail.summarizing = summaries::is_running(&path);
+        detail.times = processing::times_for(&p);
         // Until the job is done, the file has core's copy of the notes; the draft has yours.
         if let Some(notes) = processing::notes_draft_for(&p) {
             detail.notes = notes;

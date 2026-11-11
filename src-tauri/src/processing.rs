@@ -24,6 +24,31 @@ pub struct JobView {
     pub error: Option<String>,
     /// Notes typed during the recording, until they're added to the meeting file.
     pub draft: Option<String>,
+    /// When the recording started and stopped, and when processing ended (D58).
+    #[serde(flatten)]
+    pub times: JobTimes,
+}
+
+/// The times in core's job record that Margin shows (D58). RFC 3339, or None when the
+/// record does not have them.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct JobTimes {
+    pub recording_started_at: Option<String>,
+    pub recording_finished_at: Option<String>,
+    /// When the job ended. Set only for a job that produced a meeting (Complete or
+    /// NeedsReview), so it never shows the time a job failed.
+    pub ready_at: Option<String>,
+}
+
+impl JobTimes {
+    fn of(job: &jobs::ProcessingJob) -> Self {
+        let produced = matches!(job.state, JobState::Complete | JobState::NeedsReview);
+        JobTimes {
+            recording_started_at: job.recording_started_at.map(|t| t.to_rfc3339()),
+            recording_finished_at: job.recording_finished_at.map(|t| t.to_rfc3339()),
+            ready_at: job.finished_at.filter(|_| produced).map(|t| t.to_rfc3339()),
+        }
+    }
 }
 
 pub fn run_worker_mode() -> i32 {
@@ -224,6 +249,7 @@ pub fn job_views() -> Vec<JobView> {
     jobs::display_jobs(Some(30), true)
         .into_iter()
         .map(|j| JobView {
+            times: JobTimes::of(&j),
             draft: std::fs::read_to_string(notes_draft_path(&j.id)).ok(),
             id: j.id,
             title: j.title,
@@ -234,6 +260,40 @@ pub fn job_views() -> Vec<JobView> {
             error: j.error,
         })
         .collect()
+}
+
+/// The times of the job that wrote the meeting file at `path`, or None for a meeting that
+/// no job record names (an older meeting, a file renamed since, a meeting from the minutes
+/// CLI). Core keeps every finished job in its archive and never prunes it (D58).
+pub fn times_for(path: &Path) -> Option<JobTimes> {
+    let key = path_key(&path.to_string_lossy());
+    if let Some(found) = newest_for(&jobs::list_jobs(), &key) {
+        return Some(found);
+    }
+    // The archive listing reads one file per finished job. Keep it until the archive
+    // folder changes, as the jobs watcher does (D32).
+    static ARCHIVE: Mutex<Option<(Option<std::time::SystemTime>, Vec<jobs::ProcessingJob>)>> = Mutex::new(None);
+    let stamp = std::fs::metadata(jobs::archive_dir()).and_then(|m| m.modified()).ok();
+    let mut cache = ARCHIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.as_ref().map(|(s, _)| s) != Some(&stamp) {
+        let finished = jobs::display_jobs(None, true).into_iter().filter(|j| j.state.is_terminal()).collect();
+        *cache = Some((stamp, finished));
+    }
+    cache.as_ref().and_then(|(_, all)| newest_for(all, &key))
+}
+
+/// Of the jobs that wrote `key`, the newest. A file can have more than one job when it was
+/// processed again.
+fn newest_for(all: &[jobs::ProcessingJob], key: &str) -> Option<JobTimes> {
+    all.iter()
+        .filter(|j| j.output_path.as_deref().is_some_and(|p| path_key(p) == key))
+        .max_by_key(|j| j.created_at)
+        .map(JobTimes::of)
+}
+
+/// One spelling per file: /tmp and /private/tmp, or a symlinked folder, name the same file.
+fn path_key(path: &str) -> String {
+    std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string())
 }
 
 /// Polls job files, pushes changes to the UI, and puts the user's exact notes into the
@@ -386,6 +446,47 @@ mod tests {
     }
 
     use super::*;
+
+    fn job(json: serde_json::Value) -> jobs::ProcessingJob {
+        let mut base = serde_json::json!({
+            "id": "j", "mode": "meeting", "content_type": "meeting", "title": null,
+            "audio_path": "/a.wav", "state": "complete", "created_at": "2026-11-10T12:24:05+05:30"
+        });
+        base.as_object_mut().unwrap().extend(json.as_object().unwrap().clone());
+        serde_json::from_value(base).expect("a job record as core writes it")
+    }
+
+    #[test]
+    fn job_times_come_from_the_newest_job_that_wrote_the_file() {
+        let all = vec![
+            job(serde_json::json!({ "id": "old", "output_path": "/m/a.md", "created_at": "2026-11-10T12:24:05+05:30",
+                "recording_started_at": "2026-11-10T11:31:00+05:30", "recording_finished_at": "2026-11-10T12:24:03+05:30",
+                "finished_at": "2026-11-10T12:30:00+05:30" })),
+            job(serde_json::json!({ "id": "new", "output_path": "/m/a.md", "created_at": "2026-11-10T15:00:00+05:30",
+                "recording_started_at": "2026-11-10T11:31:00+05:30", "recording_finished_at": "2026-11-10T12:24:03+05:30",
+                "finished_at": "2026-11-10T15:00:41+05:30" })),
+            job(serde_json::json!({ "id": "other", "output_path": "/m/b.md", "finished_at": "2026-11-10T09:00:00+05:30" })),
+        ];
+        let t = newest_for(&all, "/m/a.md").unwrap();
+        assert_eq!(t.recording_started_at.as_deref(), Some("2026-11-10T11:31:00+05:30"));
+        assert_eq!(t.recording_finished_at.as_deref(), Some("2026-11-10T12:24:03+05:30"));
+        assert_eq!(t.ready_at.as_deref(), Some("2026-11-10T15:00:41+05:30"));
+        assert_eq!(newest_for(&all, "/m/c.md"), None);
+    }
+
+    #[test]
+    fn job_times_leave_out_what_the_record_does_not_have() {
+        // An old record with no recording times, and a failed job: no ready time.
+        let old = job(serde_json::json!({ "output_path": "/m/a.md", "finished_at": "2026-11-10T12:30:00+05:30" }));
+        assert_eq!(JobTimes::of(&old).recording_started_at, None);
+        assert_eq!(JobTimes::of(&old).recording_finished_at, None);
+        let failed = job(serde_json::json!({ "state": "failed", "finished_at": "2026-11-10T12:30:00+05:30",
+            "recording_finished_at": "2026-11-10T12:24:03+05:30" }));
+        assert_eq!(JobTimes::of(&failed).ready_at, None);
+        assert_eq!(JobTimes::of(&failed).recording_finished_at.as_deref(), Some("2026-11-10T12:24:03+05:30"));
+        let active = job(serde_json::json!({ "state": "transcribing", "started_at": "2026-11-10T12:24:10+05:30" }));
+        assert_eq!(JobTimes::of(&active), JobTimes::default());
+    }
 
     #[test]
     fn the_notes_guard_accepts_only_what_core_wrote() {

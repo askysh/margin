@@ -63,6 +63,8 @@ pub struct MeetingDetail {
     pub action_items: Vec<ActionItem>,
     /// Margin is writing the summary now (set by the command, not read from the file).
     pub summarizing: bool,
+    /// Start, Stop and ready times from core's job record (set by the command, D58).
+    pub times: Option<crate::processing::JobTimes>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -367,6 +369,7 @@ pub fn read(path: &Path) -> Result<MeetingDetail, String> {
         has_audio: path.with_extension("wav").exists(),
         action_items,
         summarizing: false,
+        times: None,
     })
 }
 

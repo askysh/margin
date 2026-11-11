@@ -120,6 +120,16 @@ export interface MeetingDetail extends MeetingSummary {
   action_items: ActionItem[];
   /** Margin is writing this meeting's summary now. */
   summarizing: boolean;
+  /** From core's record of the job that wrote this file, or null when there is none (D58). */
+  times: JobTimes | null;
+}
+
+/** RFC 3339 times from core's job record. A field is null when the record does not have it. */
+export interface JobTimes {
+  recording_started_at: string | null;
+  recording_finished_at: string | null;
+  /** When processing ended. Only for a job that produced a meeting. */
+  ready_at: string | null;
 }
 
 export interface ActionItem {
@@ -133,7 +143,8 @@ export type JobState =
   | "queued" | "transcribing" | "transcript-only" | "diarizing" | "summarizing"
   | "saving" | "needs-review" | "complete" | "failed";
 
-export interface Job {
+/** A processing job. The times are flattened in from core's record (D58). */
+export interface Job extends JobTimes {
   id: string;
   title: string | null;
   state: JobState;

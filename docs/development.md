@@ -58,8 +58,12 @@ The UI is React and TypeScript in `src/`, built by Vite. The backend is Rust in
 
 ```bash
 (cd src-tauri && cargo test)      # Rust unit tests
+bun test                          # UI unit tests (src/*.test.ts)
 bunx tsc --noEmit                 # UI type check (CI runs this and `bun run build`)
 ```
+
+The UI tests use bun's own test runner. `tsconfig.json` leaves them out of the type
+check, because `bun:test` has no types in this repository.
 
 CI (`.github/workflows/ci.yml`) type-checks and builds the UI on each push and pull
 request. The Rust side needs a macOS runner and a long build, so CI does not build it.
