@@ -468,7 +468,8 @@ The full comparison is in `docs/parity/app.md`.
 - Stop waits up to 20 s for a piece that is being transcribed, because the final pass
   would take longer to redo it.
 - A title typed during the meeting changes the transcriber's hints. Pieces made before the
-  change no longer match, and core transcribes their range again after Stop.
+  change no longer match, and core transcribes their range again after Stop. **Changed by
+  D60:** rolling now does those pieces again during the meeting.
 - Measured with `margin --dev rolling-job` on the synthetic calls, Balanced (details in
   docs/research/live-transcription.md, "Rolling transcription in the app"):
   - 20-minute call: the transcript is ready 6.9 s after Stop, against 78 s without
@@ -968,3 +969,27 @@ The full comparison is in `docs/parity/app.md`.
   still has the fallback words.
 - Upstream: core's resummarize could return the title that the summary call already
   writes (`Summary.title`), so no second call is needed.
+
+### D60. Rolling pieces are done again when the title or the settings change
+- New fact: on the owner's real call on 2026-11-10, a title typed after Start changed the
+  decode hints. Core rejected the first microphone piece (114 s of audio) at Stop with
+  "different transcription settings" and transcribed it again. That took 55 s of the wait
+  after Stop. D47 knew about the rejection, but not its cost.
+- Related risk: rolling loads the config at Start, and the worker loads it again at Stop.
+  A Settings change during a meeting made every piece fail the check.
+- Options:
+  - (a) Keep D47: core does the range again after Stop.
+  - (b) Hold the title until Stop. The title also goes into the hints of every later
+    piece, so this changes nothing.
+  - (c) When the inputs change, do the finished pieces again from the stem file during
+    the meeting, when the thread has no new piece to do.
+- Pick: **(c)**. `rolling.rs` keeps the inputs of each piece: the transcription settings
+  and the decode hints. Each loop reads the title, and the config file when its
+  modification time changed. When the thread is idle, it does again the first piece
+  whose inputs are not the current ones. New audio always comes first. A piece that fails
+  the second time is dropped, and the final pass covers its range.
+- A title typed in the last minute before Stop can still leave pieces that do not match.
+  Stop waits for at most one piece (20 s), as before.
+- Not measured on a real call yet. The log line "rolling transcription finished" now
+  counts `redone`.
+

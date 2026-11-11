@@ -315,6 +315,10 @@ impl Recorder {
             }
             if let Some(t) = title {
                 a.title = Some(t).filter(|t| !t.trim().is_empty());
+                // The job gets this title. Keep the rolling session on the same one.
+                if let Some(rolling) = &a.rolling {
+                    rolling.set_title(a.title.clone());
+                }
             }
             a.stop.store(true, Ordering::SeqCst);
             (a.handle.take(), a.rolling.take(), a.apple.take())
