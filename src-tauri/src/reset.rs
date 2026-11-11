@@ -71,10 +71,7 @@ pub fn run(recorder: &Recorder, opts: &ResetOptions) -> Result<ResetReport, Stri
 
     if opts.delete_meetings {
         let mut items: Vec<PathBuf> = Vec::new();
-        let add_meeting = |md: PathBuf, items: &mut Vec<PathBuf>| {
-            items.extend(minutes_core::capture::meeting_audio_artifact_paths(&md).into_iter().filter(|p| p.exists()));
-            items.push(md);
-        };
+        let add_meeting = |md: PathBuf, items: &mut Vec<PathBuf>| items.extend(library::meeting_files(&md));
         for meeting in library::list() {
             add_meeting(PathBuf::from(&meeting.path), &mut items);
             report.meetings_trashed += 1;

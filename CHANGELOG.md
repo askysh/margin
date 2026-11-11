@@ -28,6 +28,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - Notes on the processing page no longer show a rule above the first line.
 - A meeting longer than 99 minutes shows every transcript line after 99:59 as its own
   line. Before, those lines joined the line before them.
+- Move to Trash and Reset now also move the hidden backups that "Summarize again" keeps
+  beside a meeting. Each one is a full copy of the meeting (D10).
 
 ## [0.0.9] - 2026-11-10
 

@@ -636,13 +636,36 @@ pub fn obsidian_vault_for(path: &Path) -> Option<PathBuf> {
 /// Move a meeting and its audio and sidecars to the Trash.
 pub fn trash(path: &Path) -> Result<(), String> {
     ensure_inside_output(path)?;
+    trash::delete_all(meeting_files(path)).map_err(|e| format!("Could not move to Trash: {e}"))
+}
+
+/// A meeting file and every file beside it that belongs to it and exists: the audio, the
+/// stems, the voice embeddings, and the hidden backups that core's "summarize again" keeps
+/// (`.<name>.md.pre-resummarize.<time>.bak`). Each backup is a full copy of the meeting,
+/// so a delete must take them too (D10).
+pub fn meeting_files(path: &Path) -> Vec<PathBuf> {
     let mut items = vec![path.to_path_buf()];
-    items.extend(
-        minutes_core::capture::meeting_audio_artifact_paths(path)
-            .into_iter()
-            .filter(|p| p.exists()),
-    );
-    trash::delete_all(&items).map_err(|e| format!("Could not move to Trash: {e}"))
+    items.extend(minutes_core::capture::meeting_audio_artifact_paths(path).into_iter().filter(|p| p.exists()));
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let prefix = format!(".{name}.pre-resummarize.");
+    if let (Some(dir), false) = (path.parent(), name.is_empty()) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut backups: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|e| {
+                    let file = e.file_name();
+                    let file = file.to_string_lossy();
+                    file.strip_prefix(&prefix)
+                        .and_then(|rest| rest.strip_suffix(".bak"))
+                        .is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .map(|e| e.path())
+                .collect();
+            backups.sort();
+            items.extend(backups);
+        }
+    }
+    items
 }
 
 #[cfg(test)]
@@ -728,6 +751,34 @@ mod tests {
         let bare = parse_transcript("[0:09] So let's add that.");
         assert_eq!(bare[0].speaker, None);
         assert_eq!(bare[0].text, "So let's add that.");
+    }
+
+    #[test]
+    fn meeting_files_include_the_resummarize_backups() {
+        let dir = std::env::temp_dir().join(format!("margin-meeting-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("2026-11-10-call.md");
+        let mine = [
+            "2026-11-10-call.md",
+            "2026-11-10-call.wav",
+            ".2026-11-10-call.md.pre-resummarize.1784000001.bak",
+            ".2026-11-10-call.md.pre-resummarize.1784000002000000000.bak",
+        ];
+        let others = [
+            ".2026-11-10-call-2.md.pre-resummarize.1784000001.bak",
+            ".2026-11-10-call.md.pre-resummarize.x.bak",
+            "2026-11-10-call-2.md",
+        ];
+        for f in mine.iter().chain(&others) {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let mut got: Vec<String> =
+            meeting_files(&md).iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        got.sort();
+        let mut want: Vec<String> = mine.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
