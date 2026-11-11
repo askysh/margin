@@ -514,6 +514,7 @@ pub fn splice_notes(content: &str, notes: &str) -> String {
     let (_, body) = split_frontmatter(content);
     let head = &content[..content.len() - body.len()];
     // A level-2 heading typed into notes would split the section on the next read.
+    // src/notes.ts `storedNotes` repeats these rules: keep the two in step.
     let notes: String = notes
         .trim()
         .lines()

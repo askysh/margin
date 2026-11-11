@@ -11,6 +11,7 @@ import { AudioPlayer, type AudioHandle } from "./AudioPlayer";
 import { MoreMenu } from "./MoreMenu";
 import { CopyMenu } from "./CopyMenu";
 import { SideSwitch, useOneColumn, type Side } from "./Compact";
+import { sameNotes } from "../notes";
 import { ACTION_HEADING, meetingMarkdown, summaryMarkdown, transcriptMarkdown, tsSeconds, withoutCoverage } from "../meetingMarkdown";
 
 interface Props {
@@ -53,6 +54,8 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
 
   // Focus and save refreshes usually read back the same file: keep the rendered one then.
   const lastRead = useRef("");
+  const notesNow = useRef(notes);
+  notesNow.current = notes;
   const load = useCallback(() => {
     api
       .readMeeting(path)
@@ -61,7 +64,8 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
         if (json === lastRead.current) return;
         lastRead.current = json;
         setM(d);
-        if (edits.current === saved.current) setNotes(d.notes);
+        // The file has the trimmed copy of a save. Taking it would move the caret.
+        if (edits.current === saved.current && !sameNotes(notesNow.current, d.notes)) setNotes(d.notes);
       })
       .catch((e) => setError(errorText(e)));
   }, [path]);

@@ -31,6 +31,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - Move to Trash and Reset now also move the hidden backups that "Summarize again" keeps
   beside a meeting. Each one is a full copy of the meeting (D10).
 - A failed Summarize no longer leaves "Summarizing…" on the meeting.
+- Notes no longer change under the caret after a save. Before, the meeting view could
+  replace them with the saved copy, without the spaces at the end, and move the caret.
 
 ## [0.0.9] - 2026-11-10
 
