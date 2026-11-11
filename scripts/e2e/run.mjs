@@ -102,6 +102,13 @@ page.on("pageerror", (e) => consoleErrors.push(e.message));
 page.on("console", (m) => m.type() === "error" && consoleErrors.push(m.text()));
 await page.addInitScript(`window.__E2E_BRIDGE__ = "http://127.0.0.1:${port.bridge}";`);
 await page.addInitScript({ path: path.join(root, "scripts/e2e/bridge-shim.js") });
+// The notepad button asks the app to resize its window. Here the page is resized instead:
+// 480 wide, or back to 1180.
+await page.exposeFunction("__e2eNotepad", async () => {
+  const wide = page.viewportSize().width >= 760;
+  await page.setViewportSize({ width: wide ? 480 : 1180, height: 760 });
+});
+await page.addInitScript(() => (window.__E2E__.onNotepad = () => window.__e2eNotepad()));
 // Record what the page copies and which sounds it plays, without needing a clipboard or speakers.
 await page.addInitScript(() => {
   window.__copied = [];
@@ -1060,6 +1067,22 @@ await check("a narrow window shows one column and the sidebar as a drawer", asyn
   await page.locator(".sidebar").first().waitFor({ state: "hidden" });
   await page.keyboard.press("Meta+\\");
   await page.locator(".sidebar").first().waitFor();
+});
+
+await check("the notepad button narrows the window and brings it back (D57)", async () => {
+  const toggle = page.getByRole("button", { name: "Notepad view" });
+  assert((await toggle.getAttribute("aria-pressed")) === "false", "pressed in a wide window");
+  await toggle.click();
+  await page.locator(".shell.is-compact").waitFor({ timeout: 5000 });
+  assert(page.viewportSize().width === 480, `width ${page.viewportSize().width}`);
+  assert((await toggle.getAttribute("aria-pressed")) === "true", "not pressed in the notepad view");
+  // The title row: the sidebar button, then the notepad button, on one line.
+  const [a, b] = await Promise.all([page.locator(".sidebar-toggle").boundingBox(), toggle.boundingBox()]);
+  assert(a.y === b.y && b.x > a.x + a.width - 1, `toggles: ${JSON.stringify([a, b])}`);
+  await page.screenshot({ path: path.join(out, "notepad-view.png") });
+  await toggle.click();
+  await page.locator(".shell.is-compact").waitFor({ state: "detached", timeout: 5000 });
+  assert(page.viewportSize().width === 1180, `width ${page.viewportSize().width}`);
 });
 
 // ---------------------------------------------------------------- settings: model switch

@@ -442,11 +442,15 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
 
 /* ---------------------------------------------------------------- sidebar: docked, hidden, drawer (D51) */
 /* One place for the toggle, right of the traffic lights, whether the sidebar shows or not. */
-.sidebar-toggle { position: fixed; top: 12px; left: 84px; z-index: 45; }
+.sidebar-toggle, .notepad-toggle { position: fixed; top: 12px; left: 84px; z-index: 45; }
+.notepad-toggle { left: 116px; }
+/* The layout already shows that the notepad view is on, so the button keeps no tint. */
+.notepad-toggle[aria-pressed="true"] { background: none; color: var(--ink-2); }
+.notepad-toggle[aria-pressed="true"]:hover { background: var(--paper-2); color: var(--ink); }
 .shell.sidebar-hidden { grid-template-columns: minmax(0, 1fr); }
 .shell.sidebar-hidden > .sidebar { display: none; }
 .shell.sidebar-hidden > .pane { grid-area: 1 / 1; }
-.shell.sidebar-hidden .toolbar { padding-left: 124px; }
+.shell.sidebar-hidden .toolbar { padding-left: 156px; }
 /* A narrow window: the sidebar opens over the notes and closes when you pick a meeting. */
 .shell.drawer-open > .sidebar:not(.set-nav) {
   display: flex; position: fixed; top: 0; bottom: 0; left: 0; width: min(280px, 86vw); z-index: 40;

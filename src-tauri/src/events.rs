@@ -21,6 +21,10 @@ pub const SCREEN_SHARE_REFRESH: &str = "__screen-share-refresh";
 /// when the chip is on, and when you ask for it in the live view.
 pub const SHRINK_TO_CHIP: &str = "shrink-to-chip";
 
+/// Enter or leave the notepad view (notepad.rs). The window's own button sends it. The QA
+/// bridge has no window: its test resizes the page when it sees this event.
+pub const NOTEPAD_TOGGLE: &str = "notepad-toggle";
+
 /// Bring the main window back on the live notes. The chip sends it when you click it.
 pub const OPEN_LIVE: &str = "open-live";
 

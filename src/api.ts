@@ -255,6 +255,8 @@ export const api = {
   recorderView: () => invoke<RecorderView>("recorder_view"),
   /** Hide the window during a recording, so only the recording chip shows. */
   shrinkToChip: () => invoke<void>("shrink_to_chip"),
+  /** Enter or leave the notepad view: the window goes narrow, or back to its last wide frame (D57). */
+  toggleNotepad: () => invoke<void>("toggle_notepad"),
   setDraftNotes: (text: string) => invoke<void>("set_draft_notes", { text }),
   setRecordingTitle: (title: string) => invoke<void>("set_recording_title", { title }),
   discardOrphanedDraft: () => invoke<void>("discard_orphaned_draft"),

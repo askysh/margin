@@ -233,6 +233,12 @@ pub mod ops {
         Ok(())
     }
 
+    /// The window's notepad button: enter or leave the notepad view (D57).
+    pub fn toggle_notepad() -> Res<()> {
+        crate::events::emit(crate::events::NOTEPAD_TOGGLE, ());
+        Ok(())
+    }
+
     /// A click on the chip: the window comes back on the live notes.
     pub fn chip_open_notes() -> Res<()> {
         crate::events::emit(crate::events::OPEN_LIVE, ());
@@ -503,6 +509,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "stop_recording" => out(ops::stop_recording(arg(a, "notes")?, arg(a, "title")?)),
         "recorder_view" => out(ops::recorder_view()),
         "shrink_to_chip" => out(ops::shrink_to_chip()),
+        "toggle_notepad" => out(ops::toggle_notepad()),
         "chip_open_notes" => out(ops::chip_open_notes()),
         "chip_stop" => out(ops::chip_stop()),
         // The chip window's own geometry and focus. The bridge has no window: it reports
@@ -574,6 +581,7 @@ pub mod tauri_cmds {
     cmd!(stop_recording(notes: Option<String>, title: Option<String>) -> Stopped);
     cmd!(recorder_view() -> RecorderView);
     cmd!(shrink_to_chip() -> ());
+    cmd!(toggle_notepad() -> ());
     cmd!(chip_open_notes() -> ());
     cmd!(chip_stop() -> ());
     cmd!(set_draft_notes(text: String) -> ());

@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState } from "react";
 
-/** The window width under which the sidebar becomes a drawer (D51). */
+/** The window width under which the sidebar becomes a drawer: the notepad view (D51).
+ * `NARROW_BELOW` in src-tauri/src/notepad.rs must match it (D57). */
 export const COMPACT_QUERY = "(max-width: 759px)";
 
 /** The page width a page needs for notes and transcript side by side. Under it, a page

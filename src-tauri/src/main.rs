@@ -14,6 +14,7 @@ mod extras;
 mod fsutil;
 mod library;
 mod models;
+mod notepad;
 mod notify;
 mod paths;
 mod permissions;
@@ -77,6 +78,7 @@ fn main() {
                 let _ = window.set_content_protected(screenshare::hidden());
                 let _ = if at_login { window.hide() } else { window.show() };
             }
+            notepad::install_menu(&handle)?;
             tray::init(&handle)?;
             notify::init(&handle);
             shortcut::refresh(&handle);
@@ -105,7 +107,11 @@ fn main() {
                 }
                 // Minimize, restore and focus changes can show or hide the window. The
                 // recorder's tick also checks, for changes with no event, such as ⌘H.
-                WindowEvent::Focused(_) | WindowEvent::Resized(_) => chip::sync(window.app_handle()),
+                WindowEvent::Focused(_) => chip::sync(window.app_handle()),
+                WindowEvent::Resized(_) => {
+                    chip::sync(window.app_handle());
+                    notepad::sync_menu(window.app_handle());
+                }
                 _ => {}
             }
         })
@@ -126,6 +132,7 @@ fn main() {
             commands::tauri_cmds::stop_recording,
             commands::tauri_cmds::recorder_view,
             commands::tauri_cmds::shrink_to_chip,
+            commands::tauri_cmds::toggle_notepad,
             commands::tauri_cmds::chip_open_notes,
             commands::tauri_cmds::chip_stop,
             chip::chip_hello,
@@ -217,6 +224,7 @@ fn route(app: &tauri::AppHandle, name: &str, payload: serde_json::Value) {
         _ => {
             match name {
                 events::SHRINK_TO_CHIP => chip::shrink(app),
+                events::NOTEPAD_TOGGLE => notepad::toggle(app),
                 events::OPEN_LIVE => tray::show_main(app),
                 "recorder" => chip::sync(app),
                 "recorder-tick" => {

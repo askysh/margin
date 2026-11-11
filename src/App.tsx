@@ -286,6 +286,17 @@ export default function App() {
           <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><rect x="2.5" y="3.5" width="15" height="13" rx="2.5" stroke="currentColor" strokeWidth="1.5" fill="none" /><path d="M7.5 3.5v13" stroke="currentColor" strokeWidth="1.5" /></svg>
         </button>
       )}
+      {!settings && (
+        <button
+          className="icon-btn notepad-toggle"
+          aria-label="Notepad view"
+          aria-pressed={compact}
+          title={compact ? "Leave the notepad view (⌘⇧N)" : "Notepad view: a narrow window beside your call (⌘⇧N)"}
+          onClick={() => api.toggleNotepad().catch((e) => notify(errorText(e), "error"))}
+        >
+          <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><rect x="5.5" y="2.5" width="9" height="15" rx="2" stroke="currentColor" strokeWidth="1.5" fill="none" /><path d="M8 7h4M8 10.5h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+        </button>
+      )}
       {drawerOpen && <div className="drawer-scrim" onClick={() => setDrawer(false)} aria-hidden />}
       {settings && (
         <Suspense fallback={<aside className="sidebar set-nav" />}>
