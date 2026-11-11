@@ -129,6 +129,8 @@ export default function App() {
       ),
       on<{ elapsed_secs: number; level: number }>("recorder-tick", setTick),
       on<Job[]>("jobs", setJobs),
+      // A summary changes the list's snippet, and can give an untitled meeting its title (D59).
+      on<{ path: string; running: boolean }>("summary-status", (e) => !e.running && refreshMeetings()),
       on<{ job_id: string; path: string }>("meeting-ready", ({ job_id, path }) => {
         refreshMeetings();
         const sel = selectionRef.current;

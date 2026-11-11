@@ -378,6 +378,9 @@ impl Recorder {
                 tracing::error!(error = %e, saved_in, "could not queue the recording");
                 format!("Couldn't queue the recording for processing: {e}. The audio is in {saved_in}.")
             })?;
+            if job.title.is_none() {
+                processing::mark_untitled(&job.id);
+            }
             processing::save_draft(&job.id, &draft);
             processing::save_live_draft(&job.id, &lines);
             let _ = pid::set_processing_status(

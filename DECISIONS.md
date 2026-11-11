@@ -939,3 +939,32 @@ The full comparison is in `docs/parity/app.md`.
   - One separator for the whole header: the `·` in the date and the `•` dot between
     parts were mixed. A dot that would start a line is clipped, so a wrap leaves no dot
     at the end of a line.
+
+## Real recordings, 2026-11-10
+
+### D59. An untitled meeting gets its title from the summary, in the frontmatter only
+- New fact: the owner's 53-minute call had no title at Stop. It is titled "Akash", from
+  the first words of the transcript. The worker runs with summaries off (D40), so core's
+  title step had no summary text, logged `missing-summary-text`, and kept that fallback.
+  The summary that Margin writes later never set a title.
+- Options:
+  - (a) Keep the fallback title.
+  - (b) Turn summaries on in the worker. That brings back the wait that D40 removed.
+  - (c) After the summary, ask the summary engine for a title, with core's public
+    `summarize::refine_title`, and change the title in the frontmatter only.
+  - (d) As (c), and rename the file with core's `markdown::rename_meeting`, as core does
+    when it makes a title.
+- Pick: **(c)**.
+  - Only for a meeting that had no title at Stop. Stop leaves a marker,
+    `drafts/<job>.untitled`. A title typed in the meeting view before the summary ends
+    is kept.
+  - The file keeps its name, as with a title typed in the meeting view (`set_title`).
+    Links from Obsidian notes, the job record that gives the meeting's times (D58) and
+    Ask's chat key keep working.
+  - Margin checks the model's answer: one line, 2 to 12 words, at most 80 characters,
+    and not a sentence about the task. Else the meeting keeps its title. Core's own check
+    is private.
+- Cost: one more call to the summary engine for each untitled meeting. The file name
+  still has the fallback words.
+- Upstream: core's resummarize could return the title that the summary call already
+  writes (`Summary.title`), so no second call is needed.

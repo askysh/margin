@@ -65,6 +65,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - Tab stays inside the Reset dialog.
 - The log no longer warns about the Screen Recording permission at each call Start.
   Margin records the call audio with System Audio Recording, which it checks itself.
+- A meeting with no title gets one from its summary, in place of the first words of the
+  transcript. The file keeps its name (D59).
 
 ## [0.0.9] - 2026-11-10
 

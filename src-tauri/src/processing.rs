@@ -125,6 +125,16 @@ fn live_draft_path(job_id: &str) -> PathBuf {
     paths::drafts_dir().join(format!("{job_id}.live.json"))
 }
 
+/// Present while a job's meeting had no title at Stop (D59).
+fn untitled_marker(job_id: &str) -> PathBuf {
+    paths::drafts_dir().join(format!("{job_id}.untitled"))
+}
+
+/// The meeting of this job had no title at Stop. When it is ready, its summary names it.
+pub fn mark_untitled(job_id: &str) {
+    let _ = std::fs::write(untitled_marker(job_id), b"");
+}
+
 /// Held while a notes draft is written, and while `finish` moves it into the meeting file,
 /// so an edit can never land in a draft that was already moved.
 static DRAFTS: Mutex<()> = Mutex::new(());
@@ -397,9 +407,10 @@ fn finish(job: &JobView, announce: bool) {
     }
     restore_notes(job, Path::new(output));
     let _ = std::fs::remove_file(live_draft_path(&job.id));
+    let untitled = std::fs::remove_file(untitled_marker(&job.id)).is_ok();
     if announce {
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
-        crate::summaries::summarize_in_background(output.to_string());
+        crate::summaries::summarize_in_background(output.to_string(), untitled);
         // Settings → "Keep audio": a good moment to drop audio that is now too old.
         std::thread::spawn(|| corecfg::audio_cleanup(&corecfg::load()));
         events::notify(events::Notice {

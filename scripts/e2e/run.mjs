@@ -653,6 +653,27 @@ if (summaries !== "none") {
     await page.locator(".writing-summary").waitFor({ state: "detached", timeout: 5000 });
     assert(fs.readFileSync(path.join(meetingsDir, meetingFiles().find((x) => x.includes("qa-auto-summary"))), "utf8").includes("## Summary"), "no summary in the file");
   });
+  await check("an untitled meeting gets its title from the summary, and keeps its file name (D59)", async () => {
+    const before = new Set(meetingFiles());
+    dev("queue", audio);
+    let file = null;
+    for (let i = 0; i < 240 && !file; i++) {
+      await page.waitForTimeout(500);
+      file = meetingFiles().find((x) => !before.has(x));
+    }
+    assert(file, "no file for the untitled meeting");
+    const title = () => (fs.readFileSync(path.join(meetingsDir, file), "utf8").match(/^title: (.*)$/m) || [])[1];
+    const fallback = title();
+    let now = fallback;
+    for (let i = 0; i < 240 && now === fallback; i++) {
+      await page.waitForTimeout(500);
+      now = title();
+    }
+    // The stand-in Ollama answers every prompt with its summary, whose first line is this.
+    assert(now === "The team reviewed the onboarding launch plan", `title: ${fallback} -> ${now}`);
+    assert(fs.existsSync(path.join(meetingsDir, file)), "the file was renamed");
+    await page.locator(".row").filter({ hasText: "The team reviewed the onboarding launch plan" }).first().waitFor({ timeout: 10000 });
+  });
 }
 
 // ---------------------------------------------------------------- settings parity
