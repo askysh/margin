@@ -43,6 +43,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
   (D55).
 - After Settings refuses a change, later changes save again. Before, each later save
   sent the refused change too and failed.
+- Notes with a code block that holds a `## ` line no longer repeat their text at each
+  save.
 
 ## [0.0.9] - 2026-11-10
 

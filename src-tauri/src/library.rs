@@ -536,22 +536,30 @@ pub fn splice_notes(content: &str, notes: &str) -> String {
     let new_section = if notes.is_empty() { String::new() } else { format!("## Notes\n\n{notes}\n\n") };
 
     let lines: Vec<&str> = body.split_inclusive('\n').collect();
-    let is_heading = |l: &str| l.starts_with("## ");
-    let notes_at = lines.iter().position(|l| l.trim_end() == "## Notes");
+    // Section headings as `sections()` sees them: a `## ` line inside a fenced code block
+    // is text, not the end of the section.
+    let mut in_fence = false;
+    let heading: Vec<bool> = lines
+        .iter()
+        .map(|l| {
+            if l.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+            }
+            !in_fence && l.starts_with("## ")
+        })
+        .collect();
+    let heading_at = |name: &str| (0..lines.len()).find(|&i| heading[i] && lines[i].trim_end() == name);
+    let notes_at = heading_at("## Notes");
     let mut out = String::from(head);
     match notes_at {
         Some(start) => {
-            let end = lines[start + 1..]
-                .iter()
-                .position(|l| is_heading(l))
-                .map(|i| start + 1 + i)
-                .unwrap_or(lines.len());
+            let end = (start + 1..lines.len()).find(|&i| heading[i]).unwrap_or(lines.len());
             out.extend(lines[..start].iter().copied());
             out.push_str(&new_section);
             out.extend(lines[end..].iter().copied());
         }
         None => {
-            let at = lines.iter().position(|l| l.trim_end() == "## Transcript").unwrap_or(lines.len());
+            let at = heading_at("## Transcript").unwrap_or(lines.len());
             out.extend(lines[..at].iter().copied());
             if at == lines.len() && !out.ends_with("\n\n") && !new_section.is_empty() {
                 out.push('\n');
@@ -696,6 +704,19 @@ mod tests {
         let file = "---\ntitle: T\n---\n\n## Transcript\n\n[0:00] hi\n";
         let out = splice_notes(file, "x");
         assert_eq!(out, "---\ntitle: T\n---\n\n## Notes\n\nx\n\n## Transcript\n\n[0:00] hi\n");
+    }
+
+    #[test]
+    fn splice_skips_headings_in_code_blocks() {
+        let file = "---\ntitle: T\n---\n\n## Notes\n\n```\n## not a heading\n```\nold tail\n\n## Transcript\n\n[0:00] hi\n";
+        let out = splice_notes(file, "new");
+        assert_eq!(out, "---\ntitle: T\n---\n\n## Notes\n\nnew\n\n## Transcript\n\n[0:00] hi\n");
+        // Saving the same notes twice changes nothing.
+        let (_, body) = split_frontmatter(file);
+        let notes = sections(body).into_iter().find(|s| s.heading == "Notes").unwrap().body;
+        let once = splice_notes(file, &notes);
+        assert_eq!(splice_notes(&once, &notes), once);
+        assert_eq!(once.matches("old tail").count(), 1);
     }
 
     #[test]
