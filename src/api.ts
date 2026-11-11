@@ -275,7 +275,10 @@ export const api = {
   renameSpeaker: (path: string, label: string, name: string, rememberVoice: boolean) =>
     invoke<{ voice_saved: boolean; note: string | null }>("rename_speaker", { path, label, name, rememberVoice }),
   summarize: (path: string) => invoke<void>("summarize_meeting", { path }),
-  setActionItem: (path: string, index: number, done: boolean) => invoke<void>("set_action_item", { path, index, done }),
+  /** `task` is the item's text as shown. The backend refuses the tick when the item at
+   * `index` has another text now, for example after a new summary. */
+  setActionItem: (path: string, index: number, done: boolean, task: string) =>
+    invoke<void>("set_action_item", { path, index, done, task }),
   /** The recording's file path, readable through the asset protocol (convertFileSrc). */
   meetingAudio: (path: string) => invoke<string>("meeting_audio", { path }),
   listVoices: () => invoke<Voice[]>("list_voices"),

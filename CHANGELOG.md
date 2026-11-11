@@ -33,6 +33,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - A failed Summarize no longer leaves "Summarizing…" on the meeting.
 - Notes no longer change under the caret after a save. Before, the meeting view could
   replace them with the saved copy, without the spaces at the end, and move the caret.
+- Action items cannot be ticked while Margin writes the summary. Before, a tick at that
+  moment could land on another item of the new summary.
 
 ## [0.0.9] - 2026-11-10
 

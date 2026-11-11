@@ -412,10 +412,14 @@ pub mod ops {
         Ok(())
     }
 
-    pub fn set_action_item(path: String, index: usize, done: bool) -> Res<()> {
-        let p = PathBuf::from(path);
+    pub fn set_action_item(path: String, index: usize, done: bool, task: Option<String>) -> Res<()> {
+        let p = PathBuf::from(&path);
         processing::ensure_not_processing(&p)?;
-        library::set_action_item(&p, index, done)
+        // A summary replaces the action items, so an index from before it names another item.
+        if summaries::is_running(&path) {
+            return Err("Margin is writing the summary. Tick the item when it is done.".into());
+        }
+        library::set_action_item(&p, index, done, task.as_deref())
     }
 
     pub fn list_voices() -> Res<Vec<speakers::VoiceProfileView>> {
@@ -531,7 +535,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "reveal_in_finder" | "open_in_obsidian" => Ok(serde_json::Value::Null),
         "rename_speaker" => out(ops::rename_speaker(arg(a, "path")?, arg(a, "label")?, arg(a, "name")?, arg(a, "rememberVoice")?)),
         "summarize_meeting" => out(ops::summarize_meeting(arg(a, "path")?)),
-        "set_action_item" => out(ops::set_action_item(arg(a, "path")?, arg(a, "index")?, arg(a, "done")?)),
+        "set_action_item" => out(ops::set_action_item(arg(a, "path")?, arg(a, "index")?, arg(a, "done")?, arg(a, "task")?)),
         // The app adds the file to the asset scope; the bridge serves it at /asset.
         "meeting_audio" => out(library::audio_path(&PathBuf::from(arg::<String>(a, "path")?)).map(|p| p.display().to_string())),
         "list_voices" => out(ops::list_voices()),
@@ -600,7 +604,7 @@ pub mod tauri_cmds {
     cmd!(open_in_obsidian(path: String) -> ());
     cmd!(rename_speaker(path: String, label: String, name: String, remember_voice: bool) -> speakers::RenameResult);
     cmd!(summarize_meeting(path: String) -> ());
-    cmd!(set_action_item(path: String, index: usize, done: bool) -> ());
+    cmd!(set_action_item(path: String, index: usize, done: bool, task: Option<String>) -> ());
     cmd!(list_voices() -> Vec<speakers::VoiceProfileView>);
     cmd!(forget_voice(slug: String) -> ());
     cmd!(reset_preview() -> reset::ResetPreview);

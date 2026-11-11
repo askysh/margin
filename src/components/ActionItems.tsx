@@ -23,11 +23,13 @@ export function ActionItems({ path, items, names, locked, notify, onChanged }: P
     const done = !shown[index].done;
     setShown((list) => list.map((it, i) => (i === index ? { ...it, done } : it)));
     try {
-      await api.setActionItem(path, index, done);
+      await api.setActionItem(path, index, done, shown[index].task);
       onChanged();
     } catch (e) {
       setShown(items);
       notify(errorText(e), "error");
+      // The list may have changed under the tick: show the one in the file.
+      onChanged();
     }
   };
 

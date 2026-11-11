@@ -283,7 +283,7 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
             </section>
             {/* Action items follow the summary, where core puts its checklist. */}
             {hasActions && i === 0 && (
-              <ActionItems path={path} items={m.action_items} names={names} locked={processing} notify={notify} onChanged={() => { load(); onChanged(); }} />
+              <ActionItems path={path} items={m.action_items} names={names} locked={processing || writing || summarizing} notify={notify} onChanged={() => { load(); onChanged(); }} />
             )}
           </div>
         ))}
@@ -291,7 +291,7 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
           <p className="quiet-note">Part of the meeting did not reach the summarizer, so this summary can miss things. Summarize again to try once more.</p>
         )}
         {hasActions && summary.length === 0 && (
-          <ActionItems path={path} items={m.action_items} names={names} locked={processing} notify={notify} onChanged={() => { load(); onChanged(); }} />
+          <ActionItems path={path} items={m.action_items} names={names} locked={processing || writing || summarizing} notify={notify} onChanged={() => { load(); onChanged(); }} />
         )}
 
         <section className="your-notes">

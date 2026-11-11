@@ -443,11 +443,16 @@ fn checklist_item(line: &str) -> ActionItem {
 /// Check or uncheck one action item, by its position in `action_items`. Structured
 /// items go through core (frontmatter status plus the matching body line); body-only
 /// items change their checklist box.
-pub fn set_action_item(path: &Path, index: usize, done: bool) -> Result<(), String> {
+/// `task`, when given, is the text the user saw. If the item at `index` has another text
+/// now, the list changed (a new summary) and the tick is refused, not put on another item.
+pub fn set_action_item(path: &Path, index: usize, done: bool, task: Option<&str>) -> Result<(), String> {
     ensure_inside_output(path)?;
     crate::fsutil::with_file_lock(path, || {
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let (fm, body) = frontmatter(&content);
+        if task.is_some_and(|t| !task_at(&fm, body, index, t)) {
+            return Err("The action items changed. Check the list and tick the item again.".to_string());
+        }
         let structured = fm.get("action_items").and_then(|v| v.as_sequence()).is_some_and(|s| !s.is_empty());
         if structured {
             return minutes_core::markdown::set_action_item_status(path, index, done).map_err(|e| e.to_string());
@@ -461,6 +466,10 @@ pub fn set_action_item(path: &Path, index: usize, done: bool) -> Result<(), Stri
     .map_err(|e| format!("Couldn't update the action item: {e}"))?;
     let _ = minutes_core::derived::refresh_derived_views(path, &corecfg::load(), &Default::default());
     Ok(())
+}
+
+fn task_at(fm: &serde_yaml::Value, body: &str, index: usize, task: &str) -> bool {
+    action_items(fm, body).get(index).is_some_and(|i| i.task == task.trim())
 }
 
 /// The recording next to a meeting file, if there is one.
@@ -704,6 +713,17 @@ mod tests {
         assert_eq!(items[0], ActionItem { task: "send the deck".into(), assignee: Some("Priya".into()), due: None, done: false });
         assert!(items[1].done);
         assert_eq!(&body[checklist_lines(body)[1].0..][..1], "x");
+    }
+
+    #[test]
+    fn action_item_tick_checks_the_task_under_the_lock() {
+        let body = "## Action Items\n- [ ] send the deck\n- [ ] book the room\n";
+        let none = serde_yaml::Value::Null;
+        assert!(task_at(&none, body, 1, "book the room"));
+        // A new summary put another item at index 1.
+        let after = "## Action Items\n- [ ] book the room\n- [ ] call Priya\n";
+        assert!(!task_at(&none, after, 1, "book the room"));
+        assert!(!task_at(&none, after, 5, "book the room"));
     }
 
     #[test]
