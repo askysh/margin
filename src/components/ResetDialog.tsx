@@ -33,6 +33,7 @@ export function ResetDialog({ onCancel, onDone, onBusy, notify }: { onCancel: ()
 
   return (
     <div className="dialog-backdrop" onKeyDown={(e) => {
+      if (e.key === "Tab") return keepFocusIn(e);
       if (e.key !== "Escape" || busy) return;
       e.preventDefault(); // so Settings, under the dialog, stays open
       onCancel();
@@ -74,4 +75,25 @@ export function ResetDialog({ onCancel, onDone, onBusy, notify }: { onCancel: ()
       </div>
     </div>
   );
+}
+
+/** aria-modal promises that focus stays in the dialog: Tab from the last control goes to
+ * the first, and Shift-Tab from the first to the last. */
+function keepFocusIn(e: React.KeyboardEvent<HTMLElement>) {
+  const dialog = e.currentTarget.querySelector<HTMLElement>(".dialog");
+  if (!dialog) return;
+  const controls = [...dialog.querySelectorAll<HTMLElement>("button, input, [tabindex]:not([tabindex='-1'])")].filter(
+    (el) => !(el as HTMLButtonElement).disabled && el.offsetParent !== null,
+  );
+  if (controls.length === 0) return;
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  const at = document.activeElement;
+  if (e.shiftKey && (at === first || !dialog.contains(at))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (at === last || !dialog.contains(at))) {
+    e.preventDefault();
+    first.focus();
+  }
 }

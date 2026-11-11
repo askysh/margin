@@ -61,6 +61,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - A failed save, for example on a full disk, no longer leaves a hidden `.margin-tmp`
   file beside the meeting.
 - When Stop cannot queue a recording, the message names the folder that has the audio.
+- Settings → Voices → Forget asks first, and says so when it fails.
+- Tab stays inside the Reset dialog.
 
 ## [0.0.9] - 2026-11-10
 
