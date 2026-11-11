@@ -45,6 +45,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
   sent the refused change too and failed.
 - Notes with a code block that holds a `## ` line no longer repeat their text at each
   save.
+- The audio player no longer says the recording can't be played after two quick clicks
+  on transcript times.
 
 ## [0.0.9] - 2026-11-10
 
