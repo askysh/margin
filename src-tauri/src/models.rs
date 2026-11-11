@@ -157,15 +157,26 @@ pub fn fetch(f: &ModelFile, progress: &mut dyn FnMut(Progress)) -> Result<(), St
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let part = f.dest.with_extension("part");
-    let response = ureq::get(&f.url)
+    // A model is up to 1.6 GB, so there is no limit on the whole download. A connection
+    // that stops sending for a minute fails, so the download does not wait for ever.
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(20)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+        .timeout_per_read(Some(std::time::Duration::from_secs(60)))
+        .build()
+        .new_agent();
+    let response = agent
+        .get(&f.url)
         .call()
         .map_err(|e| format!("Couldn't download {}: {e}. Check your internet connection and try again.", f.label))?;
-    let total = response
+    // The size the server sends. The estimate is for the progress bar only: a file of
+    // another size is not an incomplete download.
+    let length = response
         .headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(f.approx_bytes);
+        .and_then(|v| v.parse::<u64>().ok());
+    let total = length.unwrap_or(f.approx_bytes);
     let mut reader = response.into_body().into_reader();
     let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; 256 * 1024];
@@ -184,18 +195,37 @@ pub fn fetch(f: &ModelFile, progress: &mut dyn FnMut(Progress)) -> Result<(), St
         }
     }
     out.sync_all().map_err(|e| e.to_string())?;
-    if total > 0 && downloaded != total {
+    if let Err(error) = check_size(downloaded, length) {
         let _ = std::fs::remove_file(&part);
-        return Err(format!("{} download was incomplete ({downloaded} of {total} bytes). Try again.", f.label));
+        return Err(format!("{} {error}", f.label));
     }
     std::fs::rename(&part, &f.dest).map_err(|e| e.to_string())?;
-    progress(Progress { id: f.id.clone(), downloaded, total, finished: true, all_done: false, error: None });
+    progress(Progress { id: f.id.clone(), downloaded, total: downloaded, finished: true, all_done: false, error: None });
     Ok(())
+}
+
+/// A download is complete when it has the size the server sent. Without a size, any
+/// file that is not empty is accepted.
+fn check_size(downloaded: u64, length: Option<u64>) -> Result<(), String> {
+    match length {
+        Some(total) if downloaded != total => Err(format!("download was incomplete ({downloaded} of {total} bytes). Try again.")),
+        None if downloaded == 0 => Err("download was empty. Try again.".into()),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_size_check_uses_only_the_size_the_server_sent() {
+        assert!(check_size(100, Some(100)).is_ok());
+        assert!(check_size(99, Some(100)).is_err());
+        // No Content-Length: the estimate is not the size of the file.
+        assert!(check_size(487_601_967, None).is_ok());
+        assert!(check_size(0, None).is_err());
+    }
 
     #[test]
     fn live_model_falls_back_to_base_until_small_is_downloaded() {

@@ -55,6 +55,9 @@ on) point to [DECISIONS.md](DECISIONS.md).
   closes the Record menu too.
 - Ask no longer shows the previous meeting's conversation after a fast switch between
   meetings.
+- A model download that stops receiving data fails after a minute with a message, in
+  place of waiting for ever. A server that does not send the file size no longer makes
+  a good download fail.
 
 ## [0.0.9] - 2026-11-10
 
