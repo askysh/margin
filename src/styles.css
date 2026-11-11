@@ -461,9 +461,10 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
 }
 .drawer-scrim { position: fixed; inset: 0; z-index: 39; background: rgba(20, 26, 32, 0.18); animation: fadein 160ms ease-out; }
 @keyframes drawer-in { from { transform: translateX(-24px); opacity: 0; } }
-/* Settings in a narrow window: its nav shows icons only. */
-.shell.is-compact.is-settings { grid-template-columns: 52px minmax(0, 1fr); }
-.shell.is-compact.is-settings .toolbar { padding-left: 44px; }
+/* Settings in a narrow window: its nav shows icons only. The nav is as wide as the space
+   left of the sidebar button, so the traffic lights sit inside it and do not cross its
+   border. */
+.shell.is-compact.is-settings { grid-template-columns: 84px minmax(0, 1fr); }
 .is-compact .set-nav .set-nav-label, .is-compact .set-nav .row-kbd { display: none; }
 .is-compact .set-nav-back, .is-compact .set-nav-item { justify-content: center; padding: 6px 0; }
 .is-compact .set-nav-back { width: calc(100% - 12px); margin: 0 6px 10px; }

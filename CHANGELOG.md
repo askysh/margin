@@ -67,6 +67,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
   Margin records the call audio with System Audio Recording, which it checks itself.
 - A meeting with no title gets one from its summary, in place of the first words of the
   transcript. The file keeps its name (D59).
+- Settings in the notepad view: the traffic lights no longer cross the border of the icon
+  list.
 - A title typed during a recording, or a Settings change, no longer makes the wait after
   Stop longer. Margin transcribes the earlier pieces again during the meeting (D60).
 
