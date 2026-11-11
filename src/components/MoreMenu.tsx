@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useMenu } from "../menu";
 
 export interface MoreChoice {
   label: string;
@@ -8,18 +8,7 @@ export interface MoreChoice {
 
 /** "More ▾" at the end of a meeting's action line, for the actions used less often. */
 export function MoreMenu({ choices }: { choices: MoreChoice[] }) {
-  const [open, setOpen] = useState(false);
-  useEffect(() => {
-    if (!open) return;
-    const close = () => setOpen(false);
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && close();
-    window.addEventListener("click", close);
-    window.addEventListener("keydown", esc);
-    return () => {
-      window.removeEventListener("click", close);
-      window.removeEventListener("keydown", esc);
-    };
-  }, [open]);
+  const [open, setOpen] = useMenu();
 
   return (
     <div className="copy-wrap">

@@ -199,3 +199,32 @@ here has been applied to upstream, and we work around each of the others locally
 - **Workaround:** `src-tauri/src/piece_cut.rs` has Margin's copy of the chunker's rules
   (DECISIONS.md D49). A test compiles core's own chunker from the pinned source and
   compares the two.
+
+## 17. No Screen Recording warning for a process-tap call capture
+- **Where:** `crates/core/src/capture.rs` `evaluate_permission_preflight` (~line 843 at
+  `209265f`), which adds `SCREEN_PERMISSION_DENIED_WARNING` (~line 808) for every call
+  whose system audio is ready but whose Screen Recording permission is not granted.
+- **Why:** a Core Audio process tap (`recording.capture_backend = "core-audio-tap"`) needs
+  the System Audio Recording permission, not Screen Recording. Margin records calls that
+  way (DECISIONS.md D5). So each Start in Margin logged "Minutes does not have Screen
+  Recording permission, so native call capture may not include system audio", and the
+  call audio was there. The warning also names "Minutes", not the host app.
+- **Patch:** warn about Screen Recording only for the ScreenCaptureKit route. For the
+  process tap, check the System Audio Recording permission (TCC
+  `kTCCServiceAudioCapture`) and warn about that one. Give each warning a kind (an enum
+  next to the text), so a host can filter or reword it without matching the text.
+- **Workaround:** `recorder.rs` `is_screen_recording_warning` leaves out warnings that name
+  Screen Recording when Margin's own check found System Audio Recording granted.
+
+## 18. Return the summary's title from resummarize
+- **Where:** `crates/core/src/resummarize.rs` `resummarize_meeting` (~line 685 at
+  `209265f`). The summary call already writes a title (`summarize::Summary.title`), but
+  `ResummarizeReport` does not carry it, and `sanitize_llm_title_candidate` and
+  `llm_title_passes_quality` in `pipeline.rs` are private.
+- **Why:** a host that writes the summary after processing (Margin, DECISIONS.md D40) has
+  no summary during processing, so core's title step keeps its fallback title. To name
+  the meeting, Margin makes a second model call with `summarize::refine_title` and checks
+  the answer with its own rules.
+- **Patch:** add `title: Option<String>` to `ResummarizeReport`, cleaned and checked with
+  the pipeline's title rules. Or make those two functions public.
+- **Workaround:** `summaries.rs` `title_from_summary` (DECISIONS.md D59).

@@ -24,6 +24,31 @@ pub struct JobView {
     pub error: Option<String>,
     /// Notes typed during the recording, until they're added to the meeting file.
     pub draft: Option<String>,
+    /// When the recording started and stopped, and when processing ended (D58).
+    #[serde(flatten)]
+    pub times: JobTimes,
+}
+
+/// The times in core's job record that Margin shows (D58). RFC 3339, or None when the
+/// record does not have them.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct JobTimes {
+    pub recording_started_at: Option<String>,
+    pub recording_finished_at: Option<String>,
+    /// When the job ended. Set only for a job that produced a meeting (Complete or
+    /// NeedsReview), so it never shows the time a job failed.
+    pub ready_at: Option<String>,
+}
+
+impl JobTimes {
+    fn of(job: &jobs::ProcessingJob) -> Self {
+        let produced = matches!(job.state, JobState::Complete | JobState::NeedsReview);
+        JobTimes {
+            recording_started_at: job.recording_started_at.map(|t| t.to_rfc3339()),
+            recording_finished_at: job.recording_finished_at.map(|t| t.to_rfc3339()),
+            ready_at: job.finished_at.filter(|_| produced).map(|t| t.to_rfc3339()),
+        }
+    }
 }
 
 pub fn run_worker_mode() -> i32 {
@@ -100,6 +125,16 @@ fn live_draft_path(job_id: &str) -> PathBuf {
     paths::drafts_dir().join(format!("{job_id}.live.json"))
 }
 
+/// Present while a job's meeting had no title at Stop (D59).
+fn untitled_marker(job_id: &str) -> PathBuf {
+    paths::drafts_dir().join(format!("{job_id}.untitled"))
+}
+
+/// The meeting of this job had no title at Stop. When it is ready, its summary names it.
+pub fn mark_untitled(job_id: &str) {
+    let _ = std::fs::write(untitled_marker(job_id), b"");
+}
+
 /// Held while a notes draft is written, and while `finish` moves it into the meeting file,
 /// so an edit can never land in a draft that was already moved.
 static DRAFTS: Mutex<()> = Mutex::new(());
@@ -152,36 +187,46 @@ pub fn ensure_not_processing(path: &Path) -> Result<(), String> {
 
 /// The job whose notes draft stands in for the notes of `path`: a job that still writes the
 /// file, or one whose draft is not in the file yet (it moves in when the job completes).
-fn notes_job_for(path: &Path) -> Option<String> {
+/// The flag is true for a failed job: a retry rewrites the file, so its draft stays.
+fn notes_job_for(path: &Path) -> Option<(String, bool)> {
     if let Some(job) = active_job_for(path) {
-        return Some(job.id);
+        return Some((job.id, false));
     }
     let entries = std::fs::read_dir(paths::drafts_dir()).ok()?;
     entries.flatten().find_map(|entry| {
         let name = entry.file_name().into_string().ok()?;
         let id = name.strip_suffix(".md").filter(|id| *id != "current")?;
         let job = jobs::load_job(id)?;
-        job.output_path.as_deref().is_some_and(|o| same_file(Path::new(o), path)).then(|| job.id)
+        let failed = job.state == JobState::Failed;
+        job.output_path.as_deref().is_some_and(|o| same_file(Path::new(o), path)).then(|| (job.id, failed))
     })
 }
 
 /// The notes to show for `path`: the job's draft while it has one, else `None` (use the
 /// file's own notes).
 pub fn notes_draft_for(path: &Path) -> Option<String> {
-    let id = notes_job_for(path)?;
+    let (id, _) = notes_job_for(path)?;
     std::fs::read_to_string(notes_draft_path(&id)).ok()
 }
 
 /// Save notes typed in the meeting view. While core may still write the file, they go into
 /// the job's notes draft, and `finish` puts them in the file when the job completes.
+///
+/// A job that failed after it wrote the file can be retried, and the retry writes the
+/// file again with the notes from Stop. So its draft stays, and the notes go into the
+/// file too. Then the file has them even if nobody retries, and after a Reset, which
+/// deletes the drafts.
 pub fn save_notes(path: &Path, notes: &str) -> Result<(), String> {
     let drafts = DRAFTS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(id) = notes_job_for(path) {
+    if let Some((id, failed)) = notes_job_for(path) {
         // An empty draft is kept too: it means "the notes were cleared".
-        return crate::fsutil::write_atomic(&notes_draft_path(&id), notes.as_bytes(), Some(0o600)).map_err(|e| e.to_string());
+        crate::fsutil::write_atomic(&notes_draft_path(&id), notes.as_bytes(), Some(0o600)).map_err(|e| e.to_string())?;
+        if !failed {
+            return Ok(());
+        }
     }
     drop(drafts);
-    library::replace_notes(path, notes)
+    crate::summaries::save_notes(&path.display().to_string(), notes, || library::replace_notes(path, notes))
 }
 
 /// A meeting is queued or being processed.
@@ -224,6 +269,7 @@ pub fn job_views() -> Vec<JobView> {
     jobs::display_jobs(Some(30), true)
         .into_iter()
         .map(|j| JobView {
+            times: JobTimes::of(&j),
             draft: std::fs::read_to_string(notes_draft_path(&j.id)).ok(),
             id: j.id,
             title: j.title,
@@ -234,6 +280,40 @@ pub fn job_views() -> Vec<JobView> {
             error: j.error,
         })
         .collect()
+}
+
+/// The times of the job that wrote the meeting file at `path`, or None for a meeting that
+/// no job record names (an older meeting, a file renamed since, a meeting from the minutes
+/// CLI). Core keeps every finished job in its archive and never prunes it (D58).
+pub fn times_for(path: &Path) -> Option<JobTimes> {
+    let key = path_key(&path.to_string_lossy());
+    if let Some(found) = newest_for(&jobs::list_jobs(), &key) {
+        return Some(found);
+    }
+    // The archive listing reads one file per finished job. Keep it until the archive
+    // folder changes, as the jobs watcher does (D32).
+    static ARCHIVE: Mutex<Option<(Option<std::time::SystemTime>, Vec<jobs::ProcessingJob>)>> = Mutex::new(None);
+    let stamp = std::fs::metadata(jobs::archive_dir()).and_then(|m| m.modified()).ok();
+    let mut cache = ARCHIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.as_ref().map(|(s, _)| s) != Some(&stamp) {
+        let finished = jobs::display_jobs(None, true).into_iter().filter(|j| j.state.is_terminal()).collect();
+        *cache = Some((stamp, finished));
+    }
+    cache.as_ref().and_then(|(_, all)| newest_for(all, &key))
+}
+
+/// Of the jobs that wrote `key`, the newest. A file can have more than one job when it was
+/// processed again.
+fn newest_for(all: &[jobs::ProcessingJob], key: &str) -> Option<JobTimes> {
+    all.iter()
+        .filter(|j| j.output_path.as_deref().is_some_and(|p| path_key(p) == key))
+        .max_by_key(|j| j.created_at)
+        .map(JobTimes::of)
+}
+
+/// One spelling per file: /tmp and /private/tmp, or a symlinked folder, name the same file.
+fn path_key(path: &str) -> String {
+    std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string())
 }
 
 /// Polls job files, pushes changes to the UI, and puts the user's exact notes into the
@@ -317,15 +397,20 @@ fn finish(job: &JobView, announce: bool) {
         return;
     };
     // A failed job may be retried, and a retry rewrites the file. Keep the drafts until a
-    // run succeeds.
+    // run succeeds, and put a copy of the notes in the file it wrote, if any.
+    if job.state == JobState::Failed {
+        copy_notes_to_failed(job, Path::new(output));
+        return;
+    }
     if !matches!(job.state, JobState::Complete | JobState::NeedsReview) {
         return;
     }
     restore_notes(job, Path::new(output));
     let _ = std::fs::remove_file(live_draft_path(&job.id));
+    let untitled = std::fs::remove_file(untitled_marker(&job.id)).is_ok();
     if announce {
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
-        crate::summaries::summarize_in_background(output.to_string());
+        crate::summaries::summarize_in_background(output.to_string(), untitled);
         // Settings → "Keep audio": a good moment to drop audio that is now too old.
         std::thread::spawn(|| corecfg::audio_cleanup(&corecfg::load()));
         events::notify(events::Notice {
@@ -363,6 +448,22 @@ fn restore_notes(job: &JobView, out: &Path) {
     }
 }
 
+/// A job that failed after it wrote the meeting file: copy its notes draft into the file,
+/// and keep the draft for a retry. Notes edited in the file since (Obsidian) win, as in
+/// `restore_notes`.
+fn copy_notes_to_failed(job: &JobView, out: &Path) {
+    let _drafts = DRAFTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(notes) = std::fs::read_to_string(notes_draft_path(&job.id)) else { return };
+    let Some(written) = library::notes_section(out) else { return };
+    let queued = jobs::load_job(&job.id).and_then(|j| j.user_notes);
+    if !core_wrote_these_notes(&written, queued.as_deref()) {
+        return;
+    }
+    if let Err(error) = library::replace_notes(out, &notes) {
+        tracing::warn!(%error, output = %out.display(), "could not copy notes into the file of a failed job");
+    }
+}
+
 /// True when `written` (the file's notes section) is what core renders for the notes it
 /// was given: one bullet per line.
 fn core_wrote_these_notes(written: &str, queued: Option<&str>) -> bool {
@@ -386,6 +487,47 @@ mod tests {
     }
 
     use super::*;
+
+    fn job(json: serde_json::Value) -> jobs::ProcessingJob {
+        let mut base = serde_json::json!({
+            "id": "j", "mode": "meeting", "content_type": "meeting", "title": null,
+            "audio_path": "/a.wav", "state": "complete", "created_at": "2026-11-10T12:24:05+05:30"
+        });
+        base.as_object_mut().unwrap().extend(json.as_object().unwrap().clone());
+        serde_json::from_value(base).expect("a job record as core writes it")
+    }
+
+    #[test]
+    fn job_times_come_from_the_newest_job_that_wrote_the_file() {
+        let all = vec![
+            job(serde_json::json!({ "id": "old", "output_path": "/m/a.md", "created_at": "2026-11-10T12:24:05+05:30",
+                "recording_started_at": "2026-11-10T11:31:00+05:30", "recording_finished_at": "2026-11-10T12:24:03+05:30",
+                "finished_at": "2026-11-10T12:30:00+05:30" })),
+            job(serde_json::json!({ "id": "new", "output_path": "/m/a.md", "created_at": "2026-11-10T15:00:00+05:30",
+                "recording_started_at": "2026-11-10T11:31:00+05:30", "recording_finished_at": "2026-11-10T12:24:03+05:30",
+                "finished_at": "2026-11-10T15:00:41+05:30" })),
+            job(serde_json::json!({ "id": "other", "output_path": "/m/b.md", "finished_at": "2026-11-10T09:00:00+05:30" })),
+        ];
+        let t = newest_for(&all, "/m/a.md").unwrap();
+        assert_eq!(t.recording_started_at.as_deref(), Some("2026-11-10T11:31:00+05:30"));
+        assert_eq!(t.recording_finished_at.as_deref(), Some("2026-11-10T12:24:03+05:30"));
+        assert_eq!(t.ready_at.as_deref(), Some("2026-11-10T15:00:41+05:30"));
+        assert_eq!(newest_for(&all, "/m/c.md"), None);
+    }
+
+    #[test]
+    fn job_times_leave_out_what_the_record_does_not_have() {
+        // An old record with no recording times, and a failed job: no ready time.
+        let old = job(serde_json::json!({ "output_path": "/m/a.md", "finished_at": "2026-11-10T12:30:00+05:30" }));
+        assert_eq!(JobTimes::of(&old).recording_started_at, None);
+        assert_eq!(JobTimes::of(&old).recording_finished_at, None);
+        let failed = job(serde_json::json!({ "state": "failed", "finished_at": "2026-11-10T12:30:00+05:30",
+            "recording_finished_at": "2026-11-10T12:24:03+05:30" }));
+        assert_eq!(JobTimes::of(&failed).ready_at, None);
+        assert_eq!(JobTimes::of(&failed).recording_finished_at.as_deref(), Some("2026-11-10T12:24:03+05:30"));
+        let active = job(serde_json::json!({ "state": "transcribing", "started_at": "2026-11-10T12:24:10+05:30" }));
+        assert_eq!(JobTimes::of(&active), JobTimes::default());
+    }
 
     #[test]
     fn the_notes_guard_accepts_only_what_core_wrote() {

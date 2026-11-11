@@ -63,6 +63,8 @@ pub struct MeetingDetail {
     pub action_items: Vec<ActionItem>,
     /// Margin is writing the summary now (set by the command, not read from the file).
     pub summarizing: bool,
+    /// Start, Stop and ready times from core's job record (set by the command, D58).
+    pub times: Option<crate::processing::JobTimes>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -276,9 +278,10 @@ pub fn sections(body: &str) -> Vec<Section> {
     out
 }
 
+/// Core writes `[m:ss]` with no limit on the minutes, so a long meeting has `[100:00]`.
 fn turn_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\[(?:(.+?) )?(\d{1,2}:\d{2}(?::\d{2})?)\]\s?(.*)$").unwrap())
+    RE.get_or_init(|| Regex::new(r"^\[(?:(.+?) )?(\d+:\d{2}(?::\d{2})?)\]\s?(.*)$").unwrap())
 }
 
 fn parse_transcript(body: &str) -> Vec<Turn> {
@@ -367,6 +370,7 @@ pub fn read(path: &Path) -> Result<MeetingDetail, String> {
         has_audio: path.with_extension("wav").exists(),
         action_items,
         summarizing: false,
+        times: None,
     })
 }
 
@@ -439,11 +443,16 @@ fn checklist_item(line: &str) -> ActionItem {
 /// Check or uncheck one action item, by its position in `action_items`. Structured
 /// items go through core (frontmatter status plus the matching body line); body-only
 /// items change their checklist box.
-pub fn set_action_item(path: &Path, index: usize, done: bool) -> Result<(), String> {
+/// `task`, when given, is the text the user saw. If the item at `index` has another text
+/// now, the list changed (a new summary) and the tick is refused, not put on another item.
+pub fn set_action_item(path: &Path, index: usize, done: bool, task: Option<&str>) -> Result<(), String> {
     ensure_inside_output(path)?;
     crate::fsutil::with_file_lock(path, || {
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let (fm, body) = frontmatter(&content);
+        if task.is_some_and(|t| !task_at(&fm, body, index, t)) {
+            return Err("The action items changed. Check the list and tick the item again.".to_string());
+        }
         let structured = fm.get("action_items").and_then(|v| v.as_sequence()).is_some_and(|s| !s.is_empty());
         if structured {
             return minutes_core::markdown::set_action_item_status(path, index, done).map_err(|e| e.to_string());
@@ -457,6 +466,10 @@ pub fn set_action_item(path: &Path, index: usize, done: bool) -> Result<(), Stri
     .map_err(|e| format!("Couldn't update the action item: {e}"))?;
     let _ = minutes_core::derived::refresh_derived_views(path, &corecfg::load(), &Default::default());
     Ok(())
+}
+
+fn task_at(fm: &serde_yaml::Value, body: &str, index: usize, task: &str) -> bool {
+    action_items(fm, body).get(index).is_some_and(|i| i.task == task.trim())
 }
 
 /// The recording next to a meeting file, if there is one.
@@ -510,6 +523,7 @@ pub fn splice_notes(content: &str, notes: &str) -> String {
     let (_, body) = split_frontmatter(content);
     let head = &content[..content.len() - body.len()];
     // A level-2 heading typed into notes would split the section on the next read.
+    // src/notes.ts `storedNotes` repeats these rules: keep the two in step.
     let notes: String = notes
         .trim()
         .lines()
@@ -522,22 +536,30 @@ pub fn splice_notes(content: &str, notes: &str) -> String {
     let new_section = if notes.is_empty() { String::new() } else { format!("## Notes\n\n{notes}\n\n") };
 
     let lines: Vec<&str> = body.split_inclusive('\n').collect();
-    let is_heading = |l: &str| l.starts_with("## ");
-    let notes_at = lines.iter().position(|l| l.trim_end() == "## Notes");
+    // Section headings as `sections()` sees them: a `## ` line inside a fenced code block
+    // is text, not the end of the section.
+    let mut in_fence = false;
+    let heading: Vec<bool> = lines
+        .iter()
+        .map(|l| {
+            if l.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+            }
+            !in_fence && l.starts_with("## ")
+        })
+        .collect();
+    let heading_at = |name: &str| (0..lines.len()).find(|&i| heading[i] && lines[i].trim_end() == name);
+    let notes_at = heading_at("## Notes");
     let mut out = String::from(head);
     match notes_at {
         Some(start) => {
-            let end = lines[start + 1..]
-                .iter()
-                .position(|l| is_heading(l))
-                .map(|i| start + 1 + i)
-                .unwrap_or(lines.len());
+            let end = (start + 1..lines.len()).find(|&i| heading[i]).unwrap_or(lines.len());
             out.extend(lines[..start].iter().copied());
             out.push_str(&new_section);
             out.extend(lines[end..].iter().copied());
         }
         None => {
-            let at = lines.iter().position(|l| l.trim_end() == "## Transcript").unwrap_or(lines.len());
+            let at = heading_at("## Transcript").unwrap_or(lines.len());
             out.extend(lines[..at].iter().copied());
             if at == lines.len() && !out.ends_with("\n\n") && !new_section.is_empty() {
                 out.push('\n');
@@ -632,13 +654,36 @@ pub fn obsidian_vault_for(path: &Path) -> Option<PathBuf> {
 /// Move a meeting and its audio and sidecars to the Trash.
 pub fn trash(path: &Path) -> Result<(), String> {
     ensure_inside_output(path)?;
+    trash::delete_all(meeting_files(path)).map_err(|e| format!("Could not move to Trash: {e}"))
+}
+
+/// A meeting file and every file beside it that belongs to it and exists: the audio, the
+/// stems, the voice embeddings, and the hidden backups that core's "summarize again" keeps
+/// (`.<name>.md.pre-resummarize.<time>.bak`). Each backup is a full copy of the meeting,
+/// so a delete must take them too (D10).
+pub fn meeting_files(path: &Path) -> Vec<PathBuf> {
     let mut items = vec![path.to_path_buf()];
-    items.extend(
-        minutes_core::capture::meeting_audio_artifact_paths(path)
-            .into_iter()
-            .filter(|p| p.exists()),
-    );
-    trash::delete_all(&items).map_err(|e| format!("Could not move to Trash: {e}"))
+    items.extend(minutes_core::capture::meeting_audio_artifact_paths(path).into_iter().filter(|p| p.exists()));
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let prefix = format!(".{name}.pre-resummarize.");
+    if let (Some(dir), false) = (path.parent(), name.is_empty()) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut backups: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|e| {
+                    let file = e.file_name();
+                    let file = file.to_string_lossy();
+                    file.strip_prefix(&prefix)
+                        .and_then(|rest| rest.strip_suffix(".bak"))
+                        .is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .map(|e| e.path())
+                .collect();
+            backups.sort();
+            items.extend(backups);
+        }
+    }
+    items
 }
 
 #[cfg(test)]
@@ -662,6 +707,19 @@ mod tests {
     }
 
     #[test]
+    fn splice_skips_headings_in_code_blocks() {
+        let file = "---\ntitle: T\n---\n\n## Notes\n\n```\n## not a heading\n```\nold tail\n\n## Transcript\n\n[0:00] hi\n";
+        let out = splice_notes(file, "new");
+        assert_eq!(out, "---\ntitle: T\n---\n\n## Notes\n\nnew\n\n## Transcript\n\n[0:00] hi\n");
+        // Saving the same notes twice changes nothing.
+        let (_, body) = split_frontmatter(file);
+        let notes = sections(body).into_iter().find(|s| s.heading == "Notes").unwrap().body;
+        let once = splice_notes(file, &notes);
+        assert_eq!(splice_notes(&once, &notes), once);
+        assert_eq!(once.matches("old tail").count(), 1);
+    }
+
+    #[test]
     fn splice_empty_removes_section() {
         let out = splice_notes(FILE, "  ");
         assert!(!out.contains("## Notes"));
@@ -676,6 +734,17 @@ mod tests {
         assert_eq!(items[0], ActionItem { task: "send the deck".into(), assignee: Some("Priya".into()), due: None, done: false });
         assert!(items[1].done);
         assert_eq!(&body[checklist_lines(body)[1].0..][..1], "x");
+    }
+
+    #[test]
+    fn action_item_tick_checks_the_task_under_the_lock() {
+        let body = "## Action Items\n- [ ] send the deck\n- [ ] book the room\n";
+        let none = serde_yaml::Value::Null;
+        assert!(task_at(&none, body, 1, "book the room"));
+        // A new summary put another item at index 1.
+        let after = "## Action Items\n- [ ] book the room\n- [ ] call Priya\n";
+        assert!(!task_at(&none, after, 1, "book the room"));
+        assert!(!task_at(&none, after, 5, "book the room"));
     }
 
     #[test]
@@ -724,5 +793,43 @@ mod tests {
         let bare = parse_transcript("[0:09] So let's add that.");
         assert_eq!(bare[0].speaker, None);
         assert_eq!(bare[0].text, "So let's add that.");
+    }
+
+    #[test]
+    fn meeting_files_include_the_resummarize_backups() {
+        let dir = std::env::temp_dir().join(format!("margin-meeting-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("2026-11-10-call.md");
+        let mine = [
+            "2026-11-10-call.md",
+            "2026-11-10-call.wav",
+            ".2026-11-10-call.md.pre-resummarize.1784000001.bak",
+            ".2026-11-10-call.md.pre-resummarize.1784000002000000000.bak",
+        ];
+        let others = [
+            ".2026-11-10-call-2.md.pre-resummarize.1784000001.bak",
+            ".2026-11-10-call.md.pre-resummarize.x.bak",
+            "2026-11-10-call-2.md",
+        ];
+        for f in mine.iter().chain(&others) {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let mut got: Vec<String> =
+            meeting_files(&md).iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        got.sort();
+        let mut want: Vec<String> = mine.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_turns_after_99_minutes() {
+        let turns = parse_transcript("[SPEAKER_0 99:59] one\n[SPEAKER_1 100:00] two\n[1000:05] three");
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[1].speaker.as_deref(), Some("SPEAKER_1"));
+        assert_eq!(turns[1].ts, "100:00");
+        assert_eq!(turns[1].text, "two");
+        assert_eq!(turns[2].ts, "1000:05");
     }
 }

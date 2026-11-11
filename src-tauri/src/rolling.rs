@@ -10,6 +10,12 @@
 //! every piece against the final audio and settings, and transcribes again any range whose
 //! piece does not match.
 //!
+//! The span's settings fingerprint includes the decode hints, and the hints include the
+//! meeting title. A title typed after Start, or a Settings change during the meeting, so
+//! makes the pieces done before it useless at Stop. When the thread has no new piece to
+//! do, it transcribes such a piece again from the stem file, with the hints and settings
+//! that the final pass will use (DECISIONS.md D60).
+//!
 //! The thread only reads the growing capture files and never blocks the capture. It runs
 //! at utility priority. A failed piece is dropped (the final pass covers that range). If
 //! the thread falls behind, or a piece panics, it stops for the rest of the meeting.
@@ -22,7 +28,8 @@
 
 use crate::{corecfg, events, piece_cut, prefs};
 use minutes_core::config::Config;
-use minutes_core::transcript_checkpoint::{self as checkpoint, CheckpointSource, TranscriptCheckpoint};
+use minutes_core::transcribe::DecodeHints;
+use minutes_core::transcript_checkpoint::{self as checkpoint, CheckpointSource, CheckpointSpan, TranscriptCheckpoint};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,14 +64,31 @@ pub struct Progress {
     pub failed: usize,
     pub covered_secs: f64,
     pub compute_secs: f64,
+    /// Pieces transcribed again because the title or the settings changed after them.
+    pub redone: usize,
     /// Why the thread stopped early, if it did.
     pub stopped: Option<String>,
 }
 
 #[derive(Default)]
 struct Shared {
-    checkpoint: TranscriptCheckpoint,
+    done: Vec<Done>,
     progress: Progress,
+}
+
+/// A finished piece, with the inputs that made it. A piece whose inputs are not the
+/// latest ones is transcribed again when the thread is idle.
+struct Done {
+    span: CheckpointSpan,
+    inputs: Inputs,
+}
+
+/// What a piece's settings fingerprint depends on: the transcription settings and the
+/// decode hints, which come from the title and the config.
+#[derive(Clone, PartialEq)]
+struct Inputs {
+    settings: String,
+    hints: DecodeHints,
 }
 
 /// One meeting's rolling transcription.
@@ -82,15 +106,19 @@ pub fn start(call: bool, wav: &Path, title: Option<String>) -> Option<Session> {
     // summary engine), so the pieces match the final pass.
     let cfg = corecfg::load();
     if !pref() {
+        tracing::info!("rolling transcription off: \"Transcribe during the meeting\" is off in Settings");
         return None;
     }
     let model = crate::paths::models_dir().join(format!("ggml-{}.bin", cfg.transcription.model));
     if !model.exists() {
-        tracing::info!("rolling transcription off: the model is not installed yet");
+        tracing::info!(model = %cfg.transcription.model, "rolling transcription off: the model is not installed yet");
         return None;
     }
     let sources = if call {
-        let stems = minutes_core::capture::stem_paths_for(wav)?;
+        let Some(stems) = minutes_core::capture::stem_paths_for(wav) else {
+            tracing::info!("rolling transcription off: core gives no stem paths for this recording");
+            return None;
+        };
         vec![(CheckpointSource::Voice, stems.voice), (CheckpointSource::System, stems.system)]
     } else {
         vec![(CheckpointSource::Recording, wav.to_path_buf())]
@@ -99,6 +127,9 @@ pub fn start(call: bool, wav: &Path, title: Option<String>) -> Option<Session> {
     let title = Arc::new(Mutex::new(title));
     let shared: Arc<Mutex<Shared>> = Arc::default();
     let worker = Worker {
+        inputs: Inputs { settings: settings_key(&cfg), hints: DecodeHints::default() },
+        inputs_title: None,
+        config_stamp: config_stamp(),
         cfg,
         piece: piece_samples(),
         sources: sources.into_iter().map(|(source, path)| Tail::new(source, path)).collect(),
@@ -106,6 +137,7 @@ pub fn start(call: bool, wav: &Path, title: Option<String>) -> Option<Session> {
         title: title.clone(),
         shared: shared.clone(),
     };
+    tracing::info!(model = %worker.cfg.transcription.model, call, "rolling transcription on");
     let handle = std::thread::Builder::new()
         .name("margin-rolling".into())
         .spawn(move || worker.run())
@@ -136,7 +168,8 @@ impl Session {
         }
         let shared = self.shared.lock().unwrap();
         tracing::info!(progress = ?shared.progress, "rolling transcription finished");
-        (!shared.checkpoint.is_empty()).then(|| shared.checkpoint.clone())
+        let spans: Vec<CheckpointSpan> = shared.done.iter().map(|d| d.span.clone()).collect();
+        (!spans.is_empty()).then(|| TranscriptCheckpoint { spans, ..Default::default() })
     }
 }
 
@@ -158,6 +191,13 @@ fn piece_samples() -> usize {
 
 struct Worker {
     cfg: Config,
+    /// The inputs a piece gets now. `refresh` keeps them in step with the title and the
+    /// config file.
+    inputs: Inputs,
+    /// The title `inputs.hints` were made for. `None` with empty hints until the first
+    /// refresh.
+    inputs_title: Option<Option<String>>,
+    config_stamp: Option<std::time::SystemTime>,
     piece: usize,
     sources: Vec<Tail>,
     stop: Arc<AtomicBool>,
@@ -176,23 +216,62 @@ impl Worker {
                 self.give_up(reason);
                 return;
             }
-            // The earliest piece that can end now.
+            self.refresh();
+            // The earliest piece that can end now. New audio comes first.
             let ready = self
                 .sources
                 .iter()
                 .enumerate()
                 .filter_map(|(i, t)| Some((t.next_start, i, piece_cut::cut(&t.pending, self.piece)?)))
                 .min();
-            let Some((_, i, cut)) = ready else {
-                self.sleep(READ_EVERY);
-                continue;
+            let outcome = match ready {
+                Some((_, i, cut)) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.transcribe_next(i, cut))),
+                // Idle: a piece made with older inputs, if any, gets the current ones.
+                None => match self.stale_piece() {
+                    Some(at) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.transcribe_again(at))),
+                    None => {
+                        self.sleep(READ_EVERY);
+                        continue;
+                    }
+                },
             };
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.transcribe_next(i, cut)));
             if outcome.is_err() {
                 self.give_up("a piece crashed the transcriber".into());
                 return;
             }
         }
+    }
+
+    /// Keeps `inputs` in step with the title and with the config file. The worker loads
+    /// the config again at Stop, so a piece made with the config from Start no longer
+    /// matches after a Settings change.
+    fn refresh(&mut self) {
+        let stamp = config_stamp();
+        if stamp != self.config_stamp {
+            self.config_stamp = stamp;
+            let cfg = corecfg::load();
+            let model = crate::paths::models_dir().join(format!("ggml-{}.bin", cfg.transcription.model));
+            // A model that is not on disk yet can't make pieces. Keep the old settings.
+            if model.exists() {
+                if settings_key(&cfg) != self.inputs.settings {
+                    tracing::info!(model = %cfg.transcription.model, "rolling transcription: the settings changed; earlier pieces are done again");
+                }
+                self.inputs.settings = settings_key(&cfg);
+                // The hints come from the config too (the vocabulary, your name).
+                self.inputs_title = None;
+                self.cfg = cfg;
+            }
+        }
+        let title = self.title.lock().unwrap().clone();
+        if self.inputs_title.as_ref() != Some(&title) {
+            self.inputs.hints = checkpoint::decode_hints_for_queued_meeting(title.as_deref(), None, &self.cfg);
+            self.inputs_title = Some(title);
+        }
+    }
+
+    /// The first finished piece whose inputs are not the current ones.
+    fn stale_piece(&self) -> Option<usize> {
+        self.shared.lock().unwrap().done.iter().position(|d| d.inputs != self.inputs)
     }
 
     /// Transcribes the first `cut` pending samples of source `i`.
@@ -202,10 +281,9 @@ impl Worker {
         let start = tail.next_start;
         tail.next_start += cut as u64;
         let source = tail.source;
-        let title = self.title.lock().unwrap().clone();
-        let hints = checkpoint::decode_hints_for_queued_meeting(title.as_deref(), None, &self.cfg);
+        let inputs = self.inputs.clone();
         let t = Instant::now();
-        let result = checkpoint::transcribe_span(&samples, start, source, &self.cfg, &hints);
+        let result = checkpoint::transcribe_span(&samples, start, source, &self.cfg, &inputs.hints);
         let compute = t.elapsed().as_secs_f64();
         let secs = samples.len() as f64 / SR as f64;
         let mut shared = self.shared.lock().unwrap();
@@ -213,12 +291,51 @@ impl Worker {
         match result {
             Ok(span) => {
                 tracing::info!(?source, start_secs = start as f64 / SR as f64, secs, compute, lines = span.lines.len(), "rolling piece done");
-                shared.checkpoint.spans.push(span);
+                shared.done.push(Done { span, inputs });
                 shared.progress.pieces += 1;
                 shared.progress.covered_secs += secs;
             }
             Err(error) => {
                 tracing::warn!(?source, start_secs = start as f64 / SR as f64, %error, "rolling piece failed; the final pass covers it");
+                shared.progress.failed += 1;
+            }
+        }
+        events::emit("rolling", &shared.progress);
+    }
+
+    /// Transcribes finished piece `at` again, from its stem file, with the current inputs.
+    /// If that fails, the piece is dropped: core would not take it, and the final pass
+    /// covers its range.
+    fn transcribe_again(&mut self, at: usize) {
+        let (source, start, end) = {
+            let shared = self.shared.lock().unwrap();
+            let span = &shared.done[at].span;
+            (span.source, span.start_sample, span.end_sample)
+        };
+        let inputs = self.inputs.clone();
+        let t = Instant::now();
+        let result = self
+            .sources
+            .iter()
+            .find(|tail| tail.source == source)
+            .ok_or_else(|| "no such source".to_string())
+            .and_then(|tail| tail.read_range(start, end))
+            .and_then(|samples| checkpoint::transcribe_span(&samples, start, source, &self.cfg, &inputs.hints).map_err(|e| e.to_string()));
+        let compute = t.elapsed().as_secs_f64();
+        let mut shared = self.shared.lock().unwrap();
+        shared.progress.compute_secs += compute;
+        // Stop can't run in between: it waits for this thread. So `at` is still the piece.
+        match result {
+            Ok(span) => {
+                tracing::info!(?source, start_secs = start as f64 / SR as f64, compute, "rolling piece done again with the new title or settings");
+                shared.done[at] = Done { span, inputs };
+                shared.progress.redone += 1;
+            }
+            Err(error) => {
+                tracing::warn!(?source, start_secs = start as f64 / SR as f64, %error, "rolling piece could not be done again; the final pass covers it");
+                let gone = shared.done.remove(at);
+                shared.progress.pieces -= 1;
+                shared.progress.covered_secs -= (gone.span.end_sample - gone.span.start_sample) as f64 / SR as f64;
                 shared.progress.failed += 1;
             }
         }
@@ -245,6 +362,17 @@ impl Worker {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// The transcription settings as core's fingerprint sees them (`format!("{:?}")` of
+/// `config.transcription`, in transcript_checkpoint.rs at 209265f).
+fn settings_key(cfg: &Config) -> String {
+    format!("{:?}", cfg.transcription)
+}
+
+/// When the config file last changed. Reading the file every 2 s would cost more.
+fn config_stamp() -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::paths::config_path()).and_then(|m| m.modified()).ok()
 }
 
 /// Utility priority: the capture and the UI always come first.
@@ -306,6 +434,18 @@ impl Tail {
         let n = n & !1;
         self.pending.extend(buf[..n].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0));
         self.read += n as u64;
+    }
+
+    /// Samples `[start, end)` of the source, read again from its file, in the same
+    /// canonical form as `pending`.
+    fn read_range(&self, start: u64, end: u64) -> Result<Vec<f32>, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let data_at = self.data_at.ok_or("the file has no sample data yet")?;
+        let mut file = std::fs::File::open(&self.path).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(data_at + start * 2)).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; ((end - start) * 2) as usize];
+        file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        Ok(buf.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect())
     }
 }
 
@@ -583,6 +723,8 @@ mod tests {
         w.flush().unwrap();
         tail.read_new();
         assert_eq!(tail.pending, vec![100.0 / 32768.0, -200.0 / 32768.0, 300.0 / 32768.0, 0.5]);
+        // A piece read again from the file has the same samples as when it was pending.
+        assert_eq!(tail.read_range(1, 4).unwrap(), tail.pending[1..4].to_vec());
         w.finalize().unwrap();
         std::fs::remove_dir_all(dir).ok();
     }

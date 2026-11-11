@@ -24,7 +24,8 @@ pub mod ops {
     }
 
     pub fn boot() -> Res<Boot> {
-        tracing::info!("ui connected (boot)");
+        // Each load of the window's page calls boot: a launch, a reload, a Reset.
+        tracing::info!("window page loaded (boot)");
         Ok(Boot {
             onboarded: prefs::load().onboarding_complete && corecfg::exists(),
             settings: current_settings(),
@@ -233,6 +234,12 @@ pub mod ops {
         Ok(())
     }
 
+    /// The window's notepad button: enter or leave the notepad view (D57).
+    pub fn toggle_notepad() -> Res<()> {
+        crate::events::emit(crate::events::NOTEPAD_TOGGLE, ());
+        Ok(())
+    }
+
     /// A click on the chip: the window comes back on the live notes.
     pub fn chip_open_notes() -> Res<()> {
         crate::events::emit(crate::events::OPEN_LIVE, ());
@@ -305,8 +312,9 @@ pub mod ops {
         let p = PathBuf::from(&path);
         let mut detail = library::read(&p)?;
         detail.summarizing = summaries::is_running(&path);
+        detail.times = processing::times_for(&p);
         // Until the job is done, the file has core's copy of the notes; the draft has yours.
-        if let Some(notes) = processing::notes_draft_for(&p) {
+        if let Some(notes) = processing::notes_draft_for(&p).or_else(|| summaries::notes_draft(&path)) {
             detail.notes = notes;
         }
         Ok(detail)
@@ -379,8 +387,8 @@ pub mod ops {
         let Some(_running) = summaries::start(&p.display().to_string()) else {
             return Err("Margin is already writing this meeting's summary.".into());
         };
-        // Hold the file's lock while core rewrites the file, so notes typed meanwhile are
-        // saved after it, not overwritten by it.
+        // Hold the file's lock while core rewrites the file, so a title or speaker edit
+        // waits for it. Notes typed meanwhile go into a draft (summaries::save_notes).
         let report = crate::fsutil::with_file_lock(&p, || minutes_core::resummarize::resummarize_meeting(
             &p,
             &cfg,
@@ -405,10 +413,14 @@ pub mod ops {
         Ok(())
     }
 
-    pub fn set_action_item(path: String, index: usize, done: bool) -> Res<()> {
-        let p = PathBuf::from(path);
+    pub fn set_action_item(path: String, index: usize, done: bool, task: Option<String>) -> Res<()> {
+        let p = PathBuf::from(&path);
         processing::ensure_not_processing(&p)?;
-        library::set_action_item(&p, index, done)
+        // A summary replaces the action items, so an index from before it names another item.
+        if summaries::is_running(&path) {
+            return Err("Margin is writing the summary. Tick the item when it is done.".into());
+        }
+        library::set_action_item(&p, index, done, task.as_deref())
     }
 
     pub fn list_voices() -> Res<Vec<speakers::VoiceProfileView>> {
@@ -502,6 +514,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "stop_recording" => out(ops::stop_recording(arg(a, "notes")?, arg(a, "title")?)),
         "recorder_view" => out(ops::recorder_view()),
         "shrink_to_chip" => out(ops::shrink_to_chip()),
+        "toggle_notepad" => out(ops::toggle_notepad()),
         "chip_open_notes" => out(ops::chip_open_notes()),
         "chip_stop" => out(ops::chip_stop()),
         // The chip window's own geometry and focus. The bridge has no window: it reports
@@ -523,7 +536,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "reveal_in_finder" | "open_in_obsidian" => Ok(serde_json::Value::Null),
         "rename_speaker" => out(ops::rename_speaker(arg(a, "path")?, arg(a, "label")?, arg(a, "name")?, arg(a, "rememberVoice")?)),
         "summarize_meeting" => out(ops::summarize_meeting(arg(a, "path")?)),
-        "set_action_item" => out(ops::set_action_item(arg(a, "path")?, arg(a, "index")?, arg(a, "done")?)),
+        "set_action_item" => out(ops::set_action_item(arg(a, "path")?, arg(a, "index")?, arg(a, "done")?, arg(a, "task")?)),
         // The app adds the file to the asset scope; the bridge serves it at /asset.
         "meeting_audio" => out(library::audio_path(&PathBuf::from(arg::<String>(a, "path")?)).map(|p| p.display().to_string())),
         "list_voices" => out(ops::list_voices()),
@@ -573,6 +586,7 @@ pub mod tauri_cmds {
     cmd!(stop_recording(notes: Option<String>, title: Option<String>) -> Stopped);
     cmd!(recorder_view() -> RecorderView);
     cmd!(shrink_to_chip() -> ());
+    cmd!(toggle_notepad() -> ());
     cmd!(chip_open_notes() -> ());
     cmd!(chip_stop() -> ());
     cmd!(set_draft_notes(text: String) -> ());
@@ -591,7 +605,7 @@ pub mod tauri_cmds {
     cmd!(open_in_obsidian(path: String) -> ());
     cmd!(rename_speaker(path: String, label: String, name: String, remember_voice: bool) -> speakers::RenameResult);
     cmd!(summarize_meeting(path: String) -> ());
-    cmd!(set_action_item(path: String, index: usize, done: bool) -> ());
+    cmd!(set_action_item(path: String, index: usize, done: bool, task: Option<String>) -> ());
     cmd!(list_voices() -> Vec<speakers::VoiceProfileView>);
     cmd!(forget_voice(slug: String) -> ());
     cmd!(reset_preview() -> reset::ResetPreview);

@@ -1,7 +1,9 @@
 // Injected before the app loads in the end-to-end tests. Stands in for Tauri's IPC: every
 // invoke goes to the real backend (`margin --dev serve`) over HTTP, and backend events are
 // long-polled and delivered to listeners the way @tauri-apps/api expects.
-// Exposes window.__E2E__ for tests: pickFolder (dialog result), calls (log), errors, emit.
+// Exposes window.__E2E__ for tests: pickFolder (dialog result), calls (log), errors, emit,
+// and onNotepad: called on "notepad-toggle", so a test can resize the page as the app
+// resizes its window.
 (() => {
   const BRIDGE = window.__E2E_BRIDGE__ || "http://127.0.0.1:4545";
   const callbacks = new Map();
@@ -21,6 +23,7 @@
   }
 
   const deliver = (event, seq, payload) => {
+    if (event === "notepad-toggle") e2e.onNotepad?.();
     for (const id of listeners.get(event) || []) callbacks.get(id)?.({ event, id: seq, payload });
   };
   // Perf tests: deliver a synthetic backend event, as if the bridge had sent it.

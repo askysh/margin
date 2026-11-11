@@ -120,6 +120,16 @@ export interface MeetingDetail extends MeetingSummary {
   action_items: ActionItem[];
   /** Margin is writing this meeting's summary now. */
   summarizing: boolean;
+  /** From core's record of the job that wrote this file, or null when there is none (D58). */
+  times: JobTimes | null;
+}
+
+/** RFC 3339 times from core's job record. A field is null when the record does not have it. */
+export interface JobTimes {
+  recording_started_at: string | null;
+  recording_finished_at: string | null;
+  /** When processing ended. Only for a job that produced a meeting. */
+  ready_at: string | null;
 }
 
 export interface ActionItem {
@@ -133,7 +143,8 @@ export type JobState =
   | "queued" | "transcribing" | "transcript-only" | "diarizing" | "summarizing"
   | "saving" | "needs-review" | "complete" | "failed";
 
-export interface Job {
+/** A processing job. The times are flattened in from core's record (D58). */
+export interface Job extends JobTimes {
   id: string;
   title: string | null;
   state: JobState;
@@ -244,6 +255,8 @@ export const api = {
   recorderView: () => invoke<RecorderView>("recorder_view"),
   /** Hide the window during a recording, so only the recording chip shows. */
   shrinkToChip: () => invoke<void>("shrink_to_chip"),
+  /** Enter or leave the notepad view: the window goes narrow, or back to its last wide frame (D57). */
+  toggleNotepad: () => invoke<void>("toggle_notepad"),
   setDraftNotes: (text: string) => invoke<void>("set_draft_notes", { text }),
   setRecordingTitle: (title: string) => invoke<void>("set_recording_title", { title }),
   discardOrphanedDraft: () => invoke<void>("discard_orphaned_draft"),
@@ -262,7 +275,10 @@ export const api = {
   renameSpeaker: (path: string, label: string, name: string, rememberVoice: boolean) =>
     invoke<{ voice_saved: boolean; note: string | null }>("rename_speaker", { path, label, name, rememberVoice }),
   summarize: (path: string) => invoke<void>("summarize_meeting", { path }),
-  setActionItem: (path: string, index: number, done: boolean) => invoke<void>("set_action_item", { path, index, done }),
+  /** `task` is the item's text as shown. The backend refuses the tick when the item at
+   * `index` has another text now, for example after a new summary. */
+  setActionItem: (path: string, index: number, done: boolean, task: string) =>
+    invoke<void>("set_action_item", { path, index, done, task }),
   /** The recording's file path, readable through the asset protocol (convertFileSrc). */
   meetingAudio: (path: string) => invoke<string>("meeting_audio", { path }),
   listVoices: () => invoke<Voice[]>("list_voices"),

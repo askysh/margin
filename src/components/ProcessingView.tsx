@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type Job, type LiveLine } from "../api";
 import { LiveTranscript, Rule } from "./LiveView";
 import { SideSwitch, useOneColumn, type Side } from "./Compact";
+import { readyText, stoppedText } from "../times";
 
 const STEPS: { state: Job["state"][]; label: string }[] = [
   { state: ["queued"], label: "Queued" },
@@ -34,6 +35,7 @@ export function ProcessingView({ jobId, job, notes, title, onOpen, onRetry }: Pr
       {split && <SideSwitch side={side} onSide={setSide} transcriptLabel="Draft transcript" />}
       <div className={`notes-col${split && side !== "notes" ? " is-hidden" : ""}`}>
         <h1 className="title">{title || job?.title || "New meeting"}</h1>
+        {job && <SinceStop job={job} />}
         {failed ? (
           <div className="callout callout-error">
             <p><strong>Processing failed.</strong> {job?.error ?? "The recording is kept, so nothing is lost."}</p>
@@ -70,6 +72,27 @@ export function ProcessingView({ jobId, job, notes, title, onOpen, onRetry }: Pr
       {lines.length > 0 && (!oneColumn || side === "transcript") && (
         <LiveTranscript lines={lines} call={lines.some((l) => !!l.speaker)} draft />
       )}
+    </div>
+  );
+}
+
+/** When Stop happened and how long processing has run since, to the second (D58). When
+ * the job is done: when it was ready. A failed job shows its error instead. Its own component, so only this line ticks. */
+function SinceStop({ job }: { job: Job }) {
+  const running = !["complete", "needs-review", "failed"].includes(job.state);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (!running) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [running]);
+  const text = running ? stoppedText(job.recording_finished_at, now) : readyText(job);
+  if (!text) return null;
+  return (
+    <div className="meta since-stop">
+      <p className="meta-line meta-parts" role="timer" aria-live="off">
+        {text.split(" · ").map((part, i) => <span key={i}>{part}</span>)}
+      </p>
     </div>
   );
 }

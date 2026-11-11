@@ -131,3 +131,13 @@ export async function copyText(text: string): Promise<boolean> {
 export function meetingFileReady(job: Job): job is Job & { output_path: string } {
   return !!job.output_path && ["transcript-only", "diarizing", "summarizing", "saving", "complete", "needs-review"].includes(job.state);
 }
+
+/** `current` with each key of a refused `patch` set back to its `base` value. A key that a
+ * later change set to another value keeps that value. */
+export function withoutPatch<T extends object>(current: T, patch: Partial<T>, base: T): T {
+  const out = { ...current };
+  for (const k of Object.keys(patch) as (keyof T)[]) {
+    if (Object.is(out[k], patch[k])) out[k] = base[k];
+  }
+  return out;
+}

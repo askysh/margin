@@ -1,7 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { api, errorText, on, type Job, type MeetingDetail, type Turn } from "../api";
-import { isRawSpeaker, meetingDate, speakerNames, useDebounced } from "../util";
+import { isRawSpeaker, speakerNames, useDebounced } from "../util";
+import { readyText, whenParts } from "../times";
 import { Markdown } from "./Markdown";
 import { NotesEditor } from "./NotesEditor";
 import { Rule } from "./LiveView";
@@ -10,6 +11,7 @@ import { AudioPlayer, type AudioHandle } from "./AudioPlayer";
 import { MoreMenu } from "./MoreMenu";
 import { CopyMenu } from "./CopyMenu";
 import { SideSwitch, useOneColumn, type Side } from "./Compact";
+import { sameNotes } from "../notes";
 import { ACTION_HEADING, meetingMarkdown, summaryMarkdown, transcriptMarkdown, tsSeconds, withoutCoverage } from "../meetingMarkdown";
 
 interface Props {
@@ -52,6 +54,8 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
 
   // Focus and save refreshes usually read back the same file: keep the rendered one then.
   const lastRead = useRef("");
+  const notesNow = useRef(notes);
+  notesNow.current = notes;
   const load = useCallback(() => {
     api
       .readMeeting(path)
@@ -60,7 +64,8 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
         if (json === lastRead.current) return;
         lastRead.current = json;
         setM(d);
-        if (edits.current === saved.current) setNotes(d.notes);
+        // The file has the trimmed copy of a save. Taking it would move the caret.
+        if (edits.current === saved.current && !sameNotes(notesNow.current, d.notes)) setNotes(d.notes);
       })
       .catch((e) => setError(errorText(e)));
   }, [path]);
@@ -161,7 +166,10 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
     } catch (e) {
       notify(errorText(e), "error");
     } finally {
+      // This run is over, so no summary is being written. A failed run leaves the file as
+      // it was, so `load` reads nothing new and can't clear it.
       setSummarizing(false);
+      setWriting(false);
     }
   };
 
@@ -183,6 +191,9 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
   };
 
   const hasTranscript = m.transcript.length > 0;
+  // Shown once the job is done. Until then the "Finishing" line says what is happening.
+  const ready = job ? null : readyText(m.times);
+  const when = [...whenParts(m.date, m.times), m.duration ?? ""].filter(Boolean);
   const split = oneColumn && hasTranscript;
   const transcriptShown = hasTranscript && (oneColumn ? side === "transcript" : showTranscript);
 
@@ -203,12 +214,12 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
             }
           }}
         />
-        <div className="meta-line">
-          <span>{meetingDate(m.date)}</span>
-          {m.duration && (<><span className="dot-sep" /><span className="mono">{m.duration}</span></>)}
-          {m.attendees.length > 0 && (
-            <>
-              <span className="dot-sep" />
+        <div className="meta">
+          <div className="meta-line meta-parts">
+            {/* Day · start – Stop · duration · people. Each part brings its own dot, and a
+                dot that starts a line is clipped, so a wrap leaves no dot at a line end (D58). */}
+            {when.map((part, i) => <span key={i}>{part}</span>)}
+            {m.attendees.length > 0 && (
               <span className="people">
                 {m.attendees.map((a, i) => (
                   <span key={a}>
@@ -217,7 +228,12 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
                   </span>
                 ))}
               </span>
-            </>
+            )}
+          </div>
+          {ready && (
+            <p className="meta-line meta-parts meta-ready">
+              {ready.split(" · ").map((part) => <span key={part}>{part}</span>)}
+            </p>
           )}
         </div>
         <div className="actions">
@@ -267,7 +283,7 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
             </section>
             {/* Action items follow the summary, where core puts its checklist. */}
             {hasActions && i === 0 && (
-              <ActionItems path={path} items={m.action_items} names={names} locked={processing} notify={notify} onChanged={() => { load(); onChanged(); }} />
+              <ActionItems path={path} items={m.action_items} names={names} locked={processing || writing || summarizing} notify={notify} onChanged={() => { load(); onChanged(); }} />
             )}
           </div>
         ))}
@@ -275,7 +291,7 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
           <p className="quiet-note">Part of the meeting did not reach the summarizer, so this summary can miss things. Summarize again to try once more.</p>
         )}
         {hasActions && summary.length === 0 && (
-          <ActionItems path={path} items={m.action_items} names={names} locked={processing} notify={notify} onChanged={() => { load(); onChanged(); }} />
+          <ActionItems path={path} items={m.action_items} names={names} locked={processing || writing || summarizing} notify={notify} onChanged={() => { load(); onChanged(); }} />
         )}
 
         <section className="your-notes">

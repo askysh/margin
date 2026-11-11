@@ -14,15 +14,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Re
     let mode = mode
         .or_else(|| std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777))
         .unwrap_or(0o600);
-    {
+    // Any failure removes the temp file, so a full disk leaves no hidden copies in the
+    // meetings folder.
+    let written = (|| {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-    }
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+        drop(file);
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    written
 }
 
 /// One lock per meeting file, held for a whole read-modify-write, so the notes autosave,
@@ -35,4 +40,25 @@ pub fn with_file_lock<T>(path: &Path, f: impl FnOnce() -> T) -> T {
     let lock = LOCKS.get_or_init(Default::default).lock().unwrap().entry(key).or_default().clone();
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     f()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_write_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("margin-fsutil-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The rename fails: the target is a folder that is not empty.
+        let target = dir.join("note.md");
+        std::fs::create_dir_all(target.join("inside")).unwrap();
+        assert!(write_atomic(&target, b"x", None).is_err());
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("note.md")]);
+        let ok = dir.join("ok.md");
+        write_atomic(&ok, b"y", None).unwrap();
+        assert_eq!(std::fs::read(&ok).unwrap(), b"y");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, errorText, type AppPrefs, type Backends, type Boot, type Permissions, type Settings, type SettingsOptions, type Voice } from "../api";
+import { withoutPatch } from "../util";
 import type { SectionId } from "./SettingsNav";
 import { ResetDialog } from "./ResetDialog";
 import { GeneralSection, RecordingSection, SummariesSection, TranscriptionSection } from "./SettingsSections";
@@ -91,6 +92,8 @@ function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: No
   // Each change applies on top of the latest settings, and saves go one at a time, so a
   // name edit and a model click in quick succession can't undo each other.
   const latest = useRef<Settings>(boot.settings);
+  // The settings as the backend last saved them. A refused change goes back to these.
+  const confirmed = useRef<Settings>(boot.settings);
   const queue = useRef<Promise<void>>(Promise.resolve());
   const pendingSaves = useRef(0);
   const save = (patch: Partial<Settings>) => {
@@ -98,23 +101,34 @@ function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: No
     setS(latest.current);
     pendingSaves.current++;
     queue.current = queue.current.then(async () => {
+      let saved: Settings;
       try {
         const payload: Settings = { ...latest.current };
         for (const k of EXTRA_KEYS) if (!(k in patch)) delete payload[k];
-        const saved = await api.saveSettings(payload);
+        saved = await api.saveSettings(payload);
+      } catch (e) {
         pendingSaves.current--;
-        if (pendingSaves.current === 0) {
-          latest.current = saved;
-          setS(saved);
-          onSaved(saved);
-        }
+        // Take the refused change out, or every later save sends it again and fails too.
+        // A later change to the same setting stays.
+        latest.current = withoutPatch(latest.current, patch, confirmed.current);
+        setS(latest.current);
+        notify(errorText(e), "error");
+        return;
+      }
+      pendingSaves.current--;
+      confirmed.current = saved;
+      if (pendingSaves.current === 0) {
+        latest.current = saved;
+        setS(saved);
+        onSaved(saved);
+      }
+      try {
         if (patch.model) {
           const files = await api.modelsStatus();
           if (files.some((f) => !f.installed)) await api.downloadModels();
         }
         if (patch.output_dir) api.mcpSnippet().then(setMcp);
       } catch (e) {
-        pendingSaves.current--;
         notify(errorText(e), "error");
       }
     });

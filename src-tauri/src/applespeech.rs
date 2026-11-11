@@ -16,7 +16,7 @@ use minutes_core::pid;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -109,7 +109,8 @@ struct Lines {
 pub struct Session {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
-    children: Vec<Arc<Mutex<Child>>>,
+    /// Each helper, with its source name for the log and the count of lines it wrote.
+    children: Vec<(Arc<Mutex<Child>>, &'static str, Arc<AtomicUsize>)>,
 }
 
 /// Start a helper for each source. `sources` pairs a WAV that the recorder is writing with
@@ -120,11 +121,12 @@ pub fn start(locale: &str, sources: Vec<(PathBuf, Option<&'static str>)>) -> Opt
     let lines = Arc::new(Mutex::new(Lines { next: 0, started: chrono::Local::now() }));
     let mut session = Session { stop: stop.clone(), threads: Vec::new(), children: Vec::new() };
     for (wav, speaker) in sources {
+        let source = speaker.unwrap_or("room");
         let mut child = match Command::new(&helper)
             .args(["stream", locale])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(child) => child,
@@ -136,11 +138,21 @@ pub fn start(locale: &str, sources: Vec<(PathBuf, Option<&'static str>)>) -> Opt
         };
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        session.children.push(Arc::new(Mutex::new(child)));
+        // The helper writes only errors to stderr, never transcript text. Keep them in the
+        // log, so a live transcript with no lines can be explained.
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    tracing::warn!(source, message = %line, "Apple Speech helper");
+                }
+            });
+        }
+        let written = Arc::new(AtomicUsize::new(0));
+        session.children.push((Arc::new(Mutex::new(child)), source, written.clone()));
         let stop = stop.clone();
         session.threads.push(std::thread::spawn(move || feed(&wav, stdin, &stop)));
         let lines = lines.clone();
-        session.threads.push(std::thread::spawn(move || write_lines(stdout, speaker, &lines)));
+        session.threads.push(std::thread::spawn(move || write_lines(stdout, speaker, &lines, &written)));
     }
     tracing::info!(%locale, sources = session.children.len(), "Apple Speech live transcript started");
     Some(session)
@@ -160,12 +172,14 @@ impl Session {
                 let _ = thread.join();
             }
         }
-        for child in &self.children {
+        for (child, source, written) in &self.children {
             let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
-            if !matches!(child.try_wait(), Ok(Some(_))) {
+            let ended = matches!(child.try_wait(), Ok(Some(_)));
+            if !ended {
                 let _ = child.kill();
             }
-            let _ = child.wait();
+            let status = child.wait().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+            tracing::info!(source, lines = written.load(Ordering::SeqCst), %status, stopped_by_margin = !ended, "Apple Speech helper finished");
         }
     }
 }
@@ -228,10 +242,11 @@ struct Final {
     text: String,
 }
 
-fn write_lines(stdout: std::process::ChildStdout, speaker: Option<&'static str>, lines: &Mutex<Lines>) {
+fn write_lines(stdout: std::process::ChildStdout, speaker: Option<&'static str>, lines: &Mutex<Lines>, written: &AtomicUsize) {
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { return };
         let Ok(result) = serde_json::from_str::<Final>(&line) else { continue };
+        written.fetch_add(1, Ordering::SeqCst);
         let mut lines = lines.lock().unwrap_or_else(|e| e.into_inner());
         lines.next += 1;
         let json = live_line(lines.next, lines.started, &result, speaker);

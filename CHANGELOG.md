@@ -5,6 +5,73 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [0.0.10] - Unreleased
+
+### Added
+
+- View → "Enter Notepad View" (⌘⇧N), a button in the title row and "Open as Notepad" in
+  the menu bar make the window narrow, beside your call. The same menu item or button
+  puts the window back at its earlier size and place (D57).
+- A meeting shows when the recording started and stopped, for example "11:31 AM –
+  12:24 PM", and when it was ready, for example "Ready at 3:00 PM • 2h 36m after Stop".
+  An older meeting without these times shows the start time as before (D58).
+- While a meeting is processing, its page shows when you pressed Stop and how long ago
+  that was (D58).
+
+### Fixed
+
+- The traffic lights, the sidebar button, Record call and Settings now sit on one line
+  in the title row (D57).
+- The meeting header uses one kind of separator, and a wrapped line no longer ends in a
+  separator.
+- The sidebar shows "9:00 AM · 32m" with a space on both sides of the dot.
+- Notes on the processing page no longer show a rule above the first line.
+- A meeting longer than 99 minutes shows every transcript line after 99:59 as its own
+  line. Before, those lines joined the line before them.
+- Move to Trash and Reset now also move the hidden backups that "Summarize again" keeps
+  beside a meeting. Each one is a full copy of the meeting (D10).
+- A failed Summarize no longer leaves "Summarizing…" on the meeting.
+- Notes no longer change under the caret after a save. Before, the meeting view could
+  replace them with the saved copy, without the spaces at the end, and move the caret.
+- Action items cannot be ticked while Margin writes the summary. Before, a tick at that
+  moment could land on another item of the new summary.
+- Notes typed in a meeting whose processing failed after the transcript was saved now
+  go into the meeting file too. Before, they stayed in a draft that Reset deleted.
+- Notes typed while Margin writes a summary are kept when you quit. They wait in a
+  draft and go into the meeting when the summary ends, or at the next launch (D40).
+- "Restart to update" asks first while a meeting is still transcribing, as Quit does
+  (D55).
+- After Settings refuses a change, later changes save again. Before, each later save
+  sent the refused change too and failed.
+- Notes with a code block that holds a `## ` line no longer repeat their text at each
+  save.
+- The audio player no longer says the recording can't be played after two quick clicks
+  on transcript times.
+- The notes box grows when the window gets narrower, so the end of the notes is no
+  longer cut off.
+- A long meeting title in the sidebar ends in "…" in place of a hard cut.
+- A summary heading with a Unicode line separator no longer freezes the window.
+- Copy, More and the Record menu close each other, so only one is open at a time. Esc
+  closes the Record menu too.
+- Ask no longer shows the previous meeting's conversation after a fast switch between
+  meetings.
+- A model download that stops receiving data fails after a minute with a message, in
+  place of waiting for ever. A server that does not send the file size no longer makes
+  a good download fail.
+- A failed save, for example on a full disk, no longer leaves a hidden `.margin-tmp`
+  file beside the meeting.
+- When Stop cannot queue a recording, the message names the folder that has the audio.
+- Settings → Voices → Forget asks first, and says so when it fails.
+- Tab stays inside the Reset dialog.
+- The log no longer warns about the Screen Recording permission at each call Start.
+  Margin records the call audio with System Audio Recording, which it checks itself.
+- A meeting with no title gets one from its summary, in place of the first words of the
+  transcript. The file keeps its name (D59).
+- Settings in the notepad view: the traffic lights no longer cross the border of the icon
+  list.
+- A title typed during a recording, or a Settings change, no longer makes the wait after
+  Stop longer. Margin transcribes the earlier pieces again during the meeting (D60).
+
 ## [0.0.9] - 2026-11-10
 
 ### Added

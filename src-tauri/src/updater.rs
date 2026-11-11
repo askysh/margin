@@ -166,6 +166,11 @@ pub fn install_and_restart(app: &AppHandle) -> Result<(), String> {
     if recorder().is_recording() {
         return Err("Stop the recording first. Margin updates once it's saved.".into());
     }
+    // A restart is a Quit, so it asks the D55 question too. `app.restart()` exits with a
+    // code, which the ExitRequested handler in main.rs lets through without asking.
+    if !crate::processing::confirm_quit(app) {
+        return Ok(());
+    }
     install()?;
     app.restart();
 }
