@@ -560,7 +560,7 @@ textarea.field { max-width: none; resize: vertical; min-height: 64px; line-heigh
 
 /* Sidebar: a small mark at the right of the title-bar strip, level with the traffic lights.
    It lets drags through, so the strip still moves the window. */
-.sidebar-top { display: flex; justify-content: flex-end; align-items: flex-start; padding: 17px 16px 0 0; }
+.sidebar-top { display: flex; justify-content: flex-end; align-items: flex-start; padding: 15px 16px 0 0; }
 .sidebar-brand { pointer-events: none; opacity: 0.9; }
 
 /* The mark sits in a square with room above and below the line; the negative margins

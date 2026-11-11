@@ -337,7 +337,8 @@ export default function App() {
             <RecordButton busy={busy} onStart={start} />
           )}
           <button className="icon-btn" title={settings ? "Back (Esc)" : "Settings (⌘,)"} aria-label="Settings" aria-pressed={!!settings} onClick={() => (settings ? closeSettings() : openSettings())}>
-            <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><path fill="currentColor" d="M11.4 1.5l.5 2.3c.5.2 1 .5 1.4.8l2.2-.8 1.4 2.4-1.7 1.6c.1.5.1 1.1 0 1.6l1.7 1.6-1.4 2.4-2.2-.8c-.4.3-.9.6-1.4.8l-.5 2.3H8.6l-.5-2.3c-.5-.2-1-.5-1.4-.8l-2.2.8-1.4-2.4 1.7-1.6a4 4 0 010-1.6L3.1 6.2l1.4-2.4 2.2.8c.4-.3.9-.6 1.4-.8l.5-2.3h2.8zM10 7a3 3 0 100 6 3 3 0 000-6z" /></svg>
+            {/* The gear's teeth span y 1.5 to 16.5: the view box moves it down 1 unit, onto the centre line. */}
+            <svg width="17" height="17" viewBox="0 -1 20 20" aria-hidden><path fill="currentColor" d="M11.4 1.5l.5 2.3c.5.2 1 .5 1.4.8l2.2-.8 1.4 2.4-1.7 1.6c.1.5.1 1.1 0 1.6l1.7 1.6-1.4 2.4-2.2-.8c-.4.3-.9.6-1.4.8l-.5 2.3H8.6l-.5-2.3c-.5-.2-1-.5-1.4-.8l-2.2.8-1.4-2.4 1.7-1.6a4 4 0 010-1.6L3.1 6.2l1.4-2.4 2.2.8c.4-.3.9-.6 1.4-.8l.5-2.3h2.8zM10 7a3 3 0 100 6 3 3 0 000-6z" /></svg>
           </button>
         </header>
         <section className="content">
