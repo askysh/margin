@@ -39,6 +39,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
   go into the meeting file too. Before, they stayed in a draft that Reset deleted.
 - Notes typed while Margin writes a summary are kept when you quit. They wait in a
   draft and go into the meeting when the summary ends, or at the next launch (D40).
+- "Restart to update" asks first while a meeting is still transcribing, as Quit does
+  (D55).
 
 ## [0.0.9] - 2026-11-10
 
