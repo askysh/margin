@@ -65,11 +65,15 @@ Margin, never during a recording. Settings → Updates turns the automatic check
     the notes, and drag it up or down to move it. Settings → Recording turns the chip off.
   - The notepad has a live transcript beside it. In calls, live lines are marked
     You / Them.
-  - Make the window narrow to keep it beside the call. The sidebar becomes a drawer
-    (⌘\ hides it in a wide window), and a switch picks Notes or Transcript.
+  - The notepad view keeps the window narrow beside the call: View → Enter Notepad View
+    (⌘⇧N), or the button right of the sidebar button. The same command puts the window
+    back. A narrow window from a resize by hand is the notepad view too. The sidebar
+    becomes a drawer (⌘\ hides it in a wide window), and a switch picks Notes or
+    Transcript.
   - Margin transcribes the meeting in 2-minute pieces while it records, with every model.
     After *Stop*, only the last piece or two is left. Settings → Transcription →
     "Transcribe during the meeting" turns this off.
+  - A meeting shows when it started and stopped, and when it was ready after *Stop*.
   - After *Stop*, the meeting opens as soon as its transcript is ready. Speaker names and
     the summary fill in when they are done. Your notes stay editable the whole time.
   - Closing the window keeps Margin in the menu bar. Quitting during a recording saves

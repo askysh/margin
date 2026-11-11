@@ -5,6 +5,28 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [0.0.10] - Unreleased
+
+### Added
+
+- View → "Enter Notepad View" (⌘⇧N), a button in the title row and "Open as Notepad" in
+  the menu bar make the window narrow, beside your call. The same menu item or button
+  puts the window back at its earlier size and place (D57).
+- A meeting shows when the recording started and stopped, for example "11:31 AM –
+  12:24 PM", and when it was ready, for example "Ready at 3:00 PM • 2h 36m after Stop".
+  An older meeting without these times shows the start time as before (D58).
+- While a meeting is processing, its page shows when you pressed Stop and how long ago
+  that was (D58).
+
+### Fixed
+
+- The traffic lights, the sidebar button, Record call and Settings now sit on one line
+  in the title row (D57).
+- The meeting header uses one kind of separator, and a wrapped line no longer ends in a
+  separator.
+- The sidebar shows "9:00 AM · 32m" with a space on both sides of the dot.
+- Notes on the processing page no longer show a rule above the first line.
+
 ## [0.0.9] - 2026-11-10
 
 ### Added
