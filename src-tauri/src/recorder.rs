@@ -164,9 +164,10 @@ impl Recorder {
         // Slow checks (device listing, process scan) run without holding the lock, so the
         // UI can keep asking for the recorder state meanwhile.
         let simulate = simulated_source();
-        if simulate.is_none() {
-            ensure_permissions(kind)?;
-        }
+        let system_audio_granted = match simulate {
+            None => ensure_permissions(kind)?,
+            Some(_) => false,
+        };
         // Apple Speech, when chosen and ready, replaces core's Whisper live transcript (D56).
         let apple_locale = crate::applespeech::chosen_locale();
         let apple_locale = match apple_locale {
@@ -191,7 +192,7 @@ impl Recorder {
             if let Some(reason) = preflight.blocking_reason {
                 return Err(reason);
             }
-            for warning in &preflight.warnings {
+            for warning in preflight.warnings.iter().filter(|w| !(system_audio_granted && is_screen_recording_warning(w))) {
                 tracing::info!(%warning, "recording preflight");
             }
         }
@@ -420,10 +421,20 @@ impl Recorder {
     }
 }
 
+/// Core's preflight warns about the Screen Recording permission for every call. Margin
+/// records the call with a Core Audio process tap, which needs the System Audio Recording
+/// permission, not Screen Recording (D5). When Margin's own check says that the tap may
+/// record, the warning is false, so Margin leaves it out. Core's text is the only way to
+/// tell the warning apart (UPSTREAM-PATCHES.md).
+fn is_screen_recording_warning(warning: &str) -> bool {
+    warning.contains("Screen Recording")
+}
+
 /// Ask macOS before opening any device. Opening an input while the decision is still
 /// pending can block forever if the prompt never shows (see core's macos_permissions), and
-/// a denied system-audio permission makes the tap record silence.
-fn ensure_permissions(kind: Kind) -> Result<(), String> {
+/// a denied system-audio permission makes the tap record silence. True when a call may
+/// use the process tap: macOS granted System Audio Recording.
+fn ensure_permissions(kind: Kind) -> Result<bool, String> {
     let state = crate::permissions::state();
     let mic = match state.microphone {
         "not-determined" => crate::permissions::request_microphone(),
@@ -443,8 +454,9 @@ fn ensure_permissions(kind: Kind) -> Result<(), String> {
         if sys == "denied" {
             return Err("Margin can't hear the other people on the call. Allow it in System Settings → Privacy & Security → Screen & System Audio Recording (under System Audio Recording Only), or record in person instead.".into());
         }
+        return Ok(sys == "granted");
     }
-    Ok(())
+    Ok(false)
 }
 
 pub fn session_config(kind: Kind) -> Config {
@@ -787,6 +799,13 @@ mod tests {
         append_lines(&mut kept, vec![line(2), line(3)]);
         append_lines(&mut kept, vec![line(3)]);
         assert_eq!(kept.iter().map(|l| l.line).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn only_the_screen_recording_warnings_are_found() {
+        assert!(is_screen_recording_warning("Heads up: Minutes does not have Screen Recording permission, so native call capture may not include system audio."));
+        assert!(is_screen_recording_warning("macOS has not yet confirmed Screen Recording access for Minutes."));
+        assert!(!is_screen_recording_warning("Minutes does not have microphone permission, so this call recording will miss your side."));
     }
 
     #[test]

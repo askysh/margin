@@ -63,6 +63,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - When Stop cannot queue a recording, the message names the folder that has the audio.
 - Settings → Voices → Forget asks first, and says so when it fails.
 - Tab stays inside the Reset dialog.
+- The log no longer warns about the Screen Recording permission at each call Start.
+  Margin records the call audio with System Audio Recording, which it checks itself.
 
 ## [0.0.9] - 2026-11-10
 

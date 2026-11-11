@@ -199,3 +199,19 @@ here has been applied to upstream, and we work around each of the others locally
 - **Workaround:** `src-tauri/src/piece_cut.rs` has Margin's copy of the chunker's rules
   (DECISIONS.md D49). A test compiles core's own chunker from the pinned source and
   compares the two.
+
+## 17. No Screen Recording warning for a process-tap call capture
+- **Where:** `crates/core/src/capture.rs` `evaluate_permission_preflight` (~line 843 at
+  `209265f`), which adds `SCREEN_PERMISSION_DENIED_WARNING` (~line 808) for every call
+  whose system audio is ready but whose Screen Recording permission is not granted.
+- **Why:** a Core Audio process tap (`recording.capture_backend = "core-audio-tap"`) needs
+  the System Audio Recording permission, not Screen Recording. Margin records calls that
+  way (DECISIONS.md D5). So each Start in Margin logged "Minutes does not have Screen
+  Recording permission, so native call capture may not include system audio", and the
+  call audio was there. The warning also names "Minutes", not the host app.
+- **Patch:** warn about Screen Recording only for the ScreenCaptureKit route. For the
+  process tap, check the System Audio Recording permission (TCC
+  `kTCCServiceAudioCapture`) and warn about that one. Give each warning a kind (an enum
+  next to the text), so a host can filter or reword it without matching the text.
+- **Workaround:** `recorder.rs` `is_screen_recording_warning` leaves out warnings that name
+  Screen Recording when Margin's own check found System Audio Recording granted.
