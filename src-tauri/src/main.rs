@@ -82,6 +82,7 @@ fn main() {
             tray::init(&handle)?;
             notify::init(&handle);
             shortcut::refresh(&handle);
+            summaries::recover_notes_drafts();
             processing::spawn_watcher();
             // A model that this version needs and an earlier one did not, such as the live
             // transcript model for Best (D52), downloads in the background.

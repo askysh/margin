@@ -313,7 +313,7 @@ pub mod ops {
         detail.summarizing = summaries::is_running(&path);
         detail.times = processing::times_for(&p);
         // Until the job is done, the file has core's copy of the notes; the draft has yours.
-        if let Some(notes) = processing::notes_draft_for(&p) {
+        if let Some(notes) = processing::notes_draft_for(&p).or_else(|| summaries::notes_draft(&path)) {
             detail.notes = notes;
         }
         Ok(detail)
@@ -386,8 +386,8 @@ pub mod ops {
         let Some(_running) = summaries::start(&p.display().to_string()) else {
             return Err("Margin is already writing this meeting's summary.".into());
         };
-        // Hold the file's lock while core rewrites the file, so notes typed meanwhile are
-        // saved after it, not overwritten by it.
+        // Hold the file's lock while core rewrites the file, so a title or speaker edit
+        // waits for it. Notes typed meanwhile go into a draft (summaries::save_notes).
         let report = crate::fsutil::with_file_lock(&p, || minutes_core::resummarize::resummarize_meeting(
             &p,
             &cfg,

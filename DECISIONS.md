@@ -361,7 +361,10 @@ The full comparison is in `docs/parity/app.md`.
 - Now: the processing worker runs with summaries off. When the meeting is ready, Margin
   opens it and writes the summary in the background with the engine from Settings. The
   meeting view says "Writing the summary" and fills it in when it lands. Margin holds the
-  file's lock during the rewrite, so notes typed meanwhile are saved after it.
+  file's lock during the rewrite. Notes typed meanwhile go into a draft, as in D43, and
+  into the file when the summary ends (since 0.0.10: before, the saves waited behind the
+  lock, and a Quit lost them). A draft that a Quit left goes into the file at the next
+  launch.
 - Claude gets 15 minutes for a summary instead of 5, because nothing waits for it now.
 - Cost: core's LLM speaker naming (it guesses names from the notes during the summary
   step) no longer runs during processing. Renaming a speaker once, with voice memory,

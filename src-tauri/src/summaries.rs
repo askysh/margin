@@ -99,8 +99,81 @@ impl Drop for RunningGuard {
     /// meeting view never keeps "Summarizing…" after it. The background run sends one more
     /// event with the error.
     fn drop(&mut self) {
+        let _notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+        apply_notes_draft(&notes_draft_path(&self.0));
         RUNNING.lock().unwrap().retain(|p| p != &self.0);
         crate::events::emit("summary-status", serde_json::json!({ "path": self.0, "running": false }));
+    }
+}
+
+/// Held while notes are saved and while a summary run ends, so a save never goes into a
+/// draft after the draft was moved into the file.
+static NOTES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Notes typed while a summary is written. Core's rewrite refuses to replace a file that
+/// changed since it read it, and the model can take minutes. So the notes wait in a draft
+/// beside the job drafts (D43), not behind the file lock, and go into the file when the
+/// run ends. A Quit in between keeps the draft, and the next launch puts it in the file.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct NotesDraft {
+    path: String,
+    notes: String,
+}
+
+fn notes_draft_path(path: &str) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    crate::paths::drafts_dir().join(format!("summary-{:016x}.json", h.finish()))
+}
+
+/// Saves the notes of `path`: into the draft while its summary is written, else with
+/// `write`.
+pub fn save_notes(path: &str, notes: &str, write: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    let _notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    if !is_running(path) {
+        return write();
+    }
+    let draft = NotesDraft { path: path.to_string(), notes: notes.to_string() };
+    let json = serde_json::to_vec(&draft).map_err(|e| e.to_string())?;
+    crate::fsutil::write_atomic(&notes_draft_path(path), &json, Some(0o600)).map_err(|e| e.to_string())
+}
+
+/// The notes typed during the summary of `path`, while they wait in the draft.
+pub fn notes_draft(path: &str) -> Option<String> {
+    let bytes = std::fs::read(notes_draft_path(path)).ok()?;
+    serde_json::from_slice::<NotesDraft>(&bytes).ok().map(|d| d.notes)
+}
+
+fn apply_notes_draft(draft: &std::path::Path) {
+    let Ok(bytes) = std::fs::read(draft) else { return };
+    let Ok(d) = serde_json::from_slice::<NotesDraft>(&bytes) else {
+        let _ = std::fs::remove_file(draft);
+        return;
+    };
+    let path = std::path::Path::new(&d.path);
+    if !path.exists() {
+        tracing::info!("the meeting of a notes draft is gone; dropping the draft");
+        let _ = std::fs::remove_file(draft);
+        return;
+    }
+    match crate::library::replace_notes(path, &d.notes) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(draft);
+        }
+        Err(error) => tracing::warn!(%error, "could not put the notes typed during a summary in the file"),
+    }
+}
+
+/// At launch: notes typed during a summary that a Quit ended go into their files.
+pub fn recover_notes_drafts() {
+    let _notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(entries) = std::fs::read_dir(crate::paths::drafts_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("summary-") && name.ends_with(".json") {
+            apply_notes_draft(&entry.path());
+        }
     }
 }
 

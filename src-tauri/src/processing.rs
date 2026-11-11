@@ -216,7 +216,7 @@ pub fn save_notes(path: &Path, notes: &str) -> Result<(), String> {
         }
     }
     drop(drafts);
-    library::replace_notes(path, notes)
+    crate::summaries::save_notes(&path.display().to_string(), notes, || library::replace_notes(path, notes))
 }
 
 /// A meeting is queued or being processed.
