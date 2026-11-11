@@ -169,7 +169,7 @@ fn rename_in_body(content: &str, label: &str, new_name: &str) -> String {
 
 /// Rough seconds of speech for a label: time from each of its turns to the next turn.
 fn speech_stats(content: &str, label: &str) -> (f64, u32) {
-    let re = Regex::new(r"^\[(?:(.+?) )?(\d{1,2}:\d{2}(?::\d{2})?)\]").unwrap();
+    let re = Regex::new(r"^\[(?:(.+?) )?(\d+:\d{2}(?::\d{2})?)\]").unwrap();
     let turns: Vec<(Option<String>, f64)> = content
         .lines()
         .filter_map(|l| {
@@ -232,6 +232,10 @@ mod tests {
     fn speech_stats_counts_turns() {
         let file = "[A 0:00] x\n[B 0:10] y\n[A 0:20] z\n";
         let (secs, n) = speech_stats(file, "A");
+        assert_eq!(n, 2);
+        assert!((secs - 15.0).abs() < 0.01);
+        let long = "[A 99:50] x\n[B 100:00] y\n[A 100:10] z\n";
+        let (secs, n) = speech_stats(long, "A");
         assert_eq!(n, 2);
         assert!((secs - 15.0).abs() < 0.01);
     }

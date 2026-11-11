@@ -102,6 +102,13 @@ page.on("pageerror", (e) => consoleErrors.push(e.message));
 page.on("console", (m) => m.type() === "error" && consoleErrors.push(m.text()));
 await page.addInitScript(`window.__E2E_BRIDGE__ = "http://127.0.0.1:${port.bridge}";`);
 await page.addInitScript({ path: path.join(root, "scripts/e2e/bridge-shim.js") });
+// The notepad button asks the app to resize its window. Here the page is resized instead:
+// 480 wide, or back to 1180.
+await page.exposeFunction("__e2eNotepad", async () => {
+  const wide = page.viewportSize().width >= 760;
+  await page.setViewportSize({ width: wide ? 480 : 1180, height: 760 });
+});
+await page.addInitScript(() => (window.__E2E__.onNotepad = () => window.__e2eNotepad()));
 // Record what the page copies and which sounds it plays, without needing a clipboard or speakers.
 await page.addInitScript(() => {
   window.__copied = [];
@@ -230,6 +237,9 @@ if (simulate) {
     const who = await page.locator(".draft-transcript .live-speaker").allInnerTexts();
     assert(who.includes("You") && who.includes("Them"), `draft speakers: ${who.join(",")}`);
     assert(draftFiles().some((f) => f.endsWith(".live.json")), `live draft not kept with the job: ${draftFiles().join(", ")}`);
+    // When Stop happened, and the time since (D58).
+    const since = await page.locator(".since-stop").innerText();
+    assert(/^Stopped at \d{1,2}:\d\d[\s\S]*\d+s ago$/.test(since.trim()), `since Stop: ${since}`);
     console.log(`     draft shown ${waited} ms after Stop`);
   });
   let liveFile = null;
@@ -283,6 +293,18 @@ if (simulate) {
     const notes = liveMd.slice(liveMd.indexOf("## Notes"), liveMd.indexOf("## Transcript"));
     assert(notes === "## Notes\n\n- risk: download size\n- last words before stop\n- typed while finishing (just typed)\n\n", "notes not exact:\n" + notes);
     assert(draftFiles().every((f) => f === "current.md"), `drafts left: ${draftFiles().join(", ")}`);
+  });
+  await check("the meeting shows its Start and Stop times and when it was ready", async () => {
+    // The test call is under a minute, so its start and Stop show as one time (D58).
+    const when = await page.locator(".meta-parts").first().innerText();
+    assert(/\d:\d\d/.test(when) && !/(\d+:\d\d\s*[AP]?M?)\s*–\s*\1/.test(when), `start and Stop: ${when}`);
+    const ready = await page.locator(".meta-ready").innerText();
+    assert(/^Ready at [\s\S]+ after Stop$/.test(ready), `ready line: ${ready}`);
+    const job = (await page.evaluate(() => window.__TAURI_INTERNALS__.invoke("list_jobs"))).find((j) => j.title === "QA live call");
+    assert(job.recording_started_at && job.recording_finished_at && job.ready_at, `job times: ${JSON.stringify(job)}`);
+    const wait = (Date.parse(job.ready_at) - Date.parse(job.recording_finished_at)) / 1000;
+    assert(wait > 0 && wait < 600, `ready ${wait} s after Stop`);
+    console.log(`     ready ${wait.toFixed(1)} s after Stop`);
   });
   await check("sound cues play on start, stop and ready", async () => {
     const heard = await plays();
@@ -610,6 +632,19 @@ if (summaries !== "none") {
     const asked = fs.readFileSync(path.join(out, "ollama-requests.log"), "utf8").trim().split("\n").length;
     assert(asked >= 2, `ollama asked ${asked} times`);
   });
+  await check("a failed Summarize leaves no \"Summarizing…\" behind", async () => {
+    const fail = path.join(out, "ollama-requests.log.fail");
+    fs.writeFileSync(fail, "");
+    try {
+      await page.getByRole("button", { name: "Summarize again" }).click();
+      await page.locator(".toast").filter({ hasText: /Ollama didn't finish|failed|nothing/ }).waitFor({ timeout: 120000 });
+    } finally {
+      fs.rmSync(fail, { force: true });
+    }
+    await page.getByRole("button", { name: "Summarize again" }).waitFor({ timeout: 5000 });
+    assert(!(await page.getByText("Summarizing…").isVisible()), "Summarizing… stayed after the failure");
+    assert(!(await page.locator(".writing-summary").isVisible()), "Writing the summary stayed after the failure");
+  });
   await check("a new meeting opens first, then gets its summary by itself", async () => {
     // The stand-in Ollama answers slowly now, so the order is visible: the meeting is ready
     // without a summary, shows that one is being written, then gets it (D40).
@@ -630,6 +665,27 @@ if (summaries !== "none") {
     await page.locator(".eyebrow", { hasText: "Summary" }).waitFor({ timeout: 120000 });
     await page.locator(".writing-summary").waitFor({ state: "detached", timeout: 5000 });
     assert(fs.readFileSync(path.join(meetingsDir, meetingFiles().find((x) => x.includes("qa-auto-summary"))), "utf8").includes("## Summary"), "no summary in the file");
+  });
+  await check("an untitled meeting gets its title from the summary, and keeps its file name (D59)", async () => {
+    const before = new Set(meetingFiles());
+    dev("queue", audio);
+    let file = null;
+    for (let i = 0; i < 240 && !file; i++) {
+      await page.waitForTimeout(500);
+      file = meetingFiles().find((x) => !before.has(x));
+    }
+    assert(file, "no file for the untitled meeting");
+    const title = () => (fs.readFileSync(path.join(meetingsDir, file), "utf8").match(/^title: (.*)$/m) || [])[1];
+    const fallback = title();
+    let now = fallback;
+    for (let i = 0; i < 240 && now === fallback; i++) {
+      await page.waitForTimeout(500);
+      now = title();
+    }
+    // The stand-in Ollama answers every prompt with its summary, whose first line is this.
+    assert(now === "The team reviewed the onboarding launch plan", `title: ${fallback} -> ${now}`);
+    assert(fs.existsSync(path.join(meetingsDir, file)), "the file was renamed");
+    await page.locator(".row").filter({ hasText: "The team reviewed the onboarding launch plan" }).first().waitFor({ timeout: 10000 });
   });
 }
 
@@ -1047,6 +1103,22 @@ await check("a narrow window shows one column and the sidebar as a drawer", asyn
   await page.locator(".sidebar").first().waitFor();
 });
 
+await check("the notepad button narrows the window and brings it back (D57)", async () => {
+  const toggle = page.getByRole("button", { name: "Notepad view" });
+  assert((await toggle.getAttribute("aria-pressed")) === "false", "pressed in a wide window");
+  await toggle.click();
+  await page.locator(".shell.is-compact").waitFor({ timeout: 5000 });
+  assert(page.viewportSize().width === 480, `width ${page.viewportSize().width}`);
+  assert((await toggle.getAttribute("aria-pressed")) === "true", "not pressed in the notepad view");
+  // The title row: the sidebar button, then the notepad button, on one line.
+  const [a, b] = await Promise.all([page.locator(".sidebar-toggle").boundingBox(), toggle.boundingBox()]);
+  assert(a.y === b.y && b.x > a.x + a.width - 1, `toggles: ${JSON.stringify([a, b])}`);
+  await page.screenshot({ path: path.join(out, "notepad-view.png") });
+  await toggle.click();
+  await page.locator(".shell.is-compact").waitFor({ state: "detached", timeout: 5000 });
+  assert(page.viewportSize().width === 1180, `width ${page.viewportSize().width}`);
+});
+
 // ---------------------------------------------------------------- settings: model switch
 if (flag("--download")) {
   await check("switching to Fast downloads it with progress", async () => {
@@ -1337,14 +1409,18 @@ await check("settings: back to the Whisper live transcript", async () => {
 
 // ---------------------------------------------------------------- reset
 await check("a long meeting's transcript and notes scroll", async () => {
-  // An 80-minute meeting: hundreds of turns. The columns must scroll, not grow past the window.
-  const turns = Array.from({ length: 400 }, (_, i) => `[SPEAKER_${i % 3} ${Math.floor(i / 5)}:${String((i * 12) % 60).padStart(2, "0")}] Line ${i} of a long meeting about the bill of materials.`);
+  // A long meeting: hundreds of turns. The columns must scroll, not grow past the window.
+  // Two hours: core writes [100:00] and later with no limit on the minutes, and each of
+  // those lines must stay its own turn.
+  const turns = Array.from({ length: 400 }, (_, i) => `[SPEAKER_${i % 3} ${Math.floor(i * 18 / 60)}:${String((i * 18) % 60).padStart(2, "0")}] Line ${i} of a long meeting about the bill of materials.`);
   const notes = Array.from({ length: 80 }, (_, i) => `- note ${i}`).join("\n");
   fs.writeFileSync(path.join(meetingsDir, "2026-11-05-qa-long-meeting.md"),
-    `---\ntitle: QA long meeting\ntype: meeting\ndate: 2026-11-05T10:36:00+05:30\nduration: 80m 32s\n---\n\n## Notes\n\n${notes}\n\n## Transcript\n\n${turns.join("\n")}\n`);
+    `---\ntitle: QA long meeting\ntype: meeting\ndate: 2026-11-05T10:36:00+05:30\nduration: 2h 0m\n---\n\n## Notes\n\n${notes}\n\n## Transcript\n\n${turns.join("\n")}\n`);
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.locator(".row").filter({ hasText: "QA long meeting" }).first().click();
   await page.locator(".turn").nth(399).waitFor({ state: "attached", timeout: 8000 });
+  assert((await page.locator(".turn").count()) === 400, `${await page.locator(".turn").count()} turns, not 400`);
+  assert((await page.locator(".turn").nth(399).locator(".ts").innerText()) === "119:42", "the last turn's time");
   for (const col of [".transcript-col", ".notes-col"]) {
     const [sh, ch, bottom, vh] = await page.locator(col).evaluate((el) => [el.scrollHeight, el.clientHeight, el.getBoundingClientRect().bottom, window.innerHeight]);
     assert(bottom <= vh + 0.5, `${col} ends at ${bottom}px, below the window (${vh}px)`);

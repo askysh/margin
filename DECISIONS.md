@@ -361,7 +361,10 @@ The full comparison is in `docs/parity/app.md`.
 - Now: the processing worker runs with summaries off. When the meeting is ready, Margin
   opens it and writes the summary in the background with the engine from Settings. The
   meeting view says "Writing the summary" and fills it in when it lands. Margin holds the
-  file's lock during the rewrite, so notes typed meanwhile are saved after it.
+  file's lock during the rewrite. Notes typed meanwhile go into a draft, as in D43, and
+  into the file when the summary ends (since 0.0.10: before, the saves waited behind the
+  lock, and a Quit lost them). A draft that a Quit left goes into the file at the next
+  launch.
 - Claude gets 15 minutes for a summary instead of 5, because nothing waits for it now.
 - Cost: core's LLM speaker naming (it guesses names from the notes during the summary
   step) no longer runs during processing. Renaming a speaker once, with voice memory,
@@ -465,7 +468,8 @@ The full comparison is in `docs/parity/app.md`.
 - Stop waits up to 20 s for a piece that is being transcribed, because the final pass
   would take longer to redo it.
 - A title typed during the meeting changes the transcriber's hints. Pieces made before the
-  change no longer match, and core transcribes their range again after Stop.
+  change no longer match, and core transcribes their range again after Stop. **Changed by
+  D60:** rolling now does those pieces again during the meeting.
 - Measured with `margin --dev rolling-job` on the synthetic calls, Balanced (details in
   docs/research/live-transcription.md, "Rolling transcription in the app"):
   - 20-minute call: the transcript is ready 6.9 s after Stop, against 78 s without
@@ -879,3 +883,113 @@ The full comparison is in `docs/parity/app.md`.
 - Cost: Margin maintains a Swift helper, and the build needs Xcode 26 or later, as
   minutes-core already does. The upstream route stays open: when core allows Apple Speech
   during a recording, Margin can drop the helper.
+
+## The notepad view and meeting times
+
+### D57. A direct way into the notepad view, and back
+- New fact: the owner uses the notepad view (D51) every day, beside a call. The only way
+  into it was to drag the window narrower by hand, and the only way back was to drag it
+  wider again. The owner asked for a direct way.
+- Options:
+  - (a) A separate notepad window.
+  - (b) A mode flag that changes the layout, apart from the width.
+  - (c) The width stays the only switch. A command resizes the window, and leaving puts
+    the window back where it was.
+- Pick: **(c)**. The layout still follows the width (under 760 px is the notepad), so a
+  resize by hand still works, and there is one state, not two.
+  - Ways in and out: View → "Enter Notepad View" or "Leave Notepad View" (⌘⇧N), and a
+    button right of the sidebar button in the title row. The menu bar item has "Open as
+    Notepad". `notepad.rs`.
+  - Entering keeps the window's top, bottom and right edge, at 480 px wide. Leaving
+    restores the last wide frame. Margin also remembers the last notepad frame, so a
+    notepad that you moved or resized comes back where you left it. A frame that no
+    longer fits the screen is moved and shrunk onto it. The frames are kept for the run
+    only, because the window opens wide at each launch.
+  - AppKit animates the resize (`setFrame:display:animate:`).
+  - The recording chip gets no new control. A click on it brings the window back in the
+    view it had, and D53 keeps the chip to the time, Stop and Notes.
+  - The traffic lights move down 6 pt (`trafficLightPosition` y 22 → 28). At 22 their
+    centre was 20 pt from the top, and the title row's controls are centred at 26 pt in
+    the 52 pt row. Now all of them share one centre line, in both views.
+
+### D58. Start, Stop and ready times come from core's job record
+- New fact: the owner asked to see the recording's start and Stop times, and when the
+  notes were ready, as numbers in the app. Long waits after Stop are the problem the
+  owner works on upstream, so the time from Stop to ready matters most.
+- Options for the data:
+  - (a) Add the times to the meeting file. That changes the meeting file format, which
+    Obsidian, the minutes CLI and MCP read. Not without the owner's OK.
+  - (b) Work out Stop as the date plus the duration. The duration is the audio's length,
+    not the clock's, and there is no ready time in the file.
+  - (c) Core's job record. Core writes `recording_started_at`, `recording_finished_at`
+    and `finished_at` for each job, and keeps finished jobs in `<state>/jobs/archive/`.
+    It does not prune that folder.
+- Pick: **(c)**. `processing::times_for` finds the newest job whose `output_path` is the
+  meeting file. It reads the active jobs, then the archive. The archive listing is kept
+  until the folder changes, as in D32.
+  - The header shows "Tue, 10 Nov • 11:31 AM – 12:24 PM • 53m 3s • people". Under it, a
+    quiet line shows "Ready at 3:00 PM • 2h 36m after Stop".
+  - "Ready" is the job's `finished_at`: the time core finished the transcript and the
+    speakers, which is when the "Meeting ready" notification goes out. It is shown only
+    for a job that produced a meeting. The summary comes later (D40) and is not in it.
+  - The processing view shows "Stopped at 12:24 PM • 4m 12s ago". It counts each second.
+  - A value that the record does not have is left out. An older meeting, a meeting from
+    the minutes CLI, or a file renamed since it was written shows the date and the start
+    time as before. A Stop before the start, or a ready time before Stop, shows nothing.
+  - A recording inside one minute shows one time, not "10:37 AM – 10:37 AM".
+  - One separator for the whole header: the `·` in the date and the `•` dot between
+    parts were mixed. A dot that would start a line is clipped, so a wrap leaves no dot
+    at the end of a line.
+
+## Real recordings, 2026-11-10
+
+### D59. An untitled meeting gets its title from the summary, in the frontmatter only
+- New fact: the owner's 53-minute call had no title at Stop. It is titled "Akash", from
+  the first words of the transcript. The worker runs with summaries off (D40), so core's
+  title step had no summary text, logged `missing-summary-text`, and kept that fallback.
+  The summary that Margin writes later never set a title.
+- Options:
+  - (a) Keep the fallback title.
+  - (b) Turn summaries on in the worker. That brings back the wait that D40 removed.
+  - (c) After the summary, ask the summary engine for a title, with core's public
+    `summarize::refine_title`, and change the title in the frontmatter only.
+  - (d) As (c), and rename the file with core's `markdown::rename_meeting`, as core does
+    when it makes a title.
+- Pick: **(c)**.
+  - Only for a meeting that had no title at Stop. Stop leaves a marker,
+    `drafts/<job>.untitled`. A title typed in the meeting view before the summary ends
+    is kept.
+  - The file keeps its name, as with a title typed in the meeting view (`set_title`).
+    Links from Obsidian notes, the job record that gives the meeting's times (D58) and
+    Ask's chat key keep working.
+  - Margin checks the model's answer: one line, 2 to 12 words, at most 80 characters,
+    and not a sentence about the task. Else the meeting keeps its title. Core's own check
+    is private.
+- Cost: one more call to the summary engine for each untitled meeting. The file name
+  still has the fallback words.
+- Upstream: core's resummarize could return the title that the summary call already
+  writes (`Summary.title`), so no second call is needed.
+
+### D60. Rolling pieces are done again when the title or the settings change
+- New fact: on the owner's real call on 2026-11-10, a title typed after Start changed the
+  decode hints. Core rejected the first microphone piece (114 s of audio) at Stop with
+  "different transcription settings" and transcribed it again. That took 55 s of the wait
+  after Stop. D47 knew about the rejection, but not its cost.
+- Related risk: rolling loads the config at Start, and the worker loads it again at Stop.
+  A Settings change during a meeting made every piece fail the check.
+- Options:
+  - (a) Keep D47: core does the range again after Stop.
+  - (b) Hold the title until Stop. The title also goes into the hints of every later
+    piece, so this changes nothing.
+  - (c) When the inputs change, do the finished pieces again from the stem file during
+    the meeting, when the thread has no new piece to do.
+- Pick: **(c)**. `rolling.rs` keeps the inputs of each piece: the transcription settings
+  and the decode hints. Each loop reads the title, and the config file when its
+  modification time changed. When the thread is idle, it does again the first piece
+  whose inputs are not the current ones. New audio always comes first. A piece that fails
+  the second time is dropped, and the final pass covers its range.
+- A title typed in the last minute before Stop can still leave pieces that do not match.
+  Stop waits for at most one piece (20 s), as before.
+- Not measured on a real call yet. The log line "rolling transcription finished" now
+  counts `redone`.
+

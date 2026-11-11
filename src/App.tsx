@@ -10,6 +10,7 @@ import { COMPACT_QUERY, OneColumnContext, oneColumnQuery, useMediaQuery } from "
 import { UpdateBanner } from "./components/Updates";
 import { clock, meetingFileReady } from "./util";
 import { useCues } from "./cues";
+import { useMenu } from "./menu";
 import type { SectionId } from "./components/SettingsNav";
 
 // Rarely shown, so loaded on first use instead of at startup (docs/perf.md).
@@ -128,6 +129,8 @@ export default function App() {
       ),
       on<{ elapsed_secs: number; level: number }>("recorder-tick", setTick),
       on<Job[]>("jobs", setJobs),
+      // A summary changes the list's snippet, and can give an untitled meeting its title (D59).
+      on<{ path: string; running: boolean }>("summary-status", (e) => !e.running && refreshMeetings()),
       on<{ job_id: string; path: string }>("meeting-ready", ({ job_id, path }) => {
         refreshMeetings();
         const sel = selectionRef.current;
@@ -286,6 +289,17 @@ export default function App() {
           <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><rect x="2.5" y="3.5" width="15" height="13" rx="2.5" stroke="currentColor" strokeWidth="1.5" fill="none" /><path d="M7.5 3.5v13" stroke="currentColor" strokeWidth="1.5" /></svg>
         </button>
       )}
+      {!settings && (
+        <button
+          className="icon-btn notepad-toggle"
+          aria-label="Notepad view"
+          aria-pressed={compact}
+          title={compact ? "Leave the notepad view (⌘⇧N)" : "Notepad view: a narrow window beside your call (⌘⇧N)"}
+          onClick={() => api.toggleNotepad().catch((e) => notify(errorText(e), "error"))}
+        >
+          <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><rect x="5.5" y="2.5" width="9" height="15" rx="2" stroke="currentColor" strokeWidth="1.5" fill="none" /><path d="M8 7h4M8 10.5h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+        </button>
+      )}
       {drawerOpen && <div className="drawer-scrim" onClick={() => setDrawer(false)} aria-hidden />}
       {settings && (
         <Suspense fallback={<aside className="sidebar set-nav" />}>
@@ -337,7 +351,8 @@ export default function App() {
             <RecordButton busy={busy} onStart={start} />
           )}
           <button className="icon-btn" title={settings ? "Back (Esc)" : "Settings (⌘,)"} aria-label="Settings" aria-pressed={!!settings} onClick={() => (settings ? closeSettings() : openSettings())}>
-            <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><path fill="currentColor" d="M11.4 1.5l.5 2.3c.5.2 1 .5 1.4.8l2.2-.8 1.4 2.4-1.7 1.6c.1.5.1 1.1 0 1.6l1.7 1.6-1.4 2.4-2.2-.8c-.4.3-.9.6-1.4.8l-.5 2.3H8.6l-.5-2.3c-.5-.2-1-.5-1.4-.8l-2.2.8-1.4-2.4 1.7-1.6a4 4 0 010-1.6L3.1 6.2l1.4-2.4 2.2.8c.4-.3.9-.6 1.4-.8l.5-2.3h2.8zM10 7a3 3 0 100 6 3 3 0 000-6z" /></svg>
+            {/* The gear's teeth span y 1.5 to 16.5: the view box moves it down 1 unit, onto the centre line. */}
+            <svg width="17" height="17" viewBox="0 -1 20 20" aria-hidden><path fill="currentColor" d="M11.4 1.5l.5 2.3c.5.2 1 .5 1.4.8l2.2-.8 1.4 2.4-1.7 1.6c.1.5.1 1.1 0 1.6l1.7 1.6-1.4 2.4-2.2-.8c-.4.3-.9.6-1.4.8l-.5 2.3H8.6l-.5-2.3c-.5-.2-1-.5-1.4-.8l-2.2.8-1.4-2.4 1.7-1.6a4 4 0 010-1.6L3.1 6.2l1.4-2.4 2.2.8c.4-.3.9-.6 1.4-.8l.5-2.3h2.8zM10 7a3 3 0 100 6 3 3 0 000-6z" /></svg>
           </button>
         </header>
         <section className="content">
@@ -453,13 +468,7 @@ function writePref(key: string, value: string | null) {
 }
 
 function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => void }) {
-  const [open, setOpen] = useState(false);
-  useEffect(() => {
-    if (!open) return;
-    const close = () => setOpen(false);
-    window.addEventListener("click", close);
-    return () => window.removeEventListener("click", close);
-  }, [open]);
+  const [open, setOpen] = useMenu();
   return (
     <div className="split">
       <button className="btn btn-primary split-main" disabled={busy} onClick={() => onStart("call")} title="Records your mic and the other people on the call (⌘⇧R)">

@@ -78,6 +78,7 @@ fn menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
         menu.append(&MenuItem::with_id(app, "update", format!("Restart to update to {version}"), !state.recording, None::<&str>)?)?;
     }
     menu.append(&MenuItem::with_id(app, "open", "Open Margin", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(app, "open-notepad", "Open as Notepad", true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "Quit Margin", true, Some("CmdOrCtrl+Q"))?)?;
     *RECENT_PATHS.lock().unwrap() = state.recent.iter().map(|(p, _)| p.clone()).collect();
@@ -192,6 +193,10 @@ fn handle(app: &AppHandle, id: &str) {
             });
         }
         "open" => show_main(app),
+        "open-notepad" => {
+            show_main(app);
+            crate::notepad::set(app, true);
+        }
         "settings" => {
             show_main(app);
             events::emit("open-settings", ());

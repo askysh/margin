@@ -76,10 +76,13 @@ button { cursor: default; }
 .search input::placeholder { color: var(--pencil); }
 .list { overflow-y: auto; padding: 0 8px 16px; flex: 1; }
 .group-label { font-size: 11px; font-weight: 600; color: var(--pencil); padding: 14px 8px 4px; }
-.row { display: grid; gap: 1px; width: 100%; text-align: left; border: none; background: none; padding: 6px 8px; border-radius: 7px; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; width: 100%; text-align: left; border: none; background: none; padding: 6px 8px; border-radius: 7px; }
 .row:hover { background: color-mix(in srgb, var(--ink) 5%, transparent); }
 .row.selected { background: color-mix(in srgb, var(--rule) 20%, transparent); }
-.row-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; }
+/* A block, not flex: text-overflow does not reach the text inside a flex container, so a
+   long title was cut with no ellipsis. */
+.row-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; min-width: 0; }
+.row-title .rec-dot { vertical-align: 1px; }
 .row-meta { font-size: 11.5px; color: var(--pencil); display: flex; align-items: center; gap: 2px; overflow: hidden; white-space: nowrap; }
 .row-hit { font-size: 11.5px; color: var(--ink-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-top: 2px; }
 .row-live .row-meta { color: var(--tally); }
@@ -105,7 +108,14 @@ button { cursor: default; }
 }
 .title-input { border: none; outline: none; background: none; width: 100%; padding: 0; }
 .title-input::placeholder { color: color-mix(in srgb, var(--pencil) 70%, transparent); }
-.meta-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--pencil); font-size: 12.5px; margin-bottom: 18px; }
+.meta { margin-bottom: 18px; display: grid; gap: 2px; overflow: hidden; padding: 2px 0; }
+.meta-line.meta-parts { margin-left: -15px; gap: 2px 0; }
+.meta-parts > span { display: inline-flex; align-items: center; }
+.meta-parts > span::before { content: ""; flex: none; width: 3px; height: 3px; margin: 0 6px; border-radius: 50%; background: currentColor; opacity: 0.6; }
+.meta-line { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; color: var(--pencil); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.page-live .meta-line { margin-bottom: 18px; }
+.since-stop .meta-line { margin-top: 0; margin-bottom: 0; }
+.meta-ready { font-size: 12px; margin-top: 0; margin-bottom: 0; }
 .dot-sep { width: 3px; height: 3px; border-radius: 50%; background: currentColor; opacity: 0.6; }
 .actions { display: flex; gap: 16px; flex-wrap: wrap; margin: -6px 0 26px; }
 .eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--rule); margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
@@ -121,7 +131,14 @@ button { cursor: default; }
   background-attachment: local; background-position: 0 6px; overflow: hidden; white-space: pre-wrap;
 }
 .notes::placeholder { color: var(--pencil); opacity: 0.8; }
-.notes-static { min-height: 0; }
+.notes-static {
+  min-height: 0; padding-bottom: 6px;
+  /* The ruling tiles upward too, so a pre showed a rule above its first line. A band of
+     paper covers it, and the padding gives the last line its rule. */
+  background:
+    linear-gradient(var(--paper), var(--paper)) 0 0 / 100% 6px no-repeat,
+    repeating-linear-gradient(to bottom, transparent 0, transparent calc(var(--line) - 1px), var(--hair) calc(var(--line) - 1px), var(--hair) var(--line)) 0 6px;
+}
 .your-notes { margin-top: 26px; }
 
 .summary-block { margin-bottom: 24px; }
@@ -428,11 +445,15 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
 
 /* ---------------------------------------------------------------- sidebar: docked, hidden, drawer (D51) */
 /* One place for the toggle, right of the traffic lights, whether the sidebar shows or not. */
-.sidebar-toggle { position: fixed; top: 12px; left: 84px; z-index: 45; }
+.sidebar-toggle, .notepad-toggle { position: fixed; top: 12px; left: 84px; z-index: 45; }
+.notepad-toggle { left: 116px; }
+/* The layout already shows that the notepad view is on, so the button keeps no tint. */
+.notepad-toggle[aria-pressed="true"] { background: none; color: var(--ink-2); }
+.notepad-toggle[aria-pressed="true"]:hover { background: var(--paper-2); color: var(--ink); }
 .shell.sidebar-hidden { grid-template-columns: minmax(0, 1fr); }
 .shell.sidebar-hidden > .sidebar { display: none; }
 .shell.sidebar-hidden > .pane { grid-area: 1 / 1; }
-.shell.sidebar-hidden .toolbar { padding-left: 124px; }
+.shell.sidebar-hidden .toolbar { padding-left: 156px; }
 /* A narrow window: the sidebar opens over the notes and closes when you pick a meeting. */
 .shell.drawer-open > .sidebar:not(.set-nav) {
   display: flex; position: fixed; top: 0; bottom: 0; left: 0; width: min(280px, 86vw); z-index: 40;
@@ -440,9 +461,10 @@ kbd { font-family: var(--f-note); font-variation-settings: "MONO" 1; font-size: 
 }
 .drawer-scrim { position: fixed; inset: 0; z-index: 39; background: rgba(20, 26, 32, 0.18); animation: fadein 160ms ease-out; }
 @keyframes drawer-in { from { transform: translateX(-24px); opacity: 0; } }
-/* Settings in a narrow window: its nav shows icons only. */
-.shell.is-compact.is-settings { grid-template-columns: 52px minmax(0, 1fr); }
-.shell.is-compact.is-settings .toolbar { padding-left: 44px; }
+/* Settings in a narrow window: its nav shows icons only. The nav is as wide as the space
+   left of the sidebar button, so the traffic lights sit inside it and do not cross its
+   border. */
+.shell.is-compact.is-settings { grid-template-columns: 84px minmax(0, 1fr); }
 .is-compact .set-nav .set-nav-label, .is-compact .set-nav .row-kbd { display: none; }
 .is-compact .set-nav-back, .is-compact .set-nav-item { justify-content: center; padding: 6px 0; }
 .is-compact .set-nav-back { width: calc(100% - 12px); margin: 0 6px 10px; }
@@ -560,7 +582,7 @@ textarea.field { max-width: none; resize: vertical; min-height: 64px; line-heigh
 
 /* Sidebar: a small mark at the right of the title-bar strip, level with the traffic lights.
    It lets drags through, so the strip still moves the window. */
-.sidebar-top { display: flex; justify-content: flex-end; align-items: flex-start; padding: 17px 16px 0 0; }
+.sidebar-top { display: flex; justify-content: flex-end; align-items: flex-start; padding: 15px 16px 0 0; }
 .sidebar-brand { pointer-events: none; opacity: 0.9; }
 
 /* The mark sits in a square with room above and below the line; the negative margins

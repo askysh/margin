@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { api, errorText } from "../api";
 import { copyText } from "../util";
 import { Logo } from "./Logo";
@@ -7,10 +8,22 @@ import { Card, Row, SectionHead, ToggleRow } from "./SettingsRows";
 import { restart, useUpdateStatus } from "./Updates";
 import type { SettingsView } from "./Settings";
 
-export function VoicesSection({ voices, setVoices }: SettingsView) {
-  const forget = async (slug: string) => {
-    await api.forgetVoice(slug);
-    setVoices(await api.listVoices());
+export function VoicesSection({ voices, setVoices, notify }: SettingsView) {
+  const forget = async (slug: string, name: string) => {
+    const sure = await ask(`Margin stops labelling ${name} by voice in new meetings. Meetings that already name ${name} stay as they are.`, {
+      title: `Forget ${name}'s voice?`,
+      kind: "warning",
+      okLabel: "Forget",
+      cancelLabel: "Cancel",
+    });
+    if (!sure) return;
+    try {
+      await api.forgetVoice(slug);
+      notify(`Margin forgot ${name}'s voice.`);
+    } catch (e) {
+      notify(`Couldn't forget ${name}'s voice: ${errorText(e)}`, "error");
+    }
+    setVoices(await api.listVoices().catch(() => voices));
   };
   return (
     <>
@@ -28,7 +41,7 @@ export function VoicesSection({ voices, setVoices }: SettingsView) {
             {voices.map((v) => (
               <li key={v.slug}>
                 <Row title={v.name} help={`${v.samples} sample${v.samples === 1 ? "" : "s"}`}>
-                  <button className="btn btn-quiet btn-danger-quiet" aria-label={`Forget ${v.name}`} onClick={() => forget(v.slug)}>Forget</button>
+                  <button className="btn btn-quiet btn-danger-quiet" aria-label={`Forget ${v.name}`} onClick={() => forget(v.slug, v.name)}>Forget</button>
                 </Row>
               </li>
             ))}

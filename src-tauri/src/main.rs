@@ -14,6 +14,7 @@ mod extras;
 mod fsutil;
 mod library;
 mod models;
+mod notepad;
 mod notify;
 mod paths;
 mod permissions;
@@ -46,8 +47,16 @@ fn main() {
     minutes_core::install_whisper_logging_hooks();
     init_logging();
     extend_path();
+    let worker = std::env::args().any(|a| a == processing::WORKER_FLAG);
+    let dev = std::env::args().nth(1).as_deref() == Some("--dev");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        role = if worker { "worker" } else if dev { "dev" } else { "app" },
+        "Margin started"
+    );
 
-    if std::env::args().any(|a| a == processing::WORKER_FLAG) {
+    if worker {
         extras::use_state_cwd();
         minutes_core::exit_without_cxx_teardown(processing::run_worker_mode());
     }
@@ -76,10 +85,17 @@ fn main() {
                 }
                 let _ = window.set_content_protected(screenshare::hidden());
                 let _ = if at_login { window.hide() } else { window.show() };
+                // The notepad view follows the width (D57). Log the first size, so a window
+                // that opens narrow can be explained.
+                if let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) {
+                    tracing::info!(width = size.width as f64 / scale, height = size.height as f64 / scale, "main window opened");
+                }
             }
+            notepad::install_menu(&handle)?;
             tray::init(&handle)?;
             notify::init(&handle);
             shortcut::refresh(&handle);
+            summaries::recover_notes_drafts();
             processing::spawn_watcher();
             // A model that this version needs and an earlier one did not, such as the live
             // transcript model for Best (D52), downloads in the background.
@@ -105,7 +121,11 @@ fn main() {
                 }
                 // Minimize, restore and focus changes can show or hide the window. The
                 // recorder's tick also checks, for changes with no event, such as ⌘H.
-                WindowEvent::Focused(_) | WindowEvent::Resized(_) => chip::sync(window.app_handle()),
+                WindowEvent::Focused(_) => chip::sync(window.app_handle()),
+                WindowEvent::Resized(_) => {
+                    chip::sync(window.app_handle());
+                    notepad::sync_menu(window.app_handle());
+                }
                 _ => {}
             }
         })
@@ -126,6 +146,7 @@ fn main() {
             commands::tauri_cmds::stop_recording,
             commands::tauri_cmds::recorder_view,
             commands::tauri_cmds::shrink_to_chip,
+            commands::tauri_cmds::toggle_notepad,
             commands::tauri_cmds::chip_open_notes,
             commands::tauri_cmds::chip_stop,
             chip::chip_hello,
@@ -217,6 +238,7 @@ fn route(app: &tauri::AppHandle, name: &str, payload: serde_json::Value) {
         _ => {
             match name {
                 events::SHRINK_TO_CHIP => chip::shrink(app),
+                events::NOTEPAD_TOGGLE => notepad::toggle(app),
                 events::OPEN_LIVE => tray::show_main(app),
                 "recorder" => chip::sync(app),
                 "recorder-tick" => {

@@ -128,9 +128,9 @@ const MeetingRows = memo(function MeetingRows({ groups, hits, selectedPath, onSe
             >
               <span className="row-title">{m.title}</span>
               <span className="row-meta">
-                <span className="mono">{shortTime(m.date)}</span>
-                {m.duration && <span className="mono"> · {m.duration}</span>}
-                {m.kind === "memo" && <span> · memo</span>}
+                {/* One text run: a flex row drops the space at the start of a span. */}
+                <span className="mono">{[shortTime(m.date), m.duration].filter(Boolean).join(" · ")}</span>
+                {m.kind === "memo" && <span>&nbsp;· memo</span>}
               </span>
               {hits?.get(m.path) && <span className="row-hit">{hits.get(m.path)}</span>}
             </button>

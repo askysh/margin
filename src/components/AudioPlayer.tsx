@@ -31,12 +31,18 @@ export const AudioPlayer = forwardRef<AudioHandle, Props>(function AudioPlayer({
     };
   }, [path]);
 
+  // play() rejects with AbortError when a pause or a new seek comes before it starts, for
+  // example two timestamp clicks in a row. That is not a broken recording.
+  const playFailed = (e: unknown) => {
+    if ((e as DOMException | null)?.name !== "AbortError") setFailed(true);
+  };
+
   useImperativeHandle(ref, () => ({
     playFrom(secs: number) {
       const el = audio.current;
       if (!el) return;
       el.currentTime = Math.max(0, secs);
-      el.play().catch(() => setFailed(true));
+      el.play().catch(playFailed);
     },
   }));
 
@@ -46,7 +52,7 @@ export const AudioPlayer = forwardRef<AudioHandle, Props>(function AudioPlayer({
   const toggle = () => {
     const el = audio.current;
     if (!el) return;
-    if (el.paused) el.play().catch(() => setFailed(true));
+    if (el.paused) el.play().catch(playFailed);
     else el.pause();
   };
   const moved = () => {

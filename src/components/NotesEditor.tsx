@@ -23,12 +23,30 @@ export function NotesEditor({ value, onChange, placeholder, autoFocus, readOnly 
       el.setSelectionRange(caret.current, caret.current);
       caret.current = null;
     }
-    const scroller = el.closest(".notes-col");
-    const keep = scroller?.scrollTop ?? 0;
-    el.style.height = "0px";
-    el.style.height = `${Math.max(el.scrollHeight, 240)}px`;
-    if (scroller) scroller.scrollTop = keep;
+    fit(el);
   }, [value]);
+
+  // A narrower column wraps more lines, so the box must grow then too, or the end of the
+  // notes is cut off. Only a change of width fits it again: fit() changes the height.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let width = el.getBoundingClientRect().width;
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      const now = el.getBoundingClientRect().width;
+      if (now === width) return;
+      width = now;
+      // In the next frame: a height change inside the callback is a ResizeObserver loop.
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => fit(el));
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, []);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key !== "Enter" || e.shiftKey || e.metaKey || e.altKey || e.nativeEvent.isComposing) return;
@@ -66,4 +84,13 @@ export function NotesEditor({ value, onChange, placeholder, autoFocus, readOnly 
       aria-label="Your notes"
     />
   );
+}
+
+/** Sets the box to the height of its text, at least 240 px, and keeps the page's scroll. */
+function fit(el: HTMLTextAreaElement) {
+  const scroller = el.closest(".notes-col");
+  const keep = scroller?.scrollTop ?? 0;
+  el.style.height = "0px";
+  el.style.height = `${Math.max(el.scrollHeight, 240)}px`;
+  if (scroller) scroller.scrollTop = keep;
 }

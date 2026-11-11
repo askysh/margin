@@ -119,6 +119,9 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 None,
             )
             .map_err(|e| e.to_string())?;
+            if job.title.is_none() {
+                crate::processing::mark_untitled(&job.id);
+            }
             crate::processing::save_draft(&job.id, &notes);
             crate::processing::spawn_worker();
             println!("{}", job.id);
