@@ -10,6 +10,7 @@ import { COMPACT_QUERY, OneColumnContext, oneColumnQuery, useMediaQuery } from "
 import { UpdateBanner } from "./components/Updates";
 import { clock, meetingFileReady } from "./util";
 import { useCues } from "./cues";
+import { useMenu } from "./menu";
 import type { SectionId } from "./components/SettingsNav";
 
 // Rarely shown, so loaded on first use instead of at startup (docs/perf.md).
@@ -465,13 +466,7 @@ function writePref(key: string, value: string | null) {
 }
 
 function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => void }) {
-  const [open, setOpen] = useState(false);
-  useEffect(() => {
-    if (!open) return;
-    const close = () => setOpen(false);
-    window.addEventListener("click", close);
-    return () => window.removeEventListener("click", close);
-  }, [open]);
+  const [open, setOpen] = useMenu();
   return (
     <div className="split">
       <button className="btn btn-primary split-main" disabled={busy} onClick={() => onStart("call")} title="Records your mic and the other people on the call (⌘⇧R)">

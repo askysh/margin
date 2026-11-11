@@ -51,6 +51,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
   longer cut off.
 - A long meeting title in the sidebar ends in "…" in place of a hard cut.
 - A summary heading with a Unicode line separator no longer freezes the window.
+- Copy, More and the Record menu close each other, so only one is open at a time. Esc
+  closes the Record menu too.
 
 ## [0.0.9] - 2026-11-10
 
