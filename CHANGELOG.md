@@ -30,6 +30,7 @@ on) point to [DECISIONS.md](DECISIONS.md).
   line. Before, those lines joined the line before them.
 - Move to Trash and Reset now also move the hidden backups that "Summarize again" keeps
   beside a meeting. Each one is a full copy of the meeting (D10).
+- A failed Summarize no longer leaves "Summarizing…" on the meeting.
 
 ## [0.0.9] - 2026-11-10
 

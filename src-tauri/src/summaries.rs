@@ -95,8 +95,12 @@ pub fn start(path: &str) -> Option<RunningGuard> {
 pub struct RunningGuard(String);
 
 impl Drop for RunningGuard {
+    /// Every run ends with `running: false`, also a run that failed or was refused, so the
+    /// meeting view never keeps "Summarizing…" after it. The background run sends one more
+    /// event with the error.
     fn drop(&mut self) {
         RUNNING.lock().unwrap().retain(|p| p != &self.0);
+        crate::events::emit("summary-status", serde_json::json!({ "path": self.0, "running": false }));
     }
 }
 

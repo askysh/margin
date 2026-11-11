@@ -162,7 +162,10 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
     } catch (e) {
       notify(errorText(e), "error");
     } finally {
+      // This run is over, so no summary is being written. A failed run leaves the file as
+      // it was, so `load` reads nothing new and can't clear it.
       setSummarizing(false);
+      setWriting(false);
     }
   };
 
