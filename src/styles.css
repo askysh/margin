@@ -128,7 +128,14 @@ button { cursor: default; }
   background-attachment: local; background-position: 0 6px; overflow: hidden; white-space: pre-wrap;
 }
 .notes::placeholder { color: var(--pencil); opacity: 0.8; }
-.notes-static { min-height: 0; }
+.notes-static {
+  min-height: 0; padding-bottom: 6px;
+  /* The ruling tiles upward too, so a pre showed a rule above its first line. A band of
+     paper covers it, and the padding gives the last line its rule. */
+  background:
+    linear-gradient(var(--paper), var(--paper)) 0 0 / 100% 6px no-repeat,
+    repeating-linear-gradient(to bottom, transparent 0, transparent calc(var(--line) - 1px), var(--hair) calc(var(--line) - 1px), var(--hair) var(--line)) 0 6px;
+}
 .your-notes { margin-top: 26px; }
 
 .summary-block { margin-bottom: 24px; }
