@@ -65,10 +65,22 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen,
     checkReady();
   }, [open, checkReady]);
 
+  // The meeting this panel shows now. A reply for another one, after a fast switch, is
+  // dropped, so the panel never shows the previous meeting's thread.
+  const shownPath = useRef(path);
+  shownPath.current = path;
   useEffect(() => {
+    let live = true;
+    keyRef.current = null;
     setThread(null);
     setSendError(null);
-    api.chatThread(path).then(show).catch((e) => setSendError(errorText(e)));
+    api
+      .chatThread(path)
+      .then((t) => live && show(t))
+      .catch((e) => live && setSendError(errorText(e)));
+    return () => {
+      live = false;
+    };
   }, [path, show]);
 
   useEffect(() => {
@@ -123,12 +135,14 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen,
     setDraft("");
     const seq = doneSeq.current;
     const streamed = streamSeq.current;
+    const sentFor = path;
     try {
       const t = await api.chatSend(path, text);
-      if (doneSeq.current !== seq) return;
+      if (doneSeq.current !== seq || shownPath.current !== sentFor) return;
       if (streamSeq.current === streamed) show(t);
       else setThread(t);
     } catch (e) {
+      if (shownPath.current !== sentFor) return;
       setDraft(text);
       setSendError(errorText(e));
       checkReady();
@@ -136,8 +150,9 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen,
   };
 
   const clear = async () => {
+    const clearedFor = path;
     await api.chatClear(path).catch(() => {});
-    if (thread) show({ ...thread, messages: [], session_id: null, running: false, partial: "", activity: null });
+    if (thread && shownPath.current === clearedFor) show({ ...thread, messages: [], session_id: null, running: false, partial: "", activity: null });
     input.current?.focus();
   };
 

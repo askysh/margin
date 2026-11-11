@@ -53,6 +53,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - A summary heading with a Unicode line separator no longer freezes the window.
 - Copy, More and the Record menu close each other, so only one is open at a time. Esc
   closes the Record menu too.
+- Ask no longer shows the previous meeting's conversation after a fast switch between
+  meetings.
 
 ## [0.0.9] - 2026-11-10
 
