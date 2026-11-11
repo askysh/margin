@@ -632,6 +632,19 @@ if (summaries !== "none") {
     const asked = fs.readFileSync(path.join(out, "ollama-requests.log"), "utf8").trim().split("\n").length;
     assert(asked >= 2, `ollama asked ${asked} times`);
   });
+  await check("a failed Summarize leaves no \"Summarizing…\" behind", async () => {
+    const fail = path.join(out, "ollama-requests.log.fail");
+    fs.writeFileSync(fail, "");
+    try {
+      await page.getByRole("button", { name: "Summarize again" }).click();
+      await page.locator(".toast").filter({ hasText: /Ollama didn't finish|failed|nothing/ }).waitFor({ timeout: 120000 });
+    } finally {
+      fs.rmSync(fail, { force: true });
+    }
+    await page.getByRole("button", { name: "Summarize again" }).waitFor({ timeout: 5000 });
+    assert(!(await page.getByText("Summarizing…").isVisible()), "Summarizing… stayed after the failure");
+    assert(!(await page.locator(".writing-summary").isVisible()), "Writing the summary stayed after the failure");
+  });
   await check("a new meeting opens first, then gets its summary by itself", async () => {
     // The stand-in Ollama answers slowly now, so the order is visible: the meeting is ready
     // without a summary, shows that one is being written, then gets it (D40).
@@ -1396,14 +1409,18 @@ await check("settings: back to the Whisper live transcript", async () => {
 
 // ---------------------------------------------------------------- reset
 await check("a long meeting's transcript and notes scroll", async () => {
-  // An 80-minute meeting: hundreds of turns. The columns must scroll, not grow past the window.
-  const turns = Array.from({ length: 400 }, (_, i) => `[SPEAKER_${i % 3} ${Math.floor(i / 5)}:${String((i * 12) % 60).padStart(2, "0")}] Line ${i} of a long meeting about the bill of materials.`);
+  // A long meeting: hundreds of turns. The columns must scroll, not grow past the window.
+  // Two hours: core writes [100:00] and later with no limit on the minutes, and each of
+  // those lines must stay its own turn.
+  const turns = Array.from({ length: 400 }, (_, i) => `[SPEAKER_${i % 3} ${Math.floor(i * 18 / 60)}:${String((i * 18) % 60).padStart(2, "0")}] Line ${i} of a long meeting about the bill of materials.`);
   const notes = Array.from({ length: 80 }, (_, i) => `- note ${i}`).join("\n");
   fs.writeFileSync(path.join(meetingsDir, "2026-11-05-qa-long-meeting.md"),
-    `---\ntitle: QA long meeting\ntype: meeting\ndate: 2026-11-05T10:36:00+05:30\nduration: 80m 32s\n---\n\n## Notes\n\n${notes}\n\n## Transcript\n\n${turns.join("\n")}\n`);
+    `---\ntitle: QA long meeting\ntype: meeting\ndate: 2026-11-05T10:36:00+05:30\nduration: 2h 0m\n---\n\n## Notes\n\n${notes}\n\n## Transcript\n\n${turns.join("\n")}\n`);
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.locator(".row").filter({ hasText: "QA long meeting" }).first().click();
   await page.locator(".turn").nth(399).waitFor({ state: "attached", timeout: 8000 });
+  assert((await page.locator(".turn").count()) === 400, `${await page.locator(".turn").count()} turns, not 400`);
+  assert((await page.locator(".turn").nth(399).locator(".ts").innerText()) === "119:42", "the last turn's time");
   for (const col of [".transcript-col", ".notes-col"]) {
     const [sh, ch, bottom, vh] = await page.locator(col).evaluate((el) => [el.scrollHeight, el.clientHeight, el.getBoundingClientRect().bottom, window.innerHeight]);
     assert(bottom <= vh + 0.5, `${col} ends at ${bottom}px, below the window (${vh}px)`);
