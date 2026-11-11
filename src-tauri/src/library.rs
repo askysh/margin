@@ -278,9 +278,10 @@ pub fn sections(body: &str) -> Vec<Section> {
     out
 }
 
+/// Core writes `[m:ss]` with no limit on the minutes, so a long meeting has `[100:00]`.
 fn turn_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\[(?:(.+?) )?(\d{1,2}:\d{2}(?::\d{2})?)\]\s?(.*)$").unwrap())
+    RE.get_or_init(|| Regex::new(r"^\[(?:(.+?) )?(\d+:\d{2}(?::\d{2})?)\]\s?(.*)$").unwrap())
 }
 
 fn parse_transcript(body: &str) -> Vec<Turn> {
@@ -727,5 +728,15 @@ mod tests {
         let bare = parse_transcript("[0:09] So let's add that.");
         assert_eq!(bare[0].speaker, None);
         assert_eq!(bare[0].text, "So let's add that.");
+    }
+
+    #[test]
+    fn parses_turns_after_99_minutes() {
+        let turns = parse_transcript("[SPEAKER_0 99:59] one\n[SPEAKER_1 100:00] two\n[1000:05] three");
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[1].speaker.as_deref(), Some("SPEAKER_1"));
+        assert_eq!(turns[1].ts, "100:00");
+        assert_eq!(turns[1].text, "two");
+        assert_eq!(turns[2].ts, "1000:05");
     }
 }

@@ -26,6 +26,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
   separator.
 - The sidebar shows "9:00 AM · 32m" with a space on both sides of the dot.
 - Notes on the processing page no longer show a rule above the first line.
+- A meeting longer than 99 minutes shows every transcript line after 99:59 as its own
+  line. Before, those lines joined the line before them.
 
 ## [0.0.9] - 2026-11-10
 
