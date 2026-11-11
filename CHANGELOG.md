@@ -35,6 +35,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
   replace them with the saved copy, without the spaces at the end, and move the caret.
 - Action items cannot be ticked while Margin writes the summary. Before, a tick at that
   moment could land on another item of the new summary.
+- Notes typed in a meeting whose processing failed after the transcript was saved now
+  go into the meeting file too. Before, they stayed in a draft that Reset deleted.
 
 ## [0.0.9] - 2026-11-10
 

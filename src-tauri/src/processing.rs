@@ -177,33 +177,43 @@ pub fn ensure_not_processing(path: &Path) -> Result<(), String> {
 
 /// The job whose notes draft stands in for the notes of `path`: a job that still writes the
 /// file, or one whose draft is not in the file yet (it moves in when the job completes).
-fn notes_job_for(path: &Path) -> Option<String> {
+/// The flag is true for a failed job: a retry rewrites the file, so its draft stays.
+fn notes_job_for(path: &Path) -> Option<(String, bool)> {
     if let Some(job) = active_job_for(path) {
-        return Some(job.id);
+        return Some((job.id, false));
     }
     let entries = std::fs::read_dir(paths::drafts_dir()).ok()?;
     entries.flatten().find_map(|entry| {
         let name = entry.file_name().into_string().ok()?;
         let id = name.strip_suffix(".md").filter(|id| *id != "current")?;
         let job = jobs::load_job(id)?;
-        job.output_path.as_deref().is_some_and(|o| same_file(Path::new(o), path)).then(|| job.id)
+        let failed = job.state == JobState::Failed;
+        job.output_path.as_deref().is_some_and(|o| same_file(Path::new(o), path)).then(|| (job.id, failed))
     })
 }
 
 /// The notes to show for `path`: the job's draft while it has one, else `None` (use the
 /// file's own notes).
 pub fn notes_draft_for(path: &Path) -> Option<String> {
-    let id = notes_job_for(path)?;
+    let (id, _) = notes_job_for(path)?;
     std::fs::read_to_string(notes_draft_path(&id)).ok()
 }
 
 /// Save notes typed in the meeting view. While core may still write the file, they go into
 /// the job's notes draft, and `finish` puts them in the file when the job completes.
+///
+/// A job that failed after it wrote the file can be retried, and the retry writes the
+/// file again with the notes from Stop. So its draft stays, and the notes go into the
+/// file too. Then the file has them even if nobody retries, and after a Reset, which
+/// deletes the drafts.
 pub fn save_notes(path: &Path, notes: &str) -> Result<(), String> {
     let drafts = DRAFTS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(id) = notes_job_for(path) {
+    if let Some((id, failed)) = notes_job_for(path) {
         // An empty draft is kept too: it means "the notes were cleared".
-        return crate::fsutil::write_atomic(&notes_draft_path(&id), notes.as_bytes(), Some(0o600)).map_err(|e| e.to_string());
+        crate::fsutil::write_atomic(&notes_draft_path(&id), notes.as_bytes(), Some(0o600)).map_err(|e| e.to_string())?;
+        if !failed {
+            return Ok(());
+        }
     }
     drop(drafts);
     library::replace_notes(path, notes)
@@ -377,7 +387,11 @@ fn finish(job: &JobView, announce: bool) {
         return;
     };
     // A failed job may be retried, and a retry rewrites the file. Keep the drafts until a
-    // run succeeds.
+    // run succeeds, and put a copy of the notes in the file it wrote, if any.
+    if job.state == JobState::Failed {
+        copy_notes_to_failed(job, Path::new(output));
+        return;
+    }
     if !matches!(job.state, JobState::Complete | JobState::NeedsReview) {
         return;
     }
@@ -420,6 +434,22 @@ fn restore_notes(job: &JobView, out: &Path) {
             let _ = std::fs::remove_file(&draft);
         }
         Err(error) => tracing::warn!(%error, output = %out.display(), "could not restore notes"),
+    }
+}
+
+/// A job that failed after it wrote the meeting file: copy its notes draft into the file,
+/// and keep the draft for a retry. Notes edited in the file since (Obsidian) win, as in
+/// `restore_notes`.
+fn copy_notes_to_failed(job: &JobView, out: &Path) {
+    let _drafts = DRAFTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(notes) = std::fs::read_to_string(notes_draft_path(&job.id)) else { return };
+    let Some(written) = library::notes_section(out) else { return };
+    let queued = jobs::load_job(&job.id).and_then(|j| j.user_notes);
+    if !core_wrote_these_notes(&written, queued.as_deref()) {
+        return;
+    }
+    if let Err(error) = library::replace_notes(out, &notes) {
+        tracing::warn!(%error, output = %out.display(), "could not copy notes into the file of a failed job");
     }
 }
 
