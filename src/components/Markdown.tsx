@@ -18,7 +18,8 @@ export function Markdown({ source, onLink }: { source: string; onLink?: LinkHand
       i++;
       continue;
     }
-    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    // [\s\S], not ".": a dot does not match U+2028 or U+2029, which can be in a title.
+    const h = line.match(/^(#{1,6})\s+([\s\S]*)$/);
     if (h) {
       blocks.push(<h4 key={i} className="md-h">{inline(h[2])}</h4>);
       i++;
@@ -47,7 +48,9 @@ export function Markdown({ source, onLink }: { source: string; onLink?: LinkHand
       blocks.push(ordered ? <ol key={`l${i}`}>{items}</ol> : <ul key={`l${i}`}>{items}</ul>);
       continue;
     }
-    const para: string[] = [];
+    // The first line always goes in, so a line that no rule above took can't stop the loop.
+    const para: string[] = [line.trim()];
+    i++;
     while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|>|\s*([-*+]|\d+\.)\s)/.test(lines[i])) {
       para.push(lines[i].trim());
       i++;
