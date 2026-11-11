@@ -47,6 +47,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
   save.
 - The audio player no longer says the recording can't be played after two quick clicks
   on transcript times.
+- The notes box grows when the window gets narrower, so the end of the notes is no
+  longer cut off.
 
 ## [0.0.9] - 2026-11-10
 
