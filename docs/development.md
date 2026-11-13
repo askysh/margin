@@ -5,6 +5,8 @@ releases, see [releasing.md](releasing.md).
 
 ## Requirements
 
+The app is for macOS. The Windows build has its own section below, [Windows](#windows).
+
 - An Apple Silicon Mac with macOS 14.4 or later.
 - Xcode 26 or later, for `swiftc` and the macOS 26 Speech APIs that minutes-core uses.
   `build.rs` also compiles `src-tauri/speech/margin-speech.swift`, the Apple Speech live
@@ -150,6 +152,104 @@ $M --dev serve [port]                    # QA bridge for scripts/e2e
 ```
 
 [perf.md](perf.md) uses the same CLI to measure latency, startup and idle cost.
+
+## Windows
+
+The Windows build is on the `windows-port` branch (DECISIONS.md D61). It records a meeting
+in the room from the microphone, transcribes it and writes the meeting file. It does not
+record a call, and it has no recording chip, no Open at login, no Apple Speech and no
+updater of its own. Whisper runs on the CPU.
+
+### Requirements
+
+- Windows 10 22H2 or later, x64.
+- Rust from rustup, with the `stable-x86_64-pc-windows-msvc` toolchain.
+- Visual Studio with the "Desktop development with C++" workload.
+- CMake and LLVM. whisper.cpp needs CMake, and bindgen needs `libclang.dll`.
+- bun, and Git for Windows. The scripts run in Git Bash.
+
+### Build
+
+```bash
+scripts/build-windows.sh            # src-tauri/target/release/margin.exe
+scripts/build-windows.sh --debug    # a debug build with the UI built in
+```
+
+The script adds CMake and LLVM to the PATH, sets `LIBCLANG_PATH`, builds, and puts the
+DLLs that `margin.exe` needs beside it. For a plain `cargo build` or `cargo test`, set
+the same variables yourself:
+
+```bash
+export PATH="/c/Program Files/CMake/bin:/c/Program Files/LLVM/bin:$PATH"
+export LIBCLANG_PATH="C:/Program Files/LLVM/bin"
+```
+
+A debug build from `cargo build` loads the UI from `http://localhost:1420`. Run
+`bun run dev` beside it, or use `scripts/build-windows.sh --debug`.
+
+### The ort-sys note
+
+`ort-sys` 2.0.0-rc.10 copies `DirectML.dll` to the third folder above its `OUT_DIR`, and
+to `examples` and `deps` in that folder. Before cargo 1.100 that folder was
+`target/<profile>`, next to `margin.exe`. Cargo 1.100 changed the layout of the build
+folder, and now it is `target/<profile>/build`. Two things follow:
+
+- When Windows lets the build script make links (Developer Mode, or a shell with
+  administrator rights), the script stops with an error at `build.rs:126`: the two
+  folders do not exist. Make them first:
+  `mkdir -p src-tauri/target/debug/build/examples src-tauri/target/debug/build/deps`.
+- In every case `DirectML.dll` is in `target/<profile>/build`, not next to `margin.exe`.
+  A bare `margin.exe` then loads the older `DirectML.dll` of Windows.
+
+`scripts/build-windows.sh` does both steps. The `ort` pin stays (AGENTS.md).
+
+### The DLLs beside margin.exe
+
+| DLL | From | Why |
+|---|---|---|
+| `DirectML.dll` | the ONNX Runtime download of `ort-sys` | ONNX Runtime is linked into `margin.exe` and imports it. |
+| `msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll`, `vcruntime140_1.dll` | Visual Studio, `VC\Redist\MSVC\<version>\x64\Microsoft.VC*.CRT` | whisper.cpp and ONNX Runtime use the Visual C++ runtime. A PC without it gives error 0xC0000135 and no window. |
+
+ONNX Runtime and the WebView2 loader are linked into `margin.exe`. They need no DLL.
+
+### Tests and the sandbox
+
+On Windows the profile folder does not follow `HOME`. Set `USERPROFILE` too, and
+`APPDATA` and `LOCALAPPDATA`, so that every folder Windows gives is in the sandbox:
+
+```bash
+S="$(cygpath -w /tmp/margin-test)"
+export MARGIN_HOME="$S\\margin" HOME="$S\\home" USERPROFILE="$S\\home"
+export APPDATA="$S\\home\\AppData\\Roaming" LOCALAPPDATA="$S\\home\\AppData\\Local"
+export CARGO_HOME="C:\\Users\\<you>\\.cargo" RUSTUP_HOME="C:\\Users\\<you>\\.rustup"   # for cargo itself
+```
+
+One file still leaves the sandbox. minutes-core keeps `voices.db` in
+`%USERPROFILE%\.minutes`, and it asks Windows for that folder, so no variable moves it
+(UPSTREAM-PATCHES.md #1). Processing a meeting opens that file. Before a test run on a PC
+that has real voices, link the folder into the sandbox, and remove the link afterwards:
+
+```bash
+cmd //c mklink //J "C:\\Users\\<you>\\.minutes" "$S\\dot-minutes"    # only if .minutes does not exist
+cmd //c rmdir "C:\\Users\\<you>\\.minutes"                           # removes the link only
+```
+
+The end-to-end pass does this itself. It stops if a real `.minutes` folder exists.
+
+The end-to-end pass runs on Windows as far as the build goes. The comment at the top of
+`scripts/e2e/run.mjs` says what differs. `scripts/e2e/make-fixtures.sh` needs the macOS
+voices, so make the test audio another way: the Windows voices (`System.Speech`) can
+write the same lines to 16 kHz mono WAV files.
+
+### Where the files are
+
+| What | Where |
+|---|---|
+| Settings, state, models, logs | `%LOCALAPPDATA%\Margin` |
+| Meetings, by default | `Meetings` in the Documents folder that Windows gives. With OneDrive backup on, that folder is in OneDrive. |
+| Voices | `%USERPROFILE%\.minutes\voices.db` |
+
+Nothing is written next to `margin.exe`.
 
 ## Updating minutes-core
 

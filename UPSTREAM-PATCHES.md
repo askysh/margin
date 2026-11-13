@@ -12,6 +12,11 @@ here has been applied to upstream, and we work around each of the others locally
 - **Patch:** `Config::minutes_dir().join("voices.db")`, with a one-time fallback that reads
   the legacy path.
 - **Workaround:** we share `~/.minutes/voices.db`, and Reset leaves it alone unless asked.
+- **On Windows:** `dirs::home_dir()` asks Windows for the profile folder and ignores `HOME`
+  and `USERPROFILE`. Core's own `config::home_dir()` reads both, for that reason. So a
+  sandbox cannot move `voices.db` at all, and `margin --dev process` in a sandbox wrote
+  `C:\Users\<user>\.minutes\voices.db` (2026-11-13). The same is true for the mic-mute
+  sentinel (#9). Tests on Windows link the folder into the sandbox (docs/development.md).
 
 ## 2. Public model-download API with progress
 - **Where:** the CLI's private `download_file` and `cmd_setup` in `crates/cli/src/main.rs`.
@@ -228,3 +233,27 @@ here has been applied to upstream, and we work around each of the others locally
 - **Patch:** add `title: Option<String>` to `ResummarizeReport`, cleaned and checked with
   the pipeline's title rules. Or make those two functions public.
 - **Workaround:** `summaries.rs` `title_from_summary` (DECISIONS.md D59).
+
+## 19. Windows: say "no microphone" when there is no input device
+- **Where:** `crates/core/src/error.rs` `CaptureError::DeviceNotFound`, and the end of the
+  input device selection in `capture.rs` (~line 2895 at `209265f`,
+  `host.default_input_device().ok_or(CaptureError::DeviceNotFound)`).
+- **Why:** the text is "audio device not found — is VB-CABLE installed?". A Windows PC
+  with no microphone connected gets this for a plain microphone recording. VB-CABLE is a
+  loopback driver, and it has nothing to do with a microphone. `preflight_recording` gives
+  no blocking reason for the same PC.
+- **Patch:** a "no input device" error with its own text, and a blocking reason in
+  `preflight_recording` when the host has no input device.
+- **Workaround:** on Windows, `recorder.rs` `ensure_permissions` stops the start with
+  Margin's own message when `list_devices_categorized()` is empty.
+
+## 20. Windows: no console window for child programs
+- **Where:** `crates/core/src/engine_process.rs` `command()`, the one place where core
+  makes a `Command`.
+- **Why:** a release build of a Windows app has no console. When it starts a console
+  program, such as the `claude` CLI for a summary, Windows opens a console window for
+  that program. Core sets no `CREATE_NO_WINDOW` flag anywhere.
+- **Patch:** on Windows, `command.creation_flags(CREATE_NO_WINDOW)` in `command()`.
+- **Workaround:** none. Margin sets the flag for the programs that it starts itself
+  (`win.rs`). Not checked on a release build yet: the Windows work so far used debug
+  builds, which have a console.
