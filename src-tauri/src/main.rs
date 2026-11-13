@@ -95,6 +95,9 @@ fn main() {
                     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
                     let _ = apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None);
                 }
+                // WebView2 is a browser: turn off the reload key and the browser context menu.
+                #[cfg(windows)]
+                win::tame_webview(&window);
                 let _ = window.set_content_protected(screenshare::hidden());
                 let _ = if at_login { window.hide() } else { window.show() };
                 // The notepad view follows the width (D57). Log the first size, so a window

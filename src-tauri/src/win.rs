@@ -9,6 +9,7 @@
 //! - The shell opens a URL (`ShellExecuteW`), and Explorer shows a file.
 //! - The registry holds the microphone privacy switches.
 //! - The account's display name comes from `GetUserNameExW`.
+//! - WebView2 has its own settings for the browser keys and the context menu.
 //!
 //! Each function fails soft: a call that Windows refuses gives `None`, `false` or an
 //! `io::Error`, never a panic.
@@ -172,6 +173,104 @@ pub fn reveal(path: &std::path::Path) {
     let _ = Command::new("explorer.exe").arg(arg).spawn();
 }
 
+// ---------------------------------------------------------------- the webview
+
+/// The context menu items that a desktop app keeps: the ones that edit text. WebView2
+/// gives each item a name that does not change with the language of Windows.
+const KEPT_MENU_ITEMS: [&str; 8] = ["undo", "redo", "cut", "copy", "paste", "pasteAndMatchStyle", "selectAll", "emoji"];
+
+/// Make the page behave as an app window, not as a browser tab.
+///
+/// WebView2 is a browser. Ctrl+R and F5 load the page again, which loses what the window
+/// shows. Ctrl+P prints, F12 opens the developer tools, and the context menu has Back,
+/// Refresh, Save as and Print. Tauri turns none of this off. Two settings do:
+///
+/// - No browser keys. The keys that edit text stay: copy, cut, paste, select all, undo.
+///   The page still gets each key press, so Margin's own Ctrl+F and Ctrl+Shift+R work.
+/// - The context menu keeps the items that edit text. Where none is left, for example on
+///   a button, no menu opens.
+pub fn tame_webview(window: &tauri::WebviewWindow) {
+    use webview2_com::ContextMenuRequestedEventHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2Settings3, ICoreWebView2_11};
+    use windows_core::Interface;
+    let result = window.with_webview(|webview| {
+        // SAFETY: Tauri runs this on the thread that owns the webview, and the COM objects
+        // are live while `webview` is. Each call that fails leaves the default in place.
+        unsafe {
+            let Ok(core) = webview.controller().CoreWebView2() else {
+                return;
+            };
+            if let Ok(settings) = core.Settings().and_then(|s| s.cast::<ICoreWebView2Settings3>()) {
+                let _ = settings.SetAreBrowserAcceleratorKeysEnabled(false);
+            }
+            if let Ok(core) = core.cast::<ICoreWebView2_11>() {
+                let handler = ContextMenuRequestedEventHandler::create(Box::new(|_, args| {
+                    if let Some(args) = args {
+                        trim_context_menu(&args)?;
+                    }
+                    Ok(())
+                }));
+                let mut token = 0;
+                let _ = core.add_ContextMenuRequested(&handler, &mut token);
+            }
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not change the WebView2 settings");
+    }
+}
+
+/// Which items of a context menu to remove. `items` has the name of each item, or `None`
+/// for a separator. The result is in falling order, so that removing one item does not
+/// move the ones still to remove. A separator goes when it is first, last or after
+/// another separator.
+fn menu_items_to_remove(items: &[Option<String>]) -> Vec<u32> {
+    let kept: Vec<usize> =
+        (0..items.len()).filter(|&i| items[i].as_deref().is_none_or(|name| KEPT_MENU_ITEMS.contains(&name))).collect();
+    let mut keep = vec![false; items.len()];
+    let mut last_was_item = false;
+    for &i in &kept {
+        let is_item = items[i].is_some();
+        keep[i] = is_item || last_was_item;
+        last_was_item = is_item;
+    }
+    // A separator can still be last.
+    if let Some(&i) = kept.iter().rev().find(|&&i| keep[i]) {
+        keep[i] = items[i].is_some();
+    }
+    (0..items.len()).rev().filter(|&i| !keep[i]).map(|i| i as u32).collect()
+}
+
+/// SAFETY: call it from the handler of the context menu event, with its arguments.
+unsafe fn trim_context_menu(
+    args: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2ContextMenuRequestedEventArgs,
+) -> windows_core::Result<()> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR;
+    let menu = args.MenuItems()?;
+    let mut count = 0;
+    menu.Count(&mut count)?;
+    let mut items = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let item = menu.GetValueAtIndex(index)?;
+        let mut kind = Default::default();
+        item.Kind(&mut kind)?;
+        let mut name = windows_core::PWSTR::null();
+        item.Name(&mut name)?;
+        let name = webview2_com::take_pwstr(name);
+        items.push((kind != COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR).then_some(name));
+    }
+    let remove = menu_items_to_remove(&items);
+    tracing::debug!(?items, ?remove, "context menu");
+    if remove.len() == items.len() {
+        // Nothing is left. "Handled" tells WebView2 to show no menu.
+        return args.SetHandled(true);
+    }
+    for index in remove {
+        menu.RemoveValueAtIndex(index)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- the registry
 
 fn reg_string(root: HKEY, key: &str, value: &str) -> Option<String> {
@@ -259,6 +358,26 @@ pub fn display_name() -> Option<String> {
 mod tests {
     use super::*;
 
+    fn names(items: &[&str]) -> Vec<Option<String>> {
+        items.iter().map(|&name| (name != "-").then(|| name.to_string())).collect()
+    }
+
+    #[test]
+    fn the_context_menu_keeps_only_the_items_that_edit_text() {
+        // A text field: the browser items go, and one separator stays between groups.
+        let field = names(&["emoji", "-", "undo", "redo", "-", "cut", "copy", "paste", "pasteAndMatchStyle", "selectAll", "-", "share", "-", "inspectElement"]);
+        assert_eq!(menu_items_to_remove(&field), vec![13, 12, 11, 10]);
+        // Selected text: "copy" stays, with no separator around it.
+        let selection = names(&["copy", "-", "webSearch", "print", "-", "inspectElement"]);
+        assert_eq!(menu_items_to_remove(&selection), vec![5, 4, 3, 2, 1]);
+        // The page itself: every item goes, so no menu opens.
+        let page = names(&["back", "forward", "reload", "-", "saveAs", "print", "-", "inspectElement"]);
+        assert_eq!(menu_items_to_remove(&page).len(), page.len());
+        // Separators that end up first or side by side go too.
+        let gaps = names(&["reload", "-", "copy", "-", "-", "print", "-", "paste"]);
+        assert_eq!(menu_items_to_remove(&gaps), vec![6, 5, 4, 1, 0]);
+    }
+
     #[test]
     fn one_deny_blocks_the_microphone() {
         assert_eq!(mic_consent_from(Some("Allow"), Some("Allow"), Some("Allow")), MicConsent::Allowed);
@@ -276,7 +395,7 @@ mod tests {
         let mut command = Command::new("cmd.exe");
         // The full path of ping: under `cargo test` the PATH has every build folder of
         // whisper.cpp in it, and cmd.exe does not search a PATH that long.
-        command.args(["/c", r"%SystemRoot%System32ping.exe -n 30 127.0.0.1 >nul"]).stdin(std::process::Stdio::null());
+        command.args(["/c", r"%SystemRoot%\System32\ping.exe -n 30 127.0.0.1 >nul"]).stdin(std::process::Stdio::null());
         let (mut child, job) = spawn_in_job(&mut command).expect("spawn in a job");
         // Give cmd.exe time to start ping.
         std::thread::sleep(std::time::Duration::from_millis(700));

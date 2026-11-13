@@ -2832,8 +2832,10 @@ dependencies = [
  "tracing-subscriber",
  "trash",
  "ureq",
+ "webview2-com",
  "which 8.0.6",
  "window-vibrancy",
+ "windows-core",
  "windows-sys 0.59.0",
 ]
 

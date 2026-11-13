@@ -58,6 +58,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 # permissions.rs). minutes-core uses the same windows-sys release.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authentication_Identity", "Win32_Storage_Packaging_Appx", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# The WebView2 settings that Tauri does not set: the browser keys and the context menu
+# (win.rs). Tauri uses the same releases.
+webview2-com = "0.39"
+windows-core = "0.62"
 
 [profile.release]
 strip = true
