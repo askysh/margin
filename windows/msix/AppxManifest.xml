@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Margin Notes for Windows: the MSIX package manifest (DECISIONS.md D61).
+
+  This file is a template. The packaging step replaces the two tokens below and writes the
+  result into the package folder. It is not a valid manifest before that.
+
+    {{VERSION}}   four parts, A.B.C.0. The Store keeps the last part, so it is always 0.
+                  The first part cannot be 0, so A is Margin's major version plus 1 (D61).
+    {{ARCH}}      x64 or arm64. One package for each CPU.
+
+  Identity Name, Identity Publisher and PublisherDisplayName come from Partner Center
+  (Product management, Product identity). Partner Center refuses a package where one of
+  them differs, down to the case of a letter. Do not change them (AGENTS.md).
+
+  Capabilities:
+    runFullTrust   Margin is a desktop program. It is a restricted capability, so each
+                   submission needs the reason (docs/windows-store.md).
+    microphone     Margin records the microphone. With this line, Windows lists Margin
+                   Notes by name in Settings, Privacy and security, Microphone.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="Askysh.MarginNotes"
+    Publisher="CN=BA1A2A4F-276F-4E64-8619-08871322A90C"
+    Version="{{VERSION}}"
+    ProcessorArchitecture="{{ARCH}}" />
+
+  <Properties>
+    <DisplayName>Margin Notes</DisplayName>
+    <PublisherDisplayName>Askysh</PublisherDisplayName>
+    <Description>A calm meeting notepad. You write the notes, and Margin records, transcribes and saves each meeting as Markdown on your PC.</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Dependencies>
+    <!-- 19045 is Windows 10 22H2. The uap10 attributes below need 19041 or later. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19045.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <DeviceCapability Name="microphone" />
+  </Capabilities>
+
+  <Applications>
+    <Application
+      Id="Margin"
+      Executable="margin.exe"
+      uap10:RuntimeBehavior="packagedClassicApp"
+      uap10:TrustLevel="mediumIL">
+      <uap:VisualElements
+        DisplayName="Margin Notes"
+        Description="Margin Notes: a meeting notepad"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+</Package>

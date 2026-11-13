@@ -993,3 +993,34 @@ The full comparison is in `docs/parity/app.md`.
 - Not measured on a real call yet. The log line "rolling transcription finished" now
   counts `redone`.
 
+### D61. Margin for Windows ships on the Microsoft Store, as an MSIX named Margin Notes
+- New fact: docs/brief.md put Windows out of scope for v1. The owner now has a Microsoft
+  Store developer account and a Windows laptop for tests, and wants Margin on the Store.
+- Where the code lives:
+  - (a) A second repository for Windows.
+  - (b) This repository. The UI and most of the Rust are shared, and the Windows parts
+    sit behind `cfg` gates.
+  - Pick: **(b)**. The work is on the `windows-port` branch until the Windows build
+    records and transcribes a meeting. It then merges into `next-release` as one change.
+- The package:
+  - (a) An EXE installer from Tauri, linked from the Store. The publisher must sign it
+    with a certificate from a trusted authority, host it, and update it. Microsoft's own
+    signing service takes individual developers from the United States and Canada only.
+  - (b) An MSIX. The Store signs it, hosts it and updates it, at no cost.
+  - Pick: **(b)**. Tauri does not make an MSIX, so Microsoft's `winapp` CLI packs the
+    built `margin.exe` with `windows/msix/AppxManifest.xml`.
+- Costs of an MSIX:
+  - It needs the restricted capability `runFullTrust`. Each submission gives the reason.
+  - It cannot install WebView2. It uses the copy that Windows has.
+  - The Store build must not update itself, so the updater (D38) is off in it.
+- The name: "Margin" was taken in the Store. The product is **Margin Notes**. The package
+  display name must be a reserved name, so the Start menu and the window say "Margin
+  Notes" on Windows. The Mac app stays "Margin".
+- The version: the Store does not take a version that starts with 0, and it keeps the
+  fourth part. The package version is `(major + 1).minor.patch.0`, so Margin 0.0.10 is
+  package 1.0.10.0 and Margin 1.0.0 is package 2.0.0.0. The order of versions stays the
+  same for every release. About shows Margin's own version.
+- Not known yet: how Windows records the other people on a call. Core's
+  `core-audio-tap` backend is for macOS only. This gets its own decision.
+- The identity values, the listing text and the answers for Partner Center are in
+  docs/windows-store.md.

@@ -9,6 +9,7 @@ Margin. Everything here is for people who work on it.
 |---|---|
 | [development.md](development.md) | Build, run and test Margin. The developer CLI. Move to a new minutes-core. |
 | [releasing.md](releasing.md) | Sign, notarize and publish a release. The in-app update and the Homebrew cask. |
+| [windows-store.md](windows-store.md) | Margin Notes on the Microsoft Store: the identity, the package, the listing text and the checks before a submission. |
 | [perf.md](perf.md) | Performance measurements, and the scripts in [perf-scripts/](perf-scripts/). |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | How to send a change. |
 | [../AGENTS.md](../AGENTS.md) | Guidance for AI coding agents. |
