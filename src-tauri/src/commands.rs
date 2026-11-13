@@ -159,6 +159,10 @@ pub mod ops {
     }
 
     pub fn folder_choices() -> Res<FolderChoices> {
+        // Obsidian keeps its list of vaults in its own data folder: %APPDATA% on Windows.
+        #[cfg(windows)]
+        let registry = dirs::data_dir().unwrap_or_else(paths::home).join("obsidian").join("obsidian.json");
+        #[cfg(not(windows))]
         let registry = paths::home().join("Library/Application Support/obsidian/obsidian.json");
         let vaults = std::fs::read(registry)
             .ok()
@@ -347,6 +351,14 @@ pub mod ops {
         Ok(())
     }
 
+    /// Windows: show the file in Explorer.
+    #[cfg(windows)]
+    pub fn reveal_in_finder(path: String) -> Res<()> {
+        crate::win::reveal(std::path::Path::new(&path));
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
     pub fn reveal_in_finder(path: String) -> Res<()> {
         let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
         Ok(())
@@ -356,6 +368,9 @@ pub mod ops {
         let p = PathBuf::from(&path);
         library::obsidian_vault_for(&p).ok_or("This meeting isn't inside an Obsidian vault.")?;
         let url = format!("obsidian://open?path={}", percent_encode(&path));
+        #[cfg(windows)]
+        crate::win::shell_open(&url).map_err(|e| e.to_string())?;
+        #[cfg(not(windows))]
         std::process::Command::new("/usr/bin/open").arg(url).spawn().map_err(|e| e.to_string())?;
         Ok(())
     }

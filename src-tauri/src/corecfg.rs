@@ -312,7 +312,15 @@ pub fn expand_tilde(path: &str) -> String {
     }
 }
 
+/// The Windows account's display name, used as a default for "your name". A local account
+/// often has none. Setup then leaves the field empty.
+#[cfg(windows)]
+fn full_user_name() -> Option<String> {
+    crate::win::display_name()
+}
+
 /// The macOS account's full name, used as a default for "your name".
+#[cfg(not(windows))]
 fn full_user_name() -> Option<String> {
     let out = std::process::Command::new("/usr/bin/id").arg("-F").output().ok()?;
     let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
@@ -325,7 +333,8 @@ mod tests {
 
     fn base() -> (Config, AppSettings) {
         let mut cfg = Config::default();
-        cfg.output_dir = PathBuf::from("/tmp/margin-test-meetings");
+        // A full path on each platform. The tests write nothing there.
+        cfg.output_dir = PathBuf::from(if cfg!(windows) { r"C:\margin-test-meetings" } else { "/tmp/margin-test-meetings" });
         cfg.transcription.model = "small".into();
         cfg.summarization.engine = "none".into();
         let s = settings(&cfg);

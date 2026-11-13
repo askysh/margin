@@ -95,8 +95,13 @@ pub fn spawn_worker() {
         }
         cmd.stderr(log);
     }
-    use std::os::unix::process::CommandExt;
-    cmd.process_group(0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    crate::win::detach(&mut cmd);
     match minutes_core::spawn_reaped(&mut cmd) {
         Ok(_) => tracing::info!("processing worker started"),
         Err(error) => tracing::error!(%error, "could not start processing worker"),

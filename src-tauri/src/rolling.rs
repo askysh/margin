@@ -375,7 +375,17 @@ fn config_stamp() -> Option<std::time::SystemTime> {
     std::fs::metadata(crate::paths::config_path()).and_then(|m| m.modified()).ok()
 }
 
+/// Windows: below-normal priority for this thread. Whisper's own worker threads keep the
+/// normal priority, because Windows does not pass a thread's priority to its children.
+#[cfg(windows)]
+fn lower_priority() {
+    if !crate::win::lower_thread_priority() {
+        tracing::debug!("could not lower the rolling thread's priority");
+    }
+}
+
 /// Utility priority: the capture and the UI always come first.
+#[cfg(target_os = "macos")]
 fn lower_priority() {
     // SAFETY: sets the calling thread's own QoS class; no pointers are involved.
     let rc = unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };

@@ -225,13 +225,11 @@ struct Quick {
 
 /// Run a short `claude` subcommand with a 5 s limit.
 fn run_quick(bin: &str, args: &[&str]) -> Option<Quick> {
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut command = Command::new(bin);
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    crate::win::no_window(&mut command);
+    let mut child = command.spawn().ok()?;
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut s = String::new();
@@ -261,8 +259,14 @@ fn signed_in(bin: &str) -> Option<bool> {
 }
 
 pub const NOT_INSTALLED: &str = "Ask needs Claude Code. Install it from claude.com/claude-code, then try again.";
+#[cfg(not(windows))]
 pub const NOT_SIGNED_IN: &str = "Claude isn't signed in. Open Terminal, run `claude`, sign in, then try again.";
+#[cfg(not(windows))]
 pub const TOO_OLD: &str = "Your Claude Code is too old for Ask. Run `claude update` in Terminal, then try again.";
+#[cfg(windows)]
+pub const NOT_SIGNED_IN: &str = "Claude isn't signed in. Open Windows Terminal, run `claude`, sign in, then try again.";
+#[cfg(windows)]
+pub const TOO_OLD: &str = "Your Claude Code is too old for Ask. Run `claude update` in Windows Terminal, then try again.";
 
 pub fn readiness() -> Readiness {
     let problem = |p, m: &str| Readiness { ready: false, problem: Some(p), message: Some(m.into()) };
@@ -503,7 +507,11 @@ impl Stream {
 // ---------------------------------------------------------------- running turns
 
 struct Running {
+    #[cfg(unix)]
     pgid: Mutex<Option<i32>>,
+    /// Windows: the Job Object that holds `claude` and every process it starts.
+    #[cfg(windows)]
+    job: Mutex<Option<Arc<crate::win::Job>>>,
     cancelled: AtomicBool,
     /// Set by Clear and Reset: don't save this turn when it ends.
     discard: AtomicBool,
@@ -535,7 +543,17 @@ fn stop_key(key: &str, discard: bool) {
     kill_group(&run);
 }
 
+/// Windows: stop the job, which is `claude` and every process it started. Windows has no
+/// SIGTERM for a process tree, so there is no gentle first step.
+#[cfg(windows)]
+fn kill_group(run: &Running) {
+    if let Some(job) = run.job.lock().unwrap().as_ref() {
+        job.terminate();
+    }
+}
+
 /// SIGTERM the process group, then SIGKILL it if it is still there a moment later.
+#[cfg(unix)]
 fn kill_group(run: &Running) {
     let Some(pgid) = *run.pgid.lock().unwrap() else { return };
     unsafe { libc::killpg(pgid, libc::SIGTERM) };
@@ -562,7 +580,10 @@ pub fn send(meeting: Option<&str>, question: &str) -> Result<Thread, String> {
     let bin = claude_bin().ok_or(NOT_INSTALLED)?;
     let mut thread = read_saved(meeting);
     let run = Arc::new(Running {
+        #[cfg(unix)]
         pgid: Mutex::new(None),
+        #[cfg(windows)]
+        job: Mutex::new(None),
         cancelled: AtomicBool::new(false),
         discard: AtomicBool::new(false),
         partial: Mutex::new(String::new()),
@@ -616,17 +637,26 @@ fn answer(bin: &str, thread: &Thread, question: &str, first: String, run: &Runni
 }
 
 fn run_claude(bin: &str, args: &[String], prompt: &str, key: &str, run: &Running) -> Result<Outcome, String> {
-    use std::os::unix::process::CommandExt;
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(args)
         .current_dir(library::output_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("Couldn't start Claude: {e}"))?;
-    *run.pgid.lock().unwrap() = Some(child.id() as i32);
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    let mut child = {
+        use std::os::unix::process::CommandExt;
+        let child = command.process_group(0).spawn().map_err(|e| format!("Couldn't start Claude: {e}"))?;
+        *run.pgid.lock().unwrap() = Some(child.id() as i32);
+        child
+    };
+    #[cfg(windows)]
+    let mut child = {
+        let (child, job) = crate::win::spawn_in_job(&mut command).map_err(|e| format!("Couldn't start Claude: {e}"))?;
+        *run.job.lock().unwrap() = Some(job);
+        child
+    };
     if run.cancelled.load(Ordering::SeqCst) {
         kill_group(run);
     }
@@ -642,7 +672,10 @@ fn run_claude(bin: &str, args: &[String], prompt: &str, key: &str, run: &Running
     });
     let timed_out = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
     watchdog(*run.pgid.lock().unwrap(), done.clone(), timed_out.clone());
+    #[cfg(windows)]
+    watchdog(run.job.lock().unwrap().clone(), done.clone(), timed_out.clone());
     let stream = read_stream(child.stdout.take(), key, run);
     done.store(true, Ordering::SeqCst);
     let _ = child.wait();
@@ -650,6 +683,24 @@ fn run_claude(bin: &str, args: &[String], prompt: &str, key: &str, run: &Running
     Ok(Outcome { stream, timed_out: timed_out.load(Ordering::SeqCst), stderr })
 }
 
+/// Windows: stop the job when a turn runs longer than the limit.
+#[cfg(windows)]
+fn watchdog(job: Option<Arc<crate::win::Job>>, done: Arc<AtomicBool>, timed_out: Arc<AtomicBool>) {
+    let Some(job) = job else { return };
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        while !done.load(Ordering::SeqCst) {
+            if start.elapsed() > TURN_LIMIT {
+                timed_out.store(true, Ordering::SeqCst);
+                job.terminate();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
+#[cfg(unix)]
 fn watchdog(pgid: Option<i32>, done: Arc<AtomicBool>, timed_out: Arc<AtomicBool>) {
     let Some(pgid) = pgid else { return };
     std::thread::spawn(move || {
