@@ -1024,3 +1024,39 @@ The full comparison is in `docs/parity/app.md`.
   `core-audio-tap` backend is for macOS only. This gets its own decision.
 - The identity values, the listing text and the answers for Partner Center are in
   docs/windows-store.md.
+
+### D62. The first Windows build: where data goes, and what is off
+- New fact: on 2026-11-13 Margin built and ran on Windows 11 (the owner's laptop, Visual
+  Studio 2026, Rust 1.100). A 31 s recording from a test WAV became a meeting file 7 s
+  after Stop, on the CPU. The Mac build passed its tests and all 88 end-to-end checks
+  with the same code.
+- macOS code stays as it was. Each Windows path sits beside it behind `cfg`. The Windows
+  calls are in one module, `win.rs`.
+- Data: Margin's settings, models and state go to `%LOCALAPPDATA%\Margin`. The roaming
+  folder is wrong for them, because the models are large and a roaming profile copies
+  its folder to each PC. In a Store package, Windows redirects this folder to the
+  package's own store and removes it on uninstall.
+- Meetings: the default folder is `Meetings` in the Documents folder that Windows gives.
+  With OneDrive backup on, that folder is in OneDrive, so the audio syncs. Open: keep
+  this default, or use a local folder.
+- Voices: minutes-core keeps `voices.db` in `%USERPROFILE%\.minutes`. It ignores `HOME`
+  on Windows, so a sandbox does not isolate it. The end-to-end pass links that folder
+  into its sandbox and stops when a real one exists (UPSTREAM-PATCHES.md #1).
+- The global shortcut is Ctrl+Alt+Shift+R. Windows keeps the shortcuts with the Windows
+  key for itself.
+- Off on Windows, and hidden in the UI:
+  - Record call. Core's call capture is for macOS only. This is the next decision.
+  - The recording chip. It needs a window above full-screen apps on every desktop.
+    Start does not hide the window on Windows.
+  - The Apple Speech live transcript (D56). The live transcript is Whisper.
+  - The updater (D38) and open at login (D16). The Store updates the app. Open at login
+    needs a startup task in the package.
+  - The call suggestion.
+- The build: `ort-sys` rc.10 finds the output folder by counting folders above
+  `OUT_DIR`, and cargo 1.100 changed that layout. Options: pin an older Rust for the
+  whole repository, or prepare the folders in a script. Pick: **the script**,
+  `scripts/build-windows.sh`. It leaves the Mac build and the `ort` pin alone. It also
+  copies `DirectML.dll` and the four Visual C++ runtime DLLs beside `margin.exe`, because
+  Windows does not include them.
+- Not tested yet: a real microphone (the laptop had none active), a release build, a PC
+  that never had the build tools, Ask and summaries, and the tray by hand.

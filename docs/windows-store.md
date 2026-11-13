@@ -4,8 +4,9 @@ This page holds everything a Store submission needs: the identity, the package, 
 listing text, the images, the answers for Partner Center and the checks before you
 submit. DECISIONS.md D61 gives the reasons.
 
-The Windows app does not build yet. Lines marked **Confirm** describe a feature that the
-Windows build must have before the text goes to the Store. Store policy 10.1.1 requires
+The Windows app builds and records a meeting in the room (D62). It has no call recording
+and no GPU transcription yet, and no Store package. Lines marked **Confirm** describe a
+feature that the Windows build must have before the text goes to the Store. Store policy 10.1.1 requires
 the listing to describe the product as it is.
 
 ## Identity
@@ -34,14 +35,17 @@ installed copy carries them.
 | One package for each CPU. | x64 first. An arm64 package can come later with a lower or equal version. |
 | The Store updates an MSIX. | The Store build has no update check of its own. |
 | A package cannot write inside its own folder. | Margin keeps models and state in its data folder, never next to `margin.exe`. |
-| Windows redirects writes under `%APPDATA%` and `%LOCALAPPDATA%` to a private store. | Settings and models go away on uninstall. The meetings folder is under Documents, so it stays. |
+| Windows redirects writes under `%APPDATA%` and `%LOCALAPPDATA%` to a private store. | Settings and models (`%LOCALAPPDATA%\Margin`) go away on uninstall. The meetings folder is under Documents, so it stays. The saved voices are in `%USERPROFILE%\.minutes`, so they stay too. |
 
 `windows/msix/Assets/` holds the package logos. `scripts/make-icons.swift` draws them, with
 the rest of Margin's icons. Do not edit them by hand.
 
-To make the package, build `margin.exe`, put it in a folder with its DLLs and the
-manifest, and pack that folder with Microsoft's `winapp` CLI (`winapp pack`). The script
-for this does not exist yet. It comes with the Windows build.
+To make the package, run `scripts/build-windows.sh`. It builds `margin.exe` and puts five
+DLLs beside it: `DirectML.dll`, `msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll` and
+`vcruntime140_1.dll`. Windows does not include them, and without them the app exits with
+no message on a clean PC. Then put the exe, the DLLs, the manifest and `Assets` in one
+folder and pack it with Microsoft's `winapp` CLI (`winapp pack`). The pack step has no
+script yet.
 
 ## Partner Center, page by page
 
@@ -232,26 +236,26 @@ Summaries and Ask are optional and off by default. They use live generative AI. 
 
 The app downloads speech models only. These are data files. It does not download or run code.
 The app does not change any Windows setting. It needs no administrator rights.
-Uninstall removes the app, its settings and its models. The meetings folder stays, because the files belong to the user.
+Uninstall removes the app, its settings and its models. The meetings folder and the saved voices stay, because they belong to the user.
 ```
 
 ## What the Windows build must have for the Store
 
 These come from the Store policies (version 7.20). Each one is a requirement on the port.
 
-- [ ] **No update check of its own** in the Store build. The Store updates the package.
-- [ ] **No administrator rights**, for any feature. A product that needs elevation is not
+- [x] **No update check of its own** in the Store build. The Store updates the package.
+- [x] **No administrator rights**, for any feature. A product that needs elevation is not
       accepted.
 - [ ] **A way to report AI text** (policy 11.16): a link in Settings → About to the issue
       tracker.
 - [ ] **A link to the privacy policy** in Settings → About.
 - [ ] **A clear first run** (policy 10.1.1): setup says what Margin does before it asks
       for the microphone.
-- [ ] **A message when the PC cannot run it** (policy 10.4.1), for example when there is
+- [x] **A message when the PC cannot run it** (policy 10.4.1), for example when there is
       no microphone.
-- [ ] **The name "Margin Notes"** in the window title, the Start menu and the notification
+- [x] **The name "Margin Notes"** in the window title, the Start menu and the notification
       area, so the app matches its listing.
-- [ ] **No writes next to `margin.exe`.** The package folder is read-only.
+- [x] **No writes next to `margin.exe`.** The package folder is read-only.
 - [ ] **Summaries and Ask find `claude` on Windows** without a shell, or the listing does
       not mention Claude.
 

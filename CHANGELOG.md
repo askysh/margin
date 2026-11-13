@@ -5,6 +5,14 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [Unreleased]
+
+### Added
+
+- Margin Notes for Windows, a first build: record a meeting in the room, and get the
+  transcript and the meeting file. It cannot record a call yet (D61, D62).
+- [PRIVACY.md](PRIVACY.md), the privacy policy.
+
 ## [0.0.10] - 2026-11-11
 
 ### Added

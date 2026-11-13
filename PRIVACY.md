@@ -74,8 +74,8 @@ share a recording with anyone.
   if it also removes the models, the saved voices and the meetings.
 - **Take back a permission.** Turn off the microphone permission for Margin in the
   settings of macOS or Windows.
-- **Uninstall.** Uninstalling removes the app. Your meetings folder stays, because the
-  files are yours.
+- **Uninstall.** Uninstalling removes the app. Your meetings folder and the saved voices
+  stay, because the files are yours. *Reset Margin…* removes the voices.
 
 ## Security
 
