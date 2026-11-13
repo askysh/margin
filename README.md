@@ -153,6 +153,8 @@ Margin also connects to the internet for two things. It downloads the speech and
 models from Hugging Face and GitHub. It checks GitHub for a new version of Margin, which
 you can turn off in Settings → Updates. Margin has no account and sends no analytics.
 
+[PRIVACY.md](PRIVACY.md) is the full privacy policy.
+
 ## Known limits
 
 - **The live You / Them labels are an estimate.** Margin compares the loudness of your
