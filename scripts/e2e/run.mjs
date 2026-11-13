@@ -21,9 +21,19 @@
 // Ask (chat) runs against a stand-in claude (scripts/e2e/fake-claude.py), never the real one.
 // Screenshots and report.json go to $E2E_OUT (default /tmp/margin-e2e/out).
 // E2E_BRIDGE_PORT, E2E_UI_PORT, E2E_OLLAMA_PORT and CARGO_TARGET_DIR move a run off the defaults.
+//
+// On Windows the pass runs as far as the Windows build goes (DECISIONS.md D61):
+// - The sandbox is in the temp folder, and it sets USERPROFILE, APPDATA and LOCALAPPDATA too.
+// - minutes-core keeps voices.db in the real profile folder on Windows, whatever the
+//   environment says (UPSTREAM-PATCHES.md). So the pass links %USERPROFILE%.minutes to a
+//   folder in the sandbox while it runs. It stops if a real .minutes folder is there.
+// - The page shows its macOS text and keys by default, because the checks look for them.
+//   Set E2E_UI=windows to see the Windows text. Many checks then fail on the wording.
+// - The checks that need python3, plutil, /bin/sleep or a shell script as `claude` fail.
 import { webkit } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -39,7 +49,8 @@ const summaries = opt("--summaries", "none");
 const simulate = opt("--simulate");
 if (!audio) throw new Error("--audio <wav> is required");
 
-const base = process.env.E2E_DIR || "/tmp/margin-e2e";
+const windows = process.platform === "win32";
+const base = process.env.E2E_DIR || (windows ? path.join(os.tmpdir(), "margin-e2e") : "/tmp/margin-e2e");
 const out = process.env.E2E_OUT || path.join(base, "out");
 const home = path.join(base, "home");
 const marginHome = path.join(base, "margin");
@@ -54,8 +65,28 @@ if (seed) {
 }
 const meetingsDir = path.join(home, "Documents/Meetings");
 // With --simulate, rolling transcription cuts 8 s pieces, so the short call has several.
-const env = { ...process.env, HOME: home, MARGIN_HOME: marginHome, ...(simulate ? { MARGIN_SIMULATE_CAPTURE: path.resolve(simulate), MARGIN_ROLLING_PIECE_SECS: "8" } : {}) };
-const bin = path.join(process.env.CARGO_TARGET_DIR || path.join(root, "src-tauri/target"), "debug/margin");
+// Windows programs find the profile and the data folders through these three.
+const windowsHome = windows ? { USERPROFILE: home, APPDATA: path.join(home, "AppData", "Roaming"), LOCALAPPDATA: path.join(home, "AppData", "Local") } : {};
+const env = { ...process.env, HOME: home, MARGIN_HOME: marginHome, ...windowsHome, ...(simulate ? { MARGIN_SIMULATE_CAPTURE: path.resolve(simulate), MARGIN_ROLLING_PIECE_SECS: "8" } : {}) };
+const bin = path.join(process.env.CARGO_TARGET_DIR || path.join(root, "src-tauri/target"), windows ? "debug/margin.exe" : "debug/margin");
+// Windows: send the real %USERPROFILE%.minutes (voices.db) into the sandbox with a junction.
+const realMinutes = windows ? path.join(os.homedir(), ".minutes") : null;
+if (realMinutes) {
+  const linked = fs.lstatSync(realMinutes, { throwIfNoEntry: false });
+  if (linked && !linked.isSymbolicLink()) throw new Error(`${realMinutes} exists. The pass cannot keep voices.db out of it on Windows, so it stops.`);
+  if (linked) fs.rmdirSync(realMinutes);
+  const target = path.join(base, "dot-minutes");
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(target, { recursive: true });
+  fs.symlinkSync(target, realMinutes, "junction");
+  process.on("exit", () => {
+    try {
+      if (fs.lstatSync(realMinutes).isSymbolicLink()) fs.rmdirSync(realMinutes);
+    } catch {}
+  });
+  // Ctrl-C and a kill from a script end the process without the exit event.
+  for (const signal of ["SIGINT", "SIGTERM", "SIGBREAK"]) process.on(signal, () => process.exit(130));
+}
 // Ports can be moved so several runs (one per checkout) don't collide.
 const port = { bridge: process.env.E2E_BRIDGE_PORT || "4545", ui: process.env.E2E_UI_PORT || "4174", ollama: process.env.E2E_OLLAMA_PORT || "11435" };
 
@@ -95,7 +126,9 @@ const dev = (...a) => execFileSync(bin, ["--dev", ...a], { env, encoding: "utf8"
 const meetingFiles = () => (fs.existsSync(meetingsDir) ? fs.readdirSync(meetingsDir).filter((f) => f.endsWith(".md")) : []);
 
 const browser = await webkit.launch();
-const ctx = await browser.newContext({ viewport: { width: 1180, height: 760 }, deviceScaleFactor: 2, colorScheme: flag("--dark") ? "dark" : "light" });
+// src/platform.ts reads the user agent. The checks look for the macOS text and keys.
+const macUi = windows && process.env.E2E_UI !== "windows" ? { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15" } : {};
+const ctx = await browser.newContext({ viewport: { width: 1180, height: 760 }, deviceScaleFactor: 2, colorScheme: flag("--dark") ? "dark" : "light", ...macUi });
 const page = await ctx.newPage();
 const consoleErrors = [];
 page.on("pageerror", (e) => consoleErrors.push(e.message));
@@ -126,6 +159,10 @@ const plays = () => page.evaluate(() => window.__plays.map((s) => s.split("/").p
 const bridgeEvents = async () => (await (await fetch(`http://127.0.0.1:${port.bridge}/events?since=0`)).json());
 await page.goto(`http://localhost:${port.ui}`);
 const ui = (sel) => page.locator(sel);
+// The keys that edit text come from the system, not from the page: on Windows WebKit
+// takes Ctrl+A and Ctrl+End where macOS takes ⌘A and ⌘↓.
+const SELECT_ALL = windows ? "Control+A" : "Meta+A";
+const TO_END = windows ? "Control+End" : "Meta+ArrowDown";
 const button = (name) => page.getByRole("button", { name, exact: false });
 // Settings is a page with a section nav, not a dialog.
 const settingsPage = () => page.getByRole("region", { name: "Settings" });
@@ -167,7 +204,8 @@ await check("setup step: Documents and Balanced preselected, saved, download sta
   await page.getByText("Let Margin hear the meeting.").waitFor();
   assert(fs.existsSync(meetingsDir), "meetings folder not created");
   const cfg = fs.readFileSync(path.join(marginHome, "config.toml"), "utf8");
-  assert(cfg.includes(`output_dir = "${meetingsDir}"`), "output_dir not saved");
+  // TOML writes a path with backslashes in single quotes.
+  assert(cfg.includes(`output_dir = "${meetingsDir}"`) || cfg.includes(`output_dir = '${meetingsDir}'`), "output_dir not saved");
   assert(/\[transcription\][^[]*model = "small"/s.test(cfg), "model not saved as small");
   await page.getByText(/Speech models ready|Downloading speech models/).waitFor({ timeout: 10000 });
   assert((await page.evaluate(() => window.__E2E__.calls)).includes("download_models"), "download not started on setup");
@@ -267,7 +305,7 @@ if (simulate) {
   await check("notes typed while it finishes go to the draft, not the file", async () => {
     const before = fs.readFileSync(liveFile, "utf8");
     await page.getByLabel("Your notes").click();
-    await page.keyboard.press("Meta+ArrowDown");
+    await page.keyboard.press(TO_END);
     await page.keyboard.press("Enter"); // continues the list with "- "
     await page.keyboard.type("typed while finishing");
     await page.getByText("Saved", { exact: true }).waitFor({ timeout: 5000 });
@@ -344,7 +382,7 @@ if (simulate) {
     fs.rmSync(sb, { recursive: true, force: true });
     fs.mkdirSync(path.join(sb, "home"), { recursive: true });
     fs.cpSync(seed, path.join(sb, "margin/state/models"), { recursive: true });
-    const benv = { ...process.env, HOME: path.join(sb, "home"), MARGIN_HOME: path.join(sb, "margin") };
+    const benv = { ...process.env, HOME: path.join(sb, "home"), MARGIN_HOME: path.join(sb, "margin"), ...(windows ? { USERPROFILE: path.join(sb, "home") } : {}) };
     execFileSync(bin, ["--dev", "process", recorded, "QA live call"], { env: benv, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     const dir = path.join(sb, "home/Documents/Meetings");
     const batch = fs.readFileSync(path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith(".md"))), "utf8");
@@ -401,7 +439,7 @@ await check("editing notes saves into the file and keeps the frontmatter", async
   const fmBefore = before.slice(0, before.indexOf("\n---", 3) + 4);
   const editor = page.getByLabel("Your notes");
   await editor.click();
-  await page.keyboard.press("Meta+ArrowDown");
+  await page.keyboard.press(TO_END);
   // The last line is a task item: Enter continues it, a second Enter ends the list.
   await page.keyboard.press("Enter");
   await page.keyboard.press("Enter");
@@ -530,7 +568,7 @@ await check("rename the meeting from its title", async () => {
   await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
   const title = page.getByLabel("Meeting title");
   await title.click();
-  await page.keyboard.press("Meta+A");
+  await page.keyboard.press(SELECT_ALL);
   await page.keyboard.type("QA launch sync, renamed");
   await page.keyboard.press("Enter");
   await page.locator(".row-title", { hasText: "QA launch sync, renamed" }).waitFor({ timeout: 5000 });
@@ -553,7 +591,7 @@ await check("a silent recording explains itself", async () => {
 await check("switching meetings right after typing still saves the notes", async () => {
   await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
   await page.getByLabel("Your notes").click();
-  await page.keyboard.press("Meta+ArrowDown");
+  await page.keyboard.press(TO_END);
   await page.keyboard.type("\nquick switch note");
   await page.locator(".row").filter({ hasText: "QA launch sync" }).first().click();
   await page.waitForTimeout(1500);
