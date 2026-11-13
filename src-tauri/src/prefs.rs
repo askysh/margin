@@ -55,7 +55,8 @@ fn yes() -> bool {
 
 impl Prefs {
     pub fn recording_chip(&self) -> bool {
-        !self.no_recording_chip
+        // No chip on Windows yet (chip_off.rs), so the window never hides for it.
+        cfg!(target_os = "macos") && !self.no_recording_chip
     }
 
     pub fn app(&self) -> AppPrefs {
