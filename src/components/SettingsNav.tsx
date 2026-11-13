@@ -1,5 +1,6 @@
 import { useEffect, useRef, type KeyboardEvent } from "react";
 import { SettingsIcons } from "./SettingsIcons";
+import { hasOwnUpdater } from "../platform";
 
 /** Sections in nav order. Groups are separated by space; Start over sits apart at the bottom. */
 export const SECTIONS = [
@@ -16,6 +17,9 @@ export const SECTIONS = [
 ] as const;
 
 export type SectionId = (typeof SECTIONS)[number]["id"];
+
+/** The sections this platform has. The Store updates the Windows app, so it has no Updates. */
+const SHOWN = SECTIONS.filter((s) => hasOwnUpdater || s.id !== "updates");
 
 interface Props {
   section: SectionId;
@@ -39,8 +43,8 @@ export function SettingsNav({ section, onSection, onBack }: Props) {
       </button>
       <nav aria-label="Settings sections" className="set-nav-list">
         <ul ref={list} onKeyDown={arrowKeys}>
-          {SECTIONS.map((s, i) => (
-            <li key={s.id} className={i > 0 && SECTIONS[i - 1].group !== s.group ? `set-nav-gap${s.group === 2 ? " set-nav-end" : ""}` : undefined}>
+          {SHOWN.map((s, i) => (
+            <li key={s.id} className={i > 0 && SHOWN[i - 1].group !== s.group ? `set-nav-gap${s.group === 2 ? " set-nav-end" : ""}` : undefined}>
               <button
                 className={`set-nav-item${s.id === "reset" ? " danger" : ""}`}
                 aria-current={s.id === section ? "page" : undefined}

@@ -1,4 +1,5 @@
 import type { Backends, Settings } from "../api";
+import { DEVICE } from "../platform";
 
 interface Props {
   backends: Backends | null;
@@ -40,12 +41,12 @@ export function SummaryChoice({ backends, value, onChange }: Props) {
           onChange({ ...value, summary_engine: "ollama", ollama_model: model });
         }}
       >
-        <span className="option-title">Ollama, on this Mac</span>
+        <span className="option-title">Ollama, on this {DEVICE}</span>
         <span className="option-body">
           {!ollama
             ? "Ollama isn't running. Start it to use this."
             : backends?.ollama_models.length
-              ? "Fully local. Nothing leaves this Mac."
+              ? `Fully local. Nothing leaves this ${DEVICE}.`
               : "Ollama has no models yet. Run `ollama pull llama3.2` first."}
         </span>
       </button>

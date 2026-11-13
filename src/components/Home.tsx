@@ -2,6 +2,7 @@ import type { Kind } from "../api";
 import { copyText, tildify } from "../util";
 import { Logo } from "./Logo";
 import { DownloadProgress } from "./Models";
+import { canRecordCalls, TRAY } from "../platform";
 
 interface Props {
   count: number;
@@ -34,16 +35,20 @@ export function Home({ count, outputDir, orphanedDraft, onDismissDraft, onStart,
         </p>
         <DownloadProgress compact hideWhenReady pendingNote="Recording starts working when the speech models are downloaded." />
         <div className="home-choices">
-          <button className="choice" onClick={() => onStart("call")} disabled={busy}>
+          <button className="choice" onClick={() => onStart("call")} disabled={busy || !canRecordCalls}>
             <span className="choice-title">Record a call</span>
-            <span className="choice-body">Zoom, Meet, Teams, or any app. Captures your mic and the other people.</span>
+            <span className="choice-body">
+              {canRecordCalls
+                ? "Zoom, Meet, Teams, or any app. Captures your mic and the other people."
+                : "Not on Windows yet. Margin cannot record the other people on a call."}
+            </span>
           </button>
           <button className="choice" onClick={() => onStart("in-person")} disabled={busy}>
             <span className="choice-title">Record in person</span>
             <span className="choice-body">Mic only, for a meeting around a table.</span>
           </button>
         </div>
-        <p className="quiet-note">You can also start and stop from the menu bar.</p>
+        <p className="quiet-note">You can also start and stop from the {TRAY}.</p>
       </div>
     </div>
   );

@@ -7,6 +7,7 @@ import { MicIcon, PermissionRow, SpeakerIcon } from "./PermissionRow";
 import { Card, Row, SectionHead, ToggleRow } from "./SettingsRows";
 import { restart, useUpdateStatus } from "./Updates";
 import type { SettingsView } from "./Settings";
+import { APP_NAME, DEVICE, hasSystemAudioPermission, keys, OS_NAME } from "../platform";
 
 export function VoicesSection({ voices, setVoices, notify }: SettingsView) {
   const forget = async (slug: string, name: string) => {
@@ -55,7 +56,7 @@ export function VoicesSection({ voices, setVoices, notify }: SettingsView) {
 export function PermissionsSection({ perms, refreshPerms }: SettingsView) {
   return (
     <>
-      <SectionHead title="Permissions" about="What macOS lets Margin hear. Margin checks again each time you come back to this window." />
+      <SectionHead title="Permissions" about={`What ${OS_NAME} lets Margin hear. Margin checks again each time you come back to this window.`} />
       <Card>
         <PermissionRow
           title="Microphone"
@@ -65,21 +66,23 @@ export function PermissionsSection({ perms, refreshPerms }: SettingsView) {
           onRequest={async () => { await api.requestPermission("microphone"); await refreshPerms(); }}
           onSettings={() => api.openPrivacySettings("microphone")}
         />
-        <PermissionRow
-          title="System audio"
-          body="Needed to hear the other people on calls."
-          icon={<SpeakerIcon />}
-          state={perms?.system_audio}
-          onRequest={async () => { await api.requestPermission("system-audio"); await refreshPerms(); }}
-          onSettings={() => api.openPrivacySettings("system-audio")}
-        />
+        {hasSystemAudioPermission && (
+          <PermissionRow
+            title="System audio"
+            body="Needed to hear the other people on calls."
+            icon={<SpeakerIcon />}
+            state={perms?.system_audio}
+            onRequest={async () => { await api.requestPermission("system-audio"); await refreshPerms(); }}
+            onSettings={() => api.openPrivacySettings("system-audio")}
+          />
+        )}
       </Card>
     </>
   );
 }
 
 export function IntegrationsSection({ mcp, notify }: SettingsView) {
-  const copy = async () => notify((await copyText(mcp)) ? "Copied." : "Couldn't copy. Select the text and press ⌘C.");
+  const copy = async () => notify((await copyText(mcp)) ? "Copied." : `Couldn't copy. Select the text and press ${keys("⌘C", "Ctrl+C")}.`);
   return (
     <>
       <SectionHead title="Integrations" about="Use your meetings from other apps." />
@@ -143,8 +146,8 @@ export function AboutSection({ boot }: SettingsView) {
       <header className="set-about">
         <Logo size={56} />
         <div>
-          <h1 id="set-title" tabIndex={-1}>Margin</h1>
-          <p>A meeting notepad for macOS. Notes in your words, transcribed on your Mac.</p>
+          <h1 id="set-title" tabIndex={-1}>{APP_NAME}</h1>
+          <p>A meeting notepad for {OS_NAME}. Notes in your words, transcribed on your {DEVICE}.</p>
         </div>
       </header>
       <Card note="Margin and minutes-core are MIT licensed.">

@@ -6,6 +6,7 @@ import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { SummaryChoice } from "./SummaryChoice";
 import { Card, Row, SectionHead, SelectRow, TextRow, ToggleRow, type Choice } from "./SettingsRows";
 import type { SettingsView } from "./Settings";
+import { canRecordCalls, DEVICE, GLOBAL_SHORTCUT, hasAppleSpeech, hasOpenAtLogin, hasRecordingChip, SHOW_IN_FILES, TRAY } from "../platform";
 
 type Save = (patch: Partial<Settings>) => void;
 
@@ -30,7 +31,7 @@ export function GeneralSection({ s, save, options }: SettingsView) {
       </Card>
       <Card title="Meetings" note="Changing the folder affects new meetings. Meetings already saved stay where they are.">
         <Row title="Meetings folder" help={<span className="path">{tildify(s.output_dir)}</span>}>
-          <button className="btn btn-quiet" onClick={() => api.reveal(s.output_dir)}>Show in Finder</button>
+          <button className="btn btn-quiet" onClick={() => api.reveal(s.output_dir)}>{SHOW_IN_FILES}</button>
           <button className="btn btn-quiet" onClick={changeFolder}>Change…</button>
         </Row>
         <SelectRow
@@ -50,14 +51,16 @@ export function GeneralSection({ s, save, options }: SettingsView) {
           onChange={(on) => save({ hide_from_screen_share: on })}
         />
       </Card>
-      <Card title="Startup">
-        <ToggleRow
-          title="Open Margin when you log in"
-          help="Margin waits in the menu bar, ready for your first meeting."
-          checked={s.open_at_login ?? false}
-          onChange={(on) => save({ open_at_login: on })}
-        />
-      </Card>
+      {hasOpenAtLogin && (
+        <Card title="Startup">
+          <ToggleRow
+            title="Open Margin when you log in"
+            help={`Margin waits in the ${TRAY}, ready for your first meeting.`}
+            checked={s.open_at_login ?? false}
+            onChange={(on) => save({ open_at_login: on })}
+          />
+        </Card>
+      )}
     </>
   );
 }
@@ -111,15 +114,17 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
         />
       </Card>
       <Card title="Starting and stopping">
-        <ToggleRow
-          title="Suggest recording when a call starts"
-          help="Shows a banner when Zoom, Teams or another call app opens."
-          checked={s.call_detection ?? true}
-          onChange={(on) => save({ call_detection: on })}
-        />
+        {canRecordCalls && (
+          <ToggleRow
+            title="Suggest recording when a call starts"
+            help="Shows a banner when Zoom, Teams or another call app opens."
+            checked={s.call_detection ?? true}
+            onChange={(on) => save({ call_detection: on })}
+          />
+        )}
         <ToggleRow
           title="Keyboard shortcut in every app"
-          help={<>Start and stop recording from any app with <kbd className="kbd">⌃⌥⌘R</kbd></>}
+          help={<>Start and stop recording from any app with <kbd className="kbd">{GLOBAL_SHORTCUT}</kbd></>}
           checked={prefs.record_shortcut}
           onChange={(on) => changePrefs({ ...prefs, record_shortcut: on })}
         />
@@ -130,6 +135,7 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
           onChange={(on) => changePrefs({ ...prefs, sound_cues: on })}
         />
       </Card>
+      {(hasRecordingChip || hasAppleSpeech) && (
       <Card title="During a recording">
         <ToggleRow
           title="Show the recording chip"
@@ -146,6 +152,7 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
           onChange={(v) => changePrefs({ ...prefs, live_transcript: v })}
         />
       </Card>
+      )}
     </>
   );
 }
@@ -153,7 +160,7 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
 export function TranscriptionSection({ s, save, options }: SettingsView) {
   return (
     <>
-      <SectionHead title="Transcription" about="Speech becomes text on this Mac. Nothing is uploaded." />
+      <SectionHead title="Transcription" about={`Speech becomes text on this ${DEVICE}. Nothing is uploaded.`} />
       <Card title="Speech model">
         <div className="set-pad">
           <div className="options options-row" role="radiogroup" aria-label="Speech model">

@@ -13,6 +13,7 @@ import { CopyMenu } from "./CopyMenu";
 import { SideSwitch, useOneColumn, type Side } from "./Compact";
 import { sameNotes } from "../notes";
 import { ACTION_HEADING, meetingMarkdown, summaryMarkdown, transcriptMarkdown, tsSeconds, withoutCoverage } from "../meetingMarkdown";
+import { isWindows, SHOW_IN_FILES } from "../platform";
 
 interface Props {
   path: string;
@@ -248,7 +249,7 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
           )}
           <MoreMenu
             choices={[
-              { label: "Show in Finder", onSelect: () => api.reveal(path) },
+              { label: SHOW_IN_FILES, onSelect: () => api.reveal(path) },
               ...(m.in_obsidian_vault ? [{ label: "Open in Obsidian", onSelect: () => api.openInObsidian(path).catch((e) => notify(errorText(e), "error")) }] : []),
               { label: "Move to Trash…", onSelect: trash, danger: true },
             ]}
@@ -265,7 +266,7 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
         {m.status === "no-speech" && (
           <div className="callout">
             <p><strong>No speech was detected in this recording.</strong> Check that the right microphone is selected in
-              System Settings → Sound, and for calls, that Margin is allowed to record system audio.</p>
+              {isWindows ? "Windows Settings → System → Sound." : "System Settings → Sound, and for calls, that Margin is allowed to record system audio."}</p>
           </div>
         )}
 

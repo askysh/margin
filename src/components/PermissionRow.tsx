@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
 import type { PermState } from "../api";
+import { OS_SETTINGS } from "../platform";
 
 interface Props {
   title: string;
@@ -24,7 +25,7 @@ export function PermissionRow({ title, body, state, onRequest, onSettings, icon 
         <p className="perm-body">{asking ? "macOS is asking now. Choose Allow in its dialog." : body}</p>
       </div>
       {state === "granted" ? null : state === "denied" || state === "unknown" ? (
-        <button type="button" className="btn btn-quiet" onClick={onSettings}>Open System Settings</button>
+        <button type="button" className="btn btn-quiet" onClick={onSettings}>Open {OS_SETTINGS}</button>
       ) : (
         <button
           type="button"

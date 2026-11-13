@@ -2,6 +2,7 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "re
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { api } from "../api";
 import { clock } from "../util";
+import { SHOW_IN_FILES } from "../platform";
 
 export interface AudioHandle {
   /** Jump to `secs` and play from there. */
@@ -46,7 +47,7 @@ export const AudioPlayer = forwardRef<AudioHandle, Props>(function AudioPlayer({
     },
   }));
 
-  if (failed) return <p className="player-note">This recording can't be played here. Use Show in Finder to open it.</p>;
+  if (failed) return <p className="player-note">This recording can't be played here. Use {SHOW_IN_FILES} to open it.</p>;
   if (!src) return null;
 
   const toggle = () => {

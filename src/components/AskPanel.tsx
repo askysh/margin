@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, errorText, on, type ChatMessage, type ChatReadiness, type ChatThread } from "../api";
 import { clock } from "../util";
 import { Markdown, type LinkHandler } from "./Markdown";
+import { keys } from "../platform";
 
 export type AskScope = "meeting" | "all";
 
@@ -167,14 +168,14 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen,
   if (!open) {
     if (!bar) return null;
     return (
-      <button ref={barBtn} className="ask-bar" onClick={onOpen} title="Ask Claude about your meetings (⌘J)">
+      <button ref={barBtn} className="ask-bar" onClick={onOpen} title={`Ask Claude about your meetings (${keys("⌘J", "Ctrl+J")})`}>
         <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" fill="none" /></svg>
         {running ? (
           <span className="ask-bar-text is-busy"><span className="spinner" aria-hidden />{partial.trim() ? "Writing an answer…" : "Thinking…"}</span>
         ) : (
           <span className={`ask-bar-text${draft.trim() ? " has-draft" : ""}`}>{draft.trim() || placeholder}</span>
         )}
-        <kbd className="row-kbd">⌘J</kbd>
+        <kbd className="row-kbd">{keys("⌘J", "Ctrl+J")}</kbd>
       </button>
     );
   }

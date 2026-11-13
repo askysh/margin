@@ -6,6 +6,7 @@ import { Logo } from "./Logo";
 import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { MicIcon, PermissionRow, SpeakerIcon } from "./PermissionRow";
 import { SummaryChoice } from "./SummaryChoice";
+import { APP_NAME, canRecordCalls, DEVICE, ENTER_KEY, hasSystemAudioPermission, isWindows, joinPath, keys, TRAY } from "../platform";
 
 const STEPS = ["You", "Setup", "Permissions", "Summaries", "Ready"] as const;
 const SETUP = 1;
@@ -54,7 +55,7 @@ export function Onboarding({ initial, onDone }: { initial: Settings; onDone: () 
     <div className="onboarding" data-tauri-drag-region>
       <div className="ob-card">
         <header className="ob-head">
-          <span className="ob-brand">Margin</span>
+          <span className="ob-brand">{APP_NAME}</span>
           <ol className="ob-steps" aria-label={`Setup, step ${step + 1} of ${STEPS.length}`}>
             {STEPS.map((label, i) => (
               <li key={label} className={i < step ? "done" : i === step ? "now" : ""} aria-current={i === step ? "step" : undefined}>{label}</li>
@@ -96,7 +97,7 @@ function Continue({ label = "Continue", disabled, onClick }: { label?: string; d
   return (
     <div className="ob-actions">
       <button type="button" className="btn btn-primary btn-lg" data-primary disabled={disabled} onClick={onClick}>{label}</button>
-      <span className="ob-key" aria-hidden>or press Return</span>
+      <span className="ob-key" aria-hidden>or press {ENTER_KEY}</span>
     </div>
   );
 }
@@ -108,7 +109,7 @@ function StepYou({ s, onNext, saving }: { s: Settings; onNext: (name: string) =>
       <div className="ob-logo"><Logo size={88} /></div>
       <h1 className="ob-title">Notes in your words.<br />Transcripts on the side.</h1>
       <p className="ob-body">
-        Margin records your meetings and transcribes them on this Mac. Each one is a Markdown file you own.
+        Margin records your meetings and transcribes them on this {DEVICE}. Each one is a Markdown file you own.
         No account, no cloud, no bot in your calls.
       </p>
       <label className="field-label" htmlFor="ob-name">Your name, so transcripts can label you</label>
@@ -130,7 +131,7 @@ function StepSetup({ s, onNext, saving }: { s: Settings; onNext: (patch: Partial
   const options = useMemo(() => {
     if (!choices) return [];
     const list = [{ key: "default", title: "Documents", path: choices.default_dir }];
-    for (const v of choices.obsidian_vaults) list.push({ key: v.path, title: `Obsidian: ${v.name}`, path: `${v.path}/Meetings` });
+    for (const v of choices.obsidian_vaults) list.push({ key: v.path, title: `Obsidian: ${v.name}`, path: joinPath(v.path, "Meetings") });
     return list;
   }, [choices]);
 
@@ -154,7 +155,7 @@ function StepSetup({ s, onNext, saving }: { s: Settings; onNext: (patch: Partial
         ))}
         <button type="button" role="radio" aria-checked={custom} className={`option ${custom ? "on" : ""}`} onClick={pick}>
           <span className="option-title">Another folder…</span>
-          {custom ? <span className="option-path path">{tildify(dir)}</span> : <span className="option-body">iCloud Drive, or anywhere else.</span>}
+          {custom ? <span className="option-path path">{tildify(dir)}</span> : <span className="option-body">{isWindows ? "OneDrive, or anywhere else." : "iCloud Drive, or anywhere else."}</span>}
         </button>
       </div>
 
@@ -184,12 +185,16 @@ function StepPermissions({ onNext }: { onNext: () => void }) {
     await api.requestPermission(which).catch(() => {});
     setP(await api.permissions());
   };
-  const allGranted = p?.microphone === "granted" && p?.system_audio === "granted";
+  const allGranted = p?.microphone === "granted" && (!hasSystemAudioPermission || p?.system_audio === "granted");
 
   return (
     <>
       <h1 className="ob-title">Let Margin hear the meeting.</h1>
-      <p className="ob-body">macOS asks once for each. Margin listens only while you record, and the audio stays on this Mac.</p>
+      <p className="ob-body">
+        {isWindows
+          ? "Windows has a switch for the microphone in Settings, Privacy & security. Margin listens only while you record, and the audio stays on this PC."
+          : "macOS asks once for each. Margin listens only while you record, and the audio stays on this Mac."}
+      </p>
       <div className="perms">
         <PermissionRow
           icon={<MicIcon />}
@@ -199,16 +204,19 @@ function StepPermissions({ onNext }: { onNext: () => void }) {
           onRequest={() => ask("microphone")}
           onSettings={() => api.openPrivacySettings("microphone")}
         />
-        <PermissionRow
-          icon={<SpeakerIcon />}
-          title="System audio"
-          body="The other people on a call, straight from Zoom, Meet or Teams. macOS lists this as Screen & System Audio Recording, but Margin never records your screen."
-          state={p?.system_audio}
-          onRequest={() => ask("system-audio")}
-          onSettings={() => api.openPrivacySettings("system-audio")}
-        />
+        {hasSystemAudioPermission && (
+          <PermissionRow
+            icon={<SpeakerIcon />}
+            title="System audio"
+            body="The other people on a call, straight from Zoom, Meet or Teams. macOS lists this as Screen & System Audio Recording, but Margin never records your screen."
+            state={p?.system_audio}
+            onRequest={() => ask("system-audio")}
+            onSettings={() => api.openPrivacySettings("system-audio")}
+          />
+        )}
       </div>
-      {p && !allGranted && <p className="ob-hint">You can also allow these later, in Settings or on your first recording.</p>}
+      {p && !allGranted && hasSystemAudioPermission && <p className="ob-hint">You can also allow these later, in Settings or on your first recording.</p>}
+      {p && isWindows && p.microphone === "denied" && <p className="ob-hint">Turn on the microphone in Windows Settings. You can also do it later.</p>}
       <Continue onClick={onNext} />
     </>
   );
@@ -238,20 +246,24 @@ function StepReady({ s, saving, onFinish }: { s: Settings; saving: boolean; onFi
       </p>
       <ul className="ways" aria-label="Ways to start a recording">
         <li>
-          <span className="way-demo"><span className="btn btn-primary demo-btn">Record call</span></span>
-          <span className="way-text"><strong>In the window.</strong> Top right. Its arrow also offers In person.</span>
+          <span className="way-demo"><span className="btn btn-primary demo-btn">{canRecordCalls ? "Record call" : "Record"}</span></span>
+          <span className="way-text"><strong>In the window.</strong> {canRecordCalls ? "Top right. Its arrow also offers In person." : "Top right. It records a meeting in the room."}</span>
         </li>
         <li>
           <span className="way-demo"><span className="demo-menubar" aria-hidden><span className="demo-glyph" /></span></span>
-          <span className="way-text"><strong>From the menu bar.</strong> Margin stays there when you close the window.</span>
+          <span className="way-text"><strong>From the {TRAY}.</strong> Margin stays there when you close the window.</span>
         </li>
         <li>
-          <span className="way-demo"><kbd>⌘</kbd><kbd>⇧</kbd><kbd>R</kbd></span>
-          <span className="way-text"><strong>From the keyboard.</strong> <span className="mono">⌘⇧R</span> records a call, <span className="mono">⌘⇧I</span> a meeting in the room.</span>
+          <span className="way-demo"><kbd>{keys("⌘", "Ctrl")}</kbd><kbd>{keys("⇧", "Shift")}</kbd><kbd>R</kbd></span>
+          {canRecordCalls ? (
+            <span className="way-text"><strong>From the keyboard.</strong> <span className="mono">⌘⇧R</span> records a call, <span className="mono">⌘⇧I</span> a meeting in the room.</span>
+          ) : (
+            <span className="way-text"><strong>From the keyboard.</strong> <span className="mono">Ctrl+Shift+R</span> records a meeting in the room.</span>
+          )}
         </li>
       </ul>
       <DownloadProgress pendingNote="Recording works once this finishes. You can look around meanwhile." />
-      <Continue label="Start using Margin" disabled={saving} onClick={onFinish} />
+      <Continue label={`Start using ${APP_NAME}`} disabled={saving} onClick={onFinish} />
     </>
   );
 }
