@@ -3,6 +3,10 @@
 //! and says so. The update installs when you choose "Restart to update", or when you
 //! quit Margin. It never installs or restarts during a recording.
 //!
+//! Windows has no updater (D61): the Microsoft Store updates the package, and a Store
+//! build must not update itself. There, `status` says "not supported", the background
+//! loop does not start, and Settings does not show the update controls.
+//!
 //! The download is a `.app.tar.gz` signed with Margin's updater key (minisign); the
 //! plugin refuses anything that the public key in tauri.conf.json does not verify.
 
@@ -20,6 +24,8 @@ const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const ENDPOINT_ENV: &str = "MARGIN_UPDATE_ENDPOINT";
 /// Test only: install and restart as soon as an update is downloaded.
 const AUTO_INSTALL_ENV: &str = "MARGIN_UPDATE_AUTO_INSTALL";
+/// Only the macOS app updates itself.
+const SUPPORTED: bool = cfg!(target_os = "macos");
 
 struct Ready {
     update: Update,
@@ -51,6 +57,9 @@ pub struct UpdateStatus {
 }
 
 pub fn status() -> UpdateStatus {
+    if !SUPPORTED {
+        return unsupported();
+    }
     let s = STATE.lock().unwrap();
     UpdateStatus {
         supported: true,
@@ -82,6 +91,9 @@ pub fn ready_version() -> Option<String> {
 
 /// The background loop: a first check soon after launch, then one every six hours.
 pub fn spawn(app: &AppHandle) {
+    if !SUPPORTED {
+        return;
+    }
     let app = app.clone();
     std::thread::Builder::new()
         .name("margin-updater".into())
@@ -100,6 +112,9 @@ pub fn spawn(app: &AppHandle) {
 /// Look for a newer version and download it. Safe to call from any thread; a second
 /// call while one runs returns at once.
 pub fn check(app: &AppHandle) -> UpdateStatus {
+    if !SUPPORTED {
+        return unsupported();
+    }
     {
         let mut s = STATE.lock().unwrap();
         if s.checking || s.ready.is_some() {

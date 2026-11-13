@@ -6,7 +6,9 @@
 //!   "meeting" template. Core looks for project templates in `<cwd>/.minutes/templates/`,
 //!   and Margin runs with the state directory as its working directory (`use_state_cwd`),
 //!   so nothing is written to the shared `~/.minutes` (DECISIONS.md, settings parity).
-//! - **Open at login**: a LaunchAgent in `~/Library/LaunchAgents`.
+//! - **Open at login**: a LaunchAgent in `~/Library/LaunchAgents`. Not on Windows (D61):
+//!   a Store package needs a startup task in its manifest, which Margin does not have yet.
+//!   There the setting reads as off, a save leaves it alone, and Settings does not show it.
 //! - **Transcribe during the meeting**: Margin's prefs.json (rolling.rs).
 
 use crate::{corecfg::AppSettings, paths};
@@ -155,10 +157,16 @@ fn login_plist_path() -> PathBuf {
 }
 
 pub fn open_at_login() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
     login_plist_path().exists()
 }
 
 pub fn set_open_at_login(on: bool) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
     let path = login_plist_path();
     if !on {
         return match std::fs::remove_file(&path) {

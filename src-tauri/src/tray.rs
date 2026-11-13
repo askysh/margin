@@ -1,5 +1,11 @@
 //! Menu-bar item: start and stop recordings without opening the window, see how long the
 //! recording has run (next to the icon), and open a recent meeting.
+//!
+//! On Windows (D61) this is the icon in the notification area. The name is Margin Notes.
+//! A click opens the window, and a right-click opens the menu, as Windows users expect.
+//! Windows shows no text next to the icon, so the elapsed time is in the tooltip. The
+//! icon is the app icon, with a red dot while Margin records: a black template image
+//! does not show on a dark taskbar.
 
 use crate::commands::ops;
 use crate::events;
@@ -14,6 +20,10 @@ use tauri::{AppHandle, Manager, Wry};
 const TRAY_ID: &str = "main";
 const ICON_IDLE: &[u8] = include_bytes!("../icons/tray-template.png");
 const ICON_REC: &[u8] = include_bytes!("../icons/tray-recording.png");
+#[cfg(windows)]
+const ICON_WINDOWS: &[u8] = include_bytes!("../icons/32x32.png");
+/// The name the app shows: Margin on macOS, Margin Notes on Windows (D61).
+pub const APP_NAME: &str = if cfg!(windows) { "Margin Notes" } else { "Margin" };
 const RECENT: usize = 5;
 const RECENT_PREFIX: &str = "recent:";
 
@@ -61,7 +71,10 @@ fn menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
         menu.append(&MenuItem::with_id(app, "now", label, false, None::<&str>)?)?;
         menu.append(&MenuItem::with_id(app, "stop", "Stop recording", true, None::<&str>)?)?;
     } else {
-        menu.append(&MenuItem::with_id(app, "start-call", "Record call (mic + system audio)", can_start, None::<&str>)?)?;
+        // Windows cannot record a call yet (D61), so the menu does not offer it.
+        if !cfg!(windows) {
+            menu.append(&MenuItem::with_id(app, "start-call", "Record call (mic + system audio)", can_start, None::<&str>)?)?;
+        }
         menu.append(&MenuItem::with_id(app, "start-in-person", "Record in-person meeting", can_start, None::<&str>)?)?;
     }
     if !state.recent.is_empty() {
@@ -77,26 +90,70 @@ fn menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
         // Not while recording: the restart would cut the meeting.
         menu.append(&MenuItem::with_id(app, "update", format!("Restart to update to {version}"), !state.recording, None::<&str>)?)?;
     }
-    menu.append(&MenuItem::with_id(app, "open", "Open Margin", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(app, "open", format!("Open {APP_NAME}"), true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "open-notepad", "Open as Notepad", true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?)?;
-    menu.append(&MenuItem::with_id(app, "quit", "Quit Margin", true, Some("CmdOrCtrl+Q"))?)?;
+    // A shortcut in this menu works on macOS only: there it is also in the app menu.
+    let quit_key = (!cfg!(windows)).then_some("CmdOrCtrl+Q");
+    menu.append(&MenuItem::with_id(app, "quit", format!("Quit {APP_NAME}"), true, quit_key)?)?;
     *RECENT_PATHS.lock().unwrap() = state.recent.iter().map(|(p, _)| p.clone()).collect();
     Ok(menu)
 }
 
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
-    TrayIconBuilder::with_id(TRAY_ID)
-        .icon(Image::from_bytes(ICON_IDLE)?)
+    let builder = TrayIconBuilder::with_id(TRAY_ID)
+        .icon(icon(false)?)
         .icon_as_template(true)
-        .tooltip("Margin")
+        .tooltip(APP_NAME)
         .menu(&menu(app, &MenuState::default())?)
-        .show_menu_on_left_click(true)
-        .on_menu_event(|app, event| handle(app, event.id().as_ref()))
-        .build(app)?;
+        .show_menu_on_left_click(!cfg!(windows))
+        .on_menu_event(|app, event| handle(app, event.id().as_ref()));
+    #[cfg(windows)]
+    let builder = builder.on_tray_icon_event(|tray, event| {
+        use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+            show_main(tray.app_handle());
+        }
+    });
+    builder.build(app)?;
     // Recent meetings need a folder listing; fill them in off the main thread.
     refresh(app);
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn icon(recording: bool) -> tauri::Result<Image<'static>> {
+    Image::from_bytes(if recording { ICON_REC } else { ICON_IDLE })
+}
+
+/// Windows: the app icon, with a red dot in the lower right corner while Margin records.
+#[cfg(windows)]
+fn icon(recording: bool) -> tauri::Result<Image<'static>> {
+    let _ = (ICON_IDLE, ICON_REC);
+    let base = Image::from_bytes(ICON_WINDOWS)?;
+    let (w, h) = (base.width(), base.height());
+    let mut rgba = base.rgba().to_vec();
+    if recording {
+        red_dot(&mut rgba, w, h);
+    }
+    Ok(Image::new_owned(rgba, w, h))
+}
+
+/// Draws a red dot with a white ring on an RGBA image, in the lower right corner.
+#[cfg(any(windows, test))]
+fn red_dot(rgba: &mut [u8], w: u32, h: u32) {
+    let r = w.min(h) as f32 * 0.25;
+    let (cx, cy) = (w as f32 - r - 1.0, h as f32 - r - 1.0);
+    for y in 0..h {
+        for x in 0..w {
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            let colour = if d <= r - 1.5 { [226, 60, 50, 255] } else if d <= r { [255, 255, 255, 255] } else { continue };
+            let at = ((y * w + x) * 4) as usize;
+            if let Some(pixel) = rgba.get_mut(at..at + 4) {
+                pixel.copy_from_slice(&colour);
+            }
+        }
+    }
 }
 
 pub fn refresh(app: &AppHandle) {
@@ -123,7 +180,13 @@ pub fn tick(app: &AppHandle, elapsed_secs: u64) {
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = app2.tray_by_id(TRAY_ID) {
             // The recorder may have stopped since the tick was sent.
+            #[cfg(not(windows))]
             let _ = tray.set_title(recorder().is_recording().then_some(text));
+            // Windows has no text next to the icon. The tooltip has the time.
+            #[cfg(windows)]
+            if recorder().is_recording() {
+                let _ = tray.set_tooltip(Some(format!("{APP_NAME}: recording {text}")));
+            }
         }
     });
 }
@@ -143,15 +206,16 @@ fn apply(app: &AppHandle, state: &MenuState) {
         *SHOWN_CLOCK.lock().unwrap() = None;
         let _ = tray.set_title(None::<String>);
     }
-    if let Ok(icon) = Image::from_bytes(if recording { ICON_REC } else { ICON_IDLE }) {
+    if let Ok(icon) = icon(recording) {
         let _ = tray.set_icon(Some(icon));
         let _ = tray.set_icon_as_template(true);
     }
-    let _ = tray.set_tooltip(Some(if recording { "Margin: recording" } else { "Margin" }));
+    let _ = tray.set_tooltip(Some(if recording { format!("{APP_NAME}: recording") } else { APP_NAME.to_string() }));
 }
 
 pub fn show_main(app: &AppHandle) {
     // Margin hides itself when the recording chip takes over (chip.rs).
+    #[cfg(target_os = "macos")]
     let _ = app.show();
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -247,5 +311,15 @@ mod tests {
         assert_eq!(recent_label(&long, None).chars().count(), 40);
         assert!(recent_label("Weekly", Some("2026-11-06T10:15:04+05:30")).starts_with("Weekly  ·  "));
         assert_eq!(recent_label("Weekly", Some("not a date")), "Weekly");
+    }
+
+    #[test]
+    fn the_red_dot_is_in_the_lower_right_corner() {
+        let mut rgba = vec![0u8; 32 * 32 * 4];
+        red_dot(&mut rgba, 32, 32);
+        let pixel = |x: usize, y: usize| &rgba[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
+        assert_eq!(pixel(23, 23), [226, 60, 50, 255]);
+        assert_eq!(pixel(0, 0), [0, 0, 0, 0]);
+        assert_eq!(pixel(8, 23), [0, 0, 0, 0]);
     }
 }
