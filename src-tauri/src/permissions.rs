@@ -4,10 +4,18 @@
 //! (the TCC service behind Core Audio process taps), so we use the TCC SPI the way Apple's
 //! AudioCap sample does. It is loaded with dlopen, so a missing symbol means "unknown", not
 //! a crash.
+//!
+//! Windows (D61) has one microphone switch for the PC, one for the account and one for
+//! desktop apps, in Settings, Privacy and security, Microphone. Margin reads them from the
+//! registry (win.rs). Windows shows no prompt to a desktop app, so there is nothing to
+//! request. Windows has no System Audio permission.
 
+#[cfg(target_os = "macos")]
 use minutes_core::macos_permissions::{self, MacPermissionStatus, MicrophoneRequestOutcome};
 use serde::Serialize;
+#[cfg(target_os = "macos")]
 use std::ffi::{c_char, c_int, c_void, CString};
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 #[derive(Debug, Serialize)]
@@ -17,6 +25,51 @@ pub struct PermissionState {
     pub system_audio: &'static str,
 }
 
+/// Windows: the microphone switches from the registry. "unknown" when Windows has no
+/// value there. The System Audio permission does not exist, so it is "unknown" too, and
+/// the UI does not show it.
+#[cfg(not(target_os = "macos"))]
+pub fn state() -> PermissionState {
+    PermissionState { microphone: microphone(), system_audio: "unknown" }
+}
+
+#[cfg(windows)]
+fn microphone() -> &'static str {
+    match crate::win::microphone_consent() {
+        crate::win::MicConsent::Allowed => "granted",
+        crate::win::MicConsent::Denied => "denied",
+        crate::win::MicConsent::Unknown => "unknown",
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn microphone() -> &'static str {
+    "unknown"
+}
+
+/// Windows shows no prompt, so a request only reads the switches again.
+#[cfg(not(target_os = "macos"))]
+pub fn request_microphone() -> &'static str {
+    microphone()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn request_system_audio() -> &'static str {
+    "unknown"
+}
+
+/// Windows: the Microphone page of Settings. It is the only pane.
+#[cfg(windows)]
+pub fn open_settings(_pane: &str) {
+    if let Err(error) = crate::win::shell_open("ms-settings:privacy-microphone") {
+        tracing::warn!(%error, "could not open the microphone settings");
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn open_settings(_pane: &str) {}
+
+#[cfg(target_os = "macos")]
 pub fn state() -> PermissionState {
     PermissionState {
         microphone: match macos_permissions::microphone_status() {
@@ -34,6 +87,7 @@ pub fn state() -> PermissionState {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn request_microphone() -> &'static str {
     match macos_permissions::request_microphone_access(&|| false, Duration::from_secs(60)) {
         MicrophoneRequestOutcome::Granted => "granted",
@@ -43,6 +97,7 @@ pub fn request_microphone() -> &'static str {
 }
 
 /// Shows the macOS prompt when undecided. Returns the state afterwards.
+#[cfg(target_os = "macos")]
 pub fn request_system_audio() -> &'static str {
     match tcc::request("kTCCServiceAudioCapture", Duration::from_secs(60)) {
         Some(true) => "granted",
@@ -51,6 +106,7 @@ pub fn request_system_audio() -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn open_settings(pane: &str) {
     let anchor = match pane {
         "microphone" => "Privacy_Microphone",
@@ -61,6 +117,7 @@ pub fn open_settings(pane: &str) {
         .spawn();
 }
 
+#[cfg(target_os = "macos")]
 mod tcc {
     use super::*;
     use block2::RcBlock;

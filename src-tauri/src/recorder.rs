@@ -97,6 +97,7 @@ impl Recorder {
     }
 
     /// (recording, stopping), without a copy of the live lines.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Only the recording chip asks.
     pub fn status(&self) -> (bool, bool) {
         self.active.lock().unwrap().as_ref().map_or((false, false), |a| (true, a.stopping))
     }
@@ -437,10 +438,31 @@ fn is_screen_recording_warning(warning: &str) -> bool {
     warning.contains("Screen Recording")
 }
 
+/// Windows: no prompt exists for a desktop app, so this only reads the switches in
+/// Settings. A state that Windows does not give is not an error: the capture then says if
+/// it cannot open the microphone. A call needs the audio of the other people, and Margin
+/// cannot record that on Windows yet (D61).
+#[cfg(not(target_os = "macos"))]
+fn ensure_permissions(kind: Kind) -> Result<bool, String> {
+    if kind == Kind::Call {
+        return Err("Margin Notes can't record a call on Windows yet. Record in person instead.".into());
+    }
+    if crate::permissions::state().microphone == "denied" {
+        return Err("Margin Notes can't use the microphone. Turn it on in Settings → Privacy & security → Microphone, then try again.".into());
+    }
+    // A PC can have no microphone at all. Core's own error for that names VB-CABLE, a
+    // program the user does not have, so say it in plain words first.
+    if capture::list_devices_categorized().is_empty() {
+        return Err("Margin Notes found no microphone. Connect one, or turn it on in Settings → System → Sound, then try again.".into());
+    }
+    Ok(false)
+}
+
 /// Ask macOS before opening any device. Opening an input while the decision is still
 /// pending can block forever if the prompt never shows (see core's macos_permissions), and
 /// a denied system-audio permission makes the tap record silence. True when a call may
 /// use the process tap: macOS granted System Audio Recording.
+#[cfg(target_os = "macos")]
 fn ensure_permissions(kind: Kind) -> Result<bool, String> {
     let state = crate::permissions::state();
     let mic = match state.microphone {
