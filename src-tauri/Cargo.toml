@@ -18,13 +18,12 @@ tauri-build = { version = "2", features = [] }
 # tag has yet (DECISIONS.md, "Back on upstream minutes-core").
 # Now: v0.32.1 + 209265f.
 # Bump with scripts/bump-upstream.sh <tag|commit> (re-seeds Cargo.lock; see docs/development.md "Updating minutes-core").
-minutes-core = { git = "https://github.com/silverstein/minutes", rev = "209265fac94763d45171acb284c258eff6718690", default-features = false, features = ["whisper", "streaming", "diarize", "metal"] }
+minutes-core = { git = "https://github.com/silverstein/minutes", rev = "209265fac94763d45171acb284c258eff6718690", default-features = false, features = ["whisper", "streaming", "diarize"] }
 # minutes-core asks for ort "2.0.0-rc.10" (caret); later rcs break pyannote-rs. Upstream's CLI pins it too.
 ort = { version = "=2.0.0-rc.10", default-features = false }
 
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api", "protocol-asset"] }
 tauri-plugin-dialog = "2"
-window-vibrancy = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -34,12 +33,6 @@ ureq = "3"
 which = "8"
 regex = "1"
 trash = "5"
-libc = "0.2"
-block2 = "0.6"
-# The recording chip's window level, Spaces and frame (chip.rs). Tauri already uses these.
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSScreen", "NSWindow"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSGeometry"] }
 tiny_http = "0.12"
 hound = "3.5"
 tracing = "0.1"
@@ -47,6 +40,24 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-updater = "2"
+
+# macOS only. The Windows build has no Metal, AppKit or TCC (DECISIONS.md D61).
+[target.'cfg(target_os = "macos")'.dependencies]
+# Whisper on the GPU. Cargo adds this feature to the minutes-core line above.
+# scripts/bump-upstream.sh moves both lines to the new ref.
+minutes-core = { git = "https://github.com/silverstein/minutes", rev = "209265fac94763d45171acb284c258eff6718690", default-features = false, features = ["metal"] }
+window-vibrancy = "0.8"
+libc = "0.2"
+block2 = "0.6"
+# The recording chip's window level, Spaces and frame (chip.rs). Tauri already uses these.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSScreen", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSGeometry"] }
+
+# Windows only: Job Objects, the registry, the shell and thread priority (winproc.rs,
+# permissions.rs). minutes-core uses the same windows-sys release.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authentication_Identity", "Win32_Storage_Packaging_Appx", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 strip = true
