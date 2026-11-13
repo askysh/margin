@@ -274,7 +274,9 @@ mod tests {
     #[test]
     fn a_job_stops_the_child_and_its_children() {
         let mut command = Command::new("cmd.exe");
-        command.args(["/c", "ping -n 30 127.0.0.1 >nul"]).stdin(std::process::Stdio::null());
+        // The full path of ping: under `cargo test` the PATH has every build folder of
+        // whisper.cpp in it, and cmd.exe does not search a PATH that long.
+        command.args(["/c", r"%SystemRoot%System32ping.exe -n 30 127.0.0.1 >nul"]).stdin(std::process::Stdio::null());
         let (mut child, job) = spawn_in_job(&mut command).expect("spawn in a job");
         // Give cmd.exe time to start ping.
         std::thread::sleep(std::time::Duration::from_millis(700));
