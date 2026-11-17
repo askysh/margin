@@ -2,11 +2,14 @@
 # Build margin.exe for Windows and put the DLLs it needs at run time next to it.
 # Run it in Git Bash. scripts/package-msix.ps1 then makes the Store package from it.
 #
-#   scripts/build-windows.sh            # the Store build: release, Whisper on the GPU,
-#                                       # in src-tauri/target/vulkan/release
-#   scripts/build-windows.sh --cpu      # release, Whisper on the CPU only,
-#                                       # in src-tauri/target/release
-#   scripts/build-windows.sh --debug    # debug, CPU only, with the UI built in
+#   scripts/build-windows.sh              # the Store build: release, Whisper on the GPU,
+#                                         # in src-tauri/target/vulkan/release
+#   scripts/build-windows.sh --cpu        # release, Whisper on the CPU only,
+#                                         # in src-tauri/target/release
+#   scripts/build-windows.sh --debug      # debug, CPU only, with the UI built in
+#   scripts/build-windows.sh --installer  # the Store build, then an installer for the
+#                                         # current user, in release/windows. Add --cpu
+#                                         # for an installer of the CPU build.
 #
 # It needs Rust (MSVC), Visual Studio with the C++ workload, CMake, LLVM and bun
 # (docs/development.md, "Windows"). The Store build also needs the Vulkan SDK and the
@@ -18,21 +21,30 @@ profile=release
 flags=()
 target=src-tauri/target
 gpu=1
-case "${1:-}" in
-  --debug)
-    profile=debug
-    flags=(--debug)
-    gpu=
-    ;;
-  --cpu)
-    gpu=
-    ;;
-  "") ;;
-  *)
-    echo "Unknown option: $1. Use --cpu, --debug or no option." >&2
-    exit 1
-    ;;
-esac
+installer=
+for option in "$@"; do
+  case "$option" in
+    --debug)
+      profile=debug
+      flags=(--debug)
+      gpu=
+      ;;
+    --cpu)
+      gpu=
+      ;;
+    --installer)
+      installer=1
+      ;;
+    *)
+      echo "Unknown option: $option. Use --cpu, --debug, --installer or no option." >&2
+      exit 1
+      ;;
+  esac
+done
+if [ -n "$installer" ] && [ "$profile" = debug ]; then
+  echo "--installer makes a release build. Do not use it with --debug." >&2
+  exit 1
+fi
 
 loader=""
 if [ -n "$gpu" ]; then
@@ -131,3 +143,29 @@ fi
 
 echo "Built: $out/margin.exe"
 echo "Beside it: $beside"
+
+if [ -z "$installer" ]; then
+  exit 0
+fi
+
+# The installer: an NSIS setup from Tauri, for the current user, with no administrator
+# rights. tauri.windows.conf.json has its settings. Tauri gets NSIS by itself the first
+# time. The DLLs go in as resources at the top of the install folder, so the installed
+# app has the same files beside its exe as the Store package.
+resources=""
+for file in $beside; do
+  resources="$resources${resources:+, }\"$(cygpath -m "$PWD/$out/$file")\": \"$file\""
+done
+config="$out/installer.conf.json"
+echo "{\"bundle\": {\"resources\": {$resources}}}" >"$config"
+bunx tauri bundle "${flags[@]}" --bundles nsis --config "$config"
+
+version="$(bun -e 'console.log(require("./src-tauri/tauri.conf.json").version)')"
+setup="$out/bundle/nsis/Margin Notes_${version}_x64-setup.exe"
+if [ ! -f "$setup" ]; then
+  echo "The installer is not at $setup." >&2
+  exit 1
+fi
+mkdir -p release/windows
+cp -f "$setup" "release/windows/MarginNotes-setup-$version.exe"
+echo "Installer: release/windows/MarginNotes-setup-$version.exe"

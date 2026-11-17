@@ -14,7 +14,20 @@
     ]
   },
   "bundle": {
-    "active": false,
-    "externalBin": null
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Askysh",
+    "externalBin": null,
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "displayLanguageSelector": false
+      }
+    }
   }
 }
