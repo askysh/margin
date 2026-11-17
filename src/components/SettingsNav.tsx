@@ -1,6 +1,7 @@
 import { useEffect, useRef, type KeyboardEvent } from "react";
 import { SettingsIcons } from "./SettingsIcons";
-import { hasOwnUpdater } from "../platform";
+import { updatesAlwaysShown } from "../platform";
+import { useUpdateStatus } from "./Updates";
 
 /** Sections in nav order. Groups are separated by space; Start over sits apart at the bottom. */
 export const SECTIONS = [
@@ -18,8 +19,6 @@ export const SECTIONS = [
 
 export type SectionId = (typeof SECTIONS)[number]["id"];
 
-/** The sections this platform has. The Store updates the Windows app, so it has no Updates. */
-const SHOWN = SECTIONS.filter((s) => hasOwnUpdater || s.id !== "updates");
 
 interface Props {
   section: SectionId;
@@ -30,6 +29,10 @@ interface Props {
 /** Replaces the meeting list while Settings is open, the way T3 Code's settings route does. */
 export function SettingsNav({ section, onSection, onBack }: Props) {
   const list = useRef<HTMLUListElement>(null);
+  // The Store package and a build folder do not update themselves, so on Windows they have
+  // no Updates section.
+  const [updates] = useUpdateStatus();
+  const SHOWN = SECTIONS.filter((s) => s.id !== "updates" || updatesAlwaysShown || updates?.supported);
   // Opening Settings puts focus in the nav, so the arrow keys work straight away.
   useEffect(() => list.current?.querySelector<HTMLButtonElement>("[aria-current]")?.focus({ preventScroll: true }), []);
 

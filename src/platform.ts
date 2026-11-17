@@ -21,12 +21,14 @@ export const GLOBAL_SHORTCUT = isWindows ? "Ctrl+Alt+Shift+R" : "⌃⌥⌘R";
 
 /** Windows cannot record the other people on a call yet. */
 export const canRecordCalls = !isWindows;
-/** The recording chip, Open at login and Apple Speech are macOS only for now. The Store
- * updates the Windows app, so it has no Updates section. */
+/** The recording chip, Open at login and Apple Speech are macOS only for now. */
 export const hasRecordingChip = !isWindows;
 export const hasOpenAtLogin = !isWindows;
 export const hasAppleSpeech = !isWindows;
-export const hasOwnUpdater = !isWindows;
+/** On Windows only the copy from the installer updates itself, and the Store updates the
+ * Store package. The backend decides at run time (`UpdateStatus.supported`), and Settings
+ * shows Updates only when it says yes. The macOS app always shows the section. */
+export const updatesAlwaysShown = !isWindows;
 /** Windows has no permission for system audio. */
 export const hasSystemAudioPermission = !isWindows;
 /** The Windows build runs Whisper on the graphics card, and Settings can turn that off.

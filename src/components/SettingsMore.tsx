@@ -116,13 +116,13 @@ export function UpdatesSection({ prefs, changePrefs, notify }: SettingsView) {
       : status.checking
         ? "Checking…"
         : status.ready
-          ? `Margin ${status.ready} is downloaded. It installs when you restart or quit Margin.`
-          : status.error || (asked || status.checked_secs_ago !== null ? "Margin is up to date." : "");
+          ? `${APP_NAME} ${status.ready} is downloaded. It installs when you restart or quit ${APP_NAME}.`
+          : status.error || (asked || status.checked_secs_ago !== null ? `${APP_NAME} is up to date.` : "");
   return (
     <>
-      <SectionHead title="Updates" about="New versions of Margin, from GitHub." />
+      <SectionHead title="Updates" about={`New versions of ${APP_NAME}, from GitHub.`} />
       <Card>
-        <Row title={<>Margin <span className="mono">{status?.current ?? ""}</span></>} help={<span role="status">{line}</span>}>
+        <Row title={<>{APP_NAME} <span className="mono">{status?.current ?? ""}</span></>} help={<span role="status">{line}</span>}>
           {status?.ready ? (
             <button className="btn btn-primary" onClick={() => restart(notify)}>Restart to update</button>
           ) : (
@@ -131,7 +131,7 @@ export function UpdatesSection({ prefs, changePrefs, notify }: SettingsView) {
         </Row>
         <ToggleRow
           title="Update automatically"
-          help="Check for updates and download them in the background. They install when you restart or quit Margin."
+          help={`Check for updates and download them in the background. They install when you restart or quit ${APP_NAME}.`}
           checked={prefs.auto_update}
           onChange={(on) => changePrefs({ ...prefs, auto_update: on })}
         />
