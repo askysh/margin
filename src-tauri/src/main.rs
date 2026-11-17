@@ -158,6 +158,7 @@ fn main() {
             commands::tauri_cmds::settings_options,
             commands::tauri_cmds::save_app_prefs,
             commands::tauri_cmds::folder_choices,
+            commands::tauri_cmds::folder_in_onedrive,
             commands::tauri_cmds::complete_onboarding,
             commands::tauri_cmds::models_status,
             commands::tauri_cmds::download_models,

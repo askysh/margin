@@ -244,6 +244,8 @@ export const api = {
   installUpdate: () => invoke<void>("install_update"),
   folderChoices: () =>
     invoke<{ default_dir: string; obsidian_vaults: { name: string; path: string }[] }>("folder_choices"),
+  /** Windows: the folder is inside OneDrive. Always false on macOS. */
+  folderInOneDrive: (path: string) => invoke<boolean>("folder_in_onedrive", { path }),
   completeOnboarding: () => invoke<void>("complete_onboarding"),
   modelsStatus: () => invoke<ModelFile[]>("models_status"),
   downloadModels: () => invoke<void>("download_models"),

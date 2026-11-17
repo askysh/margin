@@ -183,6 +183,19 @@ pub mod ops {
         Ok(FolderChoices { default_dir: paths::default_output_dir().display().to_string(), obsidian_vaults: vaults })
     }
 
+    /// Windows: the folder is inside OneDrive, so OneDrive can upload what Margin saves
+    /// there. The UI then shows a note. Always false on macOS.
+    pub fn folder_in_onedrive(path: String) -> Res<bool> {
+        #[cfg(windows)]
+        let inside = crate::win::in_onedrive(std::path::Path::new(&path));
+        #[cfg(not(windows))]
+        let inside = {
+            let _ = path;
+            false
+        };
+        Ok(inside)
+    }
+
     pub fn complete_onboarding() -> Res<()> {
         let mut p = prefs::load();
         p.onboarding_complete = true;
@@ -518,6 +531,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "update_status" | "check_updates" => out(Ok::<_, String>(crate::updater::unsupported())),
         "install_update" => Err("Updates work only in the app.".into()),
         "folder_choices" => out(ops::folder_choices()),
+        "folder_in_onedrive" => out(ops::folder_in_onedrive(arg(a, "path")?)),
         "complete_onboarding" => out(ops::complete_onboarding()),
         "models_status" => out(ops::models_status()),
         "download_models" => out(ops::download_models()),
@@ -591,6 +605,7 @@ pub mod tauri_cmds {
     cmd!(settings_options() -> ops::SettingsOptions);
     cmd!(save_app_prefs(prefs: prefs::AppPrefs) -> prefs::AppPrefs);
     cmd!(folder_choices() -> ops::FolderChoices);
+    cmd!(folder_in_onedrive(path: String) -> bool);
     cmd!(complete_onboarding() -> ());
     cmd!(models_status() -> Vec<models::ModelFile>);
     cmd!(download_models() -> ());

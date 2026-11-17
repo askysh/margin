@@ -11,6 +11,7 @@
 //! - The account's display name comes from `GetUserNameExW`.
 //! - WebView2 has its own settings for the browser keys and the context menu.
 //! - The Vulkan loader reads a variable that hides the graphics drivers from Whisper.
+//! - OneDrive names its folders in three variables and in the registry.
 //!
 //! Each function fails soft: a call that Windows refuses gives `None`, `false` or an
 //! `io::Error`, never a panic.
@@ -392,6 +393,89 @@ fn package_family_name() -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
+// ---------------------------------------------------------------- OneDrive
+
+/// True when `folder` is inside a OneDrive folder of this account.
+///
+/// The default meetings folder is in Documents, and OneDrive backup moves Documents into
+/// OneDrive. The recordings then go to OneDrive too, so the UI says so. Both sides are
+/// compared as real paths, so a link or another spelling of the same folder still matches.
+pub fn in_onedrive(folder: &std::path::Path) -> bool {
+    let folder = real_path(folder);
+    onedrive_roots().iter().any(|root| is_inside(&folder, &real_path(root)))
+}
+
+/// The OneDrive folders that Windows knows for this account. OneDrive sets three
+/// variables for the programs it starts with, and it keeps the folder of each account,
+/// personal or work, in the registry.
+fn onedrive_roots() -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> =
+        ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"].iter().filter_map(std::env::var_os).map(Into::into).collect();
+    const ACCOUNTS: &str = r"Software\Microsoft\OneDrive\Accounts";
+    for account in reg_subkeys(HKEY_CURRENT_USER, ACCOUNTS) {
+        if let Some(folder) = reg_string(HKEY_CURRENT_USER, &format!(r"{ACCOUNTS}\{account}"), "UserFolder") {
+            roots.push(folder.into());
+        }
+    }
+    roots.retain(|root: &std::path::PathBuf| root.is_absolute());
+    roots
+}
+
+/// The names of the keys directly under a registry key. Empty when the key is not there.
+fn reg_subkeys(root: HKEY, key: &str) -> Vec<String> {
+    use windows_sys::Win32::System::Registry::{RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, KEY_READ};
+    let key = wide(key);
+    let mut names = Vec::new();
+    // SAFETY: the key name ends with a zero. The handle is checked, and closed at the end.
+    // `len` is the size of `buf` in characters before each call, as RegEnumKeyExW requires.
+    unsafe {
+        let mut handle: HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(root, key.as_ptr(), 0, KEY_READ, &mut handle) != ERROR_SUCCESS {
+            return names;
+        }
+        for index in 0.. {
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            let rc = RegEnumKeyExW(handle, index, buf.as_mut_ptr(), &mut len, std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+            if rc != ERROR_SUCCESS {
+                break;
+            }
+            names.push(String::from_utf16_lossy(&buf[..len as usize]));
+        }
+        RegCloseKey(handle);
+    }
+    names
+}
+
+/// The path with its links followed. A folder that does not exist yet, such as a new
+/// meetings folder, keeps its last names as they are, after the real path of the part
+/// that does exist.
+fn real_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut rest = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return rest.iter().rev().fold(real, |path, name| path.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// True when `folder` is `root` or a folder in it. Windows paths do not care about the
+/// case of a letter. The comparison is by whole names, so `C:\OneDrive2` is not inside
+/// `C:\OneDrive`.
+pub fn is_inside(folder: &std::path::Path, root: &std::path::Path) -> bool {
+    let lower = |path: &std::path::Path| -> Vec<String> { path.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect() };
+    let (folder, root) = (lower(folder), lower(root));
+    !root.is_empty() && folder.len() >= root.len() && folder[..root.len()] == root[..]
+}
+
 // ---------------------------------------------------------------- the account
 
 /// The account's display name, such as "Priya Sharma". `None` for an account that has
@@ -412,6 +496,30 @@ pub fn display_name() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_is_inside_onedrive_by_whole_names_in_any_case() {
+        use std::path::Path;
+        let root = Path::new(r"C:\Users\Priya\OneDrive");
+        assert!(is_inside(Path::new(r"C:\Users\Priya\OneDrive\Documents\Meetings"), root));
+        assert!(is_inside(Path::new(r"c:\users\PRIYA\onedrive\documents"), root));
+        assert!(is_inside(root, root), "the OneDrive folder itself");
+        assert!(!is_inside(Path::new(r"C:\Users\Priya\OneDrive - Work\Meetings"), root), "another folder that starts the same");
+        assert!(!is_inside(Path::new(r"C:\Users\Priya\Documents\Meetings"), root));
+        assert!(!is_inside(Path::new(r"C:\Users\Priya"), root), "the folder above it");
+        assert!(!is_inside(Path::new(r"D:\Users\Priya\OneDrive\Meetings"), root), "another drive");
+        assert!(!is_inside(Path::new(r"C:\Meetings"), Path::new("")), "no root");
+    }
+
+    #[test]
+    fn a_new_folder_in_a_real_folder_gets_the_real_path_of_its_parent() {
+        let dir = std::env::temp_dir().join(format!("margin-realpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(real_path(&dir.join("Meetings").join("2026")), real.join("Meetings").join("2026"));
+        assert!(is_inside(&real_path(&dir.join("Meetings")), &real_path(&dir)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn names(items: &[&str]) -> Vec<Option<String>> {
         items.iter().map(|&name| (name != "-").then(|| name.to_string())).collect()
