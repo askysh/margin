@@ -32,6 +32,9 @@ export const hasSystemAudioPermission = !isWindows;
 /** The Windows build runs Whisper on the graphics card, and Settings can turn that off.
  * The macOS build always uses the GPU of Apple Silicon. */
 export const hasGpuSwitch = isWindows;
+/** Windows can keep Documents in OneDrive, so the UI says when the meetings folder is
+ * there. */
+export const hasOneDriveNote = isWindows;
 
 /** The label of an in-window shortcut: `keys("⌘⇧N", "Ctrl+Shift+N")`. */
 export function keys(mac: string, windows: string): string {

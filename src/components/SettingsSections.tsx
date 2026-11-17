@@ -6,6 +6,7 @@ import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { SummaryChoice } from "./SummaryChoice";
 import { Card, Row, SectionHead, SelectRow, TextRow, ToggleRow, type Choice } from "./SettingsRows";
 import type { SettingsView } from "./Settings";
+import { OneDriveNote } from "./OneDriveNote";
 import { canRecordCalls, DEVICE, GLOBAL_SHORTCUT, hasAppleSpeech, hasGpuSwitch, hasOpenAtLogin, hasRecordingChip, SHOW_IN_FILES, TRAY } from "../platform";
 
 type Save = (patch: Partial<Settings>) => void;
@@ -30,7 +31,7 @@ export function GeneralSection({ s, save, options }: SettingsView) {
         <NameRow s={s} save={save} />
       </Card>
       <Card title="Meetings" note="Changing the folder affects new meetings. Meetings already saved stay where they are.">
-        <Row title="Meetings folder" help={<span className="path">{tildify(s.output_dir)}</span>}>
+        <Row title="Meetings folder" help={<><span className="path">{tildify(s.output_dir)}</span><OneDriveNote dir={s.output_dir} onChoose={changeFolder} className="set-help" /></>}>
           <button className="btn btn-quiet" onClick={() => api.reveal(s.output_dir)}>{SHOW_IN_FILES}</button>
           <button className="btn btn-quiet" onClick={changeFolder}>Change…</button>
         </Row>

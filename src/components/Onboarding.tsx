@@ -7,6 +7,7 @@ import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { MicIcon, PermissionRow, SpeakerIcon } from "./PermissionRow";
 import { SummaryChoice } from "./SummaryChoice";
 import { APP_NAME, canRecordCalls, DEVICE, ENTER_KEY, hasSystemAudioPermission, isWindows, joinPath, keys, TRAY } from "../platform";
+import { OneDriveNote } from "./OneDriveNote";
 
 const STEPS = ["You", "Setup", "Permissions", "Summaries", "Ready"] as const;
 const SETUP = 1;
@@ -158,6 +159,7 @@ function StepSetup({ s, onNext, saving }: { s: Settings; onNext: (patch: Partial
           {custom ? <span className="option-path path">{tildify(dir)}</span> : <span className="option-body">{isWindows ? "OneDrive, or anywhere else." : "iCloud Drive, or anywhere else."}</span>}
         </button>
       </div>
+      <OneDriveNote dir={dir} onChoose={pick} className="ob-hint" />
 
       <h2 className="ob-sub" id="ob-model">Transcript quality</h2>
       <div className="segmented" role="radiogroup" aria-labelledby="ob-model">
