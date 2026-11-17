@@ -64,8 +64,9 @@ webview2-com = "0.39"
 windows-core = "0.62"
 
 [features]
-# Whisper on the GPU, on Windows, through Vulkan. Off by default: the build needs the
-# Vulkan SDK, and the choice is not made yet (docs/development.md, "Whisper on the GPU").
+# Whisper on the GPU, on Windows, through Vulkan. Off here, so the macOS build and a
+# plain `cargo build` do not get it. scripts/build-windows.sh turns it on for the Store
+# build (DECISIONS.md D63, docs/development.md "Whisper on the GPU").
 vulkan = ["minutes-core/vulkan"]
 
 [profile.release]

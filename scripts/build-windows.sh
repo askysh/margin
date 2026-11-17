@@ -2,47 +2,70 @@
 # Build margin.exe for Windows and put the DLLs it needs at run time next to it.
 # Run it in Git Bash. scripts/package-msix.ps1 then makes the Store package from it.
 #
-#   scripts/build-windows.sh            # release: src-tauri/target/release/margin.exe
-#   scripts/build-windows.sh --debug    # debug, with the UI built in
-#   scripts/build-windows.sh --vulkan   # release with Whisper on the GPU, in its own
-#                                       # folder: src-tauri/target/vulkan/release
+#   scripts/build-windows.sh            # the Store build: release, Whisper on the GPU,
+#                                       # in src-tauri/target/vulkan/release
+#   scripts/build-windows.sh --cpu      # release, Whisper on the CPU only,
+#                                       # in src-tauri/target/release
+#   scripts/build-windows.sh --debug    # debug, CPU only, with the UI built in
 #
 # It needs Rust (MSVC), Visual Studio with the C++ workload, CMake, LLVM and bun
-# (docs/development.md, "Windows"). --vulkan also needs the Vulkan SDK, with VULKAN_SDK
-# set to its folder (docs/development.md, "Whisper on the GPU").
+# (docs/development.md, "Windows"). The Store build also needs the Vulkan SDK and the
+# Vulkan runtime files, with VULKAN_SDK set (docs/development.md, "Whisper on the GPU").
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 profile=release
 flags=()
 target=src-tauri/target
+gpu=1
 case "${1:-}" in
   --debug)
     profile=debug
     flags=(--debug)
+    gpu=
     ;;
-  --vulkan)
-    if [ ! -f "${VULKAN_SDK:-}/Lib/vulkan-1.lib" ]; then
-      echo "Set VULKAN_SDK to the folder of the Vulkan SDK. It has Lib/vulkan-1.lib." >&2
-      exit 1
-    fi
-    flags=(--features vulkan)
-    # Its own folder, so the CPU build stays as it is. whisper.cpp builds its shader tool
-    # in a project inside the project, and those paths go past the 260 characters that
-    # MSBuild allows, from any folder with a normal path. So give the folder a drive
-    # letter for the time of the build. `subst` needs no administrator rights.
-    target=src-tauri/target/vulkan
-    drive="${MARGIN_VULKAN_DRIVE:-V}"
-    mkdir -p "$target"
-    if [ -e "/${drive,,}/" ]; then
-      echo "Drive $drive: is in use. Set MARGIN_VULKAN_DRIVE to a free letter." >&2
-      exit 1
-    fi
-    cmd //c subst "$drive:" "$(cygpath -w "$PWD/$target")"
-    trap 'cmd //c subst "$drive:" //D >/dev/null' EXIT
-    export CARGO_TARGET_DIR="$drive:\\"
+  --cpu)
+    gpu=
+    ;;
+  "") ;;
+  *)
+    echo "Unknown option: $1. Use --cpu, --debug or no option." >&2
+    exit 1
     ;;
 esac
+
+loader=""
+if [ -n "$gpu" ]; then
+  if [ ! -f "${VULKAN_SDK:-}/Lib/vulkan-1.lib" ]; then
+    echo "Set VULKAN_SDK to the folder of the Vulkan SDK. It has Lib/vulkan-1.lib." >&2
+    echo "For a build with no GPU support, use --cpu." >&2
+    exit 1
+  fi
+  # The Vulkan loader, vulkan-1.dll. margin.exe imports it, and a PC gets it only from a
+  # graphics driver. So the app ships its own copy (DECISIONS.md D63). It is in the
+  # "Runtime components" zip of the same SDK release, not in the SDK itself.
+  loader="$(cygpath -u "${VULKAN_RUNTIME:-$VULKAN_SDK/runtime}")"
+  if [ ! -f "$loader/x64/vulkan-1.dll" ] || [ ! -f "$loader/VulkanRT-License.txt" ]; then
+    echo "The Vulkan runtime files are not in $loader." >&2
+    echo "Unzip VulkanRT-X64-<version>-Components.zip from LunarG there, or set VULKAN_RUNTIME." >&2
+    exit 1
+  fi
+  flags=(--features vulkan)
+  # Its own folder, so the CPU build stays as it is. whisper.cpp builds its shader tool
+  # in a project inside the project, and those paths go past the 260 characters that
+  # MSBuild allows, from any folder with a normal path. So give the folder a drive
+  # letter for the time of the build. `subst` needs no administrator rights.
+  target=src-tauri/target/vulkan
+  drive="${MARGIN_VULKAN_DRIVE:-V}"
+  mkdir -p "$target"
+  if [ -e "/${drive,,}/" ]; then
+    echo "Drive $drive: is in use. Set MARGIN_VULKAN_DRIVE to a free letter." >&2
+    exit 1
+  fi
+  cmd //c subst "$drive:" "$(cygpath -w "$PWD/$target")"
+  trap 'cmd //c subst "$drive:" //D >/dev/null' EXIT
+  export CARGO_TARGET_DIR="$drive:\\"
+fi
 
 export PATH="$HOME/.cargo/bin:$PATH"
 # whisper.cpp needs CMake, and bindgen needs libclang. Their installers do not always put
@@ -100,5 +123,11 @@ for dll in msvcp140.dll msvcp140_1.dll vcruntime140.dll vcruntime140_1.dll; do
   cp -f "$crt/$dll" "$out/$dll"
 done
 
+beside="DirectML.dll msvcp140.dll msvcp140_1.dll vcruntime140.dll vcruntime140_1.dll"
+if [ -n "$gpu" ]; then
+  cp -f "$loader/x64/vulkan-1.dll" "$loader/VulkanRT-License.txt" "$out/"
+  beside="$beside vulkan-1.dll VulkanRT-License.txt"
+fi
+
 echo "Built: $out/margin.exe"
-echo "Beside it: DirectML.dll msvcp140.dll msvcp140_1.dll vcruntime140.dll vcruntime140_1.dll"
+echo "Beside it: $beside"

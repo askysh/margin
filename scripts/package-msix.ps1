@@ -20,29 +20,33 @@
 
   docs/development.md, "The Store package", says where a packaged run writes.
 
+.PARAMETER Cpu
+  Pack the CPU-only build (build-windows.sh --cpu) in place of the Store build. It has
+  no Vulkan loader.
+
 .PARAMETER BuildDir
-  The folder with margin.exe and its DLLs. Default: src-tauri/target/release.
+  The folder with margin.exe and its DLLs. Default: src-tauri/target/vulkan/release, or
+  src-tauri/target/release with -Cpu.
 
 .PARAMETER Arch
   The CPU of the build: x64 or arm64.
-
-.PARAMETER ExtraDll
-  More DLLs from BuildDir to put in the package, for a build that needs them.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\package-msix.ps1
 #>
 [CmdletBinding()]
 param(
+  [switch]$Cpu,
   [string]$BuildDir,
   [ValidateSet('x64', 'arm64')]
-  [string]$Arch = 'x64',
-  [string[]]$ExtraDll = @()
+  [string]$Arch = 'x64'
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-if (-not $BuildDir) { $BuildDir = Join-Path $root 'src-tauri\target\release' }
+if (-not $BuildDir) {
+  $BuildDir = Join-Path $root $(if ($Cpu) { 'src-tauri\target\release' } else { 'src-tauri\target\vulkan\release' })
+}
 
 if (-not (Get-Command winapp -ErrorAction SilentlyContinue)) {
   throw 'The winapp CLI is not installed. Get it with: winget install Microsoft.WinAppCli'
@@ -58,7 +62,10 @@ $version = '{0}.{1}.{2}.0' -f ([int]$Matches[1] + 1), [int]$Matches[2], [int]$Ma
 
 # build-windows.sh puts these beside margin.exe. A package without one of them starts on
 # the build PC and fails on a clean PC.
-$files = @('margin.exe', 'DirectML.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') + $ExtraDll
+$files = @('margin.exe', 'DirectML.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
+# The Store build imports vulkan-1.dll, the Vulkan loader. A PC has it only when a
+# graphics driver installed it, so the package has its own copy, with its license.
+if (-not $Cpu) { $files += 'vulkan-1.dll', 'VulkanRT-License.txt' }
 foreach ($file in $files) {
   if (-not (Test-Path (Join-Path $BuildDir $file))) {
     throw "$file is not in $BuildDir. Run scripts/build-windows.sh first."
