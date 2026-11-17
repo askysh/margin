@@ -36,7 +36,11 @@ export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetB
   };
   const scroller = useRef<HTMLDivElement>(null);
   useEscape(onBack, resetOpen);
-  useEffect(() => scroller.current?.scrollTo(0, 0), [section]);
+  // The braces matter. A new Chromium, and so WebView2, gives a Promise from scrollTo.
+  // React takes what an effect gives back as its cleanup, and a Promise is not a function.
+  useEffect(() => {
+    scroller.current?.scrollTo(0, 0);
+  }, [section]);
 
   const openReset = (from: HTMLElement) => {
     resetOpener.current = from;
