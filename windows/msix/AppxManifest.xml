@@ -44,8 +44,10 @@
   </Resources>
 
   <Dependencies>
-    <!-- 19045 is Windows 10 22H2. The uap10 attributes below need 19041 or later. -->
-    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19045.0" MaxVersionTested="10.0.26100.0" />
+    <!-- 22000 is the first release of Windows 11 (DECISIONS.md D63). Windows 11 has
+         WebView2, which a package cannot install. The uap10 attributes below need 19041
+         or later. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
   </Dependencies>
 
   <Capabilities>
