@@ -158,8 +158,9 @@ $M --dev serve [port]                    # QA bridge for scripts/e2e
 
 The Windows build is on the `windows-port` branch (DECISIONS.md D61). It records a meeting
 in the room from the microphone, transcribes it and writes the meeting file. It does not
-record a call, and it has no recording chip, no Open at login, no Apple Speech and no
-updater of its own. Whisper runs on the graphics card through Vulkan, and on the CPU when
+record a call, and it has no recording chip, no Open at login and no Apple Speech. The
+copy from the installer updates itself, and the Store updates the Store package
+([Updates on Windows](#updates-on-windows)). Whisper runs on the graphics card through Vulkan, and on the CPU when
 the PC has no usable one ([Whisper on the GPU](#whisper-on-the-gpu)).
 
 ### Requirements
@@ -391,11 +392,13 @@ not signed, so SmartScreen warns before it runs.
 - The script gives the DLLs from [The DLLs beside margin.exe](#the-dlls-beside-marginexe)
   and the Vulkan loader as resources, so they go beside `margin.exe`, as in the Store
   package.
-- The app has no updater on Windows (`updater.rs`), so the installer makes no update
-  files.
+- With `MARGIN_UPDATER_KEY_PATH` and `MARGIN_UPDATER_KEY_PASSWORD_PATH`, the same
+  variables as `scripts/release.sh`, the script signs the setup exe and writes
+  `MarginNotes-setup-<version>.exe.sig` beside it. The in-app update needs it
+  ([Updates on Windows](#updates-on-windows)). Without them it makes no `.sig`.
 
-`tauri bundle` writes the bundle type into `margin.exe` in the build folder. Only the
-updater reads it.
+`tauri bundle` writes the bundle type into `margin.exe` in the build folder. The updater
+reads it.
 
 The installed app is not packaged, so it writes to the places in
 [Where the files are](#where-the-files-are). WebView2 keeps its data in
@@ -407,6 +410,85 @@ shortcuts and the Apps entry. With "Delete the application data" checked, it als
 removes `%LOCALAPPDATA%\com.akashmishra.margin` and the key
 `HKCU\Software\Askysh\Margin Notes`. It never removes `%LOCALAPPDATA%\Margin` (settings
 and models), the meetings folder or `%USERPROFILE%\.minutes`.
+
+### Updates on Windows
+
+The copy from the installer updates itself, as the Mac app does (D38). The Store package
+does not: the Store updates it, and a Store build must not update itself (D61). One
+`margin.exe` serves both, so `win.rs` `installed_by_setup` decides at start:
+
+- With package identity, the app runs from the Store package. No updater.
+- With no bundle type in the exe (a plain `cargo build`), no updater.
+- With no `uninstall.exe` beside the exe (the build folder, a layout folder, a copy
+  elsewhere), no updater. There is no installer to update.
+
+`margin.log` says `updater supported=true` or `false` at start. When the updater is off,
+Settings has no Updates section on Windows.
+
+The update file is the setup exe itself, with its `.sig`. The app reads the same
+`latest.json` as the Mac app. `scripts/latest-json-windows.mjs` adds the Windows entry
+to it:
+
+```bash
+bun scripts/latest-json-windows.mjs release/latest.json release/windows/MarginNotes-setup-<version>.exe.sig
+```
+
+The key is `windows-x86_64`. `tauri-plugin-updater` looks for `windows-x86_64-nsis`
+first and then for `windows-x86_64` (`get_urls` in its `updater.rs`), so one entry is
+enough. The URL is `https://github.com/askysh/margin/releases/download/v<version>/MarginNotes-setup-<version>.exe`.
+
+How the plugin installs it on Windows:
+
+- It checks the signature with the public key in `tauri.conf.json` before it saves the
+  file.
+- It writes the setup exe to `%TEMP%\Margin Notes-<version>-updater-<random>`, starts it
+  with `/P /UPDATE`, and ends Margin Notes at once. Before that, Margin removes its tray
+  icon (`on_before_exit`). The copy in `%TEMP%` stays after the update.
+- The setup exe from the app has no Mark of the Web, so SmartScreen does not stop it.
+- `/P` shows only a progress bar. The installer is for the current user, so Windows
+  shows no UAC prompt. It asks the user nothing.
+- "Restart to update" adds `/R`, so the installer starts the new version when it is done.
+  Quit with an update downloaded installs it without `/R`, so the app stays closed.
+- During a recording neither path installs, as on the Mac.
+- `/UPDATE` keeps the shortcuts. Settings, models and meetings are not in the install
+  folder, so they stay.
+
+To test an update on one PC, make a test key and two installers with its public key:
+
+```bash
+T="$(cygpath -m "$TEMP/margin-update-test")"; mkdir -p "$T"
+bunx tauri signer generate --ci -w "$T/test.key" -p test
+printf test > "$T/key.pass"
+# The public key from test.key.pub. An http endpoint needs dangerousInsecureTransportProtocol.
+echo '{"plugins":{"updater":{"pubkey":"<test.key.pub>","dangerousInsecureTransportProtocol":true}}}' > "$T/low.json"
+echo '{"version":"<a higher version>","plugins":{"updater":{"pubkey":"<test.key.pub>","dangerousInsecureTransportProtocol":true}}}' > "$T/high.json"
+export MARGIN_UPDATER_KEY_PATH="$T/test.key" MARGIN_UPDATER_KEY_PASSWORD_PATH="$T/key.pass"
+MARGIN_TAURI_CONFIG="$T/high.json" scripts/build-windows.sh --installer   # copy the exe and .sig away
+MARGIN_TAURI_CONFIG="$T/low.json" scripts/build-windows.sh --installer
+```
+
+Install the lower one. Serve the higher exe, its `.sig` and a `latest.json` (made with
+`MARGIN_UPDATE_BASE_URL=http://127.0.0.1:<port>`) from a local folder. Then start the
+installed app with `MARGIN_UPDATE_ENDPOINT=http://127.0.0.1:<port>/latest.json`. The
+version that the app shows comes from `Cargo.toml`, so a test build with only a higher
+version in its config still shows the old number. The Apps entry and the file version of
+`margin.exe` show the new one.
+
+Tested on 2026-11-17 with 0.0.11 and a 0.0.12 test build, both signed with a test key:
+
+- The installed 0.0.11 logged `updater supported=true`, found 0.0.12, and downloaded and
+  verified it. The build-folder exe logged `updater supported=false`.
+- During a recording, the banner said "It installs after this recording", and "Restart
+  to update" was refused.
+- "Restart to update": the setup ran with `/P /UPDATE /R /ARGS`, with no UAC prompt. The
+  new version was running 7 s after the click. The Apps entry and the file version said
+  0.0.12. `config.toml`, `prefs.json`, the model and the test meeting were the same byte
+  for byte. The Start menu and desktop shortcuts stayed. A new check found no update.
+- Quit from the notification area with an update downloaded: the setup ran with
+  `/P /UPDATE`, and the app stayed closed. The next start was 0.0.12.
+- A `latest.json` with the signature of another file: the app did not install it. The
+  log and Settings, Updates said "The update's signature didn't match, so Margin Notes
+  didn't install it."
 
 ### Whisper on the GPU
 
