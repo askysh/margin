@@ -502,6 +502,13 @@ mod tests {
         serde_json::from_value(base).expect("a job record as core writes it")
     }
 
+    /// The same instant. The record keeps a time in the zone of the computer, so the text
+    /// differs on a computer in another zone, a CI runner for example.
+    fn at(got: &Option<String>, want: &str) -> bool {
+        let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).expect("an RFC 3339 time");
+        got.as_deref().map(parse) == Some(parse(want))
+    }
+
     #[test]
     fn job_times_come_from_the_newest_job_that_wrote_the_file() {
         let all = vec![
@@ -514,9 +521,9 @@ mod tests {
             job(serde_json::json!({ "id": "other", "output_path": "/m/b.md", "finished_at": "2026-11-10T09:00:00+05:30" })),
         ];
         let t = newest_for(&all, "/m/a.md").unwrap();
-        assert_eq!(t.recording_started_at.as_deref(), Some("2026-11-10T11:31:00+05:30"));
-        assert_eq!(t.recording_finished_at.as_deref(), Some("2026-11-10T12:24:03+05:30"));
-        assert_eq!(t.ready_at.as_deref(), Some("2026-11-10T15:00:41+05:30"));
+        assert!(at(&t.recording_started_at, "2026-11-10T11:31:00+05:30"), "{t:?}");
+        assert!(at(&t.recording_finished_at, "2026-11-10T12:24:03+05:30"), "{t:?}");
+        assert!(at(&t.ready_at, "2026-11-10T15:00:41+05:30"), "{t:?}");
         assert_eq!(newest_for(&all, "/m/c.md"), None);
     }
 
@@ -529,7 +536,7 @@ mod tests {
         let failed = job(serde_json::json!({ "state": "failed", "finished_at": "2026-11-10T12:30:00+05:30",
             "recording_finished_at": "2026-11-10T12:24:03+05:30" }));
         assert_eq!(JobTimes::of(&failed).ready_at, None);
-        assert_eq!(JobTimes::of(&failed).recording_finished_at.as_deref(), Some("2026-11-10T12:24:03+05:30"));
+        assert!(at(&JobTimes::of(&failed).recording_finished_at, "2026-11-10T12:24:03+05:30"));
         let active = job(serde_json::json!({ "state": "transcribing", "started_at": "2026-11-10T12:24:10+05:30" }));
         assert_eq!(JobTimes::of(&active), JobTimes::default());
     }
