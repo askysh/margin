@@ -1037,15 +1037,20 @@ The full comparison is in `docs/parity/app.md`.
   its folder to each PC. In a Store package, Windows redirects this folder to the
   package's own store and removes it on uninstall.
 - Meetings: the default folder is `Meetings` in the Documents folder that Windows gives.
-  With OneDrive backup on, that folder is in OneDrive, so the audio syncs. Open: keep
-  this default, or use a local folder.
+  With OneDrive backup on, that folder is in OneDrive, so the audio syncs. Options: a
+  local folder as the default, or the Documents default with a note. Pick: **keep the
+  default, and say it**. Setup and Settings show a note when the chosen folder is in
+  OneDrive, with a way to choose another folder. Documents is where a user looks for
+  the files, and some users want the backup.
 - Voices: minutes-core keeps `voices.db` in `%USERPROFILE%\.minutes`. It ignores `HOME`
   on Windows, so a sandbox does not isolate it. The end-to-end pass links that folder
   into its sandbox and stops when a real one exists (UPSTREAM-PATCHES.md #1).
 - The global shortcut is Ctrl+Alt+Shift+R. Windows keeps the shortcuts with the Windows
   key for itself.
 - Off on Windows, and hidden in the UI:
-  - Record call. Core's call capture is for macOS only. This is the next decision.
+  - Record call. Core's call capture is for macOS only. Upstream tracks capture with
+    WASAPI loopback in silverstein/minutes issue 253. Margin offered to contribute it
+    there on 2026-11-17.
   - The recording chip. It needs a window above full-screen apps on every desktop.
     Start does not hide the window on Windows.
   - The Apple Speech live transcript (D56). The live transcript is Whisper.
