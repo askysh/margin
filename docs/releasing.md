@@ -97,7 +97,14 @@ on the GitHub release, and the copy that it installs updates itself from the sam
 updater key (the same secrets as the Mac build) and writes its `.sig`. It uploads both as
 the artifact `windows-installer`.
 
-For a release, attach the setup exe and its `.sig`, and add the Windows entry to
+`release.yml` does the rest. Its job `windows-build` calls that workflow with `sign`.
+Its job `windows-publish` adds the setup exe, its `.sig` and the Windows entry of
+`latest.json` to the draft, after the macOS job made the draft. The draft has the macOS
+files also when the Windows build fails. Check that the draft has the setup exe before
+you publish. `ci.yml` builds the installer, not signed, on the pull request from
+`next-release` into `main`, so a broken Windows build shows before the merge.
+
+To do it by hand, attach the setup exe and its `.sig`, and add the Windows entry to
 `latest.json` before you publish:
 
 ```bash

@@ -1196,3 +1196,28 @@ The full comparison is in `docs/parity/app.md`.
 - The uninstaller removes the app. It leaves the settings and models in
   `%LOCALAPPDATA%\Margin`, the meetings folder and `%USERPROFILE%\.minutes`. A Store
   package differs: Windows removes its settings and models (D63).
+
+### D66. The Windows copy from the installer updates itself, and the release builds it
+- New fact: D61 left Windows updates to the Store. The installer of D65 installs a copy
+  that the Store does not know, so that copy never got an update.
+- Options: no update outside the Store, a second exe with the updater built in, or one
+  exe that decides at start.
+- Pick: **one exe that decides at start**. The updater is on when the process has no
+  package identity, the exe is the one that the NSIS bundle made, and `uninstall.exe` is
+  beside it. So the Store package and a build folder keep it off, with no build flag.
+- The update is the setup exe, signed with the same updater key as the Mac update. The
+  app reads the same `latest.json`. Its Windows entry has the key `windows-x86_64`.
+- The setup runs with no questions and no administrator prompt. "Restart to update"
+  starts the new version. Quit installs and does not start it. Nothing installs during a
+  recording.
+- Tested on 2026-11-17 with a throwaway key: 0.0.11 to 0.0.12, settings, model and a
+  meeting kept byte for byte, and a wrong signature refused.
+- The release: `release.yml` got two jobs, `windows-build` and `windows-publish`. They
+  add the Windows files to the draft that the macOS job makes. A failed Windows build
+  leaves the macOS release as it is. `ci.yml` builds the installer on the release pull
+  request. The owner asked for this change to the release workflow.
+- Cost: a release with no Windows entry in `latest.json` shows an error in Settings →
+  Updates on Windows. Check the draft before you publish.
+- The installer has no code signing certificate. SmartScreen warns at the first install,
+  not at an update.
+- Not tested: an update from GitHub over HTTPS, and the Windows jobs on a runner.

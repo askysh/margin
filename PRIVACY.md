@@ -4,7 +4,7 @@ This policy covers Margin for macOS and Margin Notes for Windows. Both are the s
 and this page calls it Margin. Akash Mishra publishes it. The source code is public at
 [github.com/askysh/margin](https://github.com/askysh/margin).
 
-Last change: 13 November 2026.
+Last change: 17 November 2026.
 
 ## The short version
 
@@ -50,8 +50,9 @@ To stop this, set Summaries to None in Settings, and do not use Ask.
 - **Models.** Margin downloads the speech and speaker models from Hugging Face and GitHub.
   These requests carry no meeting data.
 - **Updates.** Margin for macOS asks GitHub for the latest version. Settings → Updates
-  turns this off. Margin Notes for Windows gets its updates from the Microsoft Store and
-  makes no update request of its own.
+  turns this off. Margin Notes for Windows does the same when you installed it with the
+  installer. A copy from the Microsoft Store gets its updates from the Store and makes no
+  update request of its own.
 
 Those services see your IP address, as with any download. The Microsoft Store has its own
 privacy terms for installs and updates.

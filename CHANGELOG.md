@@ -14,6 +14,9 @@ on) point to [DECISIONS.md](DECISIONS.md).
   needs Windows 11. *Use the graphics card* in Settings → Transcription turns that off.
   Setup and Settings say when the meetings folder is in OneDrive. It cannot record a
   call yet (D61, D62, D63).
+- `MarginNotes-setup-<version>.exe`, an installer for Windows. The copy that it installs
+  updates itself, as the Mac app does. The installer is not signed, so Windows SmartScreen
+  warns at the first install: select *More info*, then *Run anyway* (D65, D66).
 - [PRIVACY.md](PRIVACY.md), the privacy policy.
 
 ## [0.0.10] - 2026-11-11

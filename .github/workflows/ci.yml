@@ -41,3 +41,12 @@ jobs:
           fi
           section="$(awk -v v="$VERSION" 'index($0, "## [" v "]") == 1 { on = 1; next } on && /^## \[/ { exit } on { print }' CHANGELOG.md | tr -d '[:space:]')"
           [[ -n "$section" ]] || { echo "::error file=CHANGELOG.md::the ## [$VERSION] section is empty. It becomes the release notes."; exit 1; }
+
+  # The Windows installer builds only for the release pull request (next-release into
+  # main). The build takes a long time, and the release workflow builds it again with the
+  # updater key. A failure here shows before the merge, not in the release.
+  windows:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    uses: ./.github/workflows/windows-installer.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
