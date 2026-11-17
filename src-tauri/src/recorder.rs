@@ -447,7 +447,13 @@ fn ensure_permissions(kind: Kind) -> Result<bool, String> {
     if kind == Kind::Call {
         return Err("Margin Notes can't record a call on Windows yet. Record in person instead.".into());
     }
-    if crate::permissions::state().microphone == "denied" {
+    // The Store package: Windows asks the user once. Before the answer is yes, Windows
+    // shows the package no microphone, so ask before the check for a device.
+    let mut microphone = crate::permissions::state().microphone;
+    if microphone == "not-determined" {
+        microphone = crate::permissions::request_microphone();
+    }
+    if microphone == "denied" || microphone == "not-determined" {
         return Err("Margin Notes can't use the microphone. Turn it on in Settings → Privacy & security → Microphone, then try again.".into());
     }
     // A PC can have no microphone at all. Core's own error for that names VB-CABLE, a

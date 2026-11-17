@@ -7,8 +7,10 @@
 //!
 //! Windows (D61) has one microphone switch for the PC, one for the account and one for
 //! desktop apps, in Settings, Privacy and security, Microphone. Margin reads them from the
-//! registry (win.rs). Windows shows no prompt to a desktop app, so there is nothing to
-//! request. Windows has no System Audio permission.
+//! registry (win.rs). The Store package is different: Windows asks the user once, with
+//! its own prompt, and shows the package no microphone before the answer is yes. Margin
+//! asks for that prompt (win.rs `request_microphone`). Windows has no System Audio
+//! permission.
 
 #[cfg(target_os = "macos")]
 use minutes_core::macos_permissions::{self, MacPermissionStatus, MicrophoneRequestOutcome};
@@ -35,9 +37,15 @@ pub fn state() -> PermissionState {
 
 #[cfg(windows)]
 fn microphone() -> &'static str {
-    match crate::win::microphone_consent() {
+    consent_name(crate::win::microphone_consent())
+}
+
+#[cfg(windows)]
+fn consent_name(consent: crate::win::MicConsent) -> &'static str {
+    match consent {
         crate::win::MicConsent::Allowed => "granted",
         crate::win::MicConsent::Denied => "denied",
+        crate::win::MicConsent::NotAsked => "not-determined",
         crate::win::MicConsent::Unknown => "unknown",
     }
 }
@@ -47,8 +55,14 @@ fn microphone() -> &'static str {
     "unknown"
 }
 
-/// Windows shows no prompt, so a request only reads the switches again.
-#[cfg(not(target_os = "macos"))]
+/// Windows: the Store package gets the prompt of Windows. Other builds have no prompt,
+/// so a request only reads the switches again.
+#[cfg(windows)]
+pub fn request_microphone() -> &'static str {
+    consent_name(crate::win::request_microphone())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn request_microphone() -> &'static str {
     microphone()
 }

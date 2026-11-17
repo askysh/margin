@@ -304,21 +304,63 @@ fn reg_string(root: HKEY, key: &str, value: &str) -> Option<String> {
 pub enum MicConsent {
     Allowed,
     Denied,
+    /// The Store package only: Windows has not asked the user yet.
+    NotAsked,
     Unknown,
 }
 
-/// What Windows says about microphone access for this app. It reads the same registry
-/// values as the Settings page and opens no device, so no prompt can appear.
+/// What Windows says about microphone access for this app. No prompt can appear.
+///
+/// The Store package has its own answer, and Windows gives it (`package_microphone`).
+/// For other desktop programs, this reads the same registry values as the Settings page.
 pub fn microphone_consent() -> MicConsent {
+    if package_family_name().is_some() {
+        return package_microphone(false);
+    }
     const STORE: &str = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
     let read = |root: HKEY, sub: Option<&str>| {
         let key = sub.map_or(STORE.to_string(), |s| format!(r"{STORE}\{s}"));
         reg_string(root, &key, "Value")
     };
-    // A Store package has its own switch, by package family name. Other desktop programs
-    // share one switch.
-    let app = package_family_name().and_then(|name| read(HKEY_CURRENT_USER, Some(&name))).or_else(|| read(HKEY_CURRENT_USER, Some("NonPackaged")));
+    // Desktop programs share one switch.
+    let app = read(HKEY_CURRENT_USER, Some("NonPackaged"));
     mic_consent_from(read(HKEY_LOCAL_MACHINE, None).as_deref(), read(HKEY_CURRENT_USER, None).as_deref(), app.as_deref())
+}
+
+/// Ask Windows for the microphone, with its prompt when the user has not answered yet.
+///
+/// Only the Store package gets a prompt. Until the user says yes, Windows shows the
+/// package no microphone at all, so Margin must ask before it looks for one. Other
+/// desktop programs have no question to ask: this reads the switches again.
+pub fn request_microphone() -> MicConsent {
+    if package_family_name().is_some() {
+        package_microphone(true)
+    } else {
+        microphone_consent()
+    }
+}
+
+/// The answer of Windows for the `microphone` capability of the package. With `ask`,
+/// Windows shows its prompt when it needs one, and this waits for the answer.
+fn package_microphone(ask: bool) -> MicConsent {
+    use windows::Security::Authorization::AppCapabilityAccess::{AppCapability, AppCapabilityAccessStatus as Status};
+    let status = AppCapability::Create(&windows_core::HSTRING::from("microphone")).and_then(|capability| {
+        if ask {
+            capability.RequestAccessAsync()?.join()
+        } else {
+            capability.CheckAccess()
+        }
+    });
+    match status {
+        Ok(Status::Allowed) => MicConsent::Allowed,
+        Ok(Status::UserPromptRequired) => MicConsent::NotAsked,
+        Ok(Status::DeniedByUser) | Ok(Status::DeniedBySystem) => MicConsent::Denied,
+        Ok(_) => MicConsent::Unknown,
+        Err(error) => {
+            tracing::warn!(%error, ask, "Windows gave no answer about the microphone");
+            MicConsent::Unknown
+        }
+    }
 }
 
 /// `device`: the switch for the whole PC. `user`: the switch for this account. `app`: the
