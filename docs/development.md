@@ -1,3 +1,4 @@
+| Model | `--cpu` build | Vulkan, RTX 3070 Ti || `vulkan-1.dll`, with `VulkanRT-License.txt` | the Vulkan runtime files from LunarG, `<VULKAN_SDK>\runtime` | The Store build imports the Vulkan loader. A PC has it only when a graphics driver installed it. Not in a `--cpu` build. |
 # Development
 
 How to build Margin from source, run it, test it and move it to a new minutes-core. For
@@ -158,22 +159,28 @@ $M --dev serve [port]                    # QA bridge for scripts/e2e
 The Windows build is on the `windows-port` branch (DECISIONS.md D61). It records a meeting
 in the room from the microphone, transcribes it and writes the meeting file. It does not
 record a call, and it has no recording chip, no Open at login, no Apple Speech and no
-updater of its own. Whisper runs on the CPU. A build with Whisper on the GPU is an option
-([Whisper on the GPU](#whisper-on-the-gpu)).
+updater of its own. Whisper runs on the graphics card through Vulkan, and on the CPU when
+the PC has no usable one ([Whisper on the GPU](#whisper-on-the-gpu)).
 
 ### Requirements
 
-- Windows 10 22H2 or later, x64.
+- Windows 11, x64, on a CPU with AVX2. The same is true for a PC that runs the app.
 - Rust from rustup, with the `stable-x86_64-pc-windows-msvc` toolchain.
 - Visual Studio with the "Desktop development with C++" workload.
 - CMake and LLVM. whisper.cpp needs CMake, and bindgen needs `libclang.dll`.
 - bun, and Git for Windows. The scripts run in Git Bash.
+- The Vulkan SDK and the Vulkan runtime files, for the Store build
+  ([Whisper on the GPU](#whisper-on-the-gpu)). A `--cpu` build and a debug build do not
+  need them.
+- The `winapp` CLI, for the Store package.
 
 ### Build
 
 ```bash
-scripts/build-windows.sh            # src-tauri/target/release/margin.exe
-scripts/build-windows.sh --debug    # a debug build with the UI built in
+export VULKAN_SDK="C:/Users/<you>/VulkanSDK/<version>"
+scripts/build-windows.sh            # the Store build: src-tauri/target/vulkan/release/margin.exe
+scripts/build-windows.sh --cpu      # Whisper on the CPU only: src-tauri/target/release/margin.exe
+scripts/build-windows.sh --debug    # a debug build, CPU only, with the UI built in
 ```
 
 The script adds CMake and LLVM to the PATH, sets `LIBCLANG_PATH` and the whisper.cpp
@@ -295,11 +302,13 @@ Run `scripts/build-windows.sh` first. The script needs the `winapp` CLI
 (`winget install Microsoft.WinAppCli`). It writes two things into `release\windows`,
 which git ignores:
 
-- `layout`: the package folder. It has `margin.exe`, the five DLLs, `Assets`,
+- `layout`: the package folder. It has `margin.exe`, the DLLs beside it, `Assets`,
   `AppxManifest.xml` with the version and the CPU filled in, and `resources.pri`.
 - `MarginNotes_<version>_x64.msix`: the package for Partner Center, not signed. The
   Store signs it. Margin 0.0.10 is package 1.0.10.0 (DECISIONS.md D61). The package is
-  28 MB.
+  45 MB.
+
+`-Cpu` packs the `--cpu` build in place of the Store build. That package is 28 MB.
 
 `resources.pri` is the index that lets Windows pick a logo file by size and scale. The
 script makes it with MakePri, and keeps every scale in the one file.
@@ -340,13 +349,9 @@ in the sandbox. The app must write nothing into that folder.
 
 ### Whisper on the GPU
 
-minutes-core passes a `vulkan` feature to whisper.cpp. Margin has the same feature, off
-by default.
-
-```bash
-export VULKAN_SDK="C:/Users/<you>/VulkanSDK/<version>"
-scripts/build-windows.sh --vulkan    # src-tauri/target/vulkan/release/margin.exe
-```
+minutes-core passes a `vulkan` feature to whisper.cpp. Margin has the same feature. It is
+off in `Cargo.toml`, so the macOS build and a plain `cargo build` do not get it.
+`scripts/build-windows.sh` turns it on for the Store build (DECISIONS.md D63).
 
 The build needs the Vulkan SDK from LunarG, for the headers, `vulkan-1.lib` and `glslc`.
 The installer takes `copy_only=1`, which needs no administrator and changes no system
@@ -355,6 +360,14 @@ setting:
 ```powershell
 vulkansdk-windows-X64-<version>.exe --root C:\Users\<you>\VulkanSDK\<version> --accept-licenses --default-answer --confirm-command install copy_only=1
 ```
+
+The build also needs the Vulkan loader, `vulkan-1.dll`, to put beside `margin.exe`. It is
+not in the SDK. LunarG has it in the "Runtime components" zip of the same release,
+`VulkanRT-X64-<version>-Components.zip`, on the SDK download page. Unzip it, and copy
+`VulkanRT-License.txt` and `x64\vulkan-1.dll` into `<VULKAN_SDK>\runtime`, with the `x64`
+folder. Or set `VULKAN_RUNTIME` to another folder with the same two files. The loader is
+open source (Apache 2.0 and MIT), and the license file goes into the package with it.
+The laptop build used release 1.4.363.0.
 
 The script gives the build folder a drive letter (`V:`, or `MARGIN_VULKAN_DRIVE`) while
 it builds, and removes the letter at the end. whisper.cpp builds its shader tool in a
@@ -383,14 +396,18 @@ What to know about a `vulkan` build:
 - **No usable GPU.** The build falls back to the CPU. Tested with
   `VK_LOADER_DRIVERS_DISABLE=*`, which hides every driver, and with a device number that
   does not exist: the log says "no GPU found", and the meeting is written.
-- **No `vulkan-1.dll`.** `margin.exe` imports `vulkan-1.dll`. The graphics driver
-  installs it. On a PC that has none, such as a virtual machine with the basic display
-  driver, the app does not start. A package for every PC must ship the DLL beside
-  `margin.exe`. It is the Vulkan loader from Khronos (Apache 2.0, 1.7 MB). Not done yet,
-  and not tested on such a PC.
+- **No `vulkan-1.dll` on the PC.** `margin.exe` imports `vulkan-1.dll`, and a PC has it
+  only when a graphics driver installed it. So the build puts its own copy beside
+  `margin.exe`. Windows looks in the folder of the exe first: the running app shows
+  that copy in its list of modules, also on a PC that has one in `System32`. Not tested
+  on a PC with no copy in `System32`.
+- **The switch.** Settings, Transcription, "Use the graphics card" is on by default.
+  Off sends Whisper to the CPU from the next start of the app: Margin sets
+  `VK_LOADER_DRIVERS_DISABLE=*` for itself, and the log says "no GPU found"
+  (UPSTREAM-PATCHES.md #23).
 - **The first run.** The first transcription after an install takes about 15 s more. The
   driver compiles the shaders and keeps them.
-- **The size.** `margin.exe` is 108 MB in place of 52 MB, and the package is 44 MB in
+- **The size.** `margin.exe` is 108 MB in place of 52 MB, and the package is 45 MB in
   place of 28 MB. The shaders are inside the exe.
 - **Live transcript.** Not measured. The timing is for the transcript after Stop.
 
