@@ -1092,4 +1092,19 @@ The full comparison is in `docs/parity/app.md`.
   (UPSTREAM-PATCHES.md #21).
 - A real microphone works. The laptop's Windows build shows its own microphone prompt for
   Margin Notes at the first recording.
-- Not measured: Hindi-English audio, the live transcript on the GPU, and a second PC.
+- The loader is version 1.4.363.0, from the Vulkan runtime files of LunarG. Its license
+  is Apache 2.0 and MIT, and the license file ships with it.
+- "Use the graphics card" in Settings → Transcription turns the GPU off, for a PC with a
+  bad driver. minutes-core has no setting for this (UPSTREAM-PATCHES.md #23). So Margin
+  sets `VK_LOADER_DRIVERS_DISABLE=*` for itself at start, and the Vulkan loader then
+  finds no device. A change applies at the next start.
+- The package as an installed app, tested on 2026-11-17 with Developer Mode:
+  - Windows shows a package no microphone before the user answers its prompt. Margin
+    asks for that prompt at the first Record and from the Allow button.
+  - Settings and models go to the store of the package, and removal deletes them. The
+    meetings folder and `%USERPROFILE%\.minutes` stay.
+  - The app writes nothing into its install folder.
+  - To register the package folder again reset the microphone answer. Not known: if an
+    update from the Store does the same.
+- Not measured: Hindi-English audio, the live transcript on the GPU, a second PC, and a
+  PC with no `vulkan-1.dll` in Windows.

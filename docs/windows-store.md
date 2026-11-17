@@ -5,8 +5,9 @@ listing text, the images, the answers for Partner Center and the checks before y
 submit. DECISIONS.md D61 gives the reasons.
 
 The Windows app builds and records a meeting in the room (D62), and a script makes the
-Store package. It has no call recording yet. The package is not tested as an installed
-app yet. The Store build uses the graphics card and needs Windows 11 (D63). Lines marked **Confirm** describe a
+Store package. It has no call recording yet. The package works as an installed app:
+tested on 2026-11-17 on one PC, with Developer Mode. The Store build uses the graphics
+card and needs Windows 11 (D63). Lines marked **Confirm** describe a
 feature that the Windows build must have before the text goes to the Store. Store policy 10.1.1 requires
 the listing to describe the product as it is.
 
@@ -47,7 +48,8 @@ The first script builds `margin.exe` and puts five DLLs beside it: `DirectML.dll
 does not include them, and without them the app exits with no message on a clean PC. The
 second script fills in the manifest, makes `resources.pri` for the logos and packs
 `release/windows/MarginNotes_<version>_x64.msix` with Microsoft's `winapp` CLI. The
-package is not signed. It is 28 MB, or 44 MB with Whisper on the GPU.
+package is not signed. It is 45 MB. It also holds `vulkan-1.dll`, the Vulkan loader
+(D63).
 [development.md](development.md) has each step.
 
 ## Partner Center, page by page
@@ -204,7 +206,7 @@ Akash Mishra
 | App tile icon, 1:1, 300 x 300 | `windows/store/app-tile-300.png` | Ready |
 | Box art, 1:1, 2160 x 2160 | `windows/store/box-art-2160.png` | Ready |
 | Poster art, 1440 x 2160 | `windows/store/poster-1440x2160.png` | Ready |
-| Screenshots, at least 1, 1366 x 768 or larger, PNG | none | Take them from the Windows build |
+| Screenshots, at least 1, 1366 x 768 or larger, PNG | Four at 1920 x 1080, on the test laptop in `win-dev\margin-shots\m3\store\` | Look at each one. Take the recording one again if its live transcript is rough. Not in the repository yet. |
 
 Take four screenshots at 1920 x 1080, in this order: a meeting with notes and the
 transcript, a recording with the live transcript, the meeting list, and Settings. Use a
@@ -253,8 +255,8 @@ These come from the Store policies (version 7.20). Each one is a requirement on 
 - [ ] **A way to report AI text** (policy 11.16): a link in Settings → About to the issue
       tracker.
 - [ ] **A link to the privacy policy** in Settings → About.
-- [ ] **A clear first run** (policy 10.1.1): setup says what Margin does before it asks
-      for the microphone.
+- [x] **A clear first run** (policy 10.1.1): setup says what Margin does before it asks
+      for the microphone. Windows shows its microphone prompt at the first Record.
 - [x] **A message when the PC cannot run it** (policy 10.4.1), for example when there is
       no microphone.
 - [x] **The name "Margin Notes"** in the window title, the Start menu and the notification
