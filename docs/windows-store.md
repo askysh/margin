@@ -4,8 +4,9 @@ This page holds everything a Store submission needs: the identity, the package, 
 listing text, the images, the answers for Partner Center and the checks before you
 submit. DECISIONS.md D61 gives the reasons.
 
-The Windows app builds and records a meeting in the room (D62). It has no call recording
-and no GPU transcription yet, and no Store package. Lines marked **Confirm** describe a
+The Windows app builds and records a meeting in the room (D62), and a script makes the
+Store package. It has no call recording yet. The package is not tested as an installed
+app yet, and the Store build does not use the GPU yet. Lines marked **Confirm** describe a
 feature that the Windows build must have before the text goes to the Store. Store policy 10.1.1 requires
 the listing to describe the product as it is.
 
@@ -40,12 +41,14 @@ installed copy carries them.
 `windows/msix/Assets/` holds the package logos. `scripts/make-icons.swift` draws them, with
 the rest of Margin's icons. Do not edit them by hand.
 
-To make the package, run `scripts/build-windows.sh`. It builds `margin.exe` and puts five
-DLLs beside it: `DirectML.dll`, `msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll` and
-`vcruntime140_1.dll`. Windows does not include them, and without them the app exits with
-no message on a clean PC. Then put the exe, the DLLs, the manifest and `Assets` in one
-folder and pack it with Microsoft's `winapp` CLI (`winapp pack`). The pack step has no
-script yet.
+To make the package, run `scripts/build-windows.sh`, then `scripts/package-msix.ps1`.
+The first script builds `margin.exe` and puts five DLLs beside it: `DirectML.dll`,
+`msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll` and `vcruntime140_1.dll`. Windows
+does not include them, and without them the app exits with no message on a clean PC. The
+second script fills in the manifest, makes `resources.pri` for the logos and packs
+`release/windows/MarginNotes_<version>_x64.msix` with Microsoft's `winapp` CLI. The
+package is not signed. It is 28 MB, or 44 MB with Whisper on the GPU.
+[development.md](development.md) has each step.
 
 ## Partner Center, page by page
 
@@ -229,7 +232,7 @@ To test:
 1. Start Margin Notes. Finish setup: press Enter on each step to take the default. Allow the microphone when Windows asks.
 2. Setup downloads a speech model from Hugging Face (about 490 MB with the default choice). Wait for the download to finish. The app shows the progress.
 3. Select "In person", then Start. Say a few sentences. Type some notes. Select Stop.
-4. Margin processes the recording. This takes about as long as the recording on a PC with no dedicated graphics card. The meeting then opens with the transcript and the notes.
+4. Margin processes the recording. With the default model, this takes less time than the recording. The meeting then opens with the transcript and the notes.
 5. The meeting is a Markdown file in Documents\Meetings.
 
 Summaries and Ask are optional and off by default. They use live generative AI. They need software that the user installs: the Claude command line program from Anthropic, or Ollama. The app works in full without them. To report AI text that is not appropriate, a user can open an issue at https://github.com/askysh/margin/issues or email mail@akashmishra.com. The same link is in the app, in Settings, About.
@@ -261,7 +264,8 @@ These come from the Store policies (version 7.20). Each one is a requirement on 
 
 ## Before each submission
 
-1. Run the Windows App Certification Kit on the package. Fix every failure.
+1. Run the Windows App Certification Kit on the package. Fix every failure. The kit
+   needs an administrator.
 2. Install the package on a PC that never had Margin. Do the steps from the notes for
    certification.
 3. Check that the version is higher than the one in the Store.
