@@ -63,6 +63,11 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 webview2-com = "0.39"
 windows-core = "0.62"
 
+[features]
+# Whisper on the GPU, on Windows, through Vulkan. Off by default: the build needs the
+# Vulkan SDK, and the choice is not made yet (docs/development.md, "Whisper on the GPU").
+vulkan = ["minutes-core/vulkan"]
+
 [profile.release]
 strip = true
 # Whole-program LTO in one unit: an 11% smaller app, the same speed, and about 75 s

@@ -4,9 +4,12 @@
 #
 #   scripts/build-windows.sh            # release: src-tauri/target/release/margin.exe
 #   scripts/build-windows.sh --debug    # debug, with the UI built in
+#   scripts/build-windows.sh --vulkan   # release with Whisper on the GPU, in its own
+#                                       # folder: src-tauri/target/vulkan/release
 #
 # It needs Rust (MSVC), Visual Studio with the C++ workload, CMake, LLVM and bun
-# (docs/development.md, "Windows").
+# (docs/development.md, "Windows"). --vulkan also needs the Vulkan SDK, with VULKAN_SDK
+# set to its folder (docs/development.md, "Whisper on the GPU").
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,6 +20,27 @@ case "${1:-}" in
   --debug)
     profile=debug
     flags=(--debug)
+    ;;
+  --vulkan)
+    if [ ! -f "${VULKAN_SDK:-}/Lib/vulkan-1.lib" ]; then
+      echo "Set VULKAN_SDK to the folder of the Vulkan SDK. It has Lib/vulkan-1.lib." >&2
+      exit 1
+    fi
+    flags=(--features vulkan)
+    # Its own folder, so the CPU build stays as it is. whisper.cpp builds its shader tool
+    # in a project inside the project, and those paths go past the 260 characters that
+    # MSBuild allows, from any folder with a normal path. So give the folder a drive
+    # letter for the time of the build. `subst` needs no administrator rights.
+    target=src-tauri/target/vulkan
+    drive="${MARGIN_VULKAN_DRIVE:-V}"
+    mkdir -p "$target"
+    if [ -e "/${drive,,}/" ]; then
+      echo "Drive $drive: is in use. Set MARGIN_VULKAN_DRIVE to a free letter." >&2
+      exit 1
+    fi
+    cmd //c subst "$drive:" "$(cygpath -w "$PWD/$target")"
+    trap 'cmd //c subst "$drive:" //D >/dev/null' EXIT
+    export CARGO_TARGET_DIR="$drive:\\"
     ;;
 esac
 
