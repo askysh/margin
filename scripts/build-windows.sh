@@ -14,6 +14,13 @@
 # It needs Rust (MSVC), Visual Studio with the C++ workload, CMake, LLVM and bun
 # (docs/development.md, "Windows"). The Store build also needs the Vulkan SDK and the
 # Vulkan runtime files, with VULKAN_SDK set (docs/development.md, "Whisper on the GPU").
+#
+# Variables for --installer:
+#   MARGIN_UPDATER_KEY_PATH           the updater's private key. With it, the script
+#   MARGIN_UPDATER_KEY_PASSWORD_PATH  signs the setup exe and writes its .sig, which the
+#                                     in-app update needs (as in scripts/release.sh).
+#   MARGIN_TAURI_CONFIG               a JSON file that Tauri merges into its config, for
+#                                     tests only: another public key or version.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -44,6 +51,19 @@ done
 if [ -n "$installer" ] && [ "$profile" = debug ]; then
   echo "--installer makes a release build. Do not use it with --debug." >&2
   exit 1
+fi
+# Check the signing key before the long build, not after it.
+sign=
+if [ -n "$installer" ] && [ -n "${MARGIN_UPDATER_KEY_PATH:-}${MARGIN_UPDATER_KEY_PASSWORD_PATH:-}" ]; then
+  if [ ! -f "${MARGIN_UPDATER_KEY_PATH:-}" ] || [ ! -f "${MARGIN_UPDATER_KEY_PASSWORD_PATH:-}" ]; then
+    echo "Set MARGIN_UPDATER_KEY_PATH and MARGIN_UPDATER_KEY_PASSWORD_PATH to two files, or neither." >&2
+    exit 1
+  fi
+  sign=1
+fi
+extra=()
+if [ -n "${MARGIN_TAURI_CONFIG:-}" ]; then
+  extra=(--config "$MARGIN_TAURI_CONFIG")
 fi
 
 loader=""
@@ -111,7 +131,7 @@ out="$target/$profile"
 mkdir -p "$out/build/examples" "$out/build/deps"
 
 bun install
-bunx tauri build "${flags[@]}" --no-bundle
+bunx tauri build "${flags[@]}" "${extra[@]}" --no-bundle
 
 if [ ! -f "$out/build/DirectML.dll" ]; then
   echo "DirectML.dll is not in $out/build. Look at the ort-sys build output." >&2
@@ -158,14 +178,28 @@ for file in $beside; do
 done
 config="$out/installer.conf.json"
 echo "{\"bundle\": {\"resources\": {$resources}}}" >"$config"
-bunx tauri bundle "${flags[@]}" --bundles nsis --config "$config"
+bunx tauri bundle "${flags[@]}" "${extra[@]}" --bundles nsis --config "$config"
 
-version="$(bun -e 'console.log(require("./src-tauri/tauri.conf.json").version)')"
+# The version of the bundle: tauri.conf.json, or the one in MARGIN_TAURI_CONFIG.
+version="$(bun -e 'const [base, extra] = process.argv.slice(1); const v = (extra && require(require("path").resolve(extra)).version) || require(require("path").resolve(base)).version; console.log(v)' src-tauri/tauri.conf.json "${MARGIN_TAURI_CONFIG:-}")"
 setup="$out/bundle/nsis/Margin Notes_${version}_x64-setup.exe"
 if [ ! -f "$setup" ]; then
   echo "The installer is not at $setup." >&2
   exit 1
 fi
 mkdir -p release/windows
-cp -f "$setup" "release/windows/MarginNotes-setup-$version.exe"
-echo "Installer: release/windows/MarginNotes-setup-$version.exe"
+final="release/windows/MarginNotes-setup-$version.exe"
+cp -f "$setup" "$final"
+rm -f "$final.sig"
+echo "Installer: $final"
+
+# The in-app update downloads this same exe. The app installs it only when the signature
+# matches the public key in tauri.conf.json.
+if [ -n "$sign" ]; then
+  bunx tauri signer sign -f "$MARGIN_UPDATER_KEY_PATH" -p "$(cat "$MARGIN_UPDATER_KEY_PASSWORD_PATH")" "$final" >/dev/null
+  if [ ! -s "$final.sig" ]; then
+    echo "The installer was not signed." >&2
+    exit 1
+  fi
+  echo "Signature: $final.sig"
+fi
