@@ -1181,3 +1181,18 @@ The full comparison is in `docs/parity/app.md`.
   - It is not known yet that the end-to-end pass works on a GitHub runner (speech models
     on a virtual Mac, the macOS voices that the fixtures use). Its result shows in the
     pull request. When it does not pass, the checklist asks for a run on a Mac.
+
+### D65. A normal installer for Windows, for tests outside the Store
+- New fact: on 2026-11-17 the owner put the Store submission on hold, and asked for a way
+  to install Margin Notes as a normal user does.
+- `scripts/build-windows.sh --installer` makes `MarginNotes-setup-<version>.exe` with
+  Tauri's NSIS bundle. It holds the same exe and DLLs as the Store package.
+- It installs for one user, into `%LOCALAPPDATA%\Margin Notes`, with no administrator
+  rights. It has no updater.
+- It is not signed, so Windows SmartScreen warns. A certificate is a later decision, and
+  only if this installer becomes a way to ship. Today it is for tests.
+- WebView2: the installer downloads Microsoft's bootstrapper only when WebView2 is
+  missing. Windows 11 includes it.
+- The uninstaller removes the app. It leaves the settings and models in
+  `%LOCALAPPDATA%\Margin`, the meetings folder and `%USERPROFILE%\.minutes`. A Store
+  package differs: Windows removes its settings and models (D63).
