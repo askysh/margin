@@ -393,6 +393,27 @@ fn package_family_name() -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
+// ---------------------------------------------------------------- updates
+
+/// True when this copy came from the NSIS installer, so the updater can replace it.
+///
+/// - The Store package updates through the Store, and a Store build must not update
+///   itself (D61). Package identity tells the two apart at run time, so one `margin.exe`
+///   serves the installer and the package.
+/// - `tauri bundle` writes the bundle type into the exe. A plain `cargo build` has none.
+/// - The installer puts `uninstall.exe` beside the exe. The build folder, a layout
+///   folder or a copy elsewhere has no such file, and nothing there to update.
+pub fn installed_by_setup() -> bool {
+    use tauri::utils::{config::BundleType, platform::bundle_type};
+    if package_family_name().is_some() || bundle_type() != Some(BundleType::Nsis) {
+        return false;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("uninstall.exe").is_file()))
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------- OneDrive
 
 /// True when `folder` is inside a OneDrive folder of this account.
