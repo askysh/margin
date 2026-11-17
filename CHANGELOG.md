@@ -12,7 +12,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - Margin Notes for Windows, a first build: record a meeting in the room, and get the
   transcript and the meeting file. It uses the graphics card for the transcript, and
   needs Windows 11. *Use the graphics card* in Settings → Transcription turns that off.
-  It cannot record a call yet (D61, D62, D63).
+  Setup and Settings say when the meetings folder is in OneDrive. It cannot record a
+  call yet (D61, D62, D63).
 - [PRIVACY.md](PRIVACY.md), the privacy policy.
 
 ## [0.0.10] - 2026-11-11

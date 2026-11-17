@@ -1111,5 +1111,26 @@ The full comparison is in `docs/parity/app.md`.
   - The app writes nothing into its install folder.
   - To register the package folder again reset the microphone answer. Not known: if an
     update from the Store does the same.
-- Not measured: Hindi-English audio, the live transcript on the GPU, a second PC, and a
-  PC with no `vulkan-1.dll` in Windows.
+- A real meeting, 2026-11-17: 15 minutes of one of the owner's calls, two people, mostly
+  English with short parts in another language.
+
+  | Run | Total | Transcription | Words |
+  |---|---|---|---|
+  | `small`, GPU | 252 s | 209 s | 1123 |
+  | `large-v3-turbo`, GPU | 129 s | 83 s | 2116 |
+  | `large-v3-turbo`, CPU | 2252 s | 2214 s | 2052 |
+  | `large-v3-turbo`, GPU, language Hindi | 281 s | 244 s | 309 |
+
+  - On the CPU, `large-v3-turbo` took 37 minutes for 15 minutes of audio. On the GPU it
+    is about 11 times faster than the recording, and it used about 2.5 GB of GPU memory.
+  - `small` was slower than `large-v3-turbo` on the GPU, and wrote half the words.
+  - `large-v3-turbo` wrote English for each line, also where the speech was not English.
+    Some of those lines are a guess. The Mac transcript of the same 15 minutes is the
+    same: English only, 1815 words. So this is Whisper, not the Windows build. `small`
+    wrote those parts in scripts that nobody can read. Language set to Hindi lost the
+    English.
+  - Speaker separation found three speakers and a large unknown group for two people,
+    from the mixed file. A call on the Mac has one file for each side. Windows gets that
+    with call capture (D62).
+- Not measured: a meeting that is mostly Hindi, the live transcript on the GPU, a second
+  PC, and a PC with no `vulkan-1.dll` in Windows.

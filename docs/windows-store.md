@@ -69,7 +69,8 @@ package is not signed. It is 45 MB. It also holds `vulkan-1.dll`, the Vulkan loa
 - Website: `https://github.com/askysh/margin`
 - Support contact: `https://github.com/askysh/margin/issues`
 - System requirements, minimum: Windows 11, x64, a microphone, 8 GB of memory.
-  Recommended: 16 GB of memory and a dedicated graphics card (D63). **Confirm** the
+  Recommended: 16 GB of memory and a graphics card with 4 GB of memory (D63). The Best
+  model used about 2.5 GB there. **Confirm** the
   memory on a real PC.
 
 Product declarations:
