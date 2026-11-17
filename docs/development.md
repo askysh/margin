@@ -181,6 +181,7 @@ export VULKAN_SDK="C:/Users/<you>/VulkanSDK/<version>"
 scripts/build-windows.sh            # the Store build: src-tauri/target/vulkan/release/margin.exe
 scripts/build-windows.sh --cpu      # Whisper on the CPU only: src-tauri/target/release/margin.exe
 scripts/build-windows.sh --debug    # a debug build, CPU only, with the UI built in
+scripts/build-windows.sh --installer  # the Store build and an installer ([The installer](#the-installer))
 ```
 
 The script adds CMake and LLVM to the PATH, sets `LIBCLANG_PATH` and the whisper.cpp
@@ -363,6 +364,49 @@ that the PC trusts.
 
 To check the package folder without identity, start `release\windows\layout\margin.exe`
 in the sandbox. The app must write nothing into that folder.
+
+### The installer
+
+For a PC without the Store, the script also makes a normal installer:
+
+```bash
+export VULKAN_SDK="C:/Users/<you>/VulkanSDK/<version>"
+scripts/build-windows.sh --installer         # the GPU build
+scripts/build-windows.sh --cpu --installer   # the CPU build
+```
+
+It builds as above, then runs `tauri bundle --bundles nsis`. The first run downloads
+NSIS into `%LOCALAPPDATA%\tauri`. The result is
+`release\windows\MarginNotes-setup-<version>.exe`, about 27 MB for the GPU build. It is
+not signed, so SmartScreen warns before it runs.
+
+`tauri.windows.conf.json` has the settings:
+
+- `installMode` is `currentUser`. The installer asks for no administrator rights. It
+  installs into `%LOCALAPPDATA%\Margin Notes`, and adds "Margin Notes" to the Start menu,
+  to the desktop and to Apps (installed apps), with the publisher Askysh.
+- `webviewInstallMode` is `downloadBootstrapper`. It adds nothing to the installer.
+  Windows 11 has WebView2, so the step does nothing there. On a PC where WebView2 is
+  missing, the installer downloads Microsoft's bootstrapper and installs it.
+- The script gives the DLLs from [The DLLs beside margin.exe](#the-dlls-beside-marginexe)
+  and the Vulkan loader as resources, so they go beside `margin.exe`, as in the Store
+  package.
+- The app has no updater on Windows (`updater.rs`), so the installer makes no update
+  files.
+
+`tauri bundle` writes the bundle type into `margin.exe` in the build folder. Only the
+updater reads it.
+
+The installed app is not packaged, so it writes to the places in
+[Where the files are](#where-the-files-are). WebView2 keeps its data in
+`%LOCALAPPDATA%\com.akashmishra.margin`. Windows asks once for the microphone, with its
+own prompt.
+
+The uninstaller (Apps, Margin Notes, Uninstall) removes the install folder, the
+shortcuts and the Apps entry. With "Delete the application data" checked, it also
+removes `%LOCALAPPDATA%\com.akashmishra.margin` and the key
+`HKCU\Software\Askysh\Margin Notes`. It never removes `%LOCALAPPDATA%\Margin` (settings
+and models), the meetings folder or `%USERPROFILE%\.minutes`.
 
 ### Whisper on the GPU
 
