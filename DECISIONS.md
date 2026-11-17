@@ -993,3 +993,231 @@ The full comparison is in `docs/parity/app.md`.
 - Not measured on a real call yet. The log line "rolling transcription finished" now
   counts `redone`.
 
+### D61. Margin for Windows ships on the Microsoft Store, as an MSIX named Margin Notes
+- New fact: docs/brief.md put Windows out of scope for v1. The owner now has a Microsoft
+  Store developer account and a Windows laptop for tests, and wants Margin on the Store.
+- Where the code lives:
+  - (a) A second repository for Windows.
+  - (b) This repository. The UI and most of the Rust are shared, and the Windows parts
+    sit behind `cfg` gates.
+  - Pick: **(b)**. The work is on the `windows-port` branch until the Windows build
+    records and transcribes a meeting. It then merges into `next-release` as one change.
+- The package:
+  - (a) An EXE installer from Tauri, linked from the Store. The publisher must sign it
+    with a certificate from a trusted authority, host it, and update it. Microsoft's own
+    signing service takes individual developers from the United States and Canada only.
+  - (b) An MSIX. The Store signs it, hosts it and updates it, at no cost.
+  - Pick: **(b)**. Tauri does not make an MSIX, so Microsoft's `winapp` CLI packs the
+    built `margin.exe` with `windows/msix/AppxManifest.xml`.
+- Costs of an MSIX:
+  - It needs the restricted capability `runFullTrust`. Each submission gives the reason.
+  - It cannot install WebView2. It uses the copy that Windows has.
+  - The Store build must not update itself, so the updater (D38) is off in it.
+- The name: "Margin" was taken in the Store. The product is **Margin Notes**. The package
+  display name must be a reserved name, so the Start menu and the window say "Margin
+  Notes" on Windows. The Mac app stays "Margin".
+- The version: the Store does not take a version that starts with 0, and it keeps the
+  fourth part. The package version is `(major + 1).minor.patch.0`, so Margin 0.0.10 is
+  package 1.0.10.0 and Margin 1.0.0 is package 2.0.0.0. The order of versions stays the
+  same for every release. About shows Margin's own version.
+- Not known yet: how Windows records the other people on a call. Core's
+  `core-audio-tap` backend is for macOS only. This gets its own decision.
+- The identity values, the listing text and the answers for Partner Center are in
+  docs/windows-store.md.
+
+### D62. The first Windows build: where data goes, and what is off
+- New fact: on 2026-11-13 Margin built and ran on Windows 11 (the owner's laptop, Visual
+  Studio 2026, Rust 1.100). A 31 s recording from a test WAV became a meeting file 7 s
+  after Stop, on the CPU. The Mac build passed its tests and all 88 end-to-end checks
+  with the same code.
+- macOS code stays as it was. Each Windows path sits beside it behind `cfg`. The Windows
+  calls are in one module, `win.rs`.
+- Data: Margin's settings, models and state go to `%LOCALAPPDATA%\Margin`. The roaming
+  folder is wrong for them, because the models are large and a roaming profile copies
+  its folder to each PC. In a Store package, Windows redirects this folder to the
+  package's own store and removes it on uninstall.
+- Meetings: the default folder is `Meetings` in the Documents folder that Windows gives.
+  With OneDrive backup on, that folder is in OneDrive, so the audio syncs. Options: a
+  local folder as the default, or the Documents default with a note. Pick: **keep the
+  default, and say it**. Setup and Settings show a note when the chosen folder is in
+  OneDrive, with a way to choose another folder. Documents is where a user looks for
+  the files, and some users want the backup.
+- Voices: minutes-core keeps `voices.db` in `%USERPROFILE%\.minutes`. It ignores `HOME`
+  on Windows, so a sandbox does not isolate it. The end-to-end pass links that folder
+  into its sandbox and stops when a real one exists (UPSTREAM-PATCHES.md #1).
+- The global shortcut is Ctrl+Alt+Shift+R. Windows keeps the shortcuts with the Windows
+  key for itself.
+- Off on Windows, and hidden in the UI:
+  - Record call. Core's call capture is for macOS only. Upstream tracks capture with
+    WASAPI loopback in silverstein/minutes issue 253. Margin offered to contribute it
+    there on 2026-11-17.
+  - The recording chip. It needs a window above full-screen apps on every desktop.
+    Start does not hide the window on Windows.
+  - The Apple Speech live transcript (D56). The live transcript is Whisper.
+  - The updater (D38) and open at login (D16). The Store updates the app. Open at login
+    needs a startup task in the package.
+  - The call suggestion.
+- The build: `ort-sys` rc.10 finds the output folder by counting folders above
+  `OUT_DIR`, and cargo 1.100 changed that layout. Options: pin an older Rust for the
+  whole repository, or prepare the folders in a script. Pick: **the script**,
+  `scripts/build-windows.sh`. It leaves the Mac build and the `ort` pin alone. It also
+  copies `DirectML.dll` and the four Visual C++ runtime DLLs beside `margin.exe`, because
+  Windows does not include them.
+- Not tested yet: a real microphone (the laptop had none active), a release build, a PC
+  that never had the build tools, Ask and summaries, and the tray by hand.
+
+### D63. The Windows build uses the graphics card, and needs Windows 11
+- New fact: on 2026-11-13 the release build was timed on the owner's laptop (Ryzen 7
+  6800H, RTX 3070 Ti Laptop GPU). Transcription of 231 s of English speech:
+
+  | Model | CPU | Vulkan |
+  |---|---|---|
+  | `base` | 14.3 s | 4.5 to 5.4 s |
+  | `small` | 45.0 s | 7.5 to 8.6 s |
+  | `large-v3-turbo` | 219.7 s | 10.9 to 11.3 s |
+
+  The integrated Radeon GPU was also about 4 times faster than the CPU with
+  `large-v3-turbo`. Speaker separation adds about 17 s, on the CPU in each build.
+- Options: CPU only, Vulkan, or CUDA. CUDA is for NVIDIA cards only and needs its
+  runtime on the PC. Upstream prefers Vulkan on Windows.
+- Pick: **Vulkan, by default**. `large-v3-turbo` on the CPU runs at the speed of the
+  recording. The owner's Hindi-English meetings need that model.
+- One package serves each PC. With no usable Vulkan device, whisper.cpp logs "no GPU
+  found" and uses the CPU. This was tested with the drivers turned off.
+- The package ships the Vulkan loader, `vulkan-1.dll`, beside `margin.exe`. The exe
+  imports it, and only a graphics driver installs it. Without it, the app does not start
+  on a PC with no such driver.
+- Cost: the package is 44 MB, not 28 MB. The build PC needs the Vulkan SDK.
+- CPU: the build sets `GGML_NATIVE=OFF`, so whisper.cpp uses AVX2 on each build PC. A CPU
+  with no AVX2 cannot run Margin Notes. Those are older than about 2013.
+- Windows: the minimum is Windows 11. An MSIX cannot install WebView2. Windows 11
+  includes it, and Windows 10 does not always have it.
+- The release build of whisper.cpp had no optimization at first, and took 194 s for 46 s
+  of audio. `scripts/build-windows.sh` sets the compiler flags back
+  (UPSTREAM-PATCHES.md #21).
+- A real microphone works. The laptop's Windows build shows its own microphone prompt for
+  Margin Notes at the first recording.
+- The loader is version 1.4.363.0, from the Vulkan runtime files of LunarG. Its license
+  is Apache 2.0 and MIT, and the license file ships with it.
+- "Use the graphics card" in Settings → Transcription turns the GPU off, for a PC with a
+  bad driver. minutes-core has no setting for this (UPSTREAM-PATCHES.md #23). So Margin
+  sets `VK_LOADER_DRIVERS_DISABLE=*` for itself at start, and the Vulkan loader then
+  finds no device. A change applies at the next start.
+- The package as an installed app, tested on 2026-11-17 with Developer Mode:
+  - Windows shows a package no microphone before the user answers its prompt. Margin
+    asks for that prompt at the first Record and from the Allow button.
+  - Settings and models go to the store of the package, and removal deletes them. The
+    meetings folder and `%USERPROFILE%\.minutes` stay.
+  - The app writes nothing into its install folder.
+  - To register the package folder again reset the microphone answer. Not known: if an
+    update from the Store does the same.
+- A real meeting, 2026-11-17: 15 minutes of one of the owner's calls, two people, mostly
+  English with short parts in another language.
+
+  | Run | Total | Transcription | Words |
+  |---|---|---|---|
+  | `small`, GPU | 252 s | 209 s | 1123 |
+  | `large-v3-turbo`, GPU | 129 s | 83 s | 2116 |
+  | `large-v3-turbo`, CPU | 2252 s | 2214 s | 2052 |
+  | `large-v3-turbo`, GPU, language Hindi | 281 s | 244 s | 309 |
+
+  - On the CPU, `large-v3-turbo` took 37 minutes for 15 minutes of audio. On the GPU it
+    is about 11 times faster than the recording, and it used about 2.5 GB of GPU memory.
+  - `small` was slower than `large-v3-turbo` on the GPU, and wrote half the words.
+  - `large-v3-turbo` wrote English for each line, also where the speech was not English.
+    Some of those lines are a guess. The Mac transcript of the same 15 minutes is the
+    same: English only, 1815 words. So this is Whisper, not the Windows build. `small`
+    wrote those parts in scripts that nobody can read. Language set to Hindi lost the
+    English.
+  - Speaker separation found three speakers and a large unknown group for two people,
+    from the mixed file. A call on the Mac has one file for each side. Windows gets that
+    with call capture (D62).
+- Not measured: a meeting that is mostly Hindi, the live transcript on the GPU, a second
+  PC, and a PC with no `vulkan-1.dll` in Windows.
+
+## Upstream updates
+
+### D64. A workflow of Margin's own opens the pull request for a new minutes-core
+- Number: D61 to D63 are in use on the `windows-port` branch. This entry takes D64, so
+  the two branches merge without two entries with one number.
+- Need: upstream `silverstein/minutes` tags releases often. Each bump was a local build,
+  a test run and the end-to-end pass, done by hand. Upstream cannot notify Margin, so
+  Margin must ask.
+- Options:
+  - (a) Dependabot. dependabot-core can move a cargo git dependency that is pinned to a
+    tag that looks like a version. It cannot do this bump:
+    - It updates the lock with `cargo update -p minutes-core`. That resolves
+      minutes-core's crates fresh. The bump must seed `Cargo.lock` from upstream's lock
+      (D48), else `ort` and `pyannote-rs` move to releases that break the build.
+    - It does not move a pin by `rev`, the pin that D48 uses now.
+    - It does not change the label in `src-tauri/src/commands.rs` or the `# Now:` line.
+    - It runs no build or test on macOS, and `ci.yml` does not build the Rust side.
+    - `.github/dependabot.yml` turns off cargo version updates on purpose.
+  - (b) Renovate. A custom manager can find the tag. The hosted Renovate app does not
+    run commands after the update, so it cannot seed the lock or run
+    `scripts/bump-upstream.sh`. A self-hosted Renovate can, but it is a second system to
+    run and to trust.
+  - (c) A GitHub Actions workflow in this repository that runs
+    `scripts/bump-upstream.sh`.
+  - (d) Keep the bump by hand.
+- Pick: **(c)**, `.github/workflows/upstream-bump.yml`. It uses the script, so a bump in
+  CI and a bump at a Mac are the same edit. It runs each Monday, and by hand with an
+  optional tag or commit SHA.
+  - The script gets `--no-build`. Without the flag it works as before.
+  - Three jobs. `plan` and `check` have a read-only token. `check` compiles upstream code
+    on `macos-26` with no credentials on disk, and sends the change as a patch artifact
+    before the build starts. `pr` can write. It runs no upstream code, and it refuses a
+    patch that changes a file other than `Cargo.toml`, `Cargo.lock` and `commands.rs`.
+  - The checks run in the workflow: the UI type check and build, `cargo test`, and the
+    end-to-end pass. A failed check makes the pull request a draft.
+  - No cache is saved. A cache that upstream code wrote could reach the release build,
+    which has the signing keys.
+- Limits:
+  - The workflow token opens the pull request, so `ci.yml` waits for a person to select
+    "Approve workflows to run". A GitHub App token or a personal access token in a secret
+    would start it at once. That is a new secret, so it is left to the owner.
+  - The runner has no microphone, no system audio and no Apple Speech. A real call on a
+    Mac stays a manual step.
+  - It is not known yet that the end-to-end pass works on a GitHub runner (speech models
+    on a virtual Mac, the macOS voices that the fixtures use). Its result shows in the
+    pull request. When it does not pass, the checklist asks for a run on a Mac.
+
+### D65. A normal installer for Windows, for tests outside the Store
+- New fact: on 2026-11-17 the owner put the Store submission on hold, and asked for a way
+  to install Margin Notes as a normal user does.
+- `scripts/build-windows.sh --installer` makes `MarginNotes-setup-<version>.exe` with
+  Tauri's NSIS bundle. It holds the same exe and DLLs as the Store package.
+- It installs for one user, into `%LOCALAPPDATA%\Margin Notes`, with no administrator
+  rights. It has no updater.
+- It is not signed, so Windows SmartScreen warns. A certificate is a later decision, and
+  only if this installer becomes a way to ship. Today it is for tests.
+- WebView2: the installer downloads Microsoft's bootstrapper only when WebView2 is
+  missing. Windows 11 includes it.
+- The uninstaller removes the app. It leaves the settings and models in
+  `%LOCALAPPDATA%\Margin`, the meetings folder and `%USERPROFILE%\.minutes`. A Store
+  package differs: Windows removes its settings and models (D63).
+
+### D66. The Windows copy from the installer updates itself, and the release builds it
+- New fact: D61 left Windows updates to the Store. The installer of D65 installs a copy
+  that the Store does not know, so that copy never got an update.
+- Options: no update outside the Store, a second exe with the updater built in, or one
+  exe that decides at start.
+- Pick: **one exe that decides at start**. The updater is on when the process has no
+  package identity, the exe is the one that the NSIS bundle made, and `uninstall.exe` is
+  beside it. So the Store package and a build folder keep it off, with no build flag.
+- The update is the setup exe, signed with the same updater key as the Mac update. The
+  app reads the same `latest.json`. Its Windows entry has the key `windows-x86_64`.
+- The setup runs with no questions and no administrator prompt. "Restart to update"
+  starts the new version. Quit installs and does not start it. Nothing installs during a
+  recording.
+- Tested on 2026-11-17 with a throwaway key: 0.0.11 to 0.0.12, settings, model and a
+  meeting kept byte for byte, and a wrong signature refused.
+- The release: `release.yml` got two jobs, `windows-build` and `windows-publish`. They
+  add the Windows files to the draft that the macOS job makes. A failed Windows build
+  leaves the macOS release as it is. `ci.yml` builds the installer on the release pull
+  request. The owner asked for this change to the release workflow.
+- Cost: a release with no Windows entry in `latest.json` shows an error in Settings →
+  Updates on Windows. Check the draft before you publish.
+- The installer has no code signing certificate. SmartScreen warns at the first install,
+  not at an update.
+- Not tested: an update from GitHub over HTTPS, and the Windows jobs on a runner.

@@ -11,6 +11,7 @@ import { UpdateBanner } from "./components/Updates";
 import { clock, meetingFileReady } from "./util";
 import { useCues } from "./cues";
 import { useMenu } from "./menu";
+import { canRecordCalls, hasModKey, hasRecordingChip, isWindows, keys } from "./platform";
 import type { SectionId } from "./components/SettingsNav";
 
 // Rarely shown, so loaded on first use instead of at startup (docs/perf.md).
@@ -283,7 +284,7 @@ export default function App() {
           className="icon-btn sidebar-toggle"
           aria-label={sidebarHidden && !drawerOpen ? "Show sidebar" : "Hide sidebar"}
           aria-expanded={!sidebarHidden || drawerOpen}
-          title={`${sidebarHidden && !drawerOpen ? "Show" : "Hide"} sidebar (⌘\\)`}
+          title={`${sidebarHidden && !drawerOpen ? "Show" : "Hide"} sidebar (${keys("⌘\\", "Ctrl+\\")})`}
           onClick={toggleSidebar}
         >
           <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><rect x="2.5" y="3.5" width="15" height="13" rx="2.5" stroke="currentColor" strokeWidth="1.5" fill="none" /><path d="M7.5 3.5v13" stroke="currentColor" strokeWidth="1.5" /></svg>
@@ -294,7 +295,7 @@ export default function App() {
           className="icon-btn notepad-toggle"
           aria-label="Notepad view"
           aria-pressed={compact}
-          title={compact ? "Leave the notepad view (⌘⇧N)" : "Notepad view: a narrow window beside your call (⌘⇧N)"}
+          title={compact ? `Leave the notepad view (${keys("⌘⇧N", "Ctrl+Shift+N")})` : `Notepad view: a narrow window beside your call (${keys("⌘⇧N", "Ctrl+Shift+N")})`}
           onClick={() => api.toggleNotepad().catch((e) => notify(errorText(e), "error"))}
         >
           <svg width="17" height="17" viewBox="0 0 20 20" aria-hidden><rect x="5.5" y="2.5" width="9" height="15" rx="2" stroke="currentColor" strokeWidth="1.5" fill="none" /><path d="M8 7h4M8 10.5h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
@@ -321,7 +322,7 @@ export default function App() {
       <main className="pane">
         <header className="toolbar" data-tauri-drag-region>
           <div className="toolbar-spacer" data-tauri-drag-region />
-          {callApp && !recording && (
+          {callApp && !recording && canRecordCalls && (
             <div className="call-banner" role="status">
               <span>{callApp} looks active.</span>
               <button className="link-btn" onClick={() => start("call")}>Record this call</button>
@@ -333,7 +334,7 @@ export default function App() {
             <div className="rec-control">
               <span className="rec-dot" aria-hidden />
               <span className="rec-time mono">{clock(tick.elapsed_secs)}</span>
-              {boot.prefs.recording_chip && !recorder?.stopping && (
+              {hasRecordingChip && boot.prefs.recording_chip && !recorder?.stopping && (
                 <button
                   className="icon-btn shrink-btn"
                   aria-label="Shrink to the recording chip"
@@ -350,7 +351,7 @@ export default function App() {
           ) : (
             <RecordButton busy={busy} onStart={start} />
           )}
-          <button className="icon-btn" title={settings ? "Back (Esc)" : "Settings (⌘,)"} aria-label="Settings" aria-pressed={!!settings} onClick={() => (settings ? closeSettings() : openSettings())}>
+          <button className="icon-btn" title={settings ? "Back (Esc)" : `Settings (${keys("⌘,", "Ctrl+,")})`} aria-label="Settings" aria-pressed={!!settings} onClick={() => (settings ? closeSettings() : openSettings())}>
             {/* The gear's teeth span y 1.5 to 16.5: the view box moves it down 1 unit, onto the centre line. */}
             <svg width="17" height="17" viewBox="0 -1 20 20" aria-hidden><path fill="currentColor" d="M11.4 1.5l.5 2.3c.5.2 1 .5 1.4.8l2.2-.8 1.4 2.4-1.7 1.6c.1.5.1 1.1 0 1.6l1.7 1.6-1.4 2.4-2.2-.8c-.4.3-.9.6-1.4.8l-.5 2.3H8.6l-.5-2.3c-.5-.2-1-.5-1.4-.8l-2.2.8-1.4-2.4 1.7-1.6a4 4 0 010-1.6L3.1 6.2l1.4-2.4 2.2.8c.4-.3.9-.6 1.4-.8l.5-2.3h2.8zM10 7a3 3 0 100 6 3 3 0 000-6z" /></svg>
           </button>
@@ -420,7 +421,7 @@ export default function App() {
         <div className={`toast toast-${toast.tone}`} role="status" onClick={() => setToast(null)}>
           {toast.text}
           {/* Permission errors name System Settings; Margin's own page shows the state and the way there. */}
-          {toast.tone === "error" && toast.text.includes("Privacy & Security") && (
+          {toast.tone === "error" && /Privacy & Security/i.test(toast.text) && (
             <button className="toast-action" onClick={() => openSettings("permissions")}>Open Permissions</button>
           )}
         </div>
@@ -469,6 +470,14 @@ function writePref(key: string, value: string | null) {
 
 function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => void }) {
   const [open, setOpen] = useMenu();
+  // Windows cannot record a call yet (D61). One button, for a meeting in the room.
+  if (!canRecordCalls) {
+    return (
+      <button className="btn btn-primary" disabled={busy} onClick={() => onStart("in-person")} title="Records the microphone, for a meeting in the room (Ctrl+Shift+R)">
+        Record
+      </button>
+    );
+  }
   return (
     <div className="split">
       <button className="btn btn-primary split-main" disabled={busy} onClick={() => onStart("call")} title="Records your mic and the other people on the call (⌘⇧R)">
@@ -500,11 +509,13 @@ function RecordButton({ busy, onStart }: { busy: boolean; onStart: (k: Kind) => 
 }
 
 /** In-window shortcuts: ⌘, settings, ⌘F search, ⌘J Ask, ⌘\ sidebar, ⌘⇧R record a call,
- * ⌘⇧I record in person. */
+ * ⌘⇧I record in person. On Windows the modifier is Ctrl, Ctrl+Shift+R records in person
+ * (Windows cannot record a call yet), and Ctrl+Shift+N switches the notepad view. On
+ * macOS the app menu has ⌘⇧N. */
 function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk, onSearch, onSidebar }: { onSettings: () => void; onStart: (k: Kind) => void; canStart: boolean; onAsk: () => void; onSearch: () => void; onSidebar: () => void }) {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (!e.metaKey) return;
+      if (!hasModKey(e)) return;
       const key = e.key.toLowerCase();
       if (key === ",") {
         e.preventDefault();
@@ -522,7 +533,10 @@ function KeyboardShortcuts({ onSettings, onStart, canStart, onAsk, onSearch, onS
         onSidebar();
       } else if (e.shiftKey && (key === "r" || key === "i") && canStart) {
         e.preventDefault();
-        onStart(key === "r" ? "call" : "in-person");
+        onStart(key === "r" && canRecordCalls ? "call" : "in-person");
+      } else if (isWindows && e.shiftKey && key === "n") {
+        e.preventDefault();
+        api.toggleNotepad().catch(() => {});
       }
     };
     window.addEventListener("keydown", h);

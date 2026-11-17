@@ -85,6 +85,40 @@ The secrets of each workflow are listed at the top of its file.
   runner, and opens a pull request on `askysh/homebrew-tap`. That pull request merges
   itself after the tap's tests pass. Check that it merged.
 
+## Windows
+
+The Windows app has two channels (DECISIONS.md D61). The Store package goes to Partner
+Center, and the Store updates it. The installer, `MarginNotes-setup-<version>.exe`, goes
+on the GitHub release, and the copy that it installs updates itself from the same
+`latest.json` as the Mac app.
+
+`.github/workflows/windows-installer.yml` builds the installer on a Windows runner with
+`scripts/build-windows.sh --installer`. With `sign`, it signs the setup exe with the
+updater key (the same secrets as the Mac build) and writes its `.sig`. It uploads both as
+the artifact `windows-installer`.
+
+`release.yml` does the rest. Its job `windows-build` calls that workflow with `sign`.
+Its job `windows-publish` adds the setup exe, its `.sig` and the Windows entry of
+`latest.json` to the draft, after the macOS job made the draft. The draft has the macOS
+files also when the Windows build fails. Check that the draft has the setup exe before
+you publish. `ci.yml` builds the installer, not signed, on the pull request from
+`next-release` into `main`, so a broken Windows build shows before the merge.
+
+To do it by hand, attach the setup exe and its `.sig`, and add the Windows entry to
+`latest.json` before you publish:
+
+```bash
+bun scripts/latest-json-windows.mjs release/latest.json release/windows/MarginNotes-setup-<version>.exe.sig
+```
+
+The script keeps the `darwin-aarch64` entry and adds `windows-x86_64`, with the URL of
+the setup exe on the release. Publish `latest.json` with both entries. Without the
+Windows entry, an installed Windows copy finds the new version and reports an error in
+Settings, Updates.
+
+The installer is not signed with a code signing certificate, so SmartScreen warns on the
+first install. An in-app update shows no warning: the app starts the setup itself.
+
 ## Test an update locally
 
 1. Build two versions, an older one and a newer one.

@@ -259,6 +259,9 @@ button { cursor: default; }
 .ob-body { font-size: 14.5px; line-height: 1.6; color: var(--ink-2); margin: 0 0 22px; max-width: 540px; }
 .ob-sub { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--rule); margin: 24px 0 8px; }
 .ob-hint { font-size: 12.5px; color: var(--pencil); margin: 10px 0 0; max-width: 540px; }
+/* The OneDrive note (Windows). A span, so that it can sit in the help text of a row. */
+.onedrive-note { display: block; }
+.onedrive-note.set-help { margin-top: 4px; }
 .ob-actions { margin-top: 28px; display: flex; align-items: center; gap: 14px; }
 .ob-key { font-size: 12px; color: var(--pencil); }
 .ob-foot { margin-top: 30px; width: 100%; }
@@ -595,3 +598,12 @@ textarea.field { max-width: none; resize: vertical; min-height: 64px; line-heigh
    crosses the page's rule. 0.3506 is where the rule sits across the mark's width. */
 .ob-logo { margin: -22px 0 0 calc(0.75px - 40px - 88px * 0.3506); }
 .ob-logo .logo-rule { display: none; }
+
+/* ---------------------------------------------------------------- Windows (D61) */
+/* The window has the Windows title bar. So there are no traffic lights to leave room for,
+   and no vibrancy behind the page: the page paints its own background. */
+.os-windows { --f-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+.os-windows body { background: var(--paper-2); }
+.os-windows .sidebar-toggle { left: 12px; }
+.os-windows .notepad-toggle { left: 44px; }
+.os-windows .shell.sidebar-hidden .toolbar { padding-left: 84px; }

@@ -2,6 +2,10 @@
 # Move Margin to another minutes-core from upstream (silverstein/minutes).
 #   scripts/bump-upstream.sh v0.33.0      # a tag: the usual case
 #   scripts/bump-upstream.sh <full-sha>   # a commit on upstream main that no tag has yet
+#   scripts/bump-upstream.sh --no-build v0.33.0   # edit the files only, do not build or test
+#
+# --no-build is for .github/workflows/upstream-bump.yml, which builds and tests in its own
+# steps. GITHUB_TOKEN, when set, authenticates the GitHub API calls (a higher rate limit).
 #
 # A tag pins with `tag = ...`. A commit pins with `rev = ...`, only after a check that it is on
 # main and comes after the latest tag (DECISIONS.md, "Back on upstream minutes-core").
@@ -10,7 +14,12 @@
 # see upstream's lockfile, and minutes-core's caret ranges (ort, pyannote-rs) break when
 # cargo resolves newer releases. The lock keeps native deps on the versions upstream ships.
 set -euo pipefail
-ref="${1:?usage: $0 <tag | full commit sha>}"
+build=1
+if [[ "${1:-}" == "--no-build" ]]; then
+  build=0
+  shift
+fi
+ref="${1:?usage: $0 [--no-build] <tag | full commit sha>}"
 repo="https://github.com/silverstein/minutes"
 api="https://api.github.com/repos/silverstein/minutes"
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,7 +28,11 @@ lock="$root/src-tauri/Cargo.lock"
 
 # Prints "<status> <ahead_by> <behind_by>" for GitHub's compare of base...head.
 compare() {
-  curl -fsSL "${api}/compare/$1...$2" | sed -nE \
+  local auth=()
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  curl -fsSL "${auth[@]+"${auth[@]}"}" "${api}/compare/$1...$2" | sed -nE \
     -e 's/^  "status": "([a-z]+)".*/\1/p' \
     -e 's/^  "ahead_by": ([0-9]+).*/\1/p' \
     -e 's/^  "behind_by": ([0-9]+).*/\1/p' | paste -sd' ' -
@@ -69,6 +82,11 @@ fi
 if ! grep -q "^ort = { version = \"=${ort}\"" "$manifest"; then
   echo "Upstream's lock has ort ${ort}. Update the ort pin in src-tauri/Cargo.toml to \"=${ort}\", then build." >&2
   exit 1
+fi
+
+if (( ! build )); then
+  echo "Files now on minutes-core ${label}. Not built (--no-build)."
+  exit 0
 fi
 
 export CXXFLAGS="-I$(xcrun --show-sdk-path)/usr/include/c++/v1" MACOSX_DEPLOYMENT_TARGET=14.4

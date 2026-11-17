@@ -28,6 +28,10 @@ pub struct Prefs {
     /// The live transcript: an Apple Speech locale (applespeech.rs), or None for core's
     /// Whisper live transcript (D56).
     pub live_transcript: Option<String>,
+    /// Windows: run Whisper on the CPU, for a PC where the graphics driver gives a wrong
+    /// transcript or stops the app (win.rs `whisper_on_cpu`). Stored inverted so a missing
+    /// key means the graphics card is used.
+    pub no_gpu: bool,
 }
 
 /// The preferences the UI can change.
@@ -43,6 +47,9 @@ pub struct AppPrefs {
     /// "whisper", or the Apple Speech locale of the live transcript (D56).
     #[serde(default = "whisper")]
     pub live_transcript: String,
+    /// Windows: Whisper runs on the graphics card. Off sends it to the CPU.
+    #[serde(default = "yes")]
+    pub use_gpu: bool,
 }
 
 fn whisper() -> String {
@@ -55,7 +62,8 @@ fn yes() -> bool {
 
 impl Prefs {
     pub fn recording_chip(&self) -> bool {
-        !self.no_recording_chip
+        // No chip on Windows yet (chip_off.rs), so the window never hides for it.
+        cfg!(target_os = "macos") && !self.no_recording_chip
     }
 
     pub fn app(&self) -> AppPrefs {
@@ -65,6 +73,7 @@ impl Prefs {
             auto_update: !self.no_auto_update,
             recording_chip: !self.no_recording_chip,
             live_transcript: self.live_transcript.clone().unwrap_or_else(whisper),
+            use_gpu: !self.no_gpu,
         }
     }
 }

@@ -9,6 +9,9 @@
 //                     tray-template.png and tray-recording.png (menu bar, 36 px = 18 pt @2x)
 //   docs/images/      app-icon-light.png, app-icon-dark.png (256), social-preview.png (1280x640)
 //   src/components/logoMark.ts   the mark as SVG path data, for <Logo />
+//   src-tauri/icons/icon.ico     the Windows program icon (16 to 256 px)
+//   windows/msix/Assets/         the MSIX package logos (docs/windows-store.md)
+//   windows/store/               the Microsoft Store listing images
 //
 // The mark: a sound line in the margin crosses the green margin rule and turns into
 // handwriting on the page. The recording goes in the margin; your words go on the page.
@@ -316,6 +319,54 @@ func icon(_ px: Int, _ path: String, _ pal: Palette = light) {
     render(px, px, path) { drawIcon($0, pal, level: .forIcon(px)) }
 }
 
+// MARK: - Windows and the Microsoft Store
+
+/// Windows draws no plate behind an icon and gives it less room than macOS does. So the body
+/// fills 90% of the canvas here, not the 80% of the macOS grid.
+func winIcon(_ px: Int, _ path: String) {
+    render(px, px, path) { c in
+        let k: CGFloat = 0.90 * 1024 / body.width
+        c.translateBy(x: 512, y: 512); c.scaleBy(x: k, y: k); c.translateBy(x: -512, y: -512)
+        drawIcon(c, light, level: .forIcon(px))
+    }
+}
+
+/// An .ico file is a small directory followed by one PNG for each size. A size of 256 is
+/// written as 0, because the field is one byte.
+func ico(_ sizes: [Int], _ path: String) {
+    let pngs = sizes.map { px -> Data in
+        let tmp = NSTemporaryDirectory() + "margin-ico-\(getpid())-\(px).png"
+        winIcon(px, tmp)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        return try! Data(contentsOf: URL(fileURLWithPath: tmp))
+    }
+    var out = Data()
+    func le16(_ v: Int) { out.append(UInt8(v & 0xff)); out.append(UInt8((v >> 8) & 0xff)) }
+    func le32(_ v: Int) { le16(v & 0xffff); le16((v >> 16) & 0xffff) }
+    le16(0); le16(1); le16(sizes.count)
+    var offset = 6 + 16 * sizes.count
+    for (px, png) in zip(sizes, pngs) {
+        out.append(UInt8(px % 256)); out.append(UInt8(px % 256)); out.append(0); out.append(0)
+        le16(1); le16(32); le32(png.count); le32(offset)
+        offset += png.count
+    }
+    pngs.forEach { out.append($0) }
+    try! out.write(to: URL(fileURLWithPath: path))
+}
+
+/// Store art: the macOS-shaped icon in the middle of a sheet of the app's paper.
+/// `w` and `h` are in pixels. The icon takes `share` of the shorter side.
+func storeArt(_ w: Int, _ h: Int, _ path: String, share: CGFloat) {
+    render(w, h, path) { c in
+        let W: CGFloat = 1024 * CGFloat(w) / CGFloat(min(w, h)), H: CGFloat = 1024 * CGFloat(h) / CGFloat(min(w, h))
+        let paper = CGGradient(colorsSpace: srgb, colors: [light.paperTop, light.paperBottom] as CFArray, locations: [0, 1])!
+        c.drawLinearGradient(paper, start: .zero, end: CGPoint(x: 0, y: H), options: [])
+        let k = share * 1024 / body.width
+        c.translateBy(x: W / 2, y: H / 2); c.scaleBy(x: k, y: k); c.translateBy(x: -512, y: -512)
+        drawIcon(c, light, level: .full)
+    }
+}
+
 // MARK: - Social preview
 
 func recursive(size: CGFloat, weight: CGFloat, casual: CGFloat) -> CTFont {
@@ -394,6 +445,25 @@ render(36, 36, "\(iconsDir)/tray-recording.png") { drawTray($0, recording: true)
 icon(256, "\(docsDir)/app-icon-light.png", light)
 icon(256, "\(docsDir)/app-icon-dark.png", dark)
 render(1280, 640, "\(docsDir)/social-preview.png", unit: 640, drawSocial)
+
+// Windows: the program icon, the MSIX package logos and the Store listing images. The file
+// names in Assets are the ones Windows looks for (docs/windows-store.md).
+let assetsDir = "\(root)/windows/msix/Assets", storeDir = "\(root)/windows/store"
+for dir in [assetsDir, storeDir] { try! FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+ico([16, 24, 32, 48, 64, 256], "\(iconsDir)/icon.ico")
+winIcon(44, "\(assetsDir)/Square44x44Logo.png")
+winIcon(88, "\(assetsDir)/Square44x44Logo.scale-200.png")
+for px in [16, 20, 24, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 256] {
+    winIcon(px, "\(assetsDir)/Square44x44Logo.targetsize-\(px).png")
+    winIcon(px, "\(assetsDir)/Square44x44Logo.targetsize-\(px)_altform-unplated.png")
+}
+winIcon(150, "\(assetsDir)/Square150x150Logo.png")
+winIcon(300, "\(assetsDir)/Square150x150Logo.scale-200.png")
+winIcon(50, "\(assetsDir)/StoreLogo.png")
+winIcon(100, "\(assetsDir)/StoreLogo.scale-200.png")
+winIcon(300, "\(storeDir)/app-tile-300.png")
+storeArt(2160, 2160, "\(storeDir)/box-art-2160.png", share: 0.56)
+storeArt(1440, 2160, "\(storeDir)/poster-1440x2160.png", share: 0.62)
 
 // The bare mark for the UI: the icon without its tile, drawn straight on the app's paper.
 func markSource(_ m: Mark) -> String {

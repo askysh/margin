@@ -1,5 +1,7 @@
 import { useEffect, useRef, type KeyboardEvent } from "react";
 import { SettingsIcons } from "./SettingsIcons";
+import { updatesAlwaysShown } from "../platform";
+import { useUpdateStatus } from "./Updates";
 
 /** Sections in nav order. Groups are separated by space; Start over sits apart at the bottom. */
 export const SECTIONS = [
@@ -17,6 +19,7 @@ export const SECTIONS = [
 
 export type SectionId = (typeof SECTIONS)[number]["id"];
 
+
 interface Props {
   section: SectionId;
   onSection: (s: SectionId) => void;
@@ -26,6 +29,10 @@ interface Props {
 /** Replaces the meeting list while Settings is open, the way T3 Code's settings route does. */
 export function SettingsNav({ section, onSection, onBack }: Props) {
   const list = useRef<HTMLUListElement>(null);
+  // The Store package and a build folder do not update themselves, so on Windows they have
+  // no Updates section.
+  const [updates] = useUpdateStatus();
+  const SHOWN = SECTIONS.filter((s) => s.id !== "updates" || updatesAlwaysShown || updates?.supported);
   // Opening Settings puts focus in the nav, so the arrow keys work straight away.
   useEffect(() => list.current?.querySelector<HTMLButtonElement>("[aria-current]")?.focus({ preventScroll: true }), []);
 
@@ -39,8 +46,8 @@ export function SettingsNav({ section, onSection, onBack }: Props) {
       </button>
       <nav aria-label="Settings sections" className="set-nav-list">
         <ul ref={list} onKeyDown={arrowKeys}>
-          {SECTIONS.map((s, i) => (
-            <li key={s.id} className={i > 0 && SECTIONS[i - 1].group !== s.group ? `set-nav-gap${s.group === 2 ? " set-nav-end" : ""}` : undefined}>
+          {SHOWN.map((s, i) => (
+            <li key={s.id} className={i > 0 && SHOWN[i - 1].group !== s.group ? `set-nav-gap${s.group === 2 ? " set-nav-end" : ""}` : undefined}>
               <button
                 className={`set-nav-item${s.id === "reset" ? " danger" : ""}`}
                 aria-current={s.id === section ? "page" : undefined}

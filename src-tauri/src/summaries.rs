@@ -12,8 +12,25 @@ pub struct SummaryBackends {
     pub ollama_models: Vec<String>,
 }
 
+/// Windows: the usual install places, then the PATH. No shell runs. The native installer
+/// puts `claude.exe` in `.local\bin`, and npm puts a `claude.cmd` shim in its own folder. A
+/// real program comes before a shim, because a shim starts `node` through `cmd.exe`.
+#[cfg(windows)]
+pub fn find_claude() -> Option<String> {
+    let mut candidates: Vec<PathBuf> = vec![crate::paths::home().join(".local").join("bin").join("claude.exe")];
+    for dir in [dirs::data_dir(), dirs::data_local_dir()].into_iter().flatten() {
+        candidates.push(dir.join("npm").join("claude.cmd"));
+    }
+    if let Some(found) = candidates.into_iter().find(|p| is_executable(p)) {
+        return Some(found.display().to_string());
+    }
+    // `which` adds the extensions in PATHEXT, so it finds claude.exe and claude.cmd.
+    which::which("claude").ok().filter(|p| is_executable(p)).map(|p| p.display().to_string())
+}
+
 /// Finder-launched apps get a minimal PATH, so look in the usual install places and fall
 /// back to asking a login shell.
+#[cfg(not(windows))]
 pub fn find_claude() -> Option<String> {
     let home = crate::paths::home();
     let candidates: Vec<PathBuf> = vec![
@@ -36,6 +53,14 @@ pub fn find_claude() -> Option<String> {
     (!path.is_empty() && is_executable(std::path::Path::new(&path))).then_some(path)
 }
 
+/// Windows has no executable bit. The file extension says what can run.
+#[cfg(windows)]
+pub(crate) fn is_executable(path: &std::path::Path) -> bool {
+    let runs = path.extension().and_then(|e| e.to_str()).is_some_and(|e| ["exe", "cmd", "bat", "com"].iter().any(|x| e.eq_ignore_ascii_case(x)));
+    runs && path.is_file()
+}
+
+#[cfg(unix)]
 pub(crate) fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)

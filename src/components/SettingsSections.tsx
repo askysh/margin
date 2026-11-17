@@ -6,6 +6,8 @@ import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { SummaryChoice } from "./SummaryChoice";
 import { Card, Row, SectionHead, SelectRow, TextRow, ToggleRow, type Choice } from "./SettingsRows";
 import type { SettingsView } from "./Settings";
+import { OneDriveNote } from "./OneDriveNote";
+import { canRecordCalls, DEVICE, GLOBAL_SHORTCUT, hasAppleSpeech, hasGpuSwitch, hasOpenAtLogin, hasRecordingChip, SHOW_IN_FILES, TRAY } from "../platform";
 
 type Save = (patch: Partial<Settings>) => void;
 
@@ -29,8 +31,8 @@ export function GeneralSection({ s, save, options }: SettingsView) {
         <NameRow s={s} save={save} />
       </Card>
       <Card title="Meetings" note="Changing the folder affects new meetings. Meetings already saved stay where they are.">
-        <Row title="Meetings folder" help={<span className="path">{tildify(s.output_dir)}</span>}>
-          <button className="btn btn-quiet" onClick={() => api.reveal(s.output_dir)}>Show in Finder</button>
+        <Row title="Meetings folder" help={<><span className="path">{tildify(s.output_dir)}</span><OneDriveNote dir={s.output_dir} onChoose={changeFolder} className="set-help" /></>}>
+          <button className="btn btn-quiet" onClick={() => api.reveal(s.output_dir)}>{SHOW_IN_FILES}</button>
           <button className="btn btn-quiet" onClick={changeFolder}>Change…</button>
         </Row>
         <SelectRow
@@ -50,14 +52,16 @@ export function GeneralSection({ s, save, options }: SettingsView) {
           onChange={(on) => save({ hide_from_screen_share: on })}
         />
       </Card>
-      <Card title="Startup">
-        <ToggleRow
-          title="Open Margin when you log in"
-          help="Margin waits in the menu bar, ready for your first meeting."
-          checked={s.open_at_login ?? false}
-          onChange={(on) => save({ open_at_login: on })}
-        />
-      </Card>
+      {hasOpenAtLogin && (
+        <Card title="Startup">
+          <ToggleRow
+            title="Open Margin when you log in"
+            help={`Margin waits in the ${TRAY}, ready for your first meeting.`}
+            checked={s.open_at_login ?? false}
+            onChange={(on) => save({ open_at_login: on })}
+          />
+        </Card>
+      )}
     </>
   );
 }
@@ -111,15 +115,17 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
         />
       </Card>
       <Card title="Starting and stopping">
-        <ToggleRow
-          title="Suggest recording when a call starts"
-          help="Shows a banner when Zoom, Teams or another call app opens."
-          checked={s.call_detection ?? true}
-          onChange={(on) => save({ call_detection: on })}
-        />
+        {canRecordCalls && (
+          <ToggleRow
+            title="Suggest recording when a call starts"
+            help="Shows a banner when Zoom, Teams or another call app opens."
+            checked={s.call_detection ?? true}
+            onChange={(on) => save({ call_detection: on })}
+          />
+        )}
         <ToggleRow
           title="Keyboard shortcut in every app"
-          help={<>Start and stop recording from any app with <kbd className="kbd">⌃⌥⌘R</kbd></>}
+          help={<>Start and stop recording from any app with <kbd className="kbd">{GLOBAL_SHORTCUT}</kbd></>}
           checked={prefs.record_shortcut}
           onChange={(on) => changePrefs({ ...prefs, record_shortcut: on })}
         />
@@ -130,6 +136,7 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
           onChange={(on) => changePrefs({ ...prefs, sound_cues: on })}
         />
       </Card>
+      {(hasRecordingChip || hasAppleSpeech) && (
       <Card title="During a recording">
         <ToggleRow
           title="Show the recording chip"
@@ -146,14 +153,15 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
           onChange={(v) => changePrefs({ ...prefs, live_transcript: v })}
         />
       </Card>
+      )}
     </>
   );
 }
 
-export function TranscriptionSection({ s, save, options }: SettingsView) {
+export function TranscriptionSection({ s, save, options, prefs, changePrefs }: SettingsView) {
   return (
     <>
-      <SectionHead title="Transcription" about="Speech becomes text on this Mac. Nothing is uploaded." />
+      <SectionHead title="Transcription" about={`Speech becomes text on this ${DEVICE}. Nothing is uploaded.`} />
       <Card title="Speech model">
         <div className="set-pad">
           <div className="options options-row" role="radiogroup" aria-label="Speech model">
@@ -167,6 +175,14 @@ export function TranscriptionSection({ s, save, options }: SettingsView) {
           <DownloadProgress compact key={s.model} />
         </div>
         <RollingToggle s={s} save={save} />
+        {hasGpuSwitch && (
+          <ToggleRow
+            title="Use the graphics card"
+            help="Makes the transcript much faster on a PC with a graphics card. Turn it off if Margin stops while it transcribes, or if the transcript is wrong. A change applies when you start Margin Notes again."
+            checked={prefs.use_gpu}
+            onChange={(on) => changePrefs({ ...prefs, use_gpu: on })}
+          />
+        )}
       </Card>
       <Card>
         <SelectRow

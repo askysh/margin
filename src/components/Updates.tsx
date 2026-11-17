@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, errorText, on, type UpdateStatus } from "../api";
+import { APP_NAME } from "../platform";
 
 /** The updater's state, kept fresh by its "update-status" events. */
 export function useUpdateStatus() {
@@ -27,13 +28,13 @@ export function UpdateBanner({ recording, notify }: { recording: boolean; notify
   if (!status?.ready || dismissed === status.ready) return null;
   return (
     <div className="call-banner" role="status">
-      <span>Margin {status.ready} is ready.</span>
+      <span>{APP_NAME} {status.ready} is ready.</span>
       {recording ? (
         <span className="quiet">It installs after this recording.</span>
       ) : (
         <button className="link-btn" onClick={() => restart(notify)}>Restart to update</button>
       )}
-      <button className="icon-btn small" aria-label="Later" title="Later: it installs when you quit Margin" onClick={() => setDismissed(status.ready)}>×</button>
+      <button className="icon-btn small" aria-label="Later" title={`Later: it installs when you quit ${APP_NAME}`} onClick={() => setDismissed(status.ready)}>×</button>
     </div>
   );
 }

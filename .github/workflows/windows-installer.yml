@@ -1,0 +1,143 @@
+# Windows installer: build Margin Notes for Windows with Whisper on the GPU, run the Rust
+# tests, and make the NSIS installer with scripts/build-windows.sh --installer. With
+# `sign`, the script also signs the setup exe for the in-app update and writes its .sig.
+# ci.yml and release.yml call this workflow. It uploads the artifact `windows-installer`.
+#
+# Secrets, used only when `sign` is true:
+#   TAURI_SIGNING_PRIVATE_KEY           the in-app updater's private key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password
+#
+# The runner image has Visual Studio with the C++ workload, CMake, LLVM and Git Bash. It
+# does not have bun, the Vulkan SDK or NSIS. Tauri downloads NSIS by itself.
+name: windows-installer
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "The commit, branch or tag to build"
+        type: string
+        required: true
+      sign:
+        description: "Sign the setup exe for the in-app update"
+        type: boolean
+        default: false
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY:
+        required: false
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  # The Vulkan SDK and its runtime files (DECISIONS.md D63). The app ships vulkan-1.dll
+  # from the runtime zip. Change the version and the two hashes together.
+  VULKAN_VERSION: 1.4.363.0
+  VULKAN_SDK_SHA256: 94a82d378f7a5e3e54c9db7d2fb7016af136e14ac0a18dbf0f2f67a36352d141
+  VULKAN_RUNTIME_SHA256: a25a927aa8b9f0371048f1861cf88ac3b9bc9b1fb332c42d897c8ab32695769a
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+
+      # The image has an older Rust. scripts/build-windows.sh expects the build folder
+      # layout of cargo 1.100 and later (the ort-sys note in docs/development.md).
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+
+      - name: Vulkan SDK and runtime files
+        run: |
+          base="https://sdk.lunarg.com/sdk/download/$VULKAN_VERSION/windows"
+          sdk="vulkansdk-windows-X64-$VULKAN_VERSION.exe"
+          zip="VulkanRT-X64-$VULKAN_VERSION-Components.zip"
+          cd "$RUNNER_TEMP"
+          curl -sSfL --retry 3 -o "$sdk" "$base/$sdk"
+          curl -sSfL --retry 3 -o "$zip" "$base/$zip"
+          echo "$VULKAN_SDK_SHA256  $sdk" | sha256sum -c -
+          echo "$VULKAN_RUNTIME_SHA256  $zip" | sha256sum -c -
+          root="C:\\VulkanSDK\\$VULKAN_VERSION"
+          # copy_only=1 changes no system setting, as on the development PC.
+          "./$sdk" --root "$root" --accept-licenses --default-answer --confirm-command install copy_only=1
+          unzip -q "$zip"
+          mkdir -p "/c/VulkanSDK/$VULKAN_VERSION/runtime/x64"
+          cp "VulkanRT-X64-$VULKAN_VERSION-Components/VulkanRT-License.txt" "/c/VulkanSDK/$VULKAN_VERSION/runtime/"
+          cp "VulkanRT-X64-$VULKAN_VERSION-Components/x64/vulkan-1.dll" "/c/VulkanSDK/$VULKAN_VERSION/runtime/x64/"
+          test -f "/c/VulkanSDK/$VULKAN_VERSION/Lib/vulkan-1.lib"
+          echo "VULKAN_SDK=C:/VulkanSDK/$VULKAN_VERSION" >> "$GITHUB_ENV"
+          rm -f "$sdk" "$zip"
+
+      # The registry only. The two build folders take several GB, more than the cache of
+      # the repository should hold next to the macOS one.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-windows-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-windows-${{ runner.arch }}-
+
+      # The same variables that scripts/build-windows.sh sets (docs/development.md,
+      # "Windows"). A runner has administrator rights, so the ort-sys build script makes
+      # links, and it needs its two folders first.
+      - name: Rust tests
+        run: |
+          export PATH="/c/Program Files/CMake/bin:/c/Program Files/LLVM/bin:$PATH"
+          export LIBCLANG_PATH="C:/Program Files/LLVM/bin"
+          export CMAKE_C_FLAGS_RELEASE="-MD -O2 -Ob2 -DNDEBUG" CMAKE_CXX_FLAGS_RELEASE="-MD -O2 -Ob2 -DNDEBUG"
+          export GGML_NATIVE=OFF
+          mkdir -p src-tauri/target/debug/build/examples src-tauri/target/debug/build/deps
+          bun install --frozen-lockfile
+          bun run build
+          cd src-tauri && cargo test
+
+      - name: Write the updater key
+        if: inputs.sign
+        env:
+          UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          UPDATER_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$UPDATER_KEY" ]]; then
+            echo "::error::sign is true, but the secret TAURI_SIGNING_PRIVATE_KEY is empty."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$UPDATER_KEY" > "$RUNNER_TEMP/updater.key"
+          printf '%s' "$UPDATER_PASSWORD" > "$RUNNER_TEMP/updater.password"
+          # umask has no effect on NTFS. Give the files to the runner account only.
+          for f in updater.key updater.password; do
+            icacls "$(cygpath -w "$RUNNER_TEMP/$f")" //inheritance:r //grant:r "$USERNAME:F" >/dev/null
+          done
+          {
+            echo "MARGIN_UPDATER_KEY_PATH=$RUNNER_TEMP/updater.key"
+            echo "MARGIN_UPDATER_KEY_PASSWORD_PATH=$RUNNER_TEMP/updater.password"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the installer
+        run: scripts/build-windows.sh --installer
+
+      - name: Delete the updater key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/updater.key" "$RUNNER_TEMP/updater.password"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer
+          path: |
+            release/windows/MarginNotes-setup-*.exe
+            release/windows/MarginNotes-setup-*.exe.sig
+          if-no-files-found: error

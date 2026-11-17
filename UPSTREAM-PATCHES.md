@@ -12,6 +12,11 @@ here has been applied to upstream, and we work around each of the others locally
 - **Patch:** `Config::minutes_dir().join("voices.db")`, with a one-time fallback that reads
   the legacy path.
 - **Workaround:** we share `~/.minutes/voices.db`, and Reset leaves it alone unless asked.
+- **On Windows:** `dirs::home_dir()` asks Windows for the profile folder and ignores `HOME`
+  and `USERPROFILE`. Core's own `config::home_dir()` reads both, for that reason. So a
+  sandbox cannot move `voices.db` at all, and `margin --dev process` in a sandbox wrote
+  `C:\Users\<user>\.minutes\voices.db` (2026-11-13). The same is true for the mic-mute
+  sentinel (#9). Tests on Windows link the folder into the sandbox (docs/development.md).
 
 ## 2. Public model-download API with progress
 - **Where:** the CLI's private `download_file` and `cmd_setup` in `crates/cli/src/main.rs`.
@@ -228,3 +233,95 @@ here has been applied to upstream, and we work around each of the others locally
 - **Patch:** add `title: Option<String>` to `ResummarizeReport`, cleaned and checked with
   the pipeline's title rules. Or make those two functions public.
 - **Workaround:** `summaries.rs` `title_from_summary` (DECISIONS.md D59).
+
+## 19. Windows: say "no microphone" when there is no input device
+- **Where:** `crates/core/src/error.rs` `CaptureError::DeviceNotFound`, and the end of the
+  input device selection in `capture.rs` (~line 2895 at `209265f`,
+  `host.default_input_device().ok_or(CaptureError::DeviceNotFound)`).
+- **Why:** the text is "audio device not found — is VB-CABLE installed?". A Windows PC
+  with no microphone connected gets this for a plain microphone recording. VB-CABLE is a
+  loopback driver, and it has nothing to do with a microphone. `preflight_recording` gives
+  no blocking reason for the same PC.
+- **Patch:** a "no input device" error with its own text, and a blocking reason in
+  `preflight_recording` when the host has no input device.
+- **Workaround:** on Windows, `recorder.rs` `ensure_permissions` stops the start with
+  Margin's own message when `list_devices_categorized()` is empty.
+
+## 20. Windows: no console window for child programs
+- **Where:** `crates/core/src/bounded_child.rs` `configure_process_tree`, the Windows
+  version (~line 1335 at `209265f`). It sets `command.creation_flags(CREATE_SUSPENDED)`
+  and nothing else. Every `BoundedCommand` goes through it: the summary agent
+  (`summarize.rs`), ffmpeg (`ffmpeg.rs`, `pipeline.rs`, `transcribe.rs`, `diarize.rs`) and
+  the hooks (`hooks.rs`). `engine_process.rs` `command()` makes a plain `Command` with no
+  flags too.
+- **Why:** a release build of a Windows app has no console. When it starts a console
+  program, such as the `claude` CLI for a summary, Windows opens a console window for
+  that program. Core sets no `CREATE_NO_WINDOW` flag anywhere.
+- **Patch:** on Windows, `CREATE_SUSPENDED | CREATE_NO_WINDOW` in `configure_process_tree`,
+  and `CREATE_NO_WINDOW` in `engine_process::command()`.
+- **Workaround:** none for the programs that core starts. Margin sets the flag for the
+  programs that it starts itself (`win.rs`): the processing worker, Ask and the `claude`
+  checks.
+- **Checked on the release build (2026-11-13):** no console window opens when the app
+  starts, and none when it records and processes a meeting with summaries off. That path
+  starts no console program: the workers are `margin.exe` itself, which has no console.
+  A summary with `claude` goes through `BoundedCommand`, so it will open one. Not run:
+  the test PC has the owner's real `claude`.
+
+## 21. Windows: a release build compiles whisper.cpp with no optimization
+- **Where:** `whisper-rs-sys` 0.15.0 `build.rs`, which minutes-core uses through
+  `whisper-rs` 0.16. It sets `CMAKE_BUILD_TYPE=Release` for a release build. The `cmake`
+  crate then sets `CMAKE_C_FLAGS_RELEASE` and `CMAKE_CXX_FLAGS_RELEASE` to the flags of
+  the `cc` crate, with the optimization flags taken out (`cmake` 0.1.57 `lib.rs`, "The
+  visual studio generator apparently doesn't respect `CMAKE_C_FLAGS`"). With the Visual
+  Studio generator this replaces CMake's own `/O2 /Ob2 /DNDEBUG`.
+- **Why:** every release build of minutes-core on Windows with MSVC gets a whisper.cpp
+  with no optimization. On the test laptop the `small` model took 190 s for 46 s of
+  audio. With the flags back it takes 13 s. A debug build is fast by accident: the build
+  script names `RelWithDebInfo` there, so the `cmake` crate replaces the flags of a
+  configuration that the build does not use.
+- **Patch:** in `whisper-rs-sys`, do not set `CMAKE_BUILD_TYPE` for a multi-config
+  generator, or set the two `_RELEASE` variables to CMake's defaults. Until then, upstream
+  can say in its Windows build notes to set the two variables. The build script passes
+  each `CMAKE_` variable of the environment to CMake.
+- **Workaround:** `scripts/build-windows.sh` sets `CMAKE_C_FLAGS_RELEASE` and
+  `CMAKE_CXX_FLAGS_RELEASE` to `-MD -O2 -Ob2 -DNDEBUG`. It also sets `GGML_NATIVE=OFF`,
+  so the build does not depend on the CPU of the build PC. A plain
+  `cargo build --release` needs the same variables.
+
+## 22. Windows: the `vulkan` feature needs a short build path and `vulkan-1.dll`
+- **Where:** `crates/core/Cargo.toml` `vulkan = ["whisper-rs/vulkan"]`, and the text
+  that says to prefer Vulkan on Windows. The causes are in `whisper-rs-sys` 0.15.0 and
+  whisper.cpp 1.8.3 (`ggml/src/ggml-vulkan/CMakeLists.txt`, the `vulkan-shaders-gen`
+  external project).
+- **Why:** two things stop a first build or a first run.
+  - The shader tool is a CMake project inside the build folder of `whisper-rs-sys`. With
+    the folder names of cargo, its paths go past the 260 characters that MSBuild allows,
+    also from a short target folder such as `C:\Users\<user>\.margin-vk`. The build stops
+    with "The C compiler is not able to compile a simple test program".
+  - `whisper-rs-sys` links `vulkan-1` as a normal import. An app with the feature does
+    not start on a PC that has no `vulkan-1.dll`. With the DLL and no usable driver, the
+    feature works well: whisper.cpp says "no GPU found" and uses the CPU.
+- **Patch:** say both in the Windows build notes: build from a target folder with a very
+  short path (a `subst` drive works), and ship `vulkan-1.dll` beside the app. In
+  `whisper-rs-sys`, a delay-load of `vulkan-1.dll` with a check before the first call
+  would remove the second point.
+- **Workaround:** `scripts/build-windows.sh` maps the target folder to a drive
+  letter while it builds, and puts `vulkan-1.dll` from the Vulkan runtime beside the exe.
+- **Measured (2026-11-13, RTX 3070 Ti Laptop GPU):** `large-v3-turbo` runs 20 times
+  faster than real time with Vulkan, and 1.05 times on 8 CPU cores
+  (docs/development.md, "Whisper on the GPU").
+
+## 23. A setting to keep Whisper off the GPU
+- **Where:** `crates/core/src/transcribe.rs` `whisper_context_params()` (~line 1415 at
+  `209265f`). It sets `params.use_gpu` to true when a GPU feature is compiled in. The
+  config has no field for it.
+- **Why:** a build with `vulkan` or `cuda` runs on many graphics drivers. A user with a
+  driver that gives a wrong transcript, or that stops the app, has no way back to the
+  CPU. On macOS the question does not come up, because Metal is one driver.
+- **Patch:** a config field, `transcription.use_gpu`, true by default, that
+  `whisper_context_params()` reads.
+- **Workaround:** on Windows, Settings has "Use the graphics card". When it is off,
+  Margin sets `VK_LOADER_DRIVERS_DISABLE=*` in its own process before anything else runs
+  (`win.rs` `whisper_on_cpu`). The Vulkan loader then hides every driver, whisper.cpp
+  finds no device and uses the CPU. A change applies at the next start of the app.

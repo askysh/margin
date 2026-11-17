@@ -1,5 +1,9 @@
 //! Where Margin keeps its files, and the environment that isolates minutes-core from any
 //! other Minutes install on the same Mac (see DECISIONS.md D3).
+//!
+//! On Windows (D61) the app root is `%LOCALAPPDATA%Margin`, and the default meetings
+//! folder is `Meetings` in the Documents folder that Windows gives. Nothing is written
+//! next to `margin.exe`: a Store package folder is read-only.
 
 use std::path::PathBuf;
 
@@ -11,12 +15,27 @@ pub fn app_root() -> PathBuf {
             return dir;
         }
     }
+    // The local folder, not the roaming one: the models are large, and a roaming profile
+    // copies its folder to each PC of the account.
+    #[cfg(windows)]
+    if let Some(dir) = dirs::data_local_dir() {
+        return dir.join("Margin");
+    }
     dirs::data_dir()
         .unwrap_or_else(|| home().join("Library/Application Support"))
         .join("Margin")
 }
 
 pub fn home() -> PathBuf {
+    // `dirs` asks Windows for the profile folder, and Windows ignores the environment. A
+    // sandbox sets HOME and USERPROFILE (AGENTS.md), so read them first, in the order that
+    // minutes-core's config uses. A normal launch has the real profile in USERPROFILE.
+    #[cfg(windows)]
+    for name in ["HOME", "USERPROFILE"] {
+        if let Some(dir) = std::env::var_os(name).map(PathBuf::from).filter(|d| d.is_absolute()) {
+            return dir;
+        }
+    }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
@@ -49,6 +68,14 @@ pub fn drafts_dir() -> PathBuf {
 }
 
 pub fn default_output_dir() -> PathBuf {
+    // Windows can keep Documents in another place, such as OneDrive. Ask Windows where it
+    // is. A sandbox (MARGIN_HOME) never uses the real Documents folder.
+    #[cfg(windows)]
+    if std::env::var_os("MARGIN_HOME").is_none() {
+        if let Some(documents) = dirs::document_dir() {
+            return documents.join("Meetings");
+        }
+    }
     home().join("Documents").join("Meetings")
 }
 

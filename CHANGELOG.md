@@ -5,6 +5,20 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [0.0.11] - 2026-11-17
+
+### Added
+
+- Margin Notes for Windows, a first build: record a meeting in the room, and get the
+  transcript and the meeting file. It uses the graphics card for the transcript, and
+  needs Windows 11. *Use the graphics card* in Settings → Transcription turns that off.
+  Setup and Settings say when the meetings folder is in OneDrive. It cannot record a
+  call yet (D61, D62, D63).
+- `MarginNotes-setup-<version>.exe`, an installer for Windows. The copy that it installs
+  updates itself, as the Mac app does. The installer is not signed, so Windows SmartScreen
+  warns at the first install: select *More info*, then *Run anyway* (D65, D66).
+- [PRIVACY.md](PRIVACY.md), the privacy policy.
+
 ## [0.0.10] - 2026-11-11
 
 ### Added
