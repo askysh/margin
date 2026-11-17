@@ -248,12 +248,66 @@ here has been applied to upstream, and we work around each of the others locally
   Margin's own message when `list_devices_categorized()` is empty.
 
 ## 20. Windows: no console window for child programs
-- **Where:** `crates/core/src/engine_process.rs` `command()`, the one place where core
-  makes a `Command`.
+- **Where:** `crates/core/src/bounded_child.rs` `configure_process_tree`, the Windows
+  version (~line 1335 at `209265f`). It sets `command.creation_flags(CREATE_SUSPENDED)`
+  and nothing else. Every `BoundedCommand` goes through it: the summary agent
+  (`summarize.rs`), ffmpeg (`ffmpeg.rs`, `pipeline.rs`, `transcribe.rs`, `diarize.rs`) and
+  the hooks (`hooks.rs`). `engine_process.rs` `command()` makes a plain `Command` with no
+  flags too.
 - **Why:** a release build of a Windows app has no console. When it starts a console
   program, such as the `claude` CLI for a summary, Windows opens a console window for
   that program. Core sets no `CREATE_NO_WINDOW` flag anywhere.
-- **Patch:** on Windows, `command.creation_flags(CREATE_NO_WINDOW)` in `command()`.
-- **Workaround:** none. Margin sets the flag for the programs that it starts itself
-  (`win.rs`). Not checked on a release build yet: the Windows work so far used debug
-  builds, which have a console.
+- **Patch:** on Windows, `CREATE_SUSPENDED | CREATE_NO_WINDOW` in `configure_process_tree`,
+  and `CREATE_NO_WINDOW` in `engine_process::command()`.
+- **Workaround:** none for the programs that core starts. Margin sets the flag for the
+  programs that it starts itself (`win.rs`): the processing worker, Ask and the `claude`
+  checks.
+- **Checked on the release build (2026-11-13):** no console window opens when the app
+  starts, and none when it records and processes a meeting with summaries off. That path
+  starts no console program: the workers are `margin.exe` itself, which has no console.
+  A summary with `claude` goes through `BoundedCommand`, so it will open one. Not run:
+  the test PC has the owner's real `claude`.
+
+## 21. Windows: a release build compiles whisper.cpp with no optimization
+- **Where:** `whisper-rs-sys` 0.15.0 `build.rs`, which minutes-core uses through
+  `whisper-rs` 0.16. It sets `CMAKE_BUILD_TYPE=Release` for a release build. The `cmake`
+  crate then sets `CMAKE_C_FLAGS_RELEASE` and `CMAKE_CXX_FLAGS_RELEASE` to the flags of
+  the `cc` crate, with the optimization flags taken out (`cmake` 0.1.57 `lib.rs`, "The
+  visual studio generator apparently doesn't respect `CMAKE_C_FLAGS`"). With the Visual
+  Studio generator this replaces CMake's own `/O2 /Ob2 /DNDEBUG`.
+- **Why:** every release build of minutes-core on Windows with MSVC gets a whisper.cpp
+  with no optimization. On the test laptop the `small` model took 190 s for 46 s of
+  audio. With the flags back it takes 13 s. A debug build is fast by accident: the build
+  script names `RelWithDebInfo` there, so the `cmake` crate replaces the flags of a
+  configuration that the build does not use.
+- **Patch:** in `whisper-rs-sys`, do not set `CMAKE_BUILD_TYPE` for a multi-config
+  generator, or set the two `_RELEASE` variables to CMake's defaults. Until then, upstream
+  can say in its Windows build notes to set the two variables. The build script passes
+  each `CMAKE_` variable of the environment to CMake.
+- **Workaround:** `scripts/build-windows.sh` sets `CMAKE_C_FLAGS_RELEASE` and
+  `CMAKE_CXX_FLAGS_RELEASE` to `-MD -O2 -Ob2 -DNDEBUG`. It also sets `GGML_NATIVE=OFF`,
+  so the build does not depend on the CPU of the build PC. A plain
+  `cargo build --release` needs the same variables.
+
+## 22. Windows: the `vulkan` feature needs a short build path and `vulkan-1.dll`
+- **Where:** `crates/core/Cargo.toml` `vulkan = ["whisper-rs/vulkan"]`, and the text
+  that says to prefer Vulkan on Windows. The causes are in `whisper-rs-sys` 0.15.0 and
+  whisper.cpp 1.8.3 (`ggml/src/ggml-vulkan/CMakeLists.txt`, the `vulkan-shaders-gen`
+  external project).
+- **Why:** two things stop a first build or a first run.
+  - The shader tool is a CMake project inside the build folder of `whisper-rs-sys`. With
+    the folder names of cargo, its paths go past the 260 characters that MSBuild allows,
+    also from a short target folder such as `C:\Users\<user>\.margin-vk`. The build stops
+    with "The C compiler is not able to compile a simple test program".
+  - `whisper-rs-sys` links `vulkan-1` as a normal import. An app with the feature does
+    not start on a PC that has no `vulkan-1.dll`. With the DLL and no usable driver, the
+    feature works well: whisper.cpp says "no GPU found" and uses the CPU.
+- **Patch:** say both in the Windows build notes: build from a target folder with a very
+  short path (a `subst` drive works), and ship `vulkan-1.dll` beside the app. In
+  `whisper-rs-sys`, a delay-load of `vulkan-1.dll` with a check before the first call
+  would remove the second point.
+- **Workaround:** `scripts/build-windows.sh --vulkan` maps the target folder to a drive
+  letter while it builds. Margin does not ship a `vulkan` build yet.
+- **Measured (2026-11-13, RTX 3070 Ti Laptop GPU):** `large-v3-turbo` runs 20 times
+  faster than real time with Vulkan, and 1.05 times on 8 CPU cores
+  (docs/development.md, "Whisper on the GPU").

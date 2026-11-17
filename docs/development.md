@@ -158,7 +158,8 @@ $M --dev serve [port]                    # QA bridge for scripts/e2e
 The Windows build is on the `windows-port` branch (DECISIONS.md D61). It records a meeting
 in the room from the microphone, transcribes it and writes the meeting file. It does not
 record a call, and it has no recording chip, no Open at login, no Apple Speech and no
-updater of its own. Whisper runs on the CPU.
+updater of its own. Whisper runs on the CPU. A build with Whisper on the GPU is an option
+([Whisper on the GPU](#whisper-on-the-gpu)).
 
 ### Requirements
 
@@ -175,14 +176,35 @@ scripts/build-windows.sh            # src-tauri/target/release/margin.exe
 scripts/build-windows.sh --debug    # a debug build with the UI built in
 ```
 
-The script adds CMake and LLVM to the PATH, sets `LIBCLANG_PATH`, builds, and puts the
-DLLs that `margin.exe` needs beside it. For a plain `cargo build` or `cargo test`, set
-the same variables yourself:
+The script adds CMake and LLVM to the PATH, sets `LIBCLANG_PATH` and the whisper.cpp
+variables below, builds, and puts the DLLs that `margin.exe` needs beside it. For a plain
+`cargo build` or `cargo test`, set the same variables yourself:
 
 ```bash
 export PATH="/c/Program Files/CMake/bin:/c/Program Files/LLVM/bin:$PATH"
 export LIBCLANG_PATH="C:/Program Files/LLVM/bin"
+export CMAKE_C_FLAGS_RELEASE="-MD -O2 -Ob2 -DNDEBUG" CMAKE_CXX_FLAGS_RELEASE="-MD -O2 -Ob2 -DNDEBUG"
+export GGML_NATIVE=OFF
 ```
+
+A release build takes about 15 minutes from nothing on an 8-core laptop, and 9 minutes
+when only Margin's own code changed. Most of that is the link step (LTO).
+
+### The whisper.cpp variables
+
+Without the two `CMAKE_` variables, a release build compiles whisper.cpp with no
+optimization. The app works, and Whisper is about 13 times slower: 190 s for 46 s of
+audio, in place of 13 s. The `cmake` crate replaces CMake's flags for the Release
+configuration, and the new flags have no `/O2` (UPSTREAM-PATCHES.md #21). The build of
+`whisper-rs-sys` passes each `CMAKE_` and `GGML_` variable of the environment to CMake,
+so the variables put the flags back. A debug build is not affected.
+
+The build script does not see a change of these variables. After you change one, delete
+`src-tauri/target/release/build/whisper-rs-sys` and build again.
+
+`GGML_NATIVE=OFF` makes whisper.cpp use AVX2, FMA and F16C on every build PC. The
+default, `ON`, uses what the CPU of the build PC has. A build PC with AVX-512 then gives
+an app that stops on a PC without it. A CPU with no AVX2 cannot run either build.
 
 A debug build from `cargo build` loads the UI from `http://localhost:1420`. Run
 `bun run dev` beside it, or use `scripts/build-windows.sh --debug`.
@@ -236,6 +258,10 @@ cmd //c rmdir "C:\\Users\\<you>\\.minutes"                           # removes t
 
 The end-to-end pass does this itself. It stops if a real `.minutes` folder exists.
 
+Under `cargo test`, cargo puts every link folder of the build on the PATH. whisper.cpp
+has many, and the PATH goes past the length that `cmd.exe` searches. A test that starts
+a program through `cmd.exe` must give the full path of the program.
+
 The end-to-end pass runs on Windows as far as the build goes. The comment at the top of
 `scripts/e2e/run.mjs` says what differs. `scripts/e2e/make-fixtures.sh` needs the macOS
 voices, so make the test audio another way: the Windows voices (`System.Speech`) can
@@ -250,6 +276,123 @@ write the same lines to 16 kHz mono WAV files.
 | Voices | `%USERPROFILE%\.minutes\voices.db` |
 
 Nothing is written next to `margin.exe`.
+
+### The browser keys
+
+WebView2 is a browser. `win.rs` `tame_webview` turns off its keys (Ctrl+R, F5, Ctrl+P,
+F12) and takes the browser items out of the context menu. A text field keeps Emoji, Cut,
+Copy, Paste and Select all. To see the items that WebView2 offers, start the app with
+`MARGIN_LOG=info,margin=debug`. Each right click writes a "context menu" line to
+`margin.log`.
+
+### The Store package
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-msix.ps1
+```
+
+Run `scripts/build-windows.sh` first. The script needs the `winapp` CLI
+(`winget install Microsoft.WinAppCli`). It writes two things into `release\windows`,
+which git ignores:
+
+- `layout`: the package folder. It has `margin.exe`, the five DLLs, `Assets`,
+  `AppxManifest.xml` with the version and the CPU filled in, and `resources.pri`.
+- `MarginNotes_<version>_x64.msix`: the package for Partner Center, not signed. The
+  Store signs it. Margin 0.0.10 is package 1.0.10.0 (DECISIONS.md D61). The package is
+  28 MB.
+
+`resources.pri` is the index that lets Windows pick a logo file by size and scale. The
+script makes it with MakePri, and keeps every scale in the one file.
+
+Windows does not install a package that is not signed. To test the app with its package
+identity, register the package folder:
+
+```powershell
+winapp run release\windows\layout          # register the folder and start the app
+winapp unregister release\windows\layout   # remove it, with its app data
+```
+
+This needs Developer Mode (Settings, System, For developers). Without it, `winapp run`
+stops with "Developer Mode is not enabled on this machine". Developer Mode needs an
+administrator.
+
+A packaged run does not follow the sandbox variables, because Windows starts the app. It
+writes to the real places:
+
+| What | Where |
+|---|---|
+| Settings, state, models, logs | `%LOCALAPPDATA%\Packages\Askysh.MarginNotes_0f196q1bwh8q6\LocalCache\Local\Margin` |
+| The WebView2 data | the same `LocalCache\Local`, in `com.akashmishra.margin` |
+| Meetings | the folder that setup shows. The default is `Meetings` in Documents. |
+| Voices | `%USERPROFILE%\.minutes\voices.db` |
+
+These places follow the rules of Windows for a package. They are not confirmed by a
+packaged run yet. So before a packaged test: check that the PC has no real Margin data,
+pick a temporary meetings folder in setup, and keep the `.minutes` link from "Tests and
+the sandbox" in place. Afterwards, unregister, and delete the meetings folder.
+
+The Windows App Certification Kit (`appcert.exe`, with the Windows SDK) needs an
+administrator, and a package that Windows can install. So it needs a test certificate
+that the PC trusts.
+
+To check the package folder without identity, start `release\windows\layout\margin.exe`
+in the sandbox. The app must write nothing into that folder.
+
+### Whisper on the GPU
+
+minutes-core passes a `vulkan` feature to whisper.cpp. Margin has the same feature, off
+by default.
+
+```bash
+export VULKAN_SDK="C:/Users/<you>/VulkanSDK/<version>"
+scripts/build-windows.sh --vulkan    # src-tauri/target/vulkan/release/margin.exe
+```
+
+The build needs the Vulkan SDK from LunarG, for the headers, `vulkan-1.lib` and `glslc`.
+The installer takes `copy_only=1`, which needs no administrator and changes no system
+setting:
+
+```powershell
+vulkansdk-windows-X64-<version>.exe --root C:\Users\<you>\VulkanSDK\<version> --accept-licenses --default-answer --confirm-command install copy_only=1
+```
+
+The script gives the build folder a drive letter (`V:`, or `MARGIN_VULKAN_DRIVE`) while
+it builds, and removes the letter at the end. whisper.cpp builds its shader tool in a
+project inside the project, and from a normal folder those paths go past the 260
+characters that MSBuild allows.
+
+Measured on 2026-11-13: a Ryzen 7 6800H (8 cores), an RTX 3070 Ti Laptop GPU (8 GB), 231 s
+of English speech, `margin --dev process`. The time is the transcription only. Speaker
+separation adds 17 s to each run, on the CPU in both builds.
+
+| Model | CPU | Vulkan, RTX 3070 Ti | Times real time, CPU | Times real time, Vulkan |
+|---|---|---|---|---|
+| `base` (Fast) | 14.3 s | 4.5 to 5.4 s | 16 | 43 to 51 |
+| `small` (Balanced) | 45.0 s | 7.5 to 8.6 s | 5.1 | 27 to 31 |
+| `large-v3-turbo` (Best) | 219.7 s | 10.9 to 11.3 s | 1.05 | 20 to 21 |
+
+On the integrated Radeon graphics of the same laptop, `large-v3-turbo` took 16.0 s for
+46 s of audio. The CPU took 65.7 s and the RTX 6.1 s.
+
+What to know about a `vulkan` build:
+
+- **Which GPU.** whisper.cpp uses the dedicated GPUs first. On the test laptop, device 0
+  is the RTX and device 1 is the Radeon, and Whisper uses device 0. `MARGIN_LOG=debug`
+  writes the list to `margin.log` ("ggml_vulkan: 0 = ..."). To force a device, set
+  `GGML_VK_VISIBLE_DEVICES` to its number in that list.
+- **No usable GPU.** The build falls back to the CPU. Tested with
+  `VK_LOADER_DRIVERS_DISABLE=*`, which hides every driver, and with a device number that
+  does not exist: the log says "no GPU found", and the meeting is written.
+- **No `vulkan-1.dll`.** `margin.exe` imports `vulkan-1.dll`. The graphics driver
+  installs it. On a PC that has none, such as a virtual machine with the basic display
+  driver, the app does not start. A package for every PC must ship the DLL beside
+  `margin.exe`. It is the Vulkan loader from Khronos (Apache 2.0, 1.7 MB). Not done yet,
+  and not tested on such a PC.
+- **The first run.** The first transcription after an install takes about 15 s more. The
+  driver compiles the shaders and keeps them.
+- **The size.** `margin.exe` is 108 MB in place of 52 MB, and the package is 44 MB in
+  place of 28 MB. The shaders are inside the exe.
+- **Live transcript.** Not measured. The timing is for the transcript after Stop.
 
 ## Updating minutes-core
 
