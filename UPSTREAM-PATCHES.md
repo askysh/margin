@@ -306,8 +306,22 @@ here has been applied to upstream, and we work around each of the others locally
   short path (a `subst` drive works), and ship `vulkan-1.dll` beside the app. In
   `whisper-rs-sys`, a delay-load of `vulkan-1.dll` with a check before the first call
   would remove the second point.
-- **Workaround:** `scripts/build-windows.sh --vulkan` maps the target folder to a drive
-  letter while it builds. Margin does not ship a `vulkan` build yet.
+- **Workaround:** `scripts/build-windows.sh` maps the target folder to a drive
+  letter while it builds, and puts `vulkan-1.dll` from the Vulkan runtime beside the exe.
 - **Measured (2026-11-13, RTX 3070 Ti Laptop GPU):** `large-v3-turbo` runs 20 times
   faster than real time with Vulkan, and 1.05 times on 8 CPU cores
   (docs/development.md, "Whisper on the GPU").
+
+## 23. A setting to keep Whisper off the GPU
+- **Where:** `crates/core/src/transcribe.rs` `whisper_context_params()` (~line 1415 at
+  `209265f`). It sets `params.use_gpu` to true when a GPU feature is compiled in. The
+  config has no field for it.
+- **Why:** a build with `vulkan` or `cuda` runs on many graphics drivers. A user with a
+  driver that gives a wrong transcript, or that stops the app, has no way back to the
+  CPU. On macOS the question does not come up, because Metal is one driver.
+- **Patch:** a config field, `transcription.use_gpu`, true by default, that
+  `whisper_context_params()` reads.
+- **Workaround:** on Windows, Settings has "Use the graphics card". When it is off,
+  Margin sets `VK_LOADER_DRIVERS_DISABLE=*` in its own process before anything else runs
+  (`win.rs` `whisper_on_cpu`). The Vulkan loader then hides every driver, whisper.cpp
+  finds no device and uses the CPU. A change applies at the next start of the app.

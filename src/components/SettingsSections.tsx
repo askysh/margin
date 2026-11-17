@@ -6,7 +6,7 @@ import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { SummaryChoice } from "./SummaryChoice";
 import { Card, Row, SectionHead, SelectRow, TextRow, ToggleRow, type Choice } from "./SettingsRows";
 import type { SettingsView } from "./Settings";
-import { canRecordCalls, DEVICE, GLOBAL_SHORTCUT, hasAppleSpeech, hasOpenAtLogin, hasRecordingChip, SHOW_IN_FILES, TRAY } from "../platform";
+import { canRecordCalls, DEVICE, GLOBAL_SHORTCUT, hasAppleSpeech, hasGpuSwitch, hasOpenAtLogin, hasRecordingChip, SHOW_IN_FILES, TRAY } from "../platform";
 
 type Save = (patch: Partial<Settings>) => void;
 
@@ -157,7 +157,7 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
   );
 }
 
-export function TranscriptionSection({ s, save, options }: SettingsView) {
+export function TranscriptionSection({ s, save, options, prefs, changePrefs }: SettingsView) {
   return (
     <>
       <SectionHead title="Transcription" about={`Speech becomes text on this ${DEVICE}. Nothing is uploaded.`} />
@@ -174,6 +174,14 @@ export function TranscriptionSection({ s, save, options }: SettingsView) {
           <DownloadProgress compact key={s.model} />
         </div>
         <RollingToggle s={s} save={save} />
+        {hasGpuSwitch && (
+          <ToggleRow
+            title="Use the graphics card"
+            help="Makes the transcript much faster on a PC with a graphics card. Turn it off if Margin stops while it transcribes, or if the transcript is wrong. A change applies when you start Margin Notes again."
+            checked={prefs.use_gpu}
+            onChange={(on) => changePrefs({ ...prefs, use_gpu: on })}
+          />
+        )}
       </Card>
       <Card>
         <SelectRow

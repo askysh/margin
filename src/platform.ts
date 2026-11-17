@@ -29,6 +29,9 @@ export const hasAppleSpeech = !isWindows;
 export const hasOwnUpdater = !isWindows;
 /** Windows has no permission for system audio. */
 export const hasSystemAudioPermission = !isWindows;
+/** The Windows build runs Whisper on the graphics card, and Settings can turn that off.
+ * The macOS build always uses the GPU of Apple Silicon. */
+export const hasGpuSwitch = isWindows;
 
 /** The label of an in-window shortcut: `keys("⌘⇧N", "Ctrl+Shift+N")`. */
 export function keys(mac: string, windows: string): string {

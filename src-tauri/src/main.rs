@@ -48,6 +48,11 @@ use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 fn main() {
     // Isolate minutes-core from any other Minutes install before anything reads its env.
     paths::install_env();
+    // Before any thread starts, and before Whisper looks for a graphics card.
+    #[cfg(windows)]
+    if prefs::load().no_gpu {
+        win::whisper_on_cpu();
+    }
 
     // minutes-core re-executes this binary for a few sandboxed worker roles.
     if let Some(code) = minutes_core::graph_worker::maybe_run_policy_projection_worker() {

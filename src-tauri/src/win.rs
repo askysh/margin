@@ -10,6 +10,7 @@
 //! - The registry holds the microphone privacy switches.
 //! - The account's display name comes from `GetUserNameExW`.
 //! - WebView2 has its own settings for the browser keys and the context menu.
+//! - The Vulkan loader reads a variable that hides the graphics drivers from Whisper.
 //!
 //! Each function fails soft: a call that Windows refuses gives `None`, `false` or an
 //! `io::Error`, never a panic.
@@ -171,6 +172,18 @@ pub fn reveal(path: &std::path::Path) {
     arg.push(path);
     // Explorer gives exit code 1 also when it worked, so the result says nothing.
     let _ = Command::new("explorer.exe").arg(arg).spawn();
+}
+
+// ---------------------------------------------------------------- the graphics card
+
+/// Make Whisper use the CPU in this process and in the processes it starts.
+///
+/// The Store build runs Whisper on the graphics card through Vulkan (D63). minutes-core
+/// has no setting to turn that off (UPSTREAM-PATCHES.md #23). The Vulkan loader has one:
+/// with this variable it hides every driver, whisper.cpp finds no device, and it uses the
+/// CPU. Nothing else in Margin uses Vulkan. Call it before any other thread starts.
+pub fn whisper_on_cpu() {
+    std::env::set_var("VK_LOADER_DRIVERS_DISABLE", "*");
 }
 
 // ---------------------------------------------------------------- the webview

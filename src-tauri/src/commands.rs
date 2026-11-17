@@ -128,6 +128,7 @@ pub mod ops {
         p.record_shortcut = prefs.record_shortcut;
         p.no_auto_update = !prefs.auto_update;
         p.no_recording_chip = !prefs.recording_chip;
+        p.no_gpu = !prefs.use_gpu;
         let locale = Some(prefs.live_transcript.clone()).filter(|l| crate::applespeech::LOCALES.contains(&l.as_str()));
         let new_locale = locale.is_some() && locale != p.live_transcript;
         p.live_transcript = locale.clone();
