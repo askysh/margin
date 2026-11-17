@@ -804,8 +804,9 @@ await check("a permission error links to Settings → Permissions", async () => 
   await page.locator(".toast").getByRole("button", { name: "Open Permissions" }).click();
   await settingsPage().getByRole("heading", { level: 1, name: "Permissions" }).waitFor();
   assert((await current()) === "Permissions", "nav not on Permissions");
-  await settingsPage().getByText("Microphone", { exact: true }).waitFor();
-  await settingsPage().getByText("System audio", { exact: true }).waitFor();
+  // The title holds the state badge too ("Allowed") when macOS already allows the host.
+  await settingsPage().locator(".perm-title", { hasText: "Microphone" }).waitFor();
+  await settingsPage().locator(".perm-title", { hasText: "System audio" }).waitFor();
   await closeSettings();
 });
 await check("the menu bar's open-settings event opens Settings", async () => {
@@ -916,9 +917,12 @@ await check("settings: hiding from screen sharing is off, and the switch reaches
   assert(JSON.stringify(sent) === "[true,false]", `windows not told: ${JSON.stringify(sent)}`);
 });
 await check("settings: call suggestions follow the switch", async () => {
-  // A stand-in process named like Zoom's, which core's call detection looks for. (A
-  // copy of /bin/sleep is killed by macOS; a symlink keeps its own name in `ps`.)
-  const zoom = path.join(base, "bin/zoom.us");
+  // A stand-in process for a call app. (A copy of /bin/sleep is killed by macOS; a symlink
+  // keeps its own name in `ps`.) It has a name that only the sandbox config lists. With
+  // Zoom's name, a Margin that the owner has open sees it too, and tells them that Zoom
+  // looks active.
+  const callApp = "margin-e2e-call";
+  const zoom = path.join(base, "bin", callApp);
   fs.mkdirSync(path.dirname(zoom), { recursive: true });
   fs.rmSync(zoom, { force: true });
   fs.symlinkSync("/bin/sleep", zoom);
@@ -927,6 +931,10 @@ await check("settings: call suggestions follow the switch", async () => {
   await settled();
   assert(inSection("call_detection", "enabled = false"), "call_detection.enabled not false");
   await closeSettings();
+  const cfgPath = path.join(marginHome, "config.toml");
+  const withApp = cfgText().replace(/(\[call_detection\][^[]*?)^apps = \[[^\]]*\]$/m, `$1apps = ["${callApp}"]`);
+  assert(withApp.includes(`apps = ["${callApp}"]`), "no call_detection.apps line in the config");
+  fs.writeFileSync(cfgPath, withApp);
   const fake = spawn(zoom, ["300"], { stdio: "ignore" });
   procs.push(fake);
   await page.waitForTimeout(17000); // the detector polls every 15 s
@@ -935,7 +943,7 @@ await check("settings: call suggestions follow the switch", async () => {
   await toggle(/Suggest recording when a call starts/).check();
   await settled();
   await closeSettings();
-  await page.locator(".call-banner", { hasText: "Zoom looks active" }).waitFor({ timeout: 20000 });
+  await page.locator(".call-banner", { hasText: `${callApp} looks active` }).waitFor({ timeout: 20000 });
   fake.kill();
   await page.locator(".call-banner").getByRole("button", { name: "Dismiss" }).click();
 });
