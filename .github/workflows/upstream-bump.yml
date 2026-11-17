@@ -1,0 +1,432 @@
+# Upstream bump: when silverstein/minutes publishes a new release tag, open a pull request
+# into next-release that moves the minutes-core pin, with the checks already done.
+# scripts/bump-upstream.sh does the edit. This file decides the ref, runs the checks and
+# opens the pull request. DECISIONS.md D64 says why this is not Dependabot.
+#
+# Three jobs, so that upstream code never runs with a token that can write:
+#   - plan (read only): compare the newest upstream release tag with the pin.
+#   - check (read only, macOS): move the pin, save the change as a patch, then build and
+#     test. Upstream's build scripts run here, with no credentials on disk.
+#   - pr (can write): apply the patch, push upstream/<ref> and open the pull request. It
+#     runs no upstream code and accepts changes to the three pin files only.
+#
+# Run it by hand from the Actions tab (Run workflow) to pick a ref: a tag, or a full
+# commit SHA on upstream main that no tag has yet. docs/releasing.md has the details.
+#
+# The pull request comes from the workflow token, so GitHub does not start ci.yml on it
+# until a person with write access selects "Approve workflows to run".
+name: upstream-bump
+
+on:
+  schedule:
+    # Mondays at 06:17 UTC. Upstream cannot notify Margin, so the workflow asks once a week.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream tag or full commit SHA. Empty: the newest release tag."
+        required: false
+        default: ""
+
+permissions: {}
+
+# An explicit bash shell adds pipefail, so "cmd | tee log" fails when cmd fails.
+defaults:
+  run:
+    shell: bash
+
+# One bump at a time. A second run waits for the first.
+concurrency:
+  group: upstream-bump
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ref: ${{ steps.plan.outputs.ref }}
+      branch: ${{ steps.plan.outputs.branch }}
+      old: ${{ steps.plan.outputs.old }}
+      contains: ${{ steps.plan.outputs.contains }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: next-release
+          persist-credentials: false
+
+      - name: Decide the ref
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ github.event.inputs.ref }}
+        run: |
+          repo="https://github.com/silverstein/minutes"
+          api="https://api.github.com/repos/silverstein/minutes"
+          compare() {
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$api/compare/$1...$2" | jq -r .status
+          }
+
+          line="$(grep '^minutes-core = ' src-tauri/Cargo.toml)"
+          old="$(sed -nE 's/.*(tag|rev) = "([^"]+)".*/\2/p' <<<"$line")"
+          [[ -n "$old" ]] || { echo "::error file=src-tauri/Cargo.toml::no tag or rev on the minutes-core line"; exit 1; }
+          # The same rule as scripts/bump-upstream.sh: pre-releases such as v0.33.0-rc1 do not count.
+          latest="$(git ls-remote --tags --refs --sort=-v:refname "$repo" 'v*' | sed 's#.*refs/tags/##' | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sed -n 1p)"
+          echo "Pinned: $old. Newest upstream release tag: $latest."
+
+          if [[ -n "$INPUT_REF" ]]; then
+            if [[ ! "$INPUT_REF" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::$INPUT_REF is not a tag name or a commit SHA."; exit 1
+            fi
+            ref="$INPUT_REF"
+          else
+            ref="$latest"
+          fi
+          if [[ -z "$ref" ]]; then
+            echo "::error::found no release tag on $repo."; exit 1
+          fi
+          if [[ "$ref" == "$old" ]]; then
+            echo "::notice title=Up to date::minutes-core is already on $ref."
+            exit 0
+          fi
+
+          # Does the new ref contain the pinned one? "behind" means the pin is an ancestor.
+          contains="$(compare "$ref" "$old" || echo unknown)"
+          if [[ -z "$INPUT_REF" && ( "$contains" == ahead || "$contains" == identical ) ]]; then
+            echo "::notice title=Up to date::the pin $old already contains $ref."
+            exit 0
+          fi
+
+          if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then branch="upstream/${ref:0:12}"; else branch="upstream/$ref"; fi
+          # A scheduled run never proposes a ref again after its pull request was closed.
+          # A run by hand skips only an open one.
+          state=all
+          [[ -n "$INPUT_REF" ]] && state=open
+          prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state "$state" --json number --jq length)"
+          if [[ "$prs" != 0 ]]; then
+            echo "::notice title=Pull request exists::$branch already has a pull request ($state). Nothing to do."
+            exit 0
+          fi
+
+          {
+            echo "ref=$ref"
+            echo "branch=$branch"
+            echo "old=$old"
+            echo "contains=$contains"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice title=Bump::minutes-core $old to $ref"
+
+  check:
+    needs: plan
+    if: needs.plan.outputs.ref != ''
+    # The same runner as release.yml: minutes-core needs Xcode 26 for the macOS 26 Speech APIs.
+    runs-on: macos-26
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      REF: ${{ needs.plan.outputs.ref }}
+    steps:
+      # Outside the checkout, so that git diff does not see it.
+      - name: Output folder
+        run: |
+          echo "OUT=$RUNNER_TEMP/bump-out" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/bump-out"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: next-release
+          # Upstream's build scripts run in this job. Keep the token off the disk.
+          persist-credentials: false
+
+      - name: Use the newest Xcode
+        run: |
+          xcode="$(find /Applications -maxdepth 1 -name 'Xcode_*.app' | sort -V | tail -n 1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          echo "CXXFLAGS=-I$(xcrun --show-sdk-path)/usr/include/c++/v1" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=14.4" >> "$GITHUB_ENV"
+
+      - name: Move the pin
+        id: bump
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/bump-upstream.sh --no-build "$REF" 2>&1 | tee "$OUT/bump.log"
+
+      # Cargo adds Margin's own crates to the lock seeded from upstream, as a local build
+      # does. fetch resolves and downloads, and runs no build script.
+      - name: Complete the lock
+        id: fetch
+        if: steps.bump.outcome == 'success'
+        continue-on-error: true
+        working-directory: src-tauri
+        run: cargo fetch 2>&1 | tee "$OUT/fetch.log"
+
+      # The patch leaves this job before any upstream code is compiled. A broken bump (the
+      # ort check, for example) still has its edits, so the pull request can show them.
+      - name: Save the change
+        run: |
+          git diff --binary > "$OUT/bump.patch"
+          if [[ ! -s "$OUT/bump.patch" ]]; then
+            echo "::error::scripts/bump-upstream.sh changed nothing. See its output above."
+            exit 1
+          fi
+          git diff --stat
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bump-patch
+          path: |
+            ${{ env.OUT }}/bump.patch
+            ${{ env.OUT }}/bump.log
+          retention-days: 30
+
+      - name: UI dependencies
+        run: bun install --frozen-lockfile
+
+      - name: UI type check
+        id: ui_types
+        continue-on-error: true
+        run: bunx tsc --noEmit
+
+      - name: UI build
+        id: ui_build
+        continue-on-error: true
+        run: bun run build
+
+      - name: Rust tests
+        id: rust_tests
+        if: steps.fetch.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 90
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: Rust build (for the end-to-end pass)
+        id: rust_build
+        if: steps.fetch.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 60
+        working-directory: src-tauri
+        run: cargo build --locked
+
+      # The fixtures come from the macOS voices. The models come from the same download
+      # the app uses, into a sandbox: the runner has no Margin install to link them from.
+      - name: End-to-end setup
+        id: e2e_setup
+        if: steps.ui_build.outcome == 'success' && steps.rust_build.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          scripts/e2e/make-fixtures.sh "$RUNNER_TEMP/fixtures"
+          mkdir -p "$RUNNER_TEMP/models-sandbox/home"
+          HOME="$RUNNER_TEMP/models-sandbox/home" MARGIN_HOME="$RUNNER_TEMP/models-sandbox/margin" \
+            src-tauri/target/debug/margin --dev models
+          bunx playwright install webkit
+
+      - name: End-to-end pass
+        id: e2e
+        if: steps.e2e_setup.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 40
+        env:
+          E2E_DIR: ${{ runner.temp }}/e2e
+        run: |
+          node scripts/e2e/run.mjs --audio "$RUNNER_TEMP/fixtures/meeting.wav" \
+            --seed-models "$RUNNER_TEMP/models-sandbox/margin/state/models" \
+            --summaries fake-ollama --simulate "$RUNNER_TEMP/fixtures/call.wav" 2>&1 | tee "$OUT/e2e.log"
+
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.e2e.outcome != 'skipped'
+        with:
+          name: e2e-report
+          path: ${{ runner.temp }}/e2e/out
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Record the results
+        if: always()
+        env:
+          BUMP: ${{ steps.bump.outcome }}
+          FETCH: ${{ steps.fetch.outcome }}
+          UI_TYPES: ${{ steps.ui_types.outcome }}
+          UI_BUILD: ${{ steps.ui_build.outcome }}
+          RUST_TESTS: ${{ steps.rust_tests.outcome }}
+          RUST_BUILD: ${{ steps.rust_build.outcome }}
+          E2E_SETUP: ${{ steps.e2e_setup.outcome }}
+          E2E: ${{ steps.e2e.outcome }}
+        run: |
+          {
+            echo "bump=${BUMP:-skipped}"
+            echo "fetch=${FETCH:-skipped}"
+            echo "ui_types=${UI_TYPES:-skipped}"
+            echo "ui_build=${UI_BUILD:-skipped}"
+            echo "rust_tests=${RUST_TESTS:-skipped}"
+            echo "rust_build=${RUST_BUILD:-skipped}"
+            echo "e2e_setup=${E2E_SETUP:-skipped}"
+            echo "e2e=${E2E:-skipped}"
+          } > "$OUT/results.txt"
+          cat "$OUT/results.txt"
+          if [[ -f "$OUT/e2e.log" ]]; then tail -n 40 "$OUT/e2e.log" > "$OUT/e2e-tail.log"; fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bump-results
+          path: |
+            ${{ env.OUT }}/results.txt
+            ${{ env.OUT }}/e2e-tail.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  pr:
+    needs: [plan, check]
+    # Also after a failed check: a broken bump becomes a draft pull request.
+    if: ${{ !cancelled() && needs.plan.outputs.ref != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      REF: ${{ needs.plan.outputs.ref }}
+      BRANCH: ${{ needs.plan.outputs.branch }}
+      OLD: ${{ needs.plan.outputs.old }}
+      CONTAINS: ${{ needs.plan.outputs.contains }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: next-release
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bump-patch
+          path: ${{ runner.temp }}/bump
+
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: bump-results
+          path: ${{ runner.temp }}/bump
+
+      - name: Commit the change
+        run: |
+          patch="$RUNNER_TEMP/bump/bump.patch"
+          git apply --index "$patch"
+          # The bump touches the pin files only. Anything else in the patch is refused.
+          for f in $(git diff --cached --name-only); do
+            case "$f" in
+              src-tauri/Cargo.toml | src-tauri/Cargo.lock | src-tauri/src/commands.rs) ;;
+              *) echo "::error::the patch changes $f, which a bump must not change."; exit 1 ;;
+            esac
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git commit -q -F - <<EOF
+          Move minutes-core to $REF
+
+          The upstream-bump workflow made this change with
+          scripts/bump-upstream.sh --no-build $REF. The previous pin was $OLD.
+          Cargo.lock is seeded from upstream's lock at $REF, then completed by
+          cargo fetch.
+          EOF
+          # The branch belongs to this workflow. A new run for the same ref replaces it.
+          git push --force origin "$BRANCH"
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dir="$RUNNER_TEMP/bump"
+          # Only a known word is read from results.txt, never a command.
+          result() { sed -nE "s/^$1=([a-z]+)$/\1/p" "$dir/results.txt" 2>/dev/null | sed -n 1p || true; }
+          word() {
+            case "$(result "$1")" in
+              success) echo "passed" ;;
+              failure) echo "**failed**" ;;
+              cancelled) echo "**stopped** (time limit or cancel)" ;;
+              *) echo "did not run" ;;
+            esac
+          }
+          draft=()
+          for k in bump fetch ui_types ui_build rust_tests; do
+            [[ "$(result "$k")" == success ]] || draft=(--draft)
+          done
+
+          up="https://github.com/silverstein/minutes"
+          {
+            echo "Moves minutes-core from \`$OLD\` to \`$REF\`. The [upstream-bump workflow]($RUN_URL) opened this pull request."
+            echo
+            echo "- Upstream changes: [$OLD...$REF]($up/compare/$OLD...$REF)"
+            if [[ ! "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "- Release notes: [$REF]($up/releases/tag/$REF)"
+            fi
+            case "$CONTAINS" in
+              behind) echo "- \`$REF\` contains the old pin \`$OLD\`." ;;
+              *) echo "- **Check this:** \`$REF\` does not contain the old pin \`$OLD\` (GitHub compare status: ${CONTAINS:-unknown}). Changes that Margin needs from the old pin can be missing." ;;
+            esac
+            echo
+            echo "## Checks on macos-26"
+            echo
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| \`scripts/bump-upstream.sh --no-build\` | $(word bump) |"
+            echo "| \`cargo fetch\` (completes Cargo.lock) | $(word fetch) |"
+            echo "| \`bunx tsc --noEmit\` | $(word ui_types) |"
+            echo "| \`bun run build\` | $(word ui_build) |"
+            echo "| \`cargo test --locked\` | $(word rust_tests) |"
+            echo "| \`cargo build --locked\` | $(word rust_build) |"
+            echo "| End-to-end setup (fixtures, models, WebKit) | $(word e2e_setup) |"
+            echo "| End-to-end pass (\`scripts/e2e/run.mjs\`) | $(word e2e) |"
+            echo
+            echo "The logs are in the [workflow run]($RUN_URL). The end-to-end screenshots and \`report.json\` are its \`e2e-report\` artifact."
+            if [[ "$(result bump)" != success && -s "$dir/bump.log" ]]; then
+              echo
+              echo "Output of \`scripts/bump-upstream.sh\`:"
+              echo
+              echo '```'
+              tail -n 30 "$dir/bump.log"
+              echo '```'
+            fi
+            if [[ "$(result e2e)" == failure && -s "$dir/e2e-tail.log" ]]; then
+              echo
+              echo "End of the end-to-end output:"
+              echo
+              echo '```'
+              cat "$dir/e2e-tail.log"
+              echo '```'
+            fi
+            echo
+            echo "\`ci.yml\` does not start by itself on this pull request, because the workflow token opened it. Select **Approve workflows to run** to start it."
+            echo
+            echo "## Before you merge"
+            echo
+            echo "- [ ] Read the upstream changes and the release notes."
+            echo "- [ ] Read [UPSTREAM-PATCHES.md]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/next-release/UPSTREAM-PATCHES.md). Mark each patch that \`$REF\` now contains, and remove the Margin workarounds for it."
+            if [[ "$(result e2e)" == success ]]; then
+              echo "- [x] The end-to-end pass passed on the runner."
+            else
+              echo "- [ ] Run the end-to-end pass on a Mac (docs/development.md). It did not pass on the runner."
+            fi
+            echo "- [ ] Record a real call on a Mac. The runner has no microphone, no system audio and no Apple Speech."
+            echo "- [ ] Update the docs that name the old pin: \`docs/development.md\` (Updating minutes-core) and \`DECISIONS.md\`, if they do."
+            echo "- [ ] Add a line to the Unreleased section of CHANGELOG.md if users can see the change."
+          } > "$dir/body.md"
+
+          title="Move minutes-core to $REF"
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] && title="Move minutes-core to ${REF:0:7}"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base next-release --head "$BRANCH" \
+            --title "$title" --body-file "$dir/body.md" "${draft[@]+"${draft[@]}"}"
