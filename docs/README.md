@@ -7,7 +7,7 @@ Margin. Everything here is for people who work on it.
 
 | File | Covers |
 |---|---|
-| [development.md](development.md) | Build, run and test Margin. The developer CLI. Move to a new minutes-core. |
+| [development.md](development.md) | Build, run and test Margin. The developer CLI. Move to a new minutes-core, by hand or with the upstream-bump workflow. |
 | [releasing.md](releasing.md) | Sign, notarize and publish a release. The in-app update and the Homebrew cask. |
 | [perf.md](perf.md) | Performance measurements, and the scripts in [perf-scripts/](perf-scripts/). |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | How to send a change. |

@@ -174,5 +174,53 @@ The script does these steps:
 Step 2 is necessary. Downstream crates do not see upstream's lockfile. Without it,
 minutes-core's loose `ort` range resolves to a release that breaks `pyannote-rs`.
 
+`--no-build` stops the script after the file edits, before step 3. The workflow below uses
+it.
+
+### The upstream-bump workflow
+
+[`.github/workflows/upstream-bump.yml`](../.github/workflows/upstream-bump.yml) does the
+bump for you when upstream publishes a release (DECISIONS.md D64). Every Monday it
+compares the newest upstream release tag with the pin. Pre-releases do not count, the same
+rule as the script. When the tag is newer, the workflow does these steps:
+
+1. It runs `scripts/bump-upstream.sh --no-build <tag>` on a `macos-26` runner, then
+   `cargo fetch` to add Margin's own crates to the lock.
+2. It runs the UI type check and build, `cargo test --locked` and `cargo build --locked`.
+3. It runs the end-to-end pass with fixtures from `scripts/e2e/make-fixtures.sh` and
+   models that `margin --dev models` downloads. The report is the `e2e-report` artifact.
+4. It pushes the branch `upstream/<tag>` and opens a pull request into `next-release`.
+   The pull request has the old and new ref, links to the upstream changes, the result of
+   each check and a checklist.
+
+A failed check makes the pull request a draft. A broken bump is still useful to see early.
+The workflow opens no second pull request for a tag. After you close one, a scheduled run
+does not open it again.
+
+To run it by hand, open **Actions**, then **upstream-bump**, then **Run workflow**. Leave
+`ref` empty for the newest release tag. Or type a tag, or a full commit SHA on upstream
+`main` that no tag has yet. From the terminal:
+
+```bash
+gh workflow run upstream-bump.yml                                # the newest release tag
+gh workflow run upstream-bump.yml -f ref=<full-sha>              # a commit on upstream main
+```
+
+GitHub runs scheduled and manual workflows only from the default branch. So the workflow
+starts to work after `next-release` merges into `main`.
+
+Before you merge the pull request:
+
+- Select **Approve workflows to run** on the pull request. The workflow token opened it,
+  so GitHub does not start `ci.yml` without a person.
+- Do the checklist in the pull request. The runner has no microphone, no system audio and
+  no Apple Speech. Record one real call on a Mac before the release.
+
+The repository setting **Settings > Actions > General > Allow GitHub Actions to create and
+approve pull requests** must be on. Without it, the last job fails.
+
+A Windows check goes in this workflow as a job on `windows-latest`, next to the macOS job,
+when the Windows port is on `next-release`.
+
 A change that Margin needs in minutes-core goes upstream as a pull request. Each
 candidate is in [UPSTREAM-PATCHES.md](../UPSTREAM-PATCHES.md): what, why and where.
