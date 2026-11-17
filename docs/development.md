@@ -335,10 +335,27 @@ writes to the real places:
 | Meetings | the folder that setup shows. The default is `Meetings` in Documents. |
 | Voices | `%USERPROFILE%\.minutes\voices.db` |
 
-These places follow the rules of Windows for a package. They are not confirmed by a
-packaged run yet. So before a packaged test: check that the PC has no real Margin data,
-pick a temporary meetings folder in setup, and keep the `.minutes` link from "Tests and
-the sandbox" in place. Afterwards, unregister, and delete the meetings folder.
+A packaged run on 2026-11-17 confirmed the first three rows. `%LOCALAPPDATA%Margin` did
+not appear, and the app wrote nothing into its own folder. That run gave no voice a
+name, so it did not write `voices.db`. The file is not under `AppData`, so Windows does
+not move it into the package.
+
+`winapp unregister` removed the package data (207 MB with the Fast model) and the Start
+menu entry. The meetings folder and `%USERPROFILE%.minutes` stayed.
+
+So before a packaged test: check that the PC has no real Margin data, pick a temporary
+meetings folder in setup, and keep the `.minutes` link from "Tests and the sandbox" in
+place. Afterwards, unregister, and delete the meetings folder.
+
+The microphone is different in a package. Windows asks the user once, with its own
+prompt, and shows the package no microphone before the answer is yes. Margin asks for
+the prompt at the first Record, and from the Allow button in setup and in Settings
+(`win.rs` `request_microphone`). The registry has no entry for the package: the answer
+comes from `AppCapability`. A new registration of the package folder asks again.
+
+To see an error of the page, start the build outside the package with
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`, and read the
+exceptions over that port. A release build has no developer tools.
 
 The Windows App Certification Kit (`appcert.exe`, with the Windows SDK) needs an
 administrator, and a package that Windows can install. So it needs a test certificate
