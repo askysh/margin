@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, errorText, type ResetPreview } from "../api";
 import { bytes, tildify } from "../util";
+import { isWindows } from "../platform";
 
 type Notify = (t: string, tone?: "info" | "error") => void;
 
@@ -40,7 +41,7 @@ export function ResetDialog({ onCancel, onDone, onBusy, notify }: { onCancel: ()
     }}>
       <div className="dialog" role="alertdialog" aria-modal="true" aria-labelledby="reset-title">
         <h1 id="reset-title">Reset Margin?</h1>
-        <p>Your settings are cleared and setup runs again. macOS keeps the permissions you already gave.</p>
+        <p>Your settings are cleared and setup runs again.{isWindows ? "" : " macOS keeps the permissions you already gave."}</p>
         <ul className="reset-list">
           <li className="reset-always">Settings, the processing queue and logs are cleared.</li>
           <li>

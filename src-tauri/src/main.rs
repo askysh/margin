@@ -4,6 +4,11 @@ mod applespeech;
 mod audio;
 mod calldetect;
 mod chat;
+#[cfg(target_os = "macos")]
+mod chip;
+// No recording chip on Windows yet (D61): the same calls, and each one does nothing.
+#[cfg(not(target_os = "macos"))]
+#[path = "chip_off.rs"]
 mod chip;
 mod commands;
 mod corecfg;
@@ -14,6 +19,11 @@ mod extras;
 mod fsutil;
 mod library;
 mod models;
+#[cfg(target_os = "macos")]
+mod notepad;
+// The notepad view with Tauri's own window calls, in place of AppKit.
+#[cfg(not(target_os = "macos"))]
+#[path = "notepad_plain.rs"]
 mod notepad;
 mod notify;
 mod paths;
@@ -30,12 +40,19 @@ mod speakers;
 mod summaries;
 mod tray;
 mod updater;
+#[cfg(windows)]
+mod win;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
 fn main() {
     // Isolate minutes-core from any other Minutes install before anything reads its env.
     paths::install_env();
+    // Before any thread starts, and before Whisper looks for a graphics card.
+    #[cfg(windows)]
+    if prefs::load().no_gpu {
+        win::whisper_on_cpu();
+    }
 
     // minutes-core re-executes this binary for a few sandboxed worker roles.
     if let Some(code) = minutes_core::graph_worker::maybe_run_policy_projection_worker() {
@@ -83,6 +100,9 @@ fn main() {
                     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
                     let _ = apply_vibrancy(&window, NSVisualEffectMaterial::Sidebar, None, None);
                 }
+                // WebView2 is a browser: turn off the reload key and the browser context menu.
+                #[cfg(windows)]
+                win::tame_webview(&window);
                 let _ = window.set_content_protected(screenshare::hidden());
                 let _ = if at_login { window.hide() } else { window.show() };
                 // The notepad view follows the width (D57). Log the first size, so a window
@@ -104,7 +124,10 @@ fn main() {
                     tracing::warn!(%error, "could not start the model download");
                 }
             }
-            calldetect::spawn();
+            // Windows cannot record a call yet (D61), so it does not suggest one.
+            if cfg!(target_os = "macos") {
+                calldetect::spawn();
+            }
             updater::spawn(&handle);
             Ok(())
         })
@@ -135,6 +158,7 @@ fn main() {
             commands::tauri_cmds::settings_options,
             commands::tauri_cmds::save_app_prefs,
             commands::tauri_cmds::folder_choices,
+            commands::tauri_cmds::folder_in_onedrive,
             commands::tauri_cmds::complete_onboarding,
             commands::tauri_cmds::models_status,
             commands::tauri_cmds::download_models,
@@ -192,6 +216,7 @@ fn main() {
         .expect("failed to build Margin");
 
     app.run(|app, event| match event {
+        #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => tray::show_main(app),
         RunEvent::ExitRequested { api, code, .. } => {
             // Cmd-Q while recording or processing: save the meeting and ask first, off the
@@ -265,8 +290,26 @@ fn init_logging() {
     }
 }
 
+/// Windows: a program started from the Start menu has the full PATH of the account. Add
+/// the two places where `claude` installs, for a PATH that an installer has not changed
+/// yet. Windows separates PATH entries with a semicolon, so the standard library splits it.
+#[cfg(windows)]
+fn extend_path() {
+    let mut parts: Vec<std::path::PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let npm = dirs::data_dir().map(|d| d.join("npm"));
+    for extra in [Some(paths::home().join(".local").join("bin")), npm].into_iter().flatten() {
+        if !parts.contains(&extra) {
+            parts.push(extra);
+        }
+    }
+    if let Ok(path) = std::env::join_paths(parts) {
+        std::env::set_var("PATH", path);
+    }
+}
+
 /// Finder-launched apps get PATH=/usr/bin:/bin:/usr/sbin:/sbin. Summary agents (claude) and
 /// ffmpeg usually live elsewhere.
+#[cfg(not(windows))]
 fn extend_path() {
     let home = paths::home();
     let mut parts: Vec<String> = std::env::var("PATH").unwrap_or_default().split(':').map(String::from).collect();

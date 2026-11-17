@@ -20,6 +20,7 @@ same rules ([CONTRIBUTING.md](CONTRIBUTING.md)).
 | `src-tauri/src/reset.rs`, `paths.rs`, `corecfg.rs` | Reset, every path Margin uses, and the minutes-core config. |
 | `src-tauri/src/devcli.rs`, `devserve.rs` | The `margin --dev` CLI and the QA bridge for the e2e pass. |
 | `src-tauri/Cargo.toml`, `Cargo.lock` | The minutes-core pin and the lock seeded from upstream. |
+| `windows/` | The Microsoft Store package for Windows: the MSIX manifest, its logos and the listing images (D61). |
 | `scripts/` | `build-app.sh`, `release.sh`, `bump-version.sh`, `bump-upstream.sh`, the Homebrew renderer and `e2e/`. |
 | `docs/` | Development, releasing, research and parity notes. [docs/README.md](docs/README.md) is the map. |
 | `DECISIONS.md` | Every product and technical decision, numbered `D1`, `D2` and so on. |
@@ -96,6 +97,8 @@ already there without a new fact. Say what the new fact is.
   this repository.
 - Move to a new ref only with `scripts/bump-upstream.sh <tag-or-full-sha>`. It re-seeds
   `src-tauri/Cargo.lock` from upstream's lock, then builds and tests.
+- `.github/workflows/upstream-bump.yml` opens a pull request for each new upstream release
+  tag. Review that pull request. Do not bump by hand to the same tag.
 - A gap in minutes-core goes into [UPSTREAM-PATCHES.md](UPSTREAM-PATCHES.md) as a patch
   that upstream can take. Work around it in Margin until upstream ships it.
 
@@ -106,6 +109,8 @@ already there without a new fact. Say what the new fact is.
 - The updater `pubkey` in `src-tauri/tauri.conf.json`. Installed copies verify updates
   with it. A new key breaks updates for everyone.
 - The bundle identifier `com.akashmishra.margin`. macOS ties the permissions to it.
+- The identity in `windows/msix/AppxManifest.xml` (Name, Publisher, PublisherDisplayName).
+  It comes from Partner Center, and the Store refuses a package where it differs.
 - The release and Homebrew workflows in `.github/workflows/`, and their secrets.
 - The meeting file format. Obsidian, the minutes CLI and MCP read the same files.
 - `tsconfig.tsbuildinfo`. The build changes it. Do not commit those changes.

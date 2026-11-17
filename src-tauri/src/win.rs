@@ -1,0 +1,605 @@
+//! The Windows API calls that Margin makes, in one place (DECISIONS.md D61).
+//!
+//! The macOS build does the same work with process groups, `open`, TCC and thread QoS.
+//! Windows has other tools for each one:
+//!
+//! - A Job Object holds a child process and every process that the child starts. Margin
+//!   stops Ask with it. A plain "kill the child" leaves `node` running when `claude` is a
+//!   `claude.cmd` shim.
+//! - The shell opens a URL (`ShellExecuteW`), and Explorer shows a file.
+//! - The registry holds the microphone privacy switches.
+//! - The account's display name comes from `GetUserNameExW`.
+//! - WebView2 has its own settings for the browser keys and the context menu.
+//! - The Vulkan loader reads a variable that hides the graphics drivers from Whisper.
+//! - OneDrive names its folders in three variables and in the registry.
+//!
+//! Each function fails soft: a call that Windows refuses gives `None`, `false` or an
+//! `io::Error`, never a panic.
+
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::CommandExt;
+use std::process::{Child, Command};
+use std::sync::Arc;
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, OpenThread, ResumeThread, SetThreadPriority, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    THREAD_PRIORITY_BELOW_NORMAL, THREAD_SUSPEND_RESUME,
+};
+
+fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+    s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+// ---------------------------------------------------------------- child processes
+
+/// A Job Object. Every process in it stops when Margin calls `terminate`, and also when
+/// Margin itself goes away (`KILL_ON_JOB_CLOSE`).
+pub struct Job(HANDLE);
+
+// SAFETY: a job handle is a kernel object. Windows lets any thread use it.
+unsafe impl Send for Job {}
+unsafe impl Sync for Job {}
+
+impl Job {
+    fn new() -> std::io::Result<Job> {
+        // SAFETY: null arguments ask for a new job with no name and default security.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let job = Job(handle);
+        // SAFETY: the struct is plain data, and zero is a valid value for each field.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `info` lives for the call, and the size is the size of its type.
+        let ok = unsafe {
+            SetInformationJobObject(job.0, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32)
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    /// Stop every process in the job, now. Windows has no SIGTERM for a process tree.
+    pub fn terminate(&self) {
+        // SAFETY: the handle is a live job for as long as `self` is.
+        unsafe { TerminateJobObject(self.0, 1) };
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateJobObjectW and is closed only here.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Start `command` inside a new Job Object, with no console window.
+///
+/// The child starts suspended and joins the job before it runs any code. So a process that
+/// it starts at once, as `cmd.exe` does for a `.cmd` file, is in the job too.
+pub fn spawn_in_job(command: &mut Command) -> std::io::Result<(Child, Arc<Job>)> {
+    let job = Job::new()?;
+    let mut child = command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW).spawn()?;
+    // SAFETY: the process handle is live while `child` is.
+    let assigned = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) } != 0;
+    let error = std::io::Error::last_os_error();
+    if !assigned || !resume(child.id()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(if assigned { std::io::Error::other("could not start the suspended process") } else { error });
+    }
+    Ok((child, Arc::new(job)))
+}
+
+/// Resume the threads of a process that started suspended. A new suspended process has
+/// one thread. The standard library does not give its handle, so find it by process ID.
+fn resume(pid: u32) -> bool {
+    // SAFETY: the snapshot handle is checked and closed. `entry` has its size set, as
+    // Thread32First requires. Each thread handle is checked and closed.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut resumed = false;
+        let mut more = Thread32First(snapshot, &mut entry) != 0;
+        while more {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if !thread.is_null() {
+                    resumed |= ResumeThread(thread) != u32::MAX;
+                    CloseHandle(thread);
+                }
+            }
+            more = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        resumed
+    }
+}
+
+/// For a child that must outlive Margin and take no Ctrl-C meant for it: the processing
+/// worker. The same purpose as a new process group on macOS. No console window opens.
+pub fn detach(command: &mut Command) {
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+/// For a short helper that has a console, such as `claude --help`: no console window opens.
+pub fn no_window(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// Below-normal priority for the calling thread. Windows does not pass a thread's priority
+/// to the threads it starts, so Whisper's own worker threads keep the normal priority.
+pub fn lower_thread_priority() -> bool {
+    // SAFETY: GetCurrentThread gives a pseudo-handle that is always valid.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) != 0 }
+}
+
+// ---------------------------------------------------------------- the shell
+
+/// Open a URL or a file with the program that Windows has for it. No shell reads the text,
+/// so the characters in it have no special meaning.
+pub fn shell_open(target: &str) -> std::io::Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let (verb, target) = (wide("open"), wide(target));
+    // SAFETY: both strings end with a zero and live for the call. The other pointers are
+    // null, which ShellExecuteW allows.
+    let result = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), target.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+    // ShellExecuteW gives a value above 32 when it worked.
+    if result as usize > 32 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("Windows could not open it (code {})", result as usize)))
+    }
+}
+
+/// Show a file in Explorer, selected. Explorer needs the comma form with no space.
+pub fn reveal(path: &std::path::Path) {
+    let mut arg = std::ffi::OsString::from("/select,");
+    arg.push(path);
+    // Explorer gives exit code 1 also when it worked, so the result says nothing.
+    let _ = Command::new("explorer.exe").arg(arg).spawn();
+}
+
+// ---------------------------------------------------------------- the graphics card
+
+/// Make Whisper use the CPU in this process and in the processes it starts.
+///
+/// The Store build runs Whisper on the graphics card through Vulkan (D63). minutes-core
+/// has no setting to turn that off (UPSTREAM-PATCHES.md #23). The Vulkan loader has one:
+/// with this variable it hides every driver, whisper.cpp finds no device, and it uses the
+/// CPU. Nothing else in Margin uses Vulkan. Call it before any other thread starts.
+pub fn whisper_on_cpu() {
+    std::env::set_var("VK_LOADER_DRIVERS_DISABLE", "*");
+}
+
+// ---------------------------------------------------------------- the webview
+
+/// The context menu items that a desktop app keeps: the ones that edit text. WebView2
+/// gives each item a name that does not change with the language of Windows.
+const KEPT_MENU_ITEMS: [&str; 8] = ["undo", "redo", "cut", "copy", "paste", "pasteAndMatchStyle", "selectAll", "emoji"];
+
+/// Make the page behave as an app window, not as a browser tab.
+///
+/// WebView2 is a browser. Ctrl+R and F5 load the page again, which loses what the window
+/// shows. Ctrl+P prints, F12 opens the developer tools, and the context menu has Back,
+/// Refresh, Save as and Print. Tauri turns none of this off. Two settings do:
+///
+/// - No browser keys. The keys that edit text stay: copy, cut, paste, select all, undo.
+///   The page still gets each key press, so Margin's own Ctrl+F and Ctrl+Shift+R work.
+/// - The context menu keeps the items that edit text. Where none is left, for example on
+///   a button, no menu opens.
+pub fn tame_webview(window: &tauri::WebviewWindow) {
+    use webview2_com::ContextMenuRequestedEventHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2Settings3, ICoreWebView2_11};
+    use windows_core::Interface;
+    let result = window.with_webview(|webview| {
+        // SAFETY: Tauri runs this on the thread that owns the webview, and the COM objects
+        // are live while `webview` is. Each call that fails leaves the default in place.
+        unsafe {
+            let Ok(core) = webview.controller().CoreWebView2() else {
+                return;
+            };
+            if let Ok(settings) = core.Settings().and_then(|s| s.cast::<ICoreWebView2Settings3>()) {
+                let _ = settings.SetAreBrowserAcceleratorKeysEnabled(false);
+            }
+            if let Ok(core) = core.cast::<ICoreWebView2_11>() {
+                let handler = ContextMenuRequestedEventHandler::create(Box::new(|_, args| {
+                    if let Some(args) = args {
+                        trim_context_menu(&args)?;
+                    }
+                    Ok(())
+                }));
+                let mut token = 0;
+                let _ = core.add_ContextMenuRequested(&handler, &mut token);
+            }
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not change the WebView2 settings");
+    }
+}
+
+/// Which items of a context menu to remove. `items` has the name of each item, or `None`
+/// for a separator. The result is in falling order, so that removing one item does not
+/// move the ones still to remove. A separator goes when it is first, last or after
+/// another separator.
+fn menu_items_to_remove(items: &[Option<String>]) -> Vec<u32> {
+    let kept: Vec<usize> =
+        (0..items.len()).filter(|&i| items[i].as_deref().is_none_or(|name| KEPT_MENU_ITEMS.contains(&name))).collect();
+    let mut keep = vec![false; items.len()];
+    let mut last_was_item = false;
+    for &i in &kept {
+        let is_item = items[i].is_some();
+        keep[i] = is_item || last_was_item;
+        last_was_item = is_item;
+    }
+    // A separator can still be last.
+    if let Some(&i) = kept.iter().rev().find(|&&i| keep[i]) {
+        keep[i] = items[i].is_some();
+    }
+    (0..items.len()).rev().filter(|&i| !keep[i]).map(|i| i as u32).collect()
+}
+
+/// SAFETY: call it from the handler of the context menu event, with its arguments.
+unsafe fn trim_context_menu(
+    args: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2ContextMenuRequestedEventArgs,
+) -> windows_core::Result<()> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR;
+    let menu = args.MenuItems()?;
+    let mut count = 0;
+    menu.Count(&mut count)?;
+    let mut items = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let item = menu.GetValueAtIndex(index)?;
+        let mut kind = Default::default();
+        item.Kind(&mut kind)?;
+        let mut name = windows_core::PWSTR::null();
+        item.Name(&mut name)?;
+        let name = webview2_com::take_pwstr(name);
+        items.push((kind != COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR).then_some(name));
+    }
+    let remove = menu_items_to_remove(&items);
+    tracing::debug!(?items, ?remove, "context menu");
+    if remove.len() == items.len() {
+        // Nothing is left. "Handled" tells WebView2 to show no menu.
+        return args.SetHandled(true);
+    }
+    for index in remove {
+        menu.RemoveValueAtIndex(index)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- the registry
+
+fn reg_string(root: HKEY, key: &str, value: &str) -> Option<String> {
+    let (key, value) = (wide(key), wide(value));
+    let mut buf = [0u16; 512];
+    let mut bytes = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: the strings end with a zero, and `bytes` is the size of `buf` in bytes.
+    let rc = unsafe { RegGetValueW(root, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut bytes) };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
+/// The microphone switches in Settings, Privacy and security, Microphone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicConsent {
+    Allowed,
+    Denied,
+    /// The Store package only: Windows has not asked the user yet.
+    NotAsked,
+    Unknown,
+}
+
+/// What Windows says about microphone access for this app. No prompt can appear.
+///
+/// The Store package has its own answer, and Windows gives it (`package_microphone`).
+/// For other desktop programs, this reads the same registry values as the Settings page.
+pub fn microphone_consent() -> MicConsent {
+    if package_family_name().is_some() {
+        return package_microphone(false);
+    }
+    const STORE: &str = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
+    let read = |root: HKEY, sub: Option<&str>| {
+        let key = sub.map_or(STORE.to_string(), |s| format!(r"{STORE}\{s}"));
+        reg_string(root, &key, "Value")
+    };
+    // Desktop programs share one switch.
+    let app = read(HKEY_CURRENT_USER, Some("NonPackaged"));
+    mic_consent_from(read(HKEY_LOCAL_MACHINE, None).as_deref(), read(HKEY_CURRENT_USER, None).as_deref(), app.as_deref())
+}
+
+/// Ask Windows for the microphone, with its prompt when the user has not answered yet.
+///
+/// Only the Store package gets a prompt. Until the user says yes, Windows shows the
+/// package no microphone at all, so Margin must ask before it looks for one. Other
+/// desktop programs have no question to ask: this reads the switches again.
+pub fn request_microphone() -> MicConsent {
+    if package_family_name().is_some() {
+        package_microphone(true)
+    } else {
+        microphone_consent()
+    }
+}
+
+/// The answer of Windows for the `microphone` capability of the package. With `ask`,
+/// Windows shows its prompt when it needs one, and this waits for the answer.
+fn package_microphone(ask: bool) -> MicConsent {
+    use windows::Security::Authorization::AppCapabilityAccess::{AppCapability, AppCapabilityAccessStatus as Status};
+    let status = AppCapability::Create(&windows_core::HSTRING::from("microphone")).and_then(|capability| {
+        if ask {
+            capability.RequestAccessAsync()?.join()
+        } else {
+            capability.CheckAccess()
+        }
+    });
+    match status {
+        Ok(Status::Allowed) => MicConsent::Allowed,
+        Ok(Status::UserPromptRequired) => MicConsent::NotAsked,
+        Ok(Status::DeniedByUser) | Ok(Status::DeniedBySystem) => MicConsent::Denied,
+        Ok(_) => MicConsent::Unknown,
+        Err(error) => {
+            tracing::warn!(%error, ask, "Windows gave no answer about the microphone");
+            MicConsent::Unknown
+        }
+    }
+}
+
+/// `device`: the switch for the whole PC. `user`: the switch for this account. `app`: the
+/// switch for this app, or for all desktop apps. One "Deny" is enough to block the
+/// microphone. With no "Deny", one "Allow" is enough to say that it is allowed. A missing
+/// value means that Windows uses its default, which Margin cannot read.
+pub fn mic_consent_from(device: Option<&str>, user: Option<&str>, app: Option<&str>) -> MicConsent {
+    let all = [device, user, app];
+    if all.iter().flatten().any(|v| v.eq_ignore_ascii_case("Deny")) {
+        MicConsent::Denied
+    } else if all.iter().flatten().any(|v| v.eq_ignore_ascii_case("Allow")) {
+        MicConsent::Allowed
+    } else {
+        MicConsent::Unknown
+    }
+}
+
+/// The package family name when Margin runs from its Store package, else `None`.
+fn package_family_name() -> Option<String> {
+    use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFamilyName;
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    // SAFETY: `len` is the size of `buf` in characters, as the function requires.
+    let rc = unsafe { GetCurrentPackageFamilyName(&mut len, buf.as_mut_ptr()) };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+// ---------------------------------------------------------------- updates
+
+/// True when this copy came from the NSIS installer, so the updater can replace it.
+///
+/// - The Store package updates through the Store, and a Store build must not update
+///   itself (D61). Package identity tells the two apart at run time, so one `margin.exe`
+///   serves the installer and the package.
+/// - `tauri bundle` writes the bundle type into the exe. A plain `cargo build` has none.
+/// - The installer puts `uninstall.exe` beside the exe. The build folder, a layout
+///   folder or a copy elsewhere has no such file, and nothing there to update.
+pub fn installed_by_setup() -> bool {
+    use tauri::utils::{config::BundleType, platform::bundle_type};
+    if package_family_name().is_some() || bundle_type() != Some(BundleType::Nsis) {
+        return false;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("uninstall.exe").is_file()))
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------- OneDrive
+
+/// True when `folder` is inside a OneDrive folder of this account.
+///
+/// The default meetings folder is in Documents, and OneDrive backup moves Documents into
+/// OneDrive. The recordings then go to OneDrive too, so the UI says so. Both sides are
+/// compared as real paths, so a link or another spelling of the same folder still matches.
+pub fn in_onedrive(folder: &std::path::Path) -> bool {
+    let folder = real_path(folder);
+    onedrive_roots().iter().any(|root| is_inside(&folder, &real_path(root)))
+}
+
+/// The OneDrive folders that Windows knows for this account. OneDrive sets three
+/// variables for the programs it starts with, and it keeps the folder of each account,
+/// personal or work, in the registry.
+fn onedrive_roots() -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> =
+        ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"].iter().filter_map(std::env::var_os).map(Into::into).collect();
+    const ACCOUNTS: &str = r"Software\Microsoft\OneDrive\Accounts";
+    for account in reg_subkeys(HKEY_CURRENT_USER, ACCOUNTS) {
+        if let Some(folder) = reg_string(HKEY_CURRENT_USER, &format!(r"{ACCOUNTS}\{account}"), "UserFolder") {
+            roots.push(folder.into());
+        }
+    }
+    roots.retain(|root: &std::path::PathBuf| root.is_absolute());
+    roots
+}
+
+/// The names of the keys directly under a registry key. Empty when the key is not there.
+fn reg_subkeys(root: HKEY, key: &str) -> Vec<String> {
+    use windows_sys::Win32::System::Registry::{RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, KEY_READ};
+    let key = wide(key);
+    let mut names = Vec::new();
+    // SAFETY: the key name ends with a zero. The handle is checked, and closed at the end.
+    // `len` is the size of `buf` in characters before each call, as RegEnumKeyExW requires.
+    unsafe {
+        let mut handle: HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(root, key.as_ptr(), 0, KEY_READ, &mut handle) != ERROR_SUCCESS {
+            return names;
+        }
+        for index in 0.. {
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            let rc = RegEnumKeyExW(handle, index, buf.as_mut_ptr(), &mut len, std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+            if rc != ERROR_SUCCESS {
+                break;
+            }
+            names.push(String::from_utf16_lossy(&buf[..len as usize]));
+        }
+        RegCloseKey(handle);
+    }
+    names
+}
+
+/// The path with its links followed. A folder that does not exist yet, such as a new
+/// meetings folder, keeps its last names as they are, after the real path of the part
+/// that does exist.
+fn real_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut rest = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return rest.iter().rev().fold(real, |path, name| path.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// True when `folder` is `root` or a folder in it. Windows paths do not care about the
+/// case of a letter. The comparison is by whole names, so `C:\OneDrive2` is not inside
+/// `C:\OneDrive`.
+pub fn is_inside(folder: &std::path::Path, root: &std::path::Path) -> bool {
+    let lower = |path: &std::path::Path| -> Vec<String> { path.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect() };
+    let (folder, root) = (lower(folder), lower(root));
+    !root.is_empty() && folder.len() >= root.len() && folder[..root.len()] == root[..]
+}
+
+// ---------------------------------------------------------------- the account
+
+/// The account's display name, such as "Priya Sharma". `None` for an account that has
+/// none, which is usual for a local account.
+pub fn display_name() -> Option<String> {
+    use windows_sys::Win32::Security::Authentication::Identity::{GetUserNameExW, NameDisplay};
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    // SAFETY: `len` is the size of `buf` in characters, as the function requires.
+    let ok = unsafe { GetUserNameExW(NameDisplay, buf.as_mut_ptr(), &mut len) };
+    if ok == 0 {
+        return None;
+    }
+    let name = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_is_inside_onedrive_by_whole_names_in_any_case() {
+        use std::path::Path;
+        let root = Path::new(r"C:\Users\Priya\OneDrive");
+        assert!(is_inside(Path::new(r"C:\Users\Priya\OneDrive\Documents\Meetings"), root));
+        assert!(is_inside(Path::new(r"c:\users\PRIYA\onedrive\documents"), root));
+        assert!(is_inside(root, root), "the OneDrive folder itself");
+        assert!(!is_inside(Path::new(r"C:\Users\Priya\OneDrive - Work\Meetings"), root), "another folder that starts the same");
+        assert!(!is_inside(Path::new(r"C:\Users\Priya\Documents\Meetings"), root));
+        assert!(!is_inside(Path::new(r"C:\Users\Priya"), root), "the folder above it");
+        assert!(!is_inside(Path::new(r"D:\Users\Priya\OneDrive\Meetings"), root), "another drive");
+        assert!(!is_inside(Path::new(r"C:\Meetings"), Path::new("")), "no root");
+    }
+
+    #[test]
+    fn a_new_folder_in_a_real_folder_gets_the_real_path_of_its_parent() {
+        let dir = std::env::temp_dir().join(format!("margin-realpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(real_path(&dir.join("Meetings").join("2026")), real.join("Meetings").join("2026"));
+        assert!(is_inside(&real_path(&dir.join("Meetings")), &real_path(&dir)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn names(items: &[&str]) -> Vec<Option<String>> {
+        items.iter().map(|&name| (name != "-").then(|| name.to_string())).collect()
+    }
+
+    #[test]
+    fn the_context_menu_keeps_only_the_items_that_edit_text() {
+        // A text field: the browser items go, and one separator stays between groups.
+        let field = names(&["emoji", "-", "undo", "redo", "-", "cut", "copy", "paste", "pasteAndMatchStyle", "selectAll", "-", "share", "-", "inspectElement"]);
+        assert_eq!(menu_items_to_remove(&field), vec![13, 12, 11, 10]);
+        // Selected text: "copy" stays, with no separator around it.
+        let selection = names(&["copy", "-", "webSearch", "print", "-", "inspectElement"]);
+        assert_eq!(menu_items_to_remove(&selection), vec![5, 4, 3, 2, 1]);
+        // The page itself: every item goes, so no menu opens.
+        let page = names(&["back", "forward", "reload", "-", "saveAs", "print", "-", "inspectElement"]);
+        assert_eq!(menu_items_to_remove(&page).len(), page.len());
+        // Separators that end up first or side by side go too.
+        let gaps = names(&["reload", "-", "copy", "-", "-", "print", "-", "paste"]);
+        assert_eq!(menu_items_to_remove(&gaps), vec![6, 5, 4, 1, 0]);
+    }
+
+    #[test]
+    fn one_deny_blocks_the_microphone() {
+        assert_eq!(mic_consent_from(Some("Allow"), Some("Allow"), Some("Allow")), MicConsent::Allowed);
+        assert_eq!(mic_consent_from(Some("Allow"), Some("Deny"), Some("Allow")), MicConsent::Denied);
+        assert_eq!(mic_consent_from(Some("Deny"), None, None), MicConsent::Denied);
+        assert_eq!(mic_consent_from(Some("Allow"), Some("Allow"), Some("deny")), MicConsent::Denied);
+        assert_eq!(mic_consent_from(None, Some("Allow"), None), MicConsent::Allowed);
+        assert_eq!(mic_consent_from(None, None, None), MicConsent::Unknown);
+        assert_eq!(mic_consent_from(Some("Prompt"), None, None), MicConsent::Unknown);
+    }
+
+    /// A job stops the whole tree: `cmd.exe` and the `ping` that it starts.
+    #[test]
+    fn a_job_stops_the_child_and_its_children() {
+        let mut command = Command::new("cmd.exe");
+        // The full path of ping: under `cargo test` the PATH has every build folder of
+        // whisper.cpp in it, and cmd.exe does not search a PATH that long.
+        command.args(["/c", r"%SystemRoot%\System32\ping.exe -n 30 127.0.0.1 >nul"]).stdin(std::process::Stdio::null());
+        let (mut child, job) = spawn_in_job(&mut command).expect("spawn in a job");
+        // Give cmd.exe time to start ping.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        assert!(child.try_wait().unwrap().is_none(), "the child runs after the resume");
+        let started = std::time::Instant::now();
+        job.terminate();
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "ping ran for 30 s without the job");
+        assert_eq!(processes_in(&job), 0, "no process of the tree is left");
+    }
+
+    fn processes_in(job: &Job) -> u32 {
+        use windows_sys::Win32::System::JobObjects::{JobObjectBasicAccountingInformation, QueryInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION};
+        // SAFETY: the struct is plain data, and the size is the size of its type.
+        unsafe {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+            let ok = QueryInformationJobObject(job.0, JobObjectBasicAccountingInformation, &mut info as *mut _ as *mut _, std::mem::size_of_val(&info) as u32, std::ptr::null_mut());
+            assert!(ok != 0);
+            info.ActiveProcesses
+        }
+    }
+}

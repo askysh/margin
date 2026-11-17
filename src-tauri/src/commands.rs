@@ -128,6 +128,7 @@ pub mod ops {
         p.record_shortcut = prefs.record_shortcut;
         p.no_auto_update = !prefs.auto_update;
         p.no_recording_chip = !prefs.recording_chip;
+        p.no_gpu = !prefs.use_gpu;
         let locale = Some(prefs.live_transcript.clone()).filter(|l| crate::applespeech::LOCALES.contains(&l.as_str()));
         let new_locale = locale.is_some() && locale != p.live_transcript;
         p.live_transcript = locale.clone();
@@ -159,6 +160,10 @@ pub mod ops {
     }
 
     pub fn folder_choices() -> Res<FolderChoices> {
+        // Obsidian keeps its list of vaults in its own data folder: %APPDATA% on Windows.
+        #[cfg(windows)]
+        let registry = dirs::data_dir().unwrap_or_else(paths::home).join("obsidian").join("obsidian.json");
+        #[cfg(not(windows))]
         let registry = paths::home().join("Library/Application Support/obsidian/obsidian.json");
         let vaults = std::fs::read(registry)
             .ok()
@@ -176,6 +181,19 @@ pub mod ops {
             })
             .unwrap_or_default();
         Ok(FolderChoices { default_dir: paths::default_output_dir().display().to_string(), obsidian_vaults: vaults })
+    }
+
+    /// Windows: the folder is inside OneDrive, so OneDrive can upload what Margin saves
+    /// there. The UI then shows a note. Always false on macOS.
+    pub fn folder_in_onedrive(path: String) -> Res<bool> {
+        #[cfg(windows)]
+        let inside = crate::win::in_onedrive(std::path::Path::new(&path));
+        #[cfg(not(windows))]
+        let inside = {
+            let _ = path;
+            false
+        };
+        Ok(inside)
     }
 
     pub fn complete_onboarding() -> Res<()> {
@@ -347,6 +365,14 @@ pub mod ops {
         Ok(())
     }
 
+    /// Windows: show the file in Explorer.
+    #[cfg(windows)]
+    pub fn reveal_in_finder(path: String) -> Res<()> {
+        crate::win::reveal(std::path::Path::new(&path));
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
     pub fn reveal_in_finder(path: String) -> Res<()> {
         let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(path).spawn();
         Ok(())
@@ -356,6 +382,9 @@ pub mod ops {
         let p = PathBuf::from(&path);
         library::obsidian_vault_for(&p).ok_or("This meeting isn't inside an Obsidian vault.")?;
         let url = format!("obsidian://open?path={}", percent_encode(&path));
+        #[cfg(windows)]
+        crate::win::shell_open(&url).map_err(|e| e.to_string())?;
+        #[cfg(not(windows))]
         std::process::Command::new("/usr/bin/open").arg(url).spawn().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -502,6 +531,7 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "update_status" | "check_updates" => out(Ok::<_, String>(crate::updater::unsupported())),
         "install_update" => Err("Updates work only in the app.".into()),
         "folder_choices" => out(ops::folder_choices()),
+        "folder_in_onedrive" => out(ops::folder_in_onedrive(arg(a, "path")?)),
         "complete_onboarding" => out(ops::complete_onboarding()),
         "models_status" => out(ops::models_status()),
         "download_models" => out(ops::download_models()),
@@ -575,6 +605,7 @@ pub mod tauri_cmds {
     cmd!(settings_options() -> ops::SettingsOptions);
     cmd!(save_app_prefs(prefs: prefs::AppPrefs) -> prefs::AppPrefs);
     cmd!(folder_choices() -> ops::FolderChoices);
+    cmd!(folder_in_onedrive(path: String) -> bool);
     cmd!(complete_onboarding() -> ());
     cmd!(models_status() -> Vec<models::ModelFile>);
     cmd!(download_models() -> ());

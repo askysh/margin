@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, on, type ModelFile, type ModelProgress } from "../api";
 import { bytes } from "../util";
+import { DEVICE } from "../platform";
 
 export const MODEL_CHOICES = [
   { id: "base", title: "Fast", size: "148 MB", body: "Quick and light. Fine for clear audio." },
@@ -53,7 +54,7 @@ export function DownloadProgress({ compact, hideWhenReady, pendingNote }: Props)
     <div className={`download ${compact ? "compact" : ""} ${all ? "is-ready" : ""}`}>
       <div className="download-head">
         <span>{all ? "Speech models ready" : error ? "Download stopped" : "Downloading speech models"}</span>
-        <span className="mono">{all ? `${bytes(total)} on this Mac` : `${bytes(done)} of ${bytes(total)}`}</span>
+        <span className="mono">{all ? `${bytes(total)} on this ${DEVICE}` : `${bytes(done)} of ${bytes(total)}`}</span>
       </div>
       <div className="bar" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
         <div className="bar-fill" style={{ width: `${pct}%` }} />

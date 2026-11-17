@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
 import type { PermState } from "../api";
+import { OS_NAME, OS_SETTINGS } from "../platform";
 
 interface Props {
   title: string;
@@ -21,10 +22,10 @@ export function PermissionRow({ title, body, state, onRequest, onSettings, icon 
           {state === "granted" && <span className="badge badge-ok">Allowed</span>}
           {state === "denied" && <span className="badge badge-warn">Not allowed</span>}
         </div>
-        <p className="perm-body">{asking ? "macOS is asking now. Choose Allow in its dialog." : body}</p>
+        <p className="perm-body">{asking ? `${OS_NAME} is asking now. Choose Allow in its dialog.` : body}</p>
       </div>
       {state === "granted" ? null : state === "denied" || state === "unknown" ? (
-        <button type="button" className="btn btn-quiet" onClick={onSettings}>Open System Settings</button>
+        <button type="button" className="btn btn-quiet" onClick={onSettings}>Open {OS_SETTINGS}</button>
       ) : (
         <button
           type="button"
@@ -32,7 +33,7 @@ export function PermissionRow({ title, body, state, onRequest, onSettings, icon 
           disabled={asking}
           onClick={async () => { setAsking(true); try { await onRequest(); } finally { setAsking(false); } }}
         >
-          {asking ? "Waiting for macOS…" : "Allow"}
+          {asking ? `Waiting for ${OS_NAME}…` : "Allow"}
         </button>
       )}
     </div>

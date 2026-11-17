@@ -11,6 +11,9 @@
 //! its samples to the helper. A reader thread writes each final result to the live
 //! transcript file in core's line format, with the source as the speaker. The recorder
 //! reads that file as before. With Apple Speech on, core's live transcript is off.
+//!
+//! Apple Speech exists on macOS only. On Windows (D61) `chosen_locale` gives `None`, so
+//! the live transcript is always core's Whisper one, and Settings does not offer a choice.
 
 use minutes_core::pid;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -37,6 +40,9 @@ fn helper() -> Option<PathBuf> {
 
 /// The Apple Speech locale chosen in Settings, or `None` for Whisper.
 pub fn chosen_locale() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
     crate::prefs::load().live_transcript.filter(|l| LOCALES.contains(&l.as_str()))
 }
 

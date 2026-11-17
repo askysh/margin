@@ -3,12 +3,23 @@
 //! and says so. The update installs when you choose "Restart to update", or when you
 //! quit Margin. It never installs or restarts during a recording.
 //!
-//! The download is a `.app.tar.gz` signed with Margin's updater key (minisign); the
-//! plugin refuses anything that the public key in tauri.conf.json does not verify.
+//! On Windows only the copy from the NSIS installer updates itself (`win::installed_by_setup`).
+//! The Microsoft Store updates the Store package, and a Store build must not update
+//! itself (D61). A build folder has nothing to update. In those cases `status` says
+//! "not supported", the background loop does not start, and Settings does not show the
+//! update controls.
+//!
+//! The download is a `.app.tar.gz` on macOS and the setup exe on Windows, signed with
+//! Margin's updater key (minisign). The plugin refuses anything that the public key in
+//! tauri.conf.json does not verify.
+//!
+//! On Windows the plugin starts the setup exe and then ends the process itself. The setup
+//! runs with a progress bar only, for the current user, so Windows asks nothing. After
+//! "Restart to update" it starts the new version. After Quit it does not.
 
-use crate::{events, prefs, recorder::recorder};
+use crate::{events, prefs, recorder::recorder, tray::APP_NAME};
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tauri::AppHandle;
 use tauri_plugin_updater::{Update, UpdaterExt};
@@ -20,6 +31,19 @@ const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const ENDPOINT_ENV: &str = "MARGIN_UPDATE_ENDPOINT";
 /// Test only: install and restart as soon as an update is downloaded.
 const AUTO_INSTALL_ENV: &str = "MARGIN_UPDATE_AUTO_INSTALL";
+/// The macOS app, and on Windows the copy that the installer installed. Decided once, at
+/// run time.
+fn supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        #[cfg(windows)]
+        let supported = crate::win::installed_by_setup();
+        #[cfg(not(windows))]
+        let supported = cfg!(target_os = "macos");
+        tracing::info!(supported, "updater");
+        supported
+    })
+}
 
 struct Ready {
     update: Update,
@@ -51,6 +75,9 @@ pub struct UpdateStatus {
 }
 
 pub fn status() -> UpdateStatus {
+    if !supported() {
+        return unsupported();
+    }
     let s = STATE.lock().unwrap();
     UpdateStatus {
         supported: true,
@@ -82,6 +109,9 @@ pub fn ready_version() -> Option<String> {
 
 /// The background loop: a first check soon after launch, then one every six hours.
 pub fn spawn(app: &AppHandle) {
+    if !supported() {
+        return;
+    }
     let app = app.clone();
     std::thread::Builder::new()
         .name("margin-updater".into())
@@ -100,6 +130,9 @@ pub fn spawn(app: &AppHandle) {
 /// Look for a newer version and download it. Safe to call from any thread; a second
 /// call while one runs returns at once.
 pub fn check(app: &AppHandle) -> UpdateStatus {
+    if !supported() {
+        return unsupported();
+    }
     {
         let mut s = STATE.lock().unwrap();
         if s.checking || s.ready.is_some() {
@@ -139,7 +172,10 @@ pub fn check(app: &AppHandle) -> UpdateStatus {
 }
 
 async fn find_and_download(app: &AppHandle) -> Result<Option<Ready>, String> {
-    let mut builder = app.updater_builder();
+    // On Windows the plugin ends the process after it starts the setup. Remove the tray
+    // icon first, as a normal exit does.
+    let handle = app.clone();
+    let mut builder = app.updater_builder().on_before_exit(move || handle.cleanup_before_exit());
     if let Ok(url) = std::env::var(ENDPOINT_ENV) {
         let url = url.parse().map_err(|e| format!("{ENDPOINT_ENV}: {e}"))?;
         builder = builder.endpoints(vec![url]).map_err(|e| e.to_string())?;
@@ -156,7 +192,7 @@ fn friendly(error: tauri_plugin_updater::Error) -> String {
     use tauri_plugin_updater::Error as E;
     match error {
         E::Reqwest(_) | E::Network(_) => "Couldn't reach GitHub to check for updates.".into(),
-        E::Minisign(_) | E::SignatureUtf8(_) => "The update's signature didn't match, so Margin didn't install it.".into(),
+        E::Minisign(_) | E::SignatureUtf8(_) => format!("The update's signature didn't match, so {APP_NAME} didn't install it."),
         other => other.to_string(),
     }
 }
@@ -164,14 +200,15 @@ fn friendly(error: tauri_plugin_updater::Error) -> String {
 /// "Restart to update": install the downloaded version and start it.
 pub fn install_and_restart(app: &AppHandle) -> Result<(), String> {
     if recorder().is_recording() {
-        return Err("Stop the recording first. Margin updates once it's saved.".into());
+        return Err(format!("Stop the recording first. {APP_NAME} updates once it's saved."));
     }
     // A restart is a Quit, so it asks the D55 question too. `app.restart()` exits with a
     // code, which the ExitRequested handler in main.rs lets through without asking.
     if !crate::processing::confirm_quit(app) {
         return Ok(());
     }
-    install()?;
+    // On Windows `install` does not return: the setup starts the new version.
+    install(true)?;
     app.restart();
 }
 
@@ -180,15 +217,17 @@ pub fn install_on_quit() {
     if recorder().is_recording() || STATE.lock().unwrap().ready.is_none() {
         return;
     }
-    if let Err(error) = install() {
+    if let Err(error) = install(false) {
         tracing::warn!(%error, "update not installed on quit");
     }
 }
 
-fn install() -> Result<(), String> {
+/// `restart` matters on Windows only: whether the setup starts the app when it is done.
+fn install(restart: bool) -> Result<(), String> {
     let Some(ready) = STATE.lock().unwrap().ready.take() else {
         return Err("No update is ready.".into());
     };
-    tracing::info!(version = %ready.update.version, "installing update");
-    ready.update.install(&ready.bytes).map_err(|e| format!("The update couldn't be installed: {e}"))
+    tracing::info!(version = %ready.update.version, restart, "installing update");
+    let update = ready.update.restart_after_install(restart);
+    update.install(&ready.bytes).map_err(|e| format!("The update couldn't be installed: {e}"))
 }

@@ -3,6 +3,7 @@ import { api, type Job, type LiveLine } from "../api";
 import { LiveTranscript, Rule } from "./LiveView";
 import { SideSwitch, useOneColumn, type Side } from "./Compact";
 import { readyText, stoppedText } from "../times";
+import { DEVICE, TRAY } from "../platform";
 
 const STEPS: { state: Job["state"][]; label: string }[] = [
   { state: ["queued"], label: "Queued" },
@@ -57,8 +58,8 @@ export function ProcessingView({ jobId, job, notes, title, onOpen, onRetry }: Pr
           </ol>
         )}
         <p className="quiet-note">
-          Everything runs on this Mac. The meeting opens here when its transcript is ready. You can close the window.
-          Margin keeps working from the menu bar.
+          Everything runs on this {DEVICE}. The meeting opens here when its transcript is ready. You can close the window.
+          Margin keeps working from the {TRAY}.
         </p>
         {notes.trim() && (
           <section className="your-notes">

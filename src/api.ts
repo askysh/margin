@@ -62,6 +62,8 @@ export interface AppPrefs {
   recording_chip: boolean;
   /** "whisper", or the Apple Speech locale of the live transcript (D56). */
   live_transcript: string;
+  /** Windows: Whisper runs on the graphics card. Off sends it to the CPU (D63). */
+  use_gpu: boolean;
 }
 
 /** The updater's state. `ready` is a newer version that is downloaded. */
@@ -242,6 +244,8 @@ export const api = {
   installUpdate: () => invoke<void>("install_update"),
   folderChoices: () =>
     invoke<{ default_dir: string; obsidian_vaults: { name: string; path: string }[] }>("folder_choices"),
+  /** Windows: the folder is inside OneDrive. Always false on macOS. */
+  folderInOneDrive: (path: string) => invoke<boolean>("folder_in_onedrive", { path }),
   completeOnboarding: () => invoke<void>("complete_onboarding"),
   modelsStatus: () => invoke<ModelFile[]>("models_status"),
   downloadModels: () => invoke<void>("download_models"),
