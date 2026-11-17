@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build margin.exe for Windows and put the DLLs it needs at run time next to it.
-# Run it in Git Bash. It does not make the Store package (docs/windows-store.md).
+# Run it in Git Bash. scripts/package-msix.ps1 then makes the Store package from it.
 #
 #   scripts/build-windows.sh            # release: src-tauri/target/release/margin.exe
 #   scripts/build-windows.sh --debug    # debug, with the UI built in
@@ -12,10 +12,13 @@ cd "$(dirname "$0")/.."
 
 profile=release
 flags=()
-if [ "${1:-}" = "--debug" ]; then
-  profile=debug
-  flags=(--debug)
-fi
+target=src-tauri/target
+case "${1:-}" in
+  --debug)
+    profile=debug
+    flags=(--debug)
+    ;;
+esac
 
 export PATH="$HOME/.cargo/bin:$PATH"
 # whisper.cpp needs CMake, and bindgen needs libclang. Their installers do not always put
@@ -27,7 +30,20 @@ if [ -z "${LIBCLANG_PATH:-}" ] && [ -f "/c/Program Files/LLVM/bin/libclang.dll" 
   export LIBCLANG_PATH="C:/Program Files/LLVM/bin"
 fi
 
-out="src-tauri/target/$profile"
+# whisper.cpp: two settings that the build of `whisper-rs-sys` gets wrong for a release
+# build with Visual Studio. It passes each CMAKE_ and GGML_ variable to CMake.
+#
+# 1. The `cmake` crate replaces CMAKE_<LANG>_FLAGS_RELEASE with flags that have no
+#    optimization level. Whisper then runs about 13 times slower (UPSTREAM-PATCHES.md #21).
+#    These are CMake's own flags for Release. The dash form keeps Git Bash from reading
+#    them as paths.
+# 2. GGML_NATIVE=ON compiles for the CPU of the build PC. A build PC with AVX-512 would
+#    give an app that stops on most PCs. OFF gives AVX2, FMA and F16C on every build PC.
+export CMAKE_C_FLAGS_RELEASE="${CMAKE_C_FLAGS_RELEASE:--MD -O2 -Ob2 -DNDEBUG}"
+export CMAKE_CXX_FLAGS_RELEASE="${CMAKE_CXX_FLAGS_RELEASE:--MD -O2 -Ob2 -DNDEBUG}"
+export GGML_NATIVE="${GGML_NATIVE:-OFF}"
+
+out="$target/$profile"
 # ort-sys 2.0.0-rc.10 copies DirectML.dll to the third folder above its OUT_DIR, and to
 # `examples` and `deps` in it. Before cargo 1.100 that folder was target/<profile>. Now it
 # is target/<profile>/build, where those two folders do not exist, and the build script
