@@ -1134,3 +1134,50 @@ The full comparison is in `docs/parity/app.md`.
     with call capture (D62).
 - Not measured: a meeting that is mostly Hindi, the live transcript on the GPU, a second
   PC, and a PC with no `vulkan-1.dll` in Windows.
+
+## Upstream updates
+
+### D64. A workflow of Margin's own opens the pull request for a new minutes-core
+- Number: D61 to D63 are in use on the `windows-port` branch. This entry takes D64, so
+  the two branches merge without two entries with one number.
+- Need: upstream `silverstein/minutes` tags releases often. Each bump was a local build,
+  a test run and the end-to-end pass, done by hand. Upstream cannot notify Margin, so
+  Margin must ask.
+- Options:
+  - (a) Dependabot. dependabot-core can move a cargo git dependency that is pinned to a
+    tag that looks like a version. It cannot do this bump:
+    - It updates the lock with `cargo update -p minutes-core`. That resolves
+      minutes-core's crates fresh. The bump must seed `Cargo.lock` from upstream's lock
+      (D48), else `ort` and `pyannote-rs` move to releases that break the build.
+    - It does not move a pin by `rev`, the pin that D48 uses now.
+    - It does not change the label in `src-tauri/src/commands.rs` or the `# Now:` line.
+    - It runs no build or test on macOS, and `ci.yml` does not build the Rust side.
+    - `.github/dependabot.yml` turns off cargo version updates on purpose.
+  - (b) Renovate. A custom manager can find the tag. The hosted Renovate app does not
+    run commands after the update, so it cannot seed the lock or run
+    `scripts/bump-upstream.sh`. A self-hosted Renovate can, but it is a second system to
+    run and to trust.
+  - (c) A GitHub Actions workflow in this repository that runs
+    `scripts/bump-upstream.sh`.
+  - (d) Keep the bump by hand.
+- Pick: **(c)**, `.github/workflows/upstream-bump.yml`. It uses the script, so a bump in
+  CI and a bump at a Mac are the same edit. It runs each Monday, and by hand with an
+  optional tag or commit SHA.
+  - The script gets `--no-build`. Without the flag it works as before.
+  - Three jobs. `plan` and `check` have a read-only token. `check` compiles upstream code
+    on `macos-26` with no credentials on disk, and sends the change as a patch artifact
+    before the build starts. `pr` can write. It runs no upstream code, and it refuses a
+    patch that changes a file other than `Cargo.toml`, `Cargo.lock` and `commands.rs`.
+  - The checks run in the workflow: the UI type check and build, `cargo test`, and the
+    end-to-end pass. A failed check makes the pull request a draft.
+  - No cache is saved. A cache that upstream code wrote could reach the release build,
+    which has the signing keys.
+- Limits:
+  - The workflow token opens the pull request, so `ci.yml` waits for a person to select
+    "Approve workflows to run". A GitHub App token or a personal access token in a secret
+    would start it at once. That is a new secret, so it is left to the owner.
+  - The runner has no microphone, no system audio and no Apple Speech. A real call on a
+    Mac stays a manual step.
+  - It is not known yet that the end-to-end pass works on a GitHub runner (speech models
+    on a virtual Mac, the macOS voices that the fixtures use). Its result shows in the
+    pull request. When it does not pass, the checklist asks for a run on a Mac.

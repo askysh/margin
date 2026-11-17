@@ -97,6 +97,8 @@ already there without a new fact. Say what the new fact is.
   this repository.
 - Move to a new ref only with `scripts/bump-upstream.sh <tag-or-full-sha>`. It re-seeds
   `src-tauri/Cargo.lock` from upstream's lock, then builds and tests.
+- `.github/workflows/upstream-bump.yml` opens a pull request for each new upstream release
+  tag. Review that pull request. Do not bump by hand to the same tag.
 - A gap in minutes-core goes into [UPSTREAM-PATCHES.md](UPSTREAM-PATCHES.md) as a patch
   that upstream can take. Work around it in Margin until upstream ships it.
 

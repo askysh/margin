@@ -13,6 +13,7 @@
 # minutes-core's lock by scripts/bump-upstream.sh, and newer native crates
 # (ort, pyannote-rs) can break the build. CI does not build the Rust side, so
 # a crate update must be built and tested on a Mac before it merges.
+# minutes-core itself moves with .github/workflows/upstream-bump.yml (DECISIONS.md D64).
 #
 # The pull requests go to next-release, like every other change (docs/releasing.md).
 version: 2
