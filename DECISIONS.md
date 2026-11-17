@@ -1060,3 +1060,36 @@ The full comparison is in `docs/parity/app.md`.
   Windows does not include them.
 - Not tested yet: a real microphone (the laptop had none active), a release build, a PC
   that never had the build tools, Ask and summaries, and the tray by hand.
+
+### D63. The Windows build uses the graphics card, and needs Windows 11
+- New fact: on 2026-11-13 the release build was timed on the owner's laptop (Ryzen 7
+  6800H, RTX 3070 Ti Laptop GPU). Transcription of 231 s of English speech:
+
+  | Model | CPU | Vulkan |
+  |---|---|---|
+  | `base` | 14.3 s | 4.5 to 5.4 s |
+  | `small` | 45.0 s | 7.5 to 8.6 s |
+  | `large-v3-turbo` | 219.7 s | 10.9 to 11.3 s |
+
+  The integrated Radeon GPU was also about 4 times faster than the CPU with
+  `large-v3-turbo`. Speaker separation adds about 17 s, on the CPU in each build.
+- Options: CPU only, Vulkan, or CUDA. CUDA is for NVIDIA cards only and needs its
+  runtime on the PC. Upstream prefers Vulkan on Windows.
+- Pick: **Vulkan, by default**. `large-v3-turbo` on the CPU runs at the speed of the
+  recording. The owner's Hindi-English meetings need that model.
+- One package serves each PC. With no usable Vulkan device, whisper.cpp logs "no GPU
+  found" and uses the CPU. This was tested with the drivers turned off.
+- The package ships the Vulkan loader, `vulkan-1.dll`, beside `margin.exe`. The exe
+  imports it, and only a graphics driver installs it. Without it, the app does not start
+  on a PC with no such driver.
+- Cost: the package is 44 MB, not 28 MB. The build PC needs the Vulkan SDK.
+- CPU: the build sets `GGML_NATIVE=OFF`, so whisper.cpp uses AVX2 on each build PC. A CPU
+  with no AVX2 cannot run Margin Notes. Those are older than about 2013.
+- Windows: the minimum is Windows 11. An MSIX cannot install WebView2. Windows 11
+  includes it, and Windows 10 does not always have it.
+- The release build of whisper.cpp had no optimization at first, and took 194 s for 46 s
+  of audio. `scripts/build-windows.sh` sets the compiler flags back
+  (UPSTREAM-PATCHES.md #21).
+- A real microphone works. The laptop's Windows build shows its own microphone prompt for
+  Margin Notes at the first recording.
+- Not measured: Hindi-English audio, the live transcript on the GPU, and a second PC.

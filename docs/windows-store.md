@@ -6,7 +6,7 @@ submit. DECISIONS.md D61 gives the reasons.
 
 The Windows app builds and records a meeting in the room (D62), and a script makes the
 Store package. It has no call recording yet. The package is not tested as an installed
-app yet, and the Store build does not use the GPU yet. Lines marked **Confirm** describe a
+app yet. The Store build uses the graphics card and needs Windows 11 (D63). Lines marked **Confirm** describe a
 feature that the Windows build must have before the text goes to the Store. Store policy 10.1.1 requires
 the listing to describe the product as it is.
 
@@ -66,8 +66,9 @@ package is not signed. It is 28 MB, or 44 MB with Whisper on the GPU.
   works after [PRIVACY.md](../PRIVACY.md) is on `main`.
 - Website: `https://github.com/askysh/margin`
 - Support contact: `https://github.com/askysh/margin/issues`
-- System requirements, minimum: a microphone, 8 GB of memory. Recommended: 16 GB of
-  memory and a dedicated graphics card. **Confirm** both on a real PC.
+- System requirements, minimum: Windows 11, x64, a microphone, 8 GB of memory.
+  Recommended: 16 GB of memory and a dedicated graphics card (D63). **Confirm** the
+  memory on a real PC.
 
 Product declarations:
 
