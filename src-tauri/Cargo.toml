@@ -16,9 +16,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # minutes-core from upstream: a tag, or a commit on main when Margin needs a change that no
 # tag has yet (DECISIONS.md, "Back on upstream minutes-core").
-# Now: v0.32.1 + 209265f.
+# Now: v0.34.1.
 # Bump with scripts/bump-upstream.sh <tag|commit> (re-seeds Cargo.lock; see docs/development.md "Updating minutes-core").
-minutes-core = { git = "https://github.com/silverstein/minutes", rev = "209265fac94763d45171acb284c258eff6718690", default-features = false, features = ["whisper", "streaming", "diarize"] }
+minutes-core = { git = "https://github.com/silverstein/minutes", tag = "v0.34.1", default-features = false, features = ["whisper", "streaming", "diarize"] }
 # minutes-core asks for ort "2.0.0-rc.10" (caret); later rcs break pyannote-rs. Upstream's CLI pins it too.
 ort = { version = "=2.0.0-rc.10", default-features = false }
 
@@ -45,7 +45,7 @@ tauri-plugin-updater = "2"
 [target.'cfg(target_os = "macos")'.dependencies]
 # Whisper on the GPU. Cargo adds this feature to the minutes-core line above.
 # scripts/bump-upstream.sh moves both lines to the new ref.
-minutes-core = { git = "https://github.com/silverstein/minutes", rev = "209265fac94763d45171acb284c258eff6718690", default-features = false, features = ["metal"] }
+minutes-core = { git = "https://github.com/silverstein/minutes", tag = "v0.34.1", default-features = false, features = ["metal"] }
 window-vibrancy = "0.8"
 libc = "0.2"
 block2 = "0.6"
