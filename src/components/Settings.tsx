@@ -101,42 +101,47 @@ function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: No
   const confirmed = useRef<Settings>(boot.settings);
   const queue = useRef<Promise<void>>(Promise.resolve());
   const pendingSaves = useRef(0);
-  const save = (patch: Partial<Settings>) => {
+  /** Resolves to the refusal's text, or null once the change is saved. */
+  const save = (patch: Partial<Settings>): Promise<string | null> => {
     latest.current = { ...latest.current, ...patch };
     setS(latest.current);
     pendingSaves.current++;
-    queue.current = queue.current.then(async () => {
-      let saved: Settings;
-      try {
-        const payload: Settings = { ...latest.current };
-        for (const k of EXTRA_KEYS) if (!(k in patch)) delete payload[k];
-        saved = await api.saveSettings(payload);
-      } catch (e) {
-        pendingSaves.current--;
-        // Take the refused change out, or every later save sends it again and fails too.
-        // A later change to the same setting stays.
-        latest.current = withoutPatch(latest.current, patch, confirmed.current);
-        setS(latest.current);
-        notify(errorText(e), "error");
-        return;
-      }
-      pendingSaves.current--;
-      confirmed.current = saved;
-      if (pendingSaves.current === 0) {
-        latest.current = saved;
-        setS(saved);
-        onSaved(saved);
-      }
-      try {
-        // A new speech model or speaker model may need files: fetch them now, not at Record.
-        if (patch.model || patch.speaker_model) {
-          const files = await api.modelsStatus();
-          if (files.some((f) => !f.installed)) await api.downloadModels();
+    return new Promise((resolve) => {
+      queue.current = queue.current.then(async () => {
+        let saved: Settings;
+        try {
+          const payload: Settings = { ...latest.current };
+          for (const k of EXTRA_KEYS) if (!(k in patch)) delete payload[k];
+          saved = await api.saveSettings(payload);
+        } catch (e) {
+          pendingSaves.current--;
+          // Take the refused change out, or every later save sends it again and fails too.
+          // A later change to the same setting stays.
+          latest.current = withoutPatch(latest.current, patch, confirmed.current);
+          setS(latest.current);
+          notify(errorText(e), "error");
+          resolve(errorText(e));
+          return;
         }
-        if (patch.output_dir) api.mcpSnippet().then(setMcp);
-      } catch (e) {
-        notify(errorText(e), "error");
-      }
+        pendingSaves.current--;
+        confirmed.current = saved;
+        if (pendingSaves.current === 0) {
+          latest.current = saved;
+          setS(saved);
+          onSaved(saved);
+        }
+        resolve(null);
+        try {
+          // A new speech model or speaker model may need files: fetch them now, not at Record.
+          if (patch.model || patch.speaker_model) {
+            const files = await api.modelsStatus();
+            if (files.some((f) => !f.installed)) await api.downloadModels();
+          }
+          if (patch.output_dir) api.mcpSnippet().then(setMcp);
+        } catch (e) {
+          notify(errorText(e), "error");
+        }
+      });
     });
   };
 

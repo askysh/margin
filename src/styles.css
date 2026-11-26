@@ -609,3 +609,9 @@ textarea.field { max-width: none; resize: vertical; min-height: 64px; line-heigh
 .os-windows .sidebar-toggle { left: 12px; }
 .os-windows .notepad-toggle { left: 44px; }
 .os-windows .shell.sidebar-hidden .toolbar { padding-left: 84px; }
+.field[aria-invalid="true"] { border-color: var(--danger); }
+.set-error { color: var(--danger); font-size: 12px; line-height: 1.45; margin: 0; }
+.ob-toggle { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin: 0 0 4px; padding: 12px 16px; border: 1px solid var(--hair); border-radius: 11px; background: var(--sheet); font-size: 13.5px; line-height: 1.45; color: var(--ink-2); cursor: pointer; }
+.ob-toggle .switch { margin-top: 2px; }
+.ob-desk { margin: 8px 0 18px; }
+.search-corrected { margin: -4px 12px 8px; font-size: 12px; color: var(--pencil); }

@@ -8,7 +8,7 @@ import { Home } from "./components/Home";
 import { AskPanel, type AskScope } from "./components/AskPanel";
 import { COMPACT_QUERY, OneColumnContext, oneColumnQuery, useMediaQuery } from "./components/Compact";
 import { UpdateBanner } from "./components/Updates";
-import { clock, meetingFileReady } from "./util";
+import { clock, learnHome, meetingFileReady } from "./util";
 import { useCues } from "./cues";
 import { useMenu } from "./menu";
 import { canRecordCalls, hasModKey, hasRecordingChip, isWindows, keys } from "./platform";
@@ -96,8 +96,11 @@ export default function App() {
   );
 
   const reboot = useCallback(() => {
+    // The home folder is learned first, so no screen shows an absolute path before `~` is known.
     api
-      .boot()
+      .folderChoices()
+      .then((c) => learnHome(c.default_dir), () => {})
+      .then(() => api.boot())
       .then((b) => {
         setBoot(b);
         recorderRef.current = b.recorder;
@@ -357,7 +360,7 @@ export default function App() {
             <div className="call-banner mic-banner" role="alert" title={micSilent}>
               <span><b>Your microphone is silent.</b> Your own voice is not recorded.</span>
               <button className="link-btn danger" onClick={() => openSettings("recording")}>Change microphone</button>
-              <button className="icon-btn small" aria-label="Dismiss" onClick={() => setMicSilent(null)}>×</button>
+              <button className="icon-btn small" aria-label="Dismiss" onClick={() => { setMicSilent(null); requestAnimationFrame(focusNotesEnd); }}>×</button>
             </div>
           )}
           {callApp && !recording && canRecordCalls && (
@@ -409,7 +412,7 @@ export default function App() {
             </Suspense>
           )}
           {selection.type === "live" && recorder?.recording && (
-            <LiveView recorder={recorder} lines={lines} level={tick.level} />
+            <LiveView recorder={recorder} lines={lines} level={tick.level} active={!settings} />
           )}
           {selection.type === "processing" && (
             <ProcessingView

@@ -1312,3 +1312,66 @@ The full comparison is in `docs/parity/app.md`.
   Standard, so no one gets a 32 MB download or slower processing without asking. Margin
   downloads the chosen set through the existing model download.
 
+### D73. The notes get the keyboard back after Settings, and a stray key goes to them
+- New fact (UX round, 26 Nov 2026): during a recording, opening Settings (or the microphone
+  banner's *Change microphone*) and coming back left the focus on the page. Typing went
+  nowhere, and the saved notes held only the text from before Settings. Settings hides the
+  live view with `visibility: hidden`, and a hidden field loses its focus.
+- Pick: the live view knows when Settings covers it. When it shows again, the notes take
+  focus (the caret stays where it was), unless a field is already focused. Dismissing the
+  microphone banner does the same. While nothing editable has focus, a printable key without
+  ⌘, Ctrl or Alt moves focus to the notes, and the browser types the key there. Space does
+  so only on a bare page, because on a button it presses the button.
+- Cost: a key pressed on a bare page is no longer ignored. Shortcuts carry ⌘ or Ctrl, so
+  they are untouched.
+
+### D74. Setup mentions the calendar and Margin Desk, and the two shortcuts say where they work
+- New fact: setup never mentioned the calendar banner (D67), Knowledge or Margin Desk, and the
+  calendar switch is off on a new install, so nobody found them. Setup said ⌘⇧R and Settings
+  said ⌃⌥⌘R, with no word on why.
+- Pick: the last setup step has a *Start notes from my calendar* switch, off, with the line
+  that macOS asks to read the calendar when it is switched on, and one line that Margin Desk is
+  in Settings → Knowledge. The switch saves at once through `save_settings`, which asks
+  macOS and refuses without access; the step then shows the refusal and the switch stays off.
+  The shortcut line now says *In Margin*, and that a shortcut for any app is in Settings.
+  Settings says *From any app, ⌃⌥⌘R …* and *Inside Margin, ⌘⇧R and ⌘⇧I work* without it.
+- The switch is not offered on Windows, where calls cannot be recorded (D61).
+
+### D75. A command that Margin refuses stays in the box
+- New fact: a refused *Run this command* was cleared from the box. The toast said why, but
+  the text was gone. The refusal puts the old value back in the settings, and the box followed.
+- Pick: `save` answers with the refusal text (or null when saved). A text box that gets a
+  refusal keeps the text, is marked invalid (`aria-invalid`, a red border, the reason below
+  the box), and does not follow the settings back. Editing the text clears the mark. Nothing
+  is saved until the backend accepts the text. This holds for every text box in Settings.
+
+### D76. UNKNOWN is shown as "Unknown speaker"
+- New fact: a meeting whose speakers core could not match has the label `UNKNOWN`, and the
+  chip showed it in capitals.
+- Pick: `UNKNOWN` is a raw label like `SPEAKER_n`: it shows as *Unknown speaker* with the
+  dashed chip of an unnamed speaker. The other speakers keep their numbers (Speaker 1,
+  Unknown speaker, Speaker 3). The file keeps `UNKNOWN`.
+
+### D77. Ask says that it is Claude only
+- New fact: Ask runs the user's `claude` CLI (D26), read-only. The summary engine in Settings
+  does not matter to it. With Ollama, or summaries off, "Claude isn't signed in" read as if
+  Ask could use something else.
+- Options: Ask through Ollama (it cannot be limited to read-only files the way `claude
+  --tools Read,Grep,Glob` is), or say it plainly.
+- Pick: say it. When Ask is not ready, it adds that Ask always uses Claude Code and ignores the
+  summary engine.
+
+### D78. Paths show `~` for any home folder
+- New fact: `tildify` knew only `/Users/<name>`. A home elsewhere (a sandbox, Linux, Windows)
+  showed the full path on the home page, in setup and in Settings.
+- Pick: it also knows `/home/<name>` and `C:\Users\<name>`. For a home with no such shape,
+  the app learns it at boot from the default meetings folder, which is always
+  `<home>/Documents/Meetings` on macOS (`paths::default_output_dir`). A recognisable shape wins,
+  because Windows can move Documents into OneDrive. A longer folder name that only starts with
+  the home (`/Users/samuel` for `/Users/sam`) is not shortened.
+
+### D79. Search shows the spelling it used
+- New fact: the backend may correct a typo in a meeting search ("warrnty").
+- Pick: `search_meetings` answers with `{ hits: [{ path, excerpt }], corrected: string | null }`.
+  When `corrected` is a string, the sidebar shows *Showing results for "<corrected>"* under the
+  search box. The UI also accepts the bare list of an older backend, and treats null as absent.

@@ -20,19 +20,29 @@ interface Props {
 export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, elapsed, onSelect, person, onPerson }: Props) {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<Map<string, string> | null>(null);
+  const [corrected, setCorrected] = useState<string | null>(null);
 
   useEffect(() => {
     const q = query.trim();
     if (!q) {
       setHits(null);
+      setCorrected(null);
       return;
     }
     let cancelled = false;
     const t = setTimeout(() => {
       api
         .search(q)
-        .then((r) => !cancelled && setHits(new Map(r.map((h) => [h.path, h.excerpt]))))
-        .catch(() => !cancelled && setHits(new Map()));
+        .then((r) => {
+          if (cancelled) return;
+          setHits(new Map(r.hits.map((h) => [h.path, h.excerpt])));
+          setCorrected(r.corrected ?? null);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setHits(new Map());
+          setCorrected(null);
+        });
     }, 180);
     return () => {
       cancelled = true;
@@ -72,6 +82,7 @@ export function Sidebar({ meetings, jobs, selection, recording, recordingTitle, 
           aria-label="Search meetings"
         />
       </label>
+      {hits && corrected && <p className="search-corrected" role="status">Showing results for “{corrected}”</p>}
       {person && (
         <div className="filter-pill" role="status">
           <span>With <strong>{person}</strong></span>

@@ -204,6 +204,7 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen,
         {notReady && (
           <div className="callout ask-setup" role="status">
             <Markdown source={notReady.message ?? ""} />
+            <p className="quiet-note">Ask always uses Claude Code. It does not use the summary engine from Settings, so Ollama, or summaries turned off, does not change this.</p>
             <button className="btn btn-quiet" onClick={checkReady}>Check again</button>
           </div>
         )}

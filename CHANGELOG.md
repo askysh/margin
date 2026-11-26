@@ -27,6 +27,17 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Fixed
 
+- Notes typed after Settings, or after *Change microphone*, during a recording were lost.
+  The notes now take the keyboard back, and a letter typed with nothing focused goes to them
+  (D73).
+- A refused *Run this command* stays in the box, marked invalid, instead of being cleared
+  (D75).
+- A speaker core could not match shows as *Unknown speaker*, not "UNKNOWN" (D76).
+- Setup now offers *Start notes from my calendar* and points to Margin Desk in Settings →
+  Knowledge. Setup and Settings say that ⌘⇧R works in Margin and ⌃⌥⌘R in any app (D74).
+- Ask says that it always uses Claude Code, whatever the summary engine is (D77).
+- Folders show `~` for the home folder wherever it is (D78).
+- The sidebar says *Showing results for "…"* when search used a corrected spelling (D79).
 - Lines that Whisper made up from its own prompt during room noise, such as "Preserve
   spelling exactly when heard", no longer appear in the transcript (D71).
 
