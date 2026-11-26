@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { api, type Settings, type SettingsOptions } from "../api";
+import { api, errorText, type Settings, type SettingsOptions } from "../api";
 import { tildify } from "../util";
 import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { SummaryChoice } from "./SummaryChoice";
@@ -302,11 +302,11 @@ export function KnowledgeSection({ s, save, notify }: SettingsView) {
     if (typeof chosen === "string") save({ knowledge_path: chosen });
   };
   const useDesk = async () => {
-    const found = await api.deskCommand().catch(() => null);
-    if (found) {
-      save({ post_record: found });
-    } else {
-      notify("Margin Desk is not installed. Put it in ~/margin-desk (see its README), then click this again.", "error");
+    try {
+      const found = await api.deskCommand();
+      if (found) save({ post_record: found });
+    } catch (e) {
+      notify(errorText(e), "error");
     }
   };
   return (

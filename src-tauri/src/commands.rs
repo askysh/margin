@@ -414,14 +414,10 @@ pub mod ops {
     pub fn desk_command() -> Res<Option<String>> {
         let desk = paths::home().join("margin-desk").join("bin").join("desk.mjs");
         if !desk.is_file() {
-            return Ok(None);
+            return Err(format!("Margin Desk is not in {}. Put it there (see its README), then click this again.", desk.parent().and_then(|p| p.parent()).unwrap_or(&desk).display()));
         }
-        let node = which::which("node").ok().map(|p| p.display().to_string()).or_else(|| {
-            let out = std::process::Command::new("/bin/zsh").args(["-lc", "command -v node"]).output().ok()?;
-            let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
-            (!path.is_empty()).then_some(path)
-        });
-        Ok(node.map(|node| format!("{node} {} run", desk.display())))
+        let node = crate::summaries::find_node(&paths::home()).ok_or("Margin can't find Node.js, which Margin Desk needs. Install it (brew install node), then click this again.")?;
+        Ok(Some(format!("{} {} run", node.display(), desk.display())))
     }
 
     pub fn summarize_meeting(path: String) -> Res<()> {

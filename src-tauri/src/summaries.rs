@@ -296,9 +296,48 @@ fn clean_title(answer: &str) -> Option<String> {
     ((2..=12).contains(&words) && title.chars().count() <= 80 && !chatty).then(|| title.to_string())
 }
 
+/// Node.js for Margin Desk. An app opened from Finder gets a short PATH, and Homebrew's
+/// versioned `node@22` or nvm is often added only in `~/.zshrc`, which a login shell does
+/// not read. So look on PATH, then in the usual install places, newest version first, then
+/// ask an interactive login shell as the last resort.
+pub fn find_node(home: &std::path::Path) -> Option<PathBuf> {
+    if let Ok(found) = which::which("node") {
+        return Some(found);
+    }
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from("/opt/homebrew/bin/node"), PathBuf::from("/usr/local/bin/node")];
+    for root in [PathBuf::from("/opt/homebrew/opt"), PathBuf::from("/usr/local/opt"), home.join(".nvm/versions/node")] {
+        let mut versions: Vec<PathBuf> = std::fs::read_dir(&root).into_iter().flatten().flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("node") || n.starts_with('v')))
+            .collect();
+        versions.sort_by_key(|p| std::cmp::Reverse(node_version(p)));
+        candidates.extend(versions.into_iter().map(|p| p.join("bin/node")));
+    }
+    if let Some(found) = candidates.into_iter().find(|p| is_executable(p)) {
+        return Some(found);
+    }
+    let out = std::process::Command::new("/bin/zsh").args(["-lic", "command -v node"]).stdin(std::process::Stdio::null()).output().ok()?;
+    let path = String::from_utf8(out.stdout).ok()?.lines().map(str::trim).rfind(|l| l.starts_with('/'))?.to_string();
+    let path = PathBuf::from(path);
+    is_executable(&path).then_some(path)
+}
+
+/// The major version in a folder name such as `node@22` or `v20.11.0`; 0 when there is none.
+fn node_version(dir: &std::path::Path) -> u32 {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.trim_start_matches("node").trim_start_matches(['@', 'v']).split('.').next().and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::clean_title;
+
+    #[test]
+    fn node_versions_sort_newest_first() {
+        assert_eq!(super::node_version(std::path::Path::new("/opt/homebrew/opt/node@22")), 22);
+        assert_eq!(super::node_version(std::path::Path::new("/x/.nvm/versions/node/v20.11.0")), 20);
+        assert_eq!(super::node_version(std::path::Path::new("/opt/homebrew/opt/node")), 0);
+    }
 
     #[test]
     fn a_title_answer_is_cleaned_or_refused() {
