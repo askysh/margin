@@ -25,6 +25,24 @@ export interface Settings {
   open_at_login?: boolean;
   /** Transcribe during the meeting. On by default, for every model. */
   rolling_transcription?: boolean;
+  /** Ollama summaries answer without thinking first. On by default (D69). */
+  ollama_fast?: boolean;
+  /** Offer to start notes when a calendar event begins (D67). */
+  calendar_toast?: boolean;
+  /** Core's knowledge wiki after each meeting, facts from frontmatter only (D70). */
+  knowledge_enabled?: boolean;
+  knowledge_adapter?: "obsidian" | "wiki" | "para";
+  knowledge_path?: string;
+  /** A command run after each processed meeting, with the meeting path appended. "" is off. */
+  post_record?: string;
+}
+
+/** A calendar event that starts now (calendar_watch.rs). */
+export interface CalendarOffer {
+  title: string;
+  start: string;
+  url: string | null;
+  attendees: string[];
 }
 
 export interface SettingsOptions {
@@ -246,6 +264,8 @@ export const api = {
     invoke<{ default_dir: string; obsidian_vaults: { name: string; path: string }[] }>("folder_choices"),
   /** Windows: the folder is inside OneDrive. Always false on macOS. */
   folderInOneDrive: (path: string) => invoke<boolean>("folder_in_onedrive", { path }),
+  startCalendarNotes: (offer: CalendarOffer) => invoke<void>("start_calendar_notes", { offer }),
+  deskCommand: () => invoke<string | null>("desk_command"),
   completeOnboarding: () => invoke<void>("complete_onboarding"),
   modelsStatus: () => invoke<ModelFile[]>("models_status"),
   downloadModels: () => invoke<void>("download_models"),

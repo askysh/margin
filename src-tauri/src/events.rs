@@ -39,6 +39,9 @@ pub struct Notice {
     pub meeting: Option<String>,
     /// Set for "a call app is active": the notification offers Record.
     pub call_app: Option<String>,
+    /// Set for "a calendar event starts": the notification offers Start notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<crate::calendar_watch::Offer>,
 }
 
 pub fn notify(notice: Notice) {

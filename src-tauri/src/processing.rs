@@ -396,6 +396,7 @@ fn finish(job: &JobView, announce: bool) {
             body: "Open Margin to see why and try again.".into(),
             meeting: None,
             call_app: None,
+            calendar: None,
         });
     }
     let Some(output) = job.output_path.as_deref() else {
@@ -423,6 +424,7 @@ fn finish(job: &JobView, announce: bool) {
             body: format!("“{}” is transcribed and saved.", job.title.as_deref().unwrap_or("Your meeting")),
             meeting: Some(output.to_string()),
             call_app: None,
+            calendar: None,
         });
         // A new meeting for the menu bar's recent list.
         events::refresh_tray();

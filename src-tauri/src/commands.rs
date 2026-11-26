@@ -55,8 +55,16 @@ pub mod ops {
         if !(first_save && cfg.output_dir == paths::default_output_dir()) {
             std::fs::create_dir_all(&cfg.output_dir).map_err(|e| format!("Can't use that folder: {e}"))?;
         }
+        let calendar_turned_on = settings.calendar_toast == Some(true) && before.calendar_toast != Some(true);
         corecfg::save(&mut cfg)?;
         extras::apply(&settings)?;
+        // The Calendars prompt comes now, right after the click that asked for it (D67).
+        if calendar_turned_on && !crate::calendar_watch::request_access() {
+            let mut cfg = corecfg::load();
+            cfg.calendar.enabled = false;
+            corecfg::save(&mut cfg)?;
+            return Err("Margin can't read your calendar. Allow it in System Settings → Privacy & Security → Calendars, then turn this on again.".into());
+        }
         if settings.keep_audio_days.is_some() && settings.keep_audio_days != before.keep_audio_days {
             corecfg::audio_cleanup(&cfg);
         }
@@ -279,6 +287,7 @@ pub mod ops {
                     body: e.clone(),
                     meeting: None,
                     call_app: None,
+                    calendar: None,
                 });
                 Err(e)
             }
@@ -395,6 +404,27 @@ pub mod ops {
         speakers::rename(&p, &label, &name, remember_voice)
     }
 
+    /// The banner's Start notes for a calendar event (calendar_watch.rs).
+    pub fn start_calendar_notes(offer: crate::calendar_watch::Offer) -> Res<()> {
+        crate::calendar_watch::start_notes(&offer)
+    }
+
+    /// The post-record command for Margin Desk when it is installed in the usual place, so
+    /// Settings → Knowledge can fill it in. Node comes from the login shell's PATH, since an
+    /// app opened from Finder has a short PATH.
+    pub fn desk_command() -> Res<Option<String>> {
+        let desk = paths::home().join("margin-desk").join("bin").join("desk.mjs");
+        if !desk.is_file() {
+            return Ok(None);
+        }
+        let node = which::which("node").ok().map(|p| p.display().to_string()).or_else(|| {
+            let out = std::process::Command::new("/bin/zsh").args(["-lc", "command -v node"]).output().ok()?;
+            let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+            (!path.is_empty()).then_some(path)
+        });
+        Ok(node.map(|node| format!("{node} {} run", desk.display())))
+    }
+
     pub fn summarize_meeting(path: String) -> Res<()> {
         let p = PathBuf::from(path);
         library::ensure_inside_output(&p)?;
@@ -416,6 +446,8 @@ pub mod ops {
         let Some(_running) = summaries::start(&p.display().to_string()) else {
             return Err("Margin is already writing this meeting's summary.".into());
         };
+        let mut cfg = cfg;
+        let _forwarder = crate::ollama_proxy::fast_ollama(&mut cfg);
         // Hold the file's lock while core rewrites the file, so a title or speaker edit
         // waits for it. Notes typed meanwhile go into a draft (summaries::save_notes).
         let report = crate::fsutil::with_file_lock(&p, || minutes_core::resummarize::resummarize_meeting(
@@ -430,7 +462,7 @@ pub mod ops {
         .map_err(|e| {
             if cfg.summarization.engine == "ollama" {
                 format!(
-                    "Ollama didn't finish the summary. Summaries must finish within 2 minutes, and local models that think before answering (such as qwen3) are often slower than that. Try llama3.2 or gemma3, or Claude. ({e})"
+                    "Ollama didn't finish the summary. Summaries must finish within 2 minutes, and local models that think before answering (such as qwen3) are often slower than that. Turn on \u{201c}Answer without thinking first\u{201d} in Settings \u{2192} Summaries, or try llama3.2 or gemma3, or Claude. ({e})"
                 )
             } else {
                 format!("Summary failed: {e}")
@@ -532,6 +564,9 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "install_update" => Err("Updates work only in the app.".into()),
         "folder_choices" => out(ops::folder_choices()),
         "folder_in_onedrive" => out(ops::folder_in_onedrive(arg(a, "path")?)),
+        // The bridge must not open links or start recordings from a calendar.
+        "start_calendar_notes" => Err("Calendar notes work only in the app.".into()),
+        "desk_command" => out(ops::desk_command()),
         "complete_onboarding" => out(ops::complete_onboarding()),
         "models_status" => out(ops::models_status()),
         "download_models" => out(ops::download_models()),
@@ -606,6 +641,8 @@ pub mod tauri_cmds {
     cmd!(save_app_prefs(prefs: prefs::AppPrefs) -> prefs::AppPrefs);
     cmd!(folder_choices() -> ops::FolderChoices);
     cmd!(folder_in_onedrive(path: String) -> bool);
+    cmd!(start_calendar_notes(offer: crate::calendar_watch::Offer) -> ());
+    cmd!(desk_command() -> Option<String>);
     cmd!(complete_onboarding() -> ());
     cmd!(models_status() -> Vec<models::ModelFile>);
     cmd!(download_models() -> ());

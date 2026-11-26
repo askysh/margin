@@ -59,7 +59,28 @@ pub struct AppSettings {
     /// Transcribe during the meeting (rolling.rs). Kept in prefs.json.
     #[serde(default)]
     pub rolling_transcription: Option<bool>,
+    /// Ollama summaries answer without thinking first (ollama_proxy.rs). Kept in prefs.json.
+    #[serde(default)]
+    pub ollama_fast: Option<bool>,
+    /// Offer to start notes before a calendar event (calendar_watch.rs, D-calendar).
+    #[serde(default)]
+    pub calendar_toast: Option<bool>,
+    /// Core's knowledge wiki after each meeting, with engine "none" (no model).
+    #[serde(default)]
+    pub knowledge_enabled: Option<bool>,
+    /// "obsidian" | "wiki" | "para"
+    #[serde(default)]
+    pub knowledge_adapter: Option<String>,
+    #[serde(default)]
+    pub knowledge_path: Option<String>,
+    /// A shell command run after each processed meeting, with the meeting path appended
+    /// (core's `hooks.post_record`). "" turns it off.
+    #[serde(default)]
+    pub post_record: Option<String>,
 }
+
+/// Adapters core's knowledge wiki accepts.
+pub const KNOWLEDGE_ADAPTERS: &[&str] = &["obsidian", "wiki", "para"];
 
 /// Choices offered for "Stop after silence", in minutes. 30 is core's default.
 pub const SILENCE_STOP_CHOICES: &[u64] = &[0, 5, 15, 30, 60];
@@ -190,6 +211,12 @@ pub fn settings(cfg: &Config) -> AppSettings {
         summary_instructions: None,
         open_at_login: None,
         rolling_transcription: None,
+        ollama_fast: None,
+        calendar_toast: Some(cfg.calendar.enabled),
+        knowledge_enabled: Some(cfg.knowledge.enabled),
+        knowledge_adapter: Some(cfg.knowledge.adapter.clone()),
+        knowledge_path: Some(cfg.knowledge.path.display().to_string()),
+        post_record: Some(cfg.hooks.post_record.clone().unwrap_or_default()),
     }
 }
 
@@ -236,6 +263,51 @@ pub fn apply(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
     }
     if let Some(on) = s.hide_from_screen_share {
         cfg.privacy.hide_from_screen_share = on;
+    }
+    if let Some(on) = s.calendar_toast {
+        apply_calendar(cfg, on);
+    }
+    apply_knowledge(cfg, s)?;
+    if let Some(command) = &s.post_record {
+        let command = command.trim();
+        cfg.hooks.post_record = (!command.is_empty()).then(|| command.to_string());
+    }
+    Ok(())
+}
+
+/// The calendar toast and core's event match share one switch. The match gives a meeting
+/// the event's title and attendees. Events with no attendees and no call link (focus
+/// blocks, reminders) are left out, so they neither title a meeting nor raise a toast.
+fn apply_calendar(cfg: &mut Config, on: bool) {
+    cfg.calendar.enabled = on;
+    if on {
+        cfg.calendar.use_event_title_for_meeting_title = true;
+        cfg.calendar.require_attendees_or_url = true;
+    }
+}
+
+fn apply_knowledge(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
+    if let Some(adapter) = s.knowledge_adapter.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        if !KNOWLEDGE_ADAPTERS.contains(&adapter) {
+            return Err(format!("Unknown knowledge format {adapter}"));
+        }
+        cfg.knowledge.adapter = adapter.into();
+    }
+    if let Some(path) = s.knowledge_path.as_deref().map(str::trim) {
+        let path = PathBuf::from(expand_tilde(path));
+        if !path.as_os_str().is_empty() && !path.is_absolute() {
+            return Err("Choose a knowledge folder with a full path.".into());
+        }
+        cfg.knowledge.path = path;
+    }
+    if let Some(on) = s.knowledge_enabled {
+        if on && cfg.knowledge.path.as_os_str().is_empty() {
+            return Err("Choose a folder for the knowledge wiki first.".into());
+        }
+        cfg.knowledge.enabled = on;
+        // Facts from the meeting's frontmatter only. A model would write facts nobody can
+        // check against the transcript, so Margin never sets another engine here.
+        cfg.knowledge.engine = "none".into();
     }
     Ok(())
 }
@@ -339,6 +411,48 @@ mod tests {
         cfg.summarization.engine = "none".into();
         let s = settings(&cfg);
         (cfg, s)
+    }
+
+    #[test]
+    fn calendar_knowledge_and_hook_settings_round_trip() {
+        let (mut cfg, mut s) = base();
+        s.calendar_toast = Some(true);
+        s.knowledge_adapter = Some("obsidian".into());
+        s.knowledge_path = Some("/tmp/margin-test-wiki".into());
+        s.knowledge_enabled = Some(true);
+        s.post_record = Some("  /usr/local/bin/node /opt/desk.mjs run  ".into());
+        apply(&mut cfg, &s).unwrap();
+        assert!(cfg.calendar.enabled && cfg.calendar.use_event_title_for_meeting_title && cfg.calendar.require_attendees_or_url);
+        assert!(cfg.knowledge.enabled);
+        assert_eq!(cfg.knowledge.engine, "none", "Margin never asks a model for wiki facts");
+        assert_eq!(cfg.knowledge.adapter, "obsidian");
+        assert_eq!(cfg.hooks.post_record.as_deref(), Some("/usr/local/bin/node /opt/desk.mjs run"));
+        let back = settings(&cfg);
+        assert_eq!(back.calendar_toast, Some(true));
+        assert_eq!(back.knowledge_enabled, Some(true));
+        assert_eq!(back.knowledge_path.as_deref(), Some("/tmp/margin-test-wiki"));
+        assert_eq!(back.post_record.as_deref(), Some("/usr/local/bin/node /opt/desk.mjs run"));
+
+        let mut off = back.clone();
+        off.calendar_toast = Some(false);
+        off.post_record = Some("".into());
+        apply(&mut cfg, &off).unwrap();
+        assert!(!cfg.calendar.enabled);
+        assert_eq!(cfg.hooks.post_record, None, "an empty command turns the hook off");
+    }
+
+    #[test]
+    fn knowledge_settings_are_checked() {
+        let (mut cfg, mut s) = base();
+        s.knowledge_adapter = Some("notion".into());
+        assert!(apply(&mut cfg, &s).is_err());
+        let (mut cfg, mut s) = base();
+        s.knowledge_path = Some("relative/wiki".into());
+        assert!(apply(&mut cfg, &s).is_err());
+        let (mut cfg, mut s) = base();
+        s.knowledge_path = Some("".into());
+        s.knowledge_enabled = Some(true);
+        assert!(apply(&mut cfg, &s).unwrap_err().contains("folder"), "on with no folder is refused");
     }
 
     #[test]

@@ -261,7 +261,8 @@ fn title_from_summary(path: &std::path::Path, fallback: &str) {
             key_points: vec![],
             participants: fm.attendees.clone(),
         };
-        let cfg = crate::corecfg::load();
+        let mut cfg = crate::corecfg::load();
+        let _forwarder = crate::ollama_proxy::fast_ollama(&mut cfg);
         let answer = minutes_core::summarize::refine_title(&text, &summary, &fm.entities, &cfg).map_err(|e| e.to_string())?;
         Ok(clean_title(&answer.title))
     })();

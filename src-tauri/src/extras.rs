@@ -30,6 +30,7 @@ pub fn fill(mut s: AppSettings) -> AppSettings {
     s.summary_instructions = Some(summary_instructions());
     s.open_at_login = Some(open_at_login());
     s.rolling_transcription = Some(crate::rolling::pref());
+    s.ollama_fast = Some(!crate::prefs::load().ollama_thinking);
     s
 }
 
@@ -46,6 +47,11 @@ pub fn apply(s: &AppSettings) -> Result<(), String> {
     }
     if let Some(on) = s.rolling_transcription {
         crate::rolling::set_pref(on)?;
+    }
+    if let Some(fast) = s.ollama_fast {
+        let mut p = crate::prefs::load();
+        p.ollama_thinking = !fast;
+        crate::prefs::save(&p)?;
     }
     Ok(())
 }

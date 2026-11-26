@@ -123,6 +123,14 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
             onChange={(on) => save({ call_detection: on })}
           />
         )}
+        {canRecordCalls && (
+          <ToggleRow
+            title="Start notes from my calendar"
+            help="When an event with a call link or two or more people starts, Margin offers Start notes. It opens the call and records it under the event's title. Margin asks to read your calendar when you turn this on. A Google calendar works when it is added in System Settings → Internet Accounts."
+            checked={s.calendar_toast ?? false}
+            onChange={(on) => save({ calendar_toast: on })}
+          />
+        )}
         <ToggleRow
           title="Keyboard shortcut in every app"
           help={<>Start and stop recording from any app with <kbd className="kbd">{GLOBAL_SHORTCUT}</kbd></>}
@@ -239,6 +247,14 @@ export function SummariesSection({ s, save, options, backends }: SettingsView) {
 function SummaryOptions({ s, options, save }: { s: Settings; options: SettingsOptions | null; save: Save }) {
   return (
     <Card>
+      {s.summary_engine === "ollama" && (
+        <ToggleRow
+          title="Answer without thinking first"
+          help="Models such as qwen3 think before they answer, and often run past the 2-minute limit for a summary. With this on, they answer at once."
+          checked={s.ollama_fast ?? true}
+          onChange={(on) => save({ ollama_fast: on })}
+        />
+      )}
       <SelectRow
         id="set-summary-language"
         label="Summary language"
@@ -262,4 +278,65 @@ function minutesLabel(m: number): string {
   if (m === 0) return "Never";
   if (m % 60 === 0) return m === 60 ? "After 1 hour" : `After ${m / 60} hours`;
   return `After ${m} minutes`;
+}
+
+const KNOWLEDGE_FORMATS: Choice<"obsidian" | "wiki" | "para">[] = [
+  { value: "obsidian", label: "Obsidian, with [[links]]" },
+  { value: "wiki", label: "Plain Markdown pages" },
+  { value: "para", label: "PARA folders" },
+];
+
+export function KnowledgeSection({ s, save, notify }: SettingsView) {
+  const [command, setCommand] = useState<string | null>(null);
+  const chooseFolder = async () => {
+    const chosen = await open({ directory: true, multiple: false, title: "Choose a folder for the knowledge wiki", defaultPath: s.knowledge_path || s.output_dir });
+    if (typeof chosen === "string") save({ knowledge_path: chosen });
+  };
+  const useDesk = async () => {
+    const found = await api.deskCommand().catch(() => null);
+    if (found) {
+      setCommand(found);
+      save({ post_record: found });
+    } else {
+      notify("Margin Desk was not found in ~/margin-desk, or Node is not installed.", "error");
+    }
+  };
+  return (
+    <>
+      <SectionHead title="Knowledge" about="What Margin keeps from each meeting beyond the meeting itself." />
+      <Card title="Knowledge wiki" note="Facts come from each meeting's decisions, action items and people. No model writes them, so the wiki holds nothing that is not in a meeting.">
+        <Row title="Wiki folder" help={s.knowledge_path ? <span className="path">{tildify(s.knowledge_path)}</span> : "Not chosen"}>
+          {s.knowledge_path && <button className="btn btn-quiet" onClick={() => api.reveal(s.knowledge_path!)}>{SHOW_IN_FILES}</button>}
+          <button className="btn btn-quiet" onClick={chooseFolder}>Choose…</button>
+        </Row>
+        <SelectRow
+          id="set-knowledge-format"
+          label="Format"
+          value={s.knowledge_adapter ?? "wiki"}
+          choices={KNOWLEDGE_FORMATS}
+          onChange={(a) => save({ knowledge_adapter: a })}
+        />
+        <ToggleRow
+          title="Update the wiki after each meeting"
+          help="Adds a page for each person and a dated log entry for each meeting."
+          checked={s.knowledge_enabled ?? false}
+          disabled={!s.knowledge_path}
+          onChange={(on) => save({ knowledge_enabled: on })}
+        />
+      </Card>
+      <Card title="After each meeting">
+        <TextRow
+          id="set-post-record"
+          label="Run this command"
+          help="Margin runs it when a meeting is ready, with the meeting file's path added at the end. Leave it empty to run nothing."
+          placeholder="/path/to/script.sh"
+          value={command ?? s.post_record ?? ""}
+          onSave={(text) => { setCommand(text); save({ post_record: text }); }}
+        />
+        <Row title="Margin Desk" help="Turns each meeting into tasks, notes pages and a searchable brain on this Mac.">
+          <button className="btn btn-quiet" onClick={useDesk}>Use Margin Desk</button>
+        </Row>
+      </Card>
+    </>
+  );
 }

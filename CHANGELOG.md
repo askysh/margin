@@ -5,6 +5,23 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [Unreleased]
+
+### Added
+
+- *Start notes from my calendar* in Settings → Recording. When an event with a call link or
+  two or more people starts, Margin offers Start notes, in a banner and in a notification.
+  It opens the call and records it under the event's title. Margin asks to read the
+  calendar when you turn it on. Meetings then get the event's title and attendees (D67).
+- A warning when the microphone records nothing. Thirty seconds into a recording, Margin
+  checks the microphone track and says so when it is silent, for example with a
+  Bluetooth headset that a call app holds (D68).
+- *Answer without thinking first* in Settings → Summaries, for Ollama. Models such as
+  qwen3 now finish a summary inside the 2-minute limit. On by default (D69).
+- Settings → Knowledge: keep core's knowledge wiki after each meeting, with facts from the
+  meeting's decisions, action items and people only, and a command to run after each
+  meeting, with *Use Margin Desk* (D70).
+
 ## [0.0.11] - 2026-11-17
 
 ### Added

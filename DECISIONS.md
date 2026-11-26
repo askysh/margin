@@ -1221,3 +1221,61 @@ The full comparison is in `docs/parity/app.md`.
 - The installer has no code signing certificate. SmartScreen warns at the first install,
   not at an update.
 - Not tested: an update from GitHub over HTTPS, and the Windows jobs on a runner.
+
+## Meeting flow and knowledge (26 Nov 2026)
+
+### D67. Calendar lookup comes back as an opt-in, with a toast that starts notes
+- New fact for D9: the owner asked for it. Google Meet runs in a browser, so the call
+  banner (process names) never sees it, and meetings were titled with the first words
+  spoken. A calendar event has the title, the people and the call link.
+- Options: keep calendar off, turn it on for everyone, or a switch with its own
+  permission step.
+- Pick: **a switch**, *Start notes from my calendar* in Settings → Recording, off by
+  default. Turning it on asks for Calendars access right away, in the foreground. That
+  answers D9's reason: the prompt follows the click that asked for it. Refused access
+  turns the switch off again with a message.
+- When the switch is on, `calendar_watch.rs` checks every 30 seconds. An event that starts
+  within a minute, or started up to five minutes ago, and has a call link or two or more
+  attendees, gets one offer: a banner, and a notification with Start notes when the
+  window is not in front. Start notes opens the `https://` call link and records a call
+  under the event's title. Nothing records without that click.
+- The same switch sets core's `calendar.use_event_title_for_meeting_title` and
+  `calendar.require_attendees_or_url`, so the worker titles the meeting from the event and
+  ignores focus blocks.
+- Cost: core reads the calendar from the worker too, as D9 said. With access granted in
+  the foreground first, that read raises no prompt.
+- Not tested: the toast against a real calendar on this Mac (it needs the permission).
+
+### D68. A silent microphone gets a warning thirty seconds in
+- New fact: a 75-minute call on a Bluetooth headset kept only the other side. The
+  microphone stem peaked at 0.002 of full scale for the whole call, and nothing said so.
+- Pick: once per recording, 30 seconds in, Margin reads the last 20 seconds of the
+  microphone track (the voice stem on a call, the meeting file in person). A peak under
+  0.004 shows a warning in the window and a notification. The recording goes on.
+- Why the peak, not the loudness: a quiet room has a low average, but a working
+  microphone passes 0.01 within seconds (typing, breathing). A dead one does not.
+- Cost: a working microphone in a silent room for 20 seconds could warn once. The warning
+  only says to check the microphone.
+
+### D69. Ollama summaries ask the model not to think first, through a local forwarder
+- New fact: core's Ollama request has no `think` field and a fixed 2-minute limit
+  (UPSTREAM-PATCHES #3). qwen3.5:4b with thinking off extracts a 13-minute meeting in
+  42 to 50 seconds. With thinking on, Margin's summaries failed on both test meetings.
+- Options: tell people to pick another model (the old message), an Ollama Modelfile (it
+  cannot set `think`), copy core's summary code (Margin copies no core code), or a
+  forwarder.
+- Pick: **a forwarder** (`ollama_proxy.rs`). For one summary or title call, Margin starts
+  it on a free local port and points an in-memory copy of the config at it. It adds
+  `"think": false` to `/api/generate` and `/api/chat` and passes everything else through.
+  The config file does not change.
+- Settings → Summaries → *Answer without thinking first*, on by default, kept in
+  prefs.json. Remove the forwarder when core sends `think`.
+
+### D70. Settings → Knowledge: the wiki with no model, and a command after each meeting
+- Pick: core's knowledge wiki with `engine = "none"` only. Facts come from the meeting's
+  frontmatter (decisions, action items, people). A model would write facts nobody can
+  check against the transcript.
+- *After each meeting, run this command* sets core's `hooks.post_record`. *Use Margin Desk*
+  fills it when `~/margin-desk/bin/desk.mjs` and Node are found.
+- Semantic search stays out of Settings. Core's `embed-worker` is not in the app bundle,
+  so the switch would do nothing. Margin Desk has its own search.

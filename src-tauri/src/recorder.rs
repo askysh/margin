@@ -583,6 +583,7 @@ fn spawn_ticker(session: u64) {
         .spawn(move || {
             let r = recorder();
             let mut since = 0usize;
+            let mut mic_checked = false;
             loop {
                 std::thread::sleep(Duration::from_millis(500));
                 let (kind, wav, ended) = {
@@ -617,6 +618,12 @@ fn spawn_ticker(session: u64) {
                     let guard = r.active.lock().unwrap();
                     guard.as_ref().map(|a| (Local::now() - a.started_at).num_seconds().max(0)).unwrap_or(0)
                 };
+                if !mic_checked && elapsed >= MIC_CHECK_AFTER_SECS {
+                    mic_checked = true;
+                    if mic_is_silent(&mic_track(kind, &wav)) {
+                        warn_silent_mic();
+                    }
+                }
                 events::emit("recorder-tick", serde_json::json!({ "elapsed_secs": elapsed, "level": view_level }));
             }
         })
@@ -669,6 +676,68 @@ fn guess_speaker(wav: &Path, ts: DateTime<Local>, duration_ms: u64) -> Option<&'
     } else {
         None
     }
+}
+
+/// The microphone check runs once, this many seconds into a recording, over the last
+/// `MIC_CHECK_WINDOW_MS` of the microphone track.
+const MIC_CHECK_AFTER_SECS: i64 = 30;
+const MIC_CHECK_WINDOW_MS: u64 = 20_000;
+/// A peak under this, as a fraction of full scale, means the microphone sent nothing. A
+/// silent Bluetooth headset stem peaked at 0.002 for a whole call; a working microphone in
+/// a quiet room peaks well above 0.01 within seconds (typing, breathing, a chair).
+const SILENT_PEAK: f32 = 0.004;
+
+/// The file that holds the microphone alone: the voice stem on a call, the meeting file in
+/// person.
+fn mic_track(kind: Kind, wav: &Path) -> PathBuf {
+    match kind {
+        Kind::Call => capture::stem_paths_for(wav).map(|s| s.voice).unwrap_or_else(|| wav.to_path_buf()),
+        Kind::InPerson => wav.to_path_buf(),
+    }
+}
+
+/// True when the microphone track exists, holds at least the check window, and its peak in
+/// that window stays under `SILENT_PEAK`. A track that cannot be read is not reported.
+fn mic_is_silent(track: &Path) -> bool {
+    window_peak_from_end(track, MIC_CHECK_WINDOW_MS).is_some_and(|peak| peak < SILENT_PEAK)
+}
+
+/// Peak absolute sample of a growing 16 kHz, 16-bit mono WAV over its last `duration_ms`.
+/// None when the file holds less than that.
+fn window_peak_from_end(path: &Path, duration_ms: u64) -> Option<f32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut header = [0u8; 256];
+    let n = file.read(&mut header).ok()?;
+    let data_at = header[..n].windows(4).position(|w| w == b"data")? as u64 + 8;
+    let total_ms = len.saturating_sub(data_at) / 32;
+    if total_ms < duration_ms {
+        return None;
+    }
+    file.seek(SeekFrom::Start(data_at + (total_ms - duration_ms) * 32)).ok()?;
+    let mut buf = vec![0u8; (duration_ms * 32) as usize];
+    let read = file.read(&mut buf).ok()?;
+    buf[..read - read % 2]
+        .chunks_exact(2)
+        .map(|b| (i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).abs())
+        .reduce(f32::max)
+}
+
+/// Say so in the window and, when it is not in front, in a notification. The recording
+/// goes on: the other side of a call is still worth keeping.
+fn warn_silent_mic() {
+    let device = crate::corecfg::load().recording.device.filter(|d| !d.trim().is_empty()).unwrap_or_else(|| "the microphone".into());
+    let message = format!("Margin hears nothing from {device}. Your own voice is not being recorded. Check the microphone in Settings → Recording, or switch the input in macOS.");
+    tracing::warn!(%device, "microphone track is silent");
+    events::emit("mic-silent", &message);
+    events::notify(events::Notice {
+        title: "Margin can't hear your microphone".into(),
+        body: message,
+        meeting: None,
+        call_app: None,
+        calendar: None,
+    });
 }
 
 /// RMS of a 16 kHz, 16-bit mono WAV over `[end - duration, end]`, where `end` is `lag_ms`
@@ -796,6 +865,25 @@ mod tests {
             w.write_sample(*s).unwrap();
         }
         w.finalize().unwrap();
+    }
+
+    #[test]
+    fn a_silent_microphone_is_reported_and_a_quiet_room_is_not() {
+        let dir = std::env::temp_dir().join(format!("margin-mic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let silent = dir.join("silent.wav");
+        // 25 s of the T2 headset: a noise floor that never passes 67 / 32768.
+        wav_with(&(0..16_000 * 25).map(|i| ((i % 135) as i16) - 67).collect::<Vec<_>>(), &silent);
+        assert!(mic_is_silent(&silent));
+        let quiet_room = dir.join("room.wav");
+        // Mostly near-silence, with one soft 0.03 full-scale sound (a chair, a breath).
+        wav_with(&(0..16_000 * 25).map(|i| if (200_000..201_000).contains(&i) { 1000 } else { (i % 21) as i16 - 10 }).collect::<Vec<_>>(), &quiet_room);
+        assert!(!mic_is_silent(&quiet_room));
+        let short = dir.join("short.wav");
+        wav_with(&vec![0i16; 16_000 * 5], &short);
+        assert!(!mic_is_silent(&short), "too little audio to judge");
+        assert!(!mic_is_silent(&dir.join("missing.wav")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

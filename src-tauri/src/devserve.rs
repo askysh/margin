@@ -22,7 +22,12 @@ fn queue() -> &'static Queue {
     Q.get_or_init(|| Queue { items: Mutex::new(Vec::new()), ready: Condvar::new() })
 }
 
+/// True while the QA bridge runs, so commands that would raise a permission prompt can
+/// refuse instead.
+pub static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn serve(port: u16) -> Result<(), String> {
+    RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
     events::set_sink(Box::new(|name, payload| {
         // The bridge has no menu bar and no shortcut. It keeps the screen sharing
         // pseudo-event, so the e2e pass sees that the windows would change.

@@ -969,8 +969,52 @@ if (summaries === "fake-ollama") {
     assert(text.includes("Always respond in French"), "summary language not sent");
     const md = fs.readFileSync(path.join(meetingsDir, meetingFiles().find((x) => x.includes("qa-follow-up"))), "utf8");
     assert(/^template: meeting$/m.test(md), "meeting not tagged with the template");
+    assert(sent.length > 0 && sent.every((r) => r.think === false), "summary requests did not ask Ollama not to think (D69)");
+  });
+  await check("settings: Answer without thinking first can be turned off (D69)", async () => {
+    await openSettings("Summaries");
+    await toggle(/Answer without thinking first/).uncheck();
+    await settled();
+    await closeSettings();
+    const log = path.join(out, "ollama-requests.log");
+    const seen = fs.readFileSync(log, "utf8").split("\n").filter(Boolean).length;
+    await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
+    await button("Summarize").click();
+    // The previous check's toast can still be up, so wait for this summary's own requests.
+    const lines = () => fs.readFileSync(log, "utf8").split("\n").filter(Boolean);
+    for (let i = 0; i < 240 && lines().length <= seen; i += 1) await page.waitForTimeout(500);
+    await page.locator(".toast").filter({ hasText: /Summary added|Summary updated|failed|nothing/ }).waitFor({ timeout: 120000 });
+    const sent = lines().slice(seen).map((l) => JSON.parse(l));
+    assert(sent.length > 0, "no summary request after the switch was turned off");
+    assert(sent.every((r) => r.think == null), "think was still sent with the switch off");
+    await openSettings("Summaries");
+    await toggle(/Answer without thinking first/).check();
+    await settled();
+    await closeSettings();
   });
 }
+await check("settings: Knowledge saves the command to run after each meeting (D70)", async () => {
+  await openSettings("Knowledge");
+  const box = page.getByLabel("Run this command");
+  await box.fill("/bin/echo desk-hook");
+  await box.blur();
+  await settled();
+  assert(inSection("hooks", 'post_record = "/bin/echo desk-hook"'), "post_record not written");
+  assert(await toggle(/Update the wiki after each meeting/).isDisabled(), "the wiki switch works with no folder");
+  await box.fill("");
+  await box.blur();
+  await settled();
+  assert(!/^post_record\s*=/m.test(cfgText()), "an empty command did not turn the hook off");
+  await closeSettings();
+});
+await check("settings: the calendar switch never prompts in the QA bridge and stays off (D67)", async () => {
+  await openSettings("Recording");
+  await toggle(/Start notes from my calendar/).check();
+  await page.locator(".toast").filter({ hasText: /can't read your calendar/ }).waitFor({ timeout: 15000 });
+  await settled();
+  assert(inSection("calendar", "enabled = false"), "calendar was turned on without access");
+  await closeSettings();
+});
 await check("settings: with speaker separation off, a meeting has no speaker labels", async () => {
   await openSettings("Transcription");
   await toggle(/Tell speakers apart/).uncheck();

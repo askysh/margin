@@ -3,7 +3,7 @@ import { api, errorText, type AppPrefs, type Backends, type Boot, type Permissio
 import { withoutPatch } from "../util";
 import type { SectionId } from "./SettingsNav";
 import { ResetDialog } from "./ResetDialog";
-import { GeneralSection, RecordingSection, SummariesSection, TranscriptionSection } from "./SettingsSections";
+import { GeneralSection, KnowledgeSection, RecordingSection, SummariesSection, TranscriptionSection } from "./SettingsSections";
 import { AboutSection, IntegrationsSection, PermissionsSection, ResetSection, UpdatesSection, VoicesSection } from "./SettingsMore";
 
 export { SettingsNav } from "./SettingsNav";
@@ -56,6 +56,7 @@ export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetB
           {section === "recording" && <RecordingSection {...view} />}
           {section === "transcription" && <TranscriptionSection {...view} />}
           {section === "summaries" && <SummariesSection {...view} />}
+          {section === "knowledge" && <KnowledgeSection {...view} />}
           {section === "voices" && <VoicesSection {...view} />}
           {section === "permissions" && <PermissionsSection {...view} />}
           {section === "integrations" && <IntegrationsSection {...view} />}

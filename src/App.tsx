@@ -1,5 +1,5 @@
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
-import { api, errorText, on, type AppPrefs, type Boot, type Job, type Kind, type LiveLine, type MeetingSummary, type RecorderView } from "./api";
+import { api, errorText, on, type AppPrefs, type Boot, type CalendarOffer, type Job, type Kind, type LiveLine, type MeetingSummary, type RecorderView } from "./api";
 import { Sidebar } from "./components/Sidebar";
 import { LiveView, liveDraft } from "./components/LiveView";
 import { MeetingView } from "./components/MeetingView";
@@ -50,6 +50,8 @@ export default function App() {
   const [toast, setToast] = useState<{ text: string; tone: "info" | "error" } | null>(null);
   const [busy, setBusy] = useState(false);
   const [callApp, setCallApp] = useState<string | null>(null);
+  const [calendarOffer, setCalendarOffer] = useState<CalendarOffer | null>(null);
+  const [micSilent, setMicSilent] = useState<string | null>(null);
   const [person, setPerson] = useState<string | null>(null);
   const [askOpen, setAskOpen] = useState(false);
   const [askScope, setAskScope] = useState<AskScope>("meeting");
@@ -141,6 +143,8 @@ export default function App() {
       on<string>("error-toast", (t) => notify(t, "error")),
       on<string>("recording-ended", (t) => notify(t)),
       on<string | null>("call-detected", (a) => setCallApp(a)),
+      on<CalendarOffer>("calendar-upcoming", (o) => setCalendarOffer(o)),
+      on<string>("mic-silent", (m) => setMicSilent(m)),
       // The menu bar's recent meetings and a click on a "meeting ready" notification.
       on<string>("open-meeting", (path) => {
         if (resettingRef.current) return;
@@ -215,6 +219,8 @@ export default function App() {
   const start = async (kind: Kind) => {
     setBusy(true);
     setCallApp(null);
+    setCalendarOffer(null);
+    setMicSilent(null);
     try {
       const v = await api.startRecording(kind);
       recorderRef.current = v;
@@ -322,6 +328,28 @@ export default function App() {
       <main className="pane">
         <header className="toolbar" data-tauri-drag-region>
           <div className="toolbar-spacer" data-tauri-drag-region />
+          {calendarOffer && !recording && canRecordCalls && (
+            <div className="call-banner" role="status">
+              <span>{calendarOffer.title} is starting.</span>
+              <button
+                className="link-btn"
+                onClick={() => {
+                  const offer = calendarOffer;
+                  setCalendarOffer(null);
+                  api.startCalendarNotes(offer).catch((e) => notify(errorText(e), "error"));
+                }}
+              >
+                Start notes
+              </button>
+              <button className="icon-btn small" aria-label="Dismiss" onClick={() => setCalendarOffer(null)}>×</button>
+            </div>
+          )}
+          {micSilent && recording && (
+            <div className="call-banner" role="alert">
+              <span>{micSilent}</span>
+              <button className="icon-btn small" aria-label="Dismiss" onClick={() => setMicSilent(null)}>×</button>
+            </div>
+          )}
           {callApp && !recording && canRecordCalls && (
             <div className="call-banner" role="status">
               <span>{callApp} looks active.</span>

@@ -31,6 +31,7 @@ pub fn spawn() {
                         body: "Record this call in Margin?".into(),
                         meeting: None,
                         call_app: Some(app.clone()),
+                        calendar: None,
                     });
                 }
                 last = now;

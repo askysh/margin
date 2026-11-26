@@ -36,8 +36,11 @@ here has been applied to upstream, and we work around each of the others locally
   and the user only sees "provider_error".
 - **Patch:** send `"think": false` (Ollama ≥ 0.9 ignores it for models without thinking).
   Add `summarization.ollama_timeout_secs`, defaulting to the current 120.
-- **Workaround:** Margin's error message names the cause and suggests a non-thinking model
-  or Claude.
+- **Workaround:** `src-tauri/src/ollama_proxy.rs` (D69). For each summary and title call,
+  Margin points core's `ollama_url` at a local forwarder that adds `"think": false` to
+  `/api/generate` and `/api/chat`. An Ollama Modelfile cannot set `think` (Ollama 0.32.14
+  refuses `PARAMETER think`). Settings → Summaries → *Answer without thinking first* turns
+  it off. Remove the forwarder when core sends `think` itself.
 
 ## 4. Rename a speaker in the Markdown itself
 - **Where:** `crates/core/src/overlays.rs` (`write_speaker_confirmation`) and the CLI's

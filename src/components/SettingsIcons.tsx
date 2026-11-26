@@ -34,6 +34,13 @@ export const SettingsIcons = {
       <path d="M12.5 11.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6z" />
     </Icon>
   ),
+  knowledge: () => (
+    <Icon>
+      <path d="M3 2.75h7.25a1.5 1.5 0 0 1 1.5 1.5v9.5H4.5a1.5 1.5 0 0 1-1.5-1.5z" />
+      <path d="M3 12.25a1.5 1.5 0 0 1 1.5-1.5h7.25" />
+      <path d="M6 5.75h3" />
+    </Icon>
+  ),
   voices: () => (
     <Icon>
       <circle cx="6" cy="5.5" r="2.5" />
