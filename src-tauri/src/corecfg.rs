@@ -283,9 +283,27 @@ pub fn apply(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
     apply_knowledge(cfg, s)?;
     if let Some(command) = &s.post_record {
         let command = command.trim();
+        if !command.is_empty() && !command_runs(command) {
+            let program = command.split_whitespace().next().unwrap_or(command);
+            return Err(format!("Margin can't find the program “{program}”. Use its full path, or click Use Margin Desk."));
+        }
         cfg.hooks.post_record = (!command.is_empty()).then(|| command.to_string());
     }
     Ok(())
+}
+
+/// True when the command's program can run from Margin: a full path to an executable file,
+/// or a name on Margin's PATH. Core runs the hook with `sh -c` in the processing worker, so a
+/// name that only an interactive shell knows (an alias, a profile PATH) would fail there,
+/// silently, after every meeting.
+fn command_runs(command: &str) -> bool {
+    let Some(program) = command.split_whitespace().next() else { return false };
+    let program = program.trim_matches(|c| c == '"' || c == '\'');
+    if program.contains('/') {
+        let path = std::path::Path::new(program);
+        return path.is_file() && crate::summaries::is_executable(path);
+    }
+    which::which(program).is_ok()
 }
 
 /// The calendar toast and core's event match share one switch. The match gives a meeting
@@ -433,18 +451,18 @@ mod tests {
         s.knowledge_adapter = Some("obsidian".into());
         s.knowledge_path = Some("/tmp/margin-test-wiki".into());
         s.knowledge_enabled = Some(true);
-        s.post_record = Some("  /usr/local/bin/node /opt/desk.mjs run  ".into());
+        s.post_record = Some("  /bin/echo /opt/desk.mjs run  ".into());
         apply(&mut cfg, &s).unwrap();
         assert!(cfg.calendar.enabled && cfg.calendar.use_event_title_for_meeting_title && cfg.calendar.require_attendees_or_url);
         assert!(cfg.knowledge.enabled);
         assert_eq!(cfg.knowledge.engine, "none", "Margin never asks a model for wiki facts");
         assert_eq!(cfg.knowledge.adapter, "obsidian");
-        assert_eq!(cfg.hooks.post_record.as_deref(), Some("/usr/local/bin/node /opt/desk.mjs run"));
+        assert_eq!(cfg.hooks.post_record.as_deref(), Some("/bin/echo /opt/desk.mjs run"));
         let back = settings(&cfg);
         assert_eq!(back.calendar_toast, Some(true));
         assert_eq!(back.knowledge_enabled, Some(true));
         assert_eq!(back.knowledge_path.as_deref(), Some("/tmp/margin-test-wiki"));
-        assert_eq!(back.post_record.as_deref(), Some("/usr/local/bin/node /opt/desk.mjs run"));
+        assert_eq!(back.post_record.as_deref(), Some("/bin/echo /opt/desk.mjs run"));
 
         let mut off = back.clone();
         off.calendar_toast = Some(false);
@@ -463,6 +481,20 @@ mod tests {
         assert_eq!(settings(&cfg).speaker_model.as_deref(), Some("community-1"));
         s.speaker_model = Some("pyannote-cloud".into());
         assert!(apply(&mut cfg, &s).is_err());
+    }
+
+    #[test]
+    fn a_post_record_command_must_name_a_program_that_runs() {
+        let (mut cfg, mut s) = base();
+        s.post_record = Some("desk run".into());
+        let err = apply(&mut cfg, &s).unwrap_err();
+        assert!(err.contains("can't find the program “desk”"), "{err}");
+        s.post_record = Some("/no/such/node /x.mjs run".into());
+        assert!(apply(&mut cfg, &s).is_err());
+        s.post_record = Some("sh -c true".into());
+        assert!(apply(&mut cfg, &s).is_ok(), "a name on PATH runs");
+        s.post_record = Some("".into());
+        assert!(apply(&mut cfg, &s).is_ok(), "empty turns the hook off");
     }
 
     #[test]

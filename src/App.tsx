@@ -70,8 +70,13 @@ export default function App() {
 
   const notify = useCallback((text: string, tone: "info" | "error" = "info") => {
     setToast({ text, tone });
-    window.setTimeout(() => setToast((t) => (t?.text === text ? null : t)), tone === "error" ? 9000 : 4000);
+    window.setTimeout(() => setToast((t) => (t?.text === text ? null : t)), tone === "error" ? 6000 : 4000);
   }, []);
+  // An error belongs to the screen it came from: moving to another view or Settings section
+  // closes it, so it never shows up next to something unrelated.
+  useEffect(() => {
+    setToast((t) => (t?.tone === "error" ? null : t));
+  }, [selection, settings]);
 
   // Focus, saves and finished jobs all refresh the list. Most refreshes change nothing, and
   // then the sidebar is left alone.
@@ -349,8 +354,9 @@ export default function App() {
             </div>
           )}
           {micSilent && recording && (
-            <div className="call-banner" role="alert">
-              <span>{micSilent}</span>
+            <div className="call-banner mic-banner" role="alert" title={micSilent}>
+              <span><b>Your microphone is silent.</b> Your own voice is not recorded.</span>
+              <button className="link-btn danger" onClick={() => openSettings("recording")}>Change microphone</button>
               <button className="icon-btn small" aria-label="Dismiss" onClick={() => setMicSilent(null)}>×</button>
             </div>
           )}

@@ -240,8 +240,10 @@ pub mod ops {
     }
 
     pub fn start_recording(kind: Kind, title: Option<String>) -> Res<RecorderView> {
-        if !models::ready_to_record(&corecfg::load()) {
-            return Err("The speech models aren't downloaded yet. Open Settings → Transcription.".into());
+        let cfg = corecfg::load();
+        if !models::ready_to_record(&cfg) {
+            let missing: Vec<String> = models::required(&cfg).into_iter().filter(|f| !f.installed && !f.live).map(|f| f.label.to_lowercase()).collect();
+            return Err(format!("Margin is still getting the {} model. Open Settings → Transcription to see the download.", missing.join(" and ")));
         }
         let view = recorder().start(kind, title)?;
         // However the recording started, the window makes room for the call (D53).

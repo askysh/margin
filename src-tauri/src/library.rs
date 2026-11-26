@@ -246,7 +246,7 @@ fn plain_snippet(md: &str) -> String {
         .filter(|l| !l.is_empty())
         .take(3)
         .collect();
-    let joined = text.join(" ");
+    let joined = strip_inline_marks(&text.join(" "));
     match joined.char_indices().nth(160) {
         Some((i, _)) => format!("{}…", &joined[..i]),
         None => joined,
@@ -635,12 +635,17 @@ fn find_line<'a>(body: &'a str, q: &str) -> Option<&'a str> {
     Some(body[start..end].trim_end_matches('\r'))
 }
 
+/// Bold, italic and code marks read as noise in a one-line excerpt ("Price Target:** €25").
+fn strip_inline_marks(text: &str) -> String {
+    text.replace("**", "").replace("__", "").replace('`', "")
+}
+
 fn plain_line(line: &str) -> String {
     let l = line.trim();
-    let text = match turn_re().captures(l) {
+    let text = strip_inline_marks(&match turn_re().captures(l) {
         Some(c) => c[3].to_string(),
         None => l.trim_start_matches(['-', '*', '#', '>', ' ']).to_string(),
-    };
+    });
     match text.char_indices().nth(140) {
         Some((i, _)) => format!("{}…", &text[..i]),
         None => text,
@@ -707,14 +712,22 @@ pub fn scrub_prompt_echo_text(content: &str, title: &str) -> (String, usize) {
     let (head, tail) = content.split_at(start);
     let title_lines = tail.lines().filter(|l| spoken(l).is_some_and(|t| !title_n.is_empty() && norm(&t) == title_n)).count();
     let mut removed = 0;
+    let mut last_was_echo = false;
     let kept: Vec<&str> = tail
         .split_inclusive('\n')
         .filter(|l| {
-            let Some(text) = spoken(l.trim_end()) else { return true };
+            // Core writes "[...] [repeated audio removed - N identical segments collapsed]"
+            // after a line it repeated. When that line was an echo, the marker goes with it.
+            if l.trim_start().starts_with("[...] [repeated audio removed") {
+                if last_was_echo { removed += 1; return false; }
+                return true;
+            }
+            let Some(text) = spoken(l.trim_end()) else { last_was_echo = false; return true };
             let t = norm(&text);
             let echo = t.contains("preserve spelling exactly") || t.contains("names and terms that may appear")
                 || (title_lines >= 2 && !title_n.is_empty() && t == title_n);
             if echo { removed += 1; }
+            last_was_echo = echo;
             !echo
         })
         .collect();
@@ -752,6 +765,10 @@ mod tests {
         assert_eq!(n, 2);
         assert!(out.ends_with("[B 0:40] Real words.\n"));
         assert_eq!(scrub_prompt_echo_text("no transcript", "x"), ("no transcript".to_string(), 0));
+        let collapsed = "---\ntitle: T\n---\n## Transcript\n[U 1:15] T. Preserve spelling exactly when hearing.\n[...] [repeated audio removed - 7 identical segments collapsed]\n[A 2:00] Real.\n[...] [repeated audio removed - 2 identical segments collapsed]\n";
+        let (out, n) = scrub_prompt_echo_text(collapsed, "T");
+        assert_eq!(n, 2, "the echo and its marker");
+        assert!(out.contains("[A 2:00] Real.\n[...] [repeated audio removed - 2"), "a marker after real speech stays");
     }
 
     const FILE: &str = "---\ntitle: T\ntype: meeting\n---\n\n## Summary\n\nS\n\n## Notes\n\n- a\n\n## Transcript\n\n[SPEAKER_0 0:00] hi\n[Alice Smith 1:02] yo\n";

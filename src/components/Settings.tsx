@@ -128,7 +128,8 @@ function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: No
         onSaved(saved);
       }
       try {
-        if (patch.model) {
+        // A new speech model or speaker model may need files: fetch them now, not at Record.
+        if (patch.model || patch.speaker_model) {
           const files = await api.modelsStatus();
           if (files.some((f) => !f.installed)) await api.downloadModels();
         }

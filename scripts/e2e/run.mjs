@@ -207,7 +207,7 @@ await check("setup step: Documents and Balanced preselected, saved, download sta
   // TOML writes a path with backslashes in single quotes.
   assert(cfg.includes(`output_dir = "${meetingsDir}"`) || cfg.includes(`output_dir = '${meetingsDir}'`), "output_dir not saved");
   assert(/\[transcription\][^[]*model = "small"/s.test(cfg), "model not saved as small");
-  await page.getByText(/Speech models ready|Downloading speech models/).waitFor({ timeout: 10000 });
+  await page.getByText(/Models ready|Downloading /).waitFor({ timeout: 10000 });
   assert((await page.evaluate(() => window.__E2E__.calls)).includes("download_models"), "download not started on setup");
 });
 await check("permissions step explains and never prompts", async () => {
@@ -226,7 +226,7 @@ await check("summaries step: none preselected and saved", async () => {
 await check("ready step shows how to record, then setup finishes", async () => {
   await page.getByText("From the menu bar.").waitFor();
   await page.getByText(/⌘⇧R/).first().waitFor();
-  await page.getByText("Speech models ready").waitFor({ timeout: seed ? 15000 : 600000 });
+  await page.getByText("Models ready").waitFor({ timeout: seed ? 15000 : 600000 });
   await button("Start using Margin").click();
   await page.getByText(/Your first meeting starts here/).waitFor({ timeout: 8000 });
   assert(JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8")).onboarding_complete, "prefs not saved");
@@ -1216,7 +1216,7 @@ if (flag("--download")) {
     await page.getByRole("radio", { name: /Fast/ }).click();
     await page.getByText(/Downloading speech models/).waitFor({ timeout: 15000 });
     await page.screenshot({ path: path.join(out, "download-progress.png") });
-    await page.getByText("Speech models ready").waitFor({ timeout: 600000 });
+    await page.getByText("Models ready").waitFor({ timeout: 600000 });
     assert(fs.existsSync(path.join(marginHome, "state/models/ggml-base.bin")), "base model missing");
     await closeSettings();
   });

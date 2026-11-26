@@ -126,7 +126,7 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
         {canRecordCalls && (
           <ToggleRow
             title="Start notes from my calendar"
-            help="When an event with a call link or two or more people starts, Margin offers Start notes. It opens the call and records it under the event's title. Margin asks to read your calendar when you turn this on. A Google calendar works when it is added in System Settings → Internet Accounts."
+            help="When a meeting on your calendar starts, Margin offers Start notes: it opens the call and records it under the meeting's name. Google calendars work once added in System Settings → Internet Accounts."
             checked={s.calendar_toast ?? false}
             onChange={(on) => save({ calendar_toast: on })}
           />
@@ -180,7 +180,7 @@ export function TranscriptionSection({ s, save, options, prefs, changePrefs }: S
               </button>
             ))}
           </div>
-          <DownloadProgress compact key={s.model} />
+          <DownloadProgress compact key={`${s.model}-${s.speaker_model ?? "legacy"}`} />
         </div>
         <RollingToggle s={s} save={save} />
         {hasGpuSwitch && (
@@ -211,7 +211,7 @@ export function TranscriptionSection({ s, save, options, prefs, changePrefs }: S
           <SelectRow
             id="set-speaker-model"
             label="Speaker model"
-            help="Better tells similar voices apart: in a test with four people it found all four and made a third of the speaker errors. It takes about 7 minutes per hour of meeting instead of 2, and downloads 32 MB once."
+            help="Better tells similar voices apart, about 3 times fewer mix-ups. Slower: 7 min per hour of meeting. 32 MB download."
             value={s.speaker_model ?? "legacy"}
             choices={[{ value: "legacy", label: "Standard (faster)" }, { value: "community-1", label: "Better (slower)" }]}
             onChange={(m) => save({ speaker_model: m })}
@@ -306,7 +306,7 @@ export function KnowledgeSection({ s, save, notify }: SettingsView) {
     if (found) {
       save({ post_record: found });
     } else {
-      notify("Margin Desk was not found in ~/margin-desk, or Node is not installed.", "error");
+      notify("Margin Desk is not installed. Put it in ~/margin-desk (see its README), then click this again.", "error");
     }
   };
   return (
@@ -326,7 +326,7 @@ export function KnowledgeSection({ s, save, notify }: SettingsView) {
         />
         <ToggleRow
           title="Update the wiki after each meeting"
-          help="Adds a page for each person and a dated log entry for each meeting."
+          help={s.knowledge_path ? "Adds a page for each person and a dated log entry for each meeting." : "Choose a wiki folder first."}
           checked={s.knowledge_enabled ?? false}
           disabled={!s.knowledge_path}
           onChange={(on) => save({ knowledge_enabled: on })}
