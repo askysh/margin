@@ -21,6 +21,14 @@ on) point to [DECISIONS.md](DECISIONS.md).
 - Settings → Knowledge: keep core's knowledge wiki after each meeting, with the meeting's
   people and, when Margin writes a summary, its decisions and action items. No model
   writes the wiki. Also a command to run after each meeting, with *Use Margin Desk* (D70).
+- *Speaker model* in Settings → Transcription: *Better* tells similar voices apart. In a
+  test with four people it found all four and gave a third as many wrong speaker labels,
+  and it takes about 7 minutes per hour of meeting instead of 2 (D72).
+
+### Fixed
+
+- Lines that Whisper made up from its own prompt during room noise, such as "Preserve
+  spelling exactly when heard", no longer appear in the transcript (D71).
 
 ## [0.0.11] - 2026-11-17
 

@@ -328,3 +328,14 @@ here has been applied to upstream, and we work around each of the others locally
   Margin sets `VK_LOADER_DRIVERS_DISABLE=*` in its own process before anything else runs
   (`win.rs` `whisper_on_cpu`). The Vulkan loader then hides every driver, whisper.cpp
   finds no device and uses the CPU. A change applies at the next start of the app.
+
+## 24. Drop transcript segments that reproduce the Whisper prompt
+- **Where:** `crates/core/src/transcribe.rs`, `whisper_initial_prompt` and the
+  anti-hallucination layers after decoding.
+- **Why:** on noise, Whisper outputs its initial prompt ("Names and terms that may appear
+  in this audio: … Preserve spelling exactly when heard."). Margin measured 8 such lines in
+  225 seconds of room tone (D71).
+- **Patch:** after decoding, drop a segment whose normalized text is contained in the
+  normalized prompt, or that contains the prompt's fixed sentence.
+- **Workaround:** `library::scrub_prompt_echo` removes the lines when a meeting is ready.
+

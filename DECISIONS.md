@@ -1291,3 +1291,24 @@ The full comparison is in `docs/parity/app.md`.
   fills it when `~/margin-desk/bin/desk.mjs` and Node are found.
 - Semantic search stays out of Settings. Core's `embed-worker` is not in the app bundle,
   so the switch would do nothing. Margin Desk has its own search.
+
+### D71. Whisper's prompt echoes are removed from the transcript
+- New fact (benchmark, 26 Nov 2026): on room tone, keyboard noise and hum, Whisper wrote
+  "Silence test. Preserve spelling exactly when hearing." 8 times in 225 seconds. Core
+  gives Whisper the prompt "Names and terms that may appear in this audio: <title, names>.
+  Preserve spelling exactly when heard." and Whisper reads it back on noise. Digital
+  silence gave no text.
+- Pick: when a meeting is ready, before the summary, Margin removes transcript lines that
+  hold the prompt's fixed words, and title-only lines that occur two or more times. One
+  title-only line stays, since it can be real speech. Notes and frontmatter do not change.
+- UPSTREAM-PATCHES asks core to drop segments that reproduce the prompt.
+
+### D72. A choice of speaker model in Settings → Transcription
+- New fact (benchmark, AMI ES2004a, four speakers): the legacy model found 2 speakers and
+  gave the wrong speaker for 37.9% of speech. Raising the threshold split voices into 8.
+  core's `community-1` set found 4 and gave the wrong speaker for 14.0%. It took 118
+  seconds for 17.5 minutes of audio, against 26.
+- Pick: *Speaker model*, Standard (legacy) or Better (community-1). The default stays
+  Standard, so no one gets a 32 MB download or slower processing without asking. Margin
+  downloads the chosen set through the existing model download.
+
