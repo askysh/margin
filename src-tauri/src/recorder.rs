@@ -619,9 +619,12 @@ fn spawn_ticker(session: u64) {
                     guard.as_ref().map(|a| (Local::now() - a.started_at).num_seconds().max(0)).unwrap_or(0)
                 };
                 if !mic_checked && elapsed >= MIC_CHECK_AFTER_SECS {
-                    mic_checked = true;
-                    if mic_is_silent(&mic_track(kind, &wav)) {
-                        warn_silent_mic();
+                    // A track that is not readable yet is tried again on the next tick.
+                    if let Some(silent) = mic_silence(&mic_track(kind, &wav)) {
+                        mic_checked = true;
+                        if silent {
+                            warn_silent_mic();
+                        }
                     }
                 }
                 events::emit("recorder-tick", serde_json::json!({ "elapsed_secs": elapsed, "level": view_level }));
@@ -696,10 +699,10 @@ fn mic_track(kind: Kind, wav: &Path) -> PathBuf {
     }
 }
 
-/// True when the microphone track exists, holds at least the check window, and its peak in
-/// that window stays under `SILENT_PEAK`. A track that cannot be read is not reported.
-fn mic_is_silent(track: &Path) -> bool {
-    window_peak_from_end(track, MIC_CHECK_WINDOW_MS).is_some_and(|peak| peak < SILENT_PEAK)
+/// Whether the microphone track's peak over the check window stays under `SILENT_PEAK`.
+/// None when the track cannot be read or holds less than the window.
+fn mic_silence(track: &Path) -> Option<bool> {
+    window_peak_from_end(track, MIC_CHECK_WINDOW_MS).map(|peak| peak < SILENT_PEAK)
 }
 
 /// Peak absolute sample of a growing 16 kHz, 16-bit mono WAV over its last `duration_ms`.
@@ -728,7 +731,7 @@ fn window_peak_from_end(path: &Path, duration_ms: u64) -> Option<f32> {
 /// goes on: the other side of a call is still worth keeping.
 fn warn_silent_mic() {
     let device = crate::corecfg::load().recording.device.filter(|d| !d.trim().is_empty()).unwrap_or_else(|| "the microphone".into());
-    let message = format!("Margin hears nothing from {device}. Your own voice is not being recorded. Check the microphone in Settings → Recording, or switch the input in macOS.");
+    let message = format!("Margin hears nothing from {device}. Your own voice is not being recorded. Check the microphone in Settings → Recording, or choose another input.");
     tracing::warn!(%device, "microphone track is silent");
     events::emit("mic-silent", &message);
     events::notify(events::Notice {
@@ -874,15 +877,15 @@ mod tests {
         let silent = dir.join("silent.wav");
         // 25 s of the T2 headset: a noise floor that never passes 67 / 32768.
         wav_with(&(0..16_000 * 25).map(|i| ((i % 135) as i16) - 67).collect::<Vec<_>>(), &silent);
-        assert!(mic_is_silent(&silent));
+        assert_eq!(mic_silence(&silent), Some(true));
         let quiet_room = dir.join("room.wav");
         // Mostly near-silence, with one soft 0.03 full-scale sound (a chair, a breath).
         wav_with(&(0..16_000 * 25).map(|i| if (200_000..201_000).contains(&i) { 1000 } else { (i % 21) as i16 - 10 }).collect::<Vec<_>>(), &quiet_room);
-        assert!(!mic_is_silent(&quiet_room));
+        assert_eq!(mic_silence(&quiet_room), Some(false));
         let short = dir.join("short.wav");
         wav_with(&vec![0i16; 16_000 * 5], &short);
-        assert!(!mic_is_silent(&short), "too little audio to judge");
-        assert!(!mic_is_silent(&dir.join("missing.wav")));
+        assert_eq!(mic_silence(&short), None, "too little audio to judge yet");
+        assert_eq!(mic_silence(&dir.join("missing.wav")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

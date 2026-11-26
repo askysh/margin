@@ -78,37 +78,88 @@ pub fn spawn() {
         .expect("spawn calendar watch");
 }
 
-/// Start notes for an offer: open its call link, then record the call under its title.
+/// Start notes for an offer: record the call under its title, then open its call link. The
+/// link opens only when the recording started, so a failure does not leave a call open
+/// with no notes.
 pub fn start_notes(offer: &Offer) -> Result<(), String> {
+    crate::commands::ops::start_recording(crate::recorder::Kind::Call, Some(offer.title.clone()))?;
     if let Some(url) = offer.url.as_deref().filter(|u| u.starts_with("https://")) {
-        if let Err(error) = open_url(url) {
-            tracing::warn!(%error, "could not open the event's call link");
-        }
+        open_url(url);
     }
-    crate::commands::ops::start_recording(crate::recorder::Kind::Call, Some(offer.title.clone())).map(|_| ())
+    Ok(())
 }
 
+/// `open` takes the URL as one argument and runs no shell.
 #[cfg(target_os = "macos")]
-fn open_url(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("/usr/bin/open").arg(url).status().map(|_| ())
+fn open_url(url: &str) {
+    if let Err(error) = std::process::Command::new("/usr/bin/open").arg(url).status() {
+        tracing::warn!(%error, "could not open the event's call link");
+    }
 }
 
+/// Calendar offers come only from the macOS calendar, so other platforms open nothing.
 #[cfg(not(target_os = "macos"))]
-fn open_url(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("cmd").args(["/C", "start", "", url]).status().map(|_| ())
+fn open_url(_url: &str) {}
+
+/// How long the first Calendars prompt may stay on screen. Core's own calendar calls kill
+/// the helper after 3 seconds, which is shorter than it takes to read the prompt.
+#[cfg(target_os = "macos")]
+const PROMPT_WAIT: Duration = Duration::from_secs(120);
+
+/// core's `calendar-events` helper, which build.rs bundles next to the `margin` binary.
+#[cfg(target_os = "macos")]
+fn helper() -> Option<std::path::PathBuf> {
+    let beside = std::env::current_exe().ok()?.parent()?.join("calendar-events");
+    beside.is_file().then_some(beside)
 }
 
 /// Ask for Calendars access now, in the foreground, right after the switch is turned on, so
 /// the prompt has a reason the user just gave (D9 kept calendar off because the prompt came
-/// in the middle of background processing). Returns false when access is refused.
-pub fn request_access() -> bool {
-    // The QA bridge never raises a macOS prompt (D11), so there it counts as refused.
+/// in the middle of background processing). Runs the helper directly, without core's
+/// 3-second limit, so the prompt can wait for an answer. Returns true only for full access:
+/// write-only access reads nothing.
+#[cfg(target_os = "macos")]
+pub fn request_access() -> Result<(), String> {
+    // The QA bridge never raises a macOS prompt (D11).
     if crate::devserve::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
-        return false;
+        return Err("Calendar access is asked only in the app.".into());
     }
-    let _ = minutes_core::calendar::upcoming_events(60);
-    // Write-only access reads nothing, so it counts as refused.
-    matches!(minutes_core::calendar::calendar_access_status(), minutes_core::calendar::CalendarAccess::FullAccess)
+    let helper = helper().ok_or("Margin's calendar helper is missing from the app. Reinstall Margin.")?;
+    let status = |h: &std::path::Path| -> String {
+        std::process::Command::new(h).arg("--status").output().map(|o| access_state(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
+    };
+    if status(&helper) != "full-access" {
+        let mut child = std::process::Command::new(&helper)
+            .arg("1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Could not ask for calendar access: {e}"))?;
+        let deadline = std::time::Instant::now() + PROMPT_WAIT;
+        while child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let _ = child.kill();
+    }
+    match status(&helper).as_str() {
+        "full-access" => Ok(()),
+        "not-determined" => Err("Margin is still waiting for calendar access. Answer the macOS prompt, then turn this on again.".into()),
+        _ => Err("Margin can't read your calendar. Allow it in System Settings → Privacy & Security → Calendars, then turn this on again.".into()),
+    }
+}
+
+/// The state from the helper's `--status` line, `{"calendar_access":"full-access"}`.
+pub fn access_state(output: &str) -> String {
+    output
+        .lines()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .and_then(|v| v["calendar_access"].as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn request_access() -> Result<(), String> {
+    Err("Starting notes from the calendar works only on macOS.".into())
 }
 
 #[cfg(test)]
@@ -136,6 +187,14 @@ mod tests {
         assert!(!qualifies(&event("Too late", -6, Some("https://meet.google.com/x"), 3)));
         assert!(!qualifies(&event("Focus block", 0, None, 1)));
         assert!(!qualifies(&event("Blank link", 0, Some("  "), 0)));
+    }
+
+    #[test]
+    fn the_helper_status_line_is_read() {
+        assert_eq!(access_state("{\"calendar_access\":\"not-determined\"}\n"), "not-determined");
+        assert_eq!(access_state("{\"calendar_access\":\"full-access\"}"), "full-access");
+        assert_eq!(access_state("garbage"), "");
+        assert_eq!(access_state(""), "");
     }
 
     #[test]

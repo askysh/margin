@@ -60,14 +60,17 @@ fn clicked(app: &AppHandle, performed: &ActionPerformed) {
         .and_then(|n| SHOWN.lock().unwrap().as_mut()?.remove(&n.id()));
     match notice {
         Some(Notice { call_app: Some(_), .. }) if performed.action_id() == RECORD => tray::start_outside(app, Kind::Call),
-        // A click on the notification body or on Start notes both mean "take notes".
-        Some(Notice { calendar: Some(offer), .. }) => {
+        // Only Start notes records (D67). A click on the body opens the window, where the
+        // banner still offers it.
+        Some(Notice { calendar: Some(offer), .. }) if performed.action_id() == START_NOTES => {
             let chip = crate::prefs::load().recording_chip();
             if !chip {
                 tray::show_main(app);
             }
+            let app = app.clone();
             std::thread::spawn(move || {
                 if let Err(error) = crate::calendar_watch::start_notes(&offer) {
+                    tray::show_main(&app);
                     events::emit("error-toast", error);
                 }
             });

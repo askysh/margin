@@ -287,7 +287,6 @@ const KNOWLEDGE_FORMATS: Choice<"obsidian" | "wiki" | "para">[] = [
 ];
 
 export function KnowledgeSection({ s, save, notify }: SettingsView) {
-  const [command, setCommand] = useState<string | null>(null);
   const chooseFolder = async () => {
     const chosen = await open({ directory: true, multiple: false, title: "Choose a folder for the knowledge wiki", defaultPath: s.knowledge_path || s.output_dir });
     if (typeof chosen === "string") save({ knowledge_path: chosen });
@@ -295,7 +294,6 @@ export function KnowledgeSection({ s, save, notify }: SettingsView) {
   const useDesk = async () => {
     const found = await api.deskCommand().catch(() => null);
     if (found) {
-      setCommand(found);
       save({ post_record: found });
     } else {
       notify("Margin Desk was not found in ~/margin-desk, or Node is not installed.", "error");
@@ -304,7 +302,7 @@ export function KnowledgeSection({ s, save, notify }: SettingsView) {
   return (
     <>
       <SectionHead title="Knowledge" about="What Margin keeps from each meeting beyond the meeting itself." />
-      <Card title="Knowledge wiki" note="Facts come from each meeting's decisions, action items and people. No model writes them, so the wiki holds nothing that is not in a meeting.">
+      <Card title="Knowledge wiki" note="Facts come from each meeting's people and, when Margin writes a summary, its decisions and action items. No model writes the wiki itself, so it holds nothing that is not in a meeting.">
         <Row title="Wiki folder" help={s.knowledge_path ? <span className="path">{tildify(s.knowledge_path)}</span> : "Not chosen"}>
           {s.knowledge_path && <button className="btn btn-quiet" onClick={() => api.reveal(s.knowledge_path!)}>{SHOW_IN_FILES}</button>}
           <button className="btn btn-quiet" onClick={chooseFolder}>Choose…</button>
@@ -330,8 +328,8 @@ export function KnowledgeSection({ s, save, notify }: SettingsView) {
           label="Run this command"
           help="Margin runs it when a meeting is ready, with the meeting file's path added at the end. Leave it empty to run nothing."
           placeholder="/path/to/script.sh"
-          value={command ?? s.post_record ?? ""}
-          onSave={(text) => { setCommand(text); save({ post_record: text }); }}
+          value={s.post_record ?? ""}
+          onSave={(text) => save({ post_record: text })}
         />
         <Row title="Margin Desk" help="Turns each meeting into tasks, notes pages and a searchable brain on this Mac.">
           <button className="btn btn-quiet" onClick={useDesk}>Use Margin Desk</button>

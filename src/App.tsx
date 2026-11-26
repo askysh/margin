@@ -112,6 +112,10 @@ export default function App() {
         // A new recording (or one started from the menu bar) takes over the window. Later
         // updates, such as a title change, must not pull you back from another meeting.
         if (v.recording && !recorderRef.current?.recording) {
+          // Whatever started it (banner, notification, menu bar, shortcut), an offer or a
+          // warning from before belongs to the last recording.
+          setCalendarOffer(null);
+          setMicSilent(null);
           setLines(v.lines);
           setSelection({ type: "live" });
           if (!resettingRef.current) {

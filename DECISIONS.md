@@ -1231,9 +1231,14 @@ The full comparison is in `docs/parity/app.md`.
 - Options: keep calendar off, turn it on for everyone, or a switch with its own
   permission step.
 - Pick: **a switch**, *Start notes from my calendar* in Settings → Recording, off by
-  default. Turning it on asks for Calendars access right away, in the foreground. That
-  answers D9's reason: the prompt follows the click that asked for it. Refused access
-  turns the switch off again with a message.
+  default. Turning it on asks for Calendars access before anything is saved, in the
+  foreground. That answers D9's reason: the prompt follows the click that asked for it.
+  Margin runs core's helper directly for this, with up to 2 minutes for an answer, since
+  core's own calls stop the helper after 3 seconds. Refused, write-only or unanswered
+  access leaves the switch off with a message that says which.
+- Margin now bundles core's `calendar-events` helper (`build.rs` compiles it from the
+  pinned core checkout, `externalBin` signs it). Core looks for it beside the binary
+  first. Without it, only the Mac that built Margin could read the calendar.
 - When the switch is on, `calendar_watch.rs` checks every 30 seconds. An event that starts
   within a minute, or started up to five minutes ago, and has a call link or two or more
   attendees, gets one offer: a banner, and a notification with Start notes when the
@@ -1244,7 +1249,10 @@ The full comparison is in `docs/parity/app.md`.
   ignores focus blocks.
 - Cost: core reads the calendar from the worker too, as D9 said. With access granted in
   the foreground first, that read raises no prompt.
-- Not tested: the toast against a real calendar on this Mac (it needs the permission).
+- Not tested: the toast against a real calendar (it needs the permission). Core's helper
+  reads the call link from the event's location. A Google Meet link that sits only in the
+  event's notes or conference data is not seen, so such an event qualifies by its
+  attendees, and Start notes records without opening the call.
 
 ### D68. A silent microphone gets a warning thirty seconds in
 - New fact: a 75-minute call on a Bluetooth headset kept only the other side. The
@@ -1273,8 +1281,12 @@ The full comparison is in `docs/parity/app.md`.
 
 ### D70. Settings → Knowledge: the wiki with no model, and a command after each meeting
 - Pick: core's knowledge wiki with `engine = "none"` only. Facts come from the meeting's
-  frontmatter (decisions, action items, people). A model would write facts nobody can
-  check against the transcript.
+  frontmatter. A model would write facts nobody can check against the transcript.
+- Core takes decisions and action items from the summary, and Margin's worker runs with
+  summaries off (D40). So with a summary engine on, the worker leaves the wiki alone and
+  the first summary after processing updates it, with one log entry per meeting. With
+  summaries off, the worker updates it with the people only. *Summarize again* does not
+  update the wiki, because core appends a log entry on every update.
 - *After each meeting, run this command* sets core's `hooks.post_record`. *Use Margin Desk*
   fills it when `~/margin-desk/bin/desk.mjs` and Node are found.
 - Semantic search stays out of Settings. Core's `embed-worker` is not in the app bundle,

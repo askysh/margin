@@ -213,7 +213,7 @@ pub fn summarize_in_background(path: String, untitled: bool) {
         .name("margin-summary".into())
         .spawn(move || {
             let fallback = untitled.then(|| file_title(std::path::Path::new(&path))).flatten();
-            let result = crate::commands::ops::summarize_meeting(path.clone());
+            let result = crate::commands::ops::summarize_meeting_with(path.clone(), true);
             if let Err(error) = &result {
                 tracing::warn!(%error, path, "summary after processing failed");
             }

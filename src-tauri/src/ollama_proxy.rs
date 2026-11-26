@@ -14,9 +14,10 @@ use std::time::Duration;
 /// Paths whose JSON body gets `"think": false`.
 const THINKING_PATHS: &[&str] = &["/api/generate", "/api/chat"];
 
-/// Core times out its own call after 2 minutes. The forwarder waits longer, so that core's
-/// limit is the one that applies and its error message stays the same.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
+/// Core gives up on an Ollama call after 2 minutes. Ollama stops generating only when its
+/// client disconnects, so the forwarder gives up a little earlier, and a timed-out summary
+/// does not leave the model busy for the next try.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(115);
 
 /// A running forwarder. It stops when dropped.
 pub struct Forwarder {
@@ -118,8 +119,10 @@ fn forward(agent: &ureq::Agent, upstream: &str, mut request: tiny_http::Request)
     let response = match result {
         Ok(mut answer) => {
             let status = answer.status().as_u16();
-            let bytes = answer.body_mut().with_config().limit(256 * 1024 * 1024).read_to_vec().unwrap_or_default();
-            tiny_http::Response::from_data(bytes).with_status_code(status)
+            match answer.body_mut().with_config().limit(256 * 1024 * 1024).read_to_vec() {
+                Ok(bytes) => tiny_http::Response::from_data(bytes).with_status_code(status),
+                Err(error) => tiny_http::Response::from_string(format!("{{\"error\":{}}}", serde_json::Value::String(error.to_string()))).with_status_code(502),
+            }
         }
         Err(error) => tiny_http::Response::from_string(format!("{{\"error\":{}}}", serde_json::Value::String(error.to_string()))).with_status_code(502),
     };

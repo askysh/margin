@@ -43,7 +43,8 @@
     ],
     "category": "public.app-category.productivity",
     "externalBin": [
-      "binaries/margin-speech"
+      "binaries/margin-speech",
+      "binaries/calendar-events"
     ],
     "shortDescription": "Local-first meeting notes",
     "icon": [

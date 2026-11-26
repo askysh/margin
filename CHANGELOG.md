@@ -18,9 +18,9 @@ on) point to [DECISIONS.md](DECISIONS.md).
   Bluetooth headset that a call app holds (D68).
 - *Answer without thinking first* in Settings → Summaries, for Ollama. Models such as
   qwen3 now finish a summary inside the 2-minute limit. On by default (D69).
-- Settings → Knowledge: keep core's knowledge wiki after each meeting, with facts from the
-  meeting's decisions, action items and people only, and a command to run after each
-  meeting, with *Use Margin Desk* (D70).
+- Settings → Knowledge: keep core's knowledge wiki after each meeting, with the meeting's
+  people and, when Margin writes a summary, its decisions and action items. No model
+  writes the wiki. Also a command to run after each meeting, with *Use Margin Desk* (D70).
 
 ## [0.0.11] - 2026-11-17
 

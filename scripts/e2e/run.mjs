@@ -1010,7 +1010,7 @@ await check("settings: Knowledge saves the command to run after each meeting (D7
 await check("settings: the calendar switch never prompts in the QA bridge and stays off (D67)", async () => {
   await openSettings("Recording");
   await toggle(/Start notes from my calendar/).check();
-  await page.locator(".toast").filter({ hasText: /can't read your calendar/ }).waitFor({ timeout: 15000 });
+  await page.locator(".toast").filter({ hasText: /asked only in the app/ }).waitFor({ timeout: 15000 });
   await settled();
   assert(inSection("calendar", "enabled = false"), "calendar was turned on without access");
   await closeSettings();

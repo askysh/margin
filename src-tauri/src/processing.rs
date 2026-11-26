@@ -56,6 +56,12 @@ pub fn run_worker_mode() -> i32 {
     // The meeting opens as soon as the transcript and speakers are done; Margin writes the
     // summary afterwards, in the app (DECISIONS.md D40). A long meeting no longer waits
     // minutes for its summary before you can read it.
+    // The wiki takes decisions and action items from the summary. When Margin writes one
+    // later, it updates the wiki then (summaries.rs), so the worker leaves the wiki alone and
+    // the meeting gets one log entry, not two (D70).
+    if cfg.summarization.engine != "none" {
+        cfg.knowledge.enabled = false;
+    }
     cfg.summarization.engine = "none".into();
     let code = match jobs::process_pending_jobs(&cfg, |job| {
         tracing::info!(id = %job.id, state = ?job.state, "job update");

@@ -43,6 +43,11 @@ pub mod ops {
         let first_save = !corecfg::exists();
         let mut cfg = corecfg::load();
         let before = corecfg::settings(&cfg);
+        // Ask before anything is saved, so the watcher never runs with access still unknown,
+        // and the prompt follows the click that asked for it (D67).
+        if settings.calendar_toast == Some(true) && before.calendar_toast != Some(true) {
+            crate::calendar_watch::request_access()?;
+        }
         corecfg::apply(&mut cfg, &settings)?;
         // Margin keeps this switch in its own prefs (D54). `save` copies it into the config.
         if let Some(on) = settings.hide_from_screen_share {
@@ -55,16 +60,8 @@ pub mod ops {
         if !(first_save && cfg.output_dir == paths::default_output_dir()) {
             std::fs::create_dir_all(&cfg.output_dir).map_err(|e| format!("Can't use that folder: {e}"))?;
         }
-        let calendar_turned_on = settings.calendar_toast == Some(true) && before.calendar_toast != Some(true);
         corecfg::save(&mut cfg)?;
         extras::apply(&settings)?;
-        // The Calendars prompt comes now, right after the click that asked for it (D67).
-        if calendar_turned_on && !crate::calendar_watch::request_access() {
-            let mut cfg = corecfg::load();
-            cfg.calendar.enabled = false;
-            corecfg::save(&mut cfg)?;
-            return Err("Margin can't read your calendar. Allow it in System Settings → Privacy & Security → Calendars, then turn this on again.".into());
-        }
         if settings.keep_audio_days.is_some() && settings.keep_audio_days != before.keep_audio_days {
             corecfg::audio_cleanup(&cfg);
         }
@@ -426,6 +423,13 @@ pub mod ops {
     }
 
     pub fn summarize_meeting(path: String) -> Res<()> {
+        summarize_meeting_with(path, false)
+    }
+
+    /// `ingest_knowledge`: also update the knowledge wiki from the new summary. Only the
+    /// first summary after processing does this; core appends a log entry on every ingest,
+    /// so Summarize again would add a duplicate line.
+    pub fn summarize_meeting_with(path: String, ingest_knowledge: bool) -> Res<()> {
         let p = PathBuf::from(path);
         library::ensure_inside_output(&p)?;
         processing::ensure_not_processing(&p)?;
@@ -456,7 +460,7 @@ pub mod ops {
             &minutes_core::resummarize::ResummarizeOptions {
                 apply: true,
                 template_override: extras::summary_template_slug(),
-                refresh: Default::default(),
+                refresh: minutes_core::derived::RefreshOptions { ingest_knowledge: ingest_knowledge && cfg.knowledge.enabled },
             },
         ))
         .map_err(|e| {
