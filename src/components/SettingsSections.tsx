@@ -207,6 +207,16 @@ export function TranscriptionSection({ s, save, options, prefs, changePrefs }: S
           checked={s.speaker_separation ?? true}
           onChange={(on) => save({ speaker_separation: on })}
         />
+        {(s.speaker_separation ?? true) && (
+          <SelectRow
+            id="set-speaker-model"
+            label="Speaker model"
+            help="Better tells similar voices apart: in a test with four people it found all four and made a third of the speaker errors. It takes about 7 minutes per hour of meeting instead of 2, and downloads 32 MB once."
+            value={s.speaker_model ?? "legacy"}
+            choices={[{ value: "legacy", label: "Standard (faster)" }, { value: "community-1", label: "Better (slower)" }]}
+            onChange={(m) => save({ speaker_model: m })}
+          />
+        )}
         <TextRow
           id="set-vocabulary"
           label="Names and words to spell right"

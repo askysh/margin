@@ -420,6 +420,12 @@ fn finish(job: &JobView, announce: bool) {
     restore_notes(job, Path::new(output));
     let _ = std::fs::remove_file(live_draft_path(&job.id));
     let untitled = std::fs::remove_file(untitled_marker(&job.id)).is_ok();
+    // Before the summary reads it (D71).
+    match library::scrub_prompt_echo(Path::new(output)) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(removed = n, "removed Whisper prompt echoes from the transcript"),
+        Err(error) => tracing::warn!(%error, "could not check the transcript for prompt echoes"),
+    }
     if announce {
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
         crate::summaries::summarize_in_background(output.to_string(), untitled);

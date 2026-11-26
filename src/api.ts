@@ -35,6 +35,8 @@ export interface Settings {
   knowledge_path?: string;
   /** A command run after each processed meeting, with the meeting path appended. "" is off. */
   post_record?: string;
+  /** Core's speaker model set (D72). */
+  speaker_model?: "legacy" | "community-1";
 }
 
 /** A calendar event that starts now (calendar_watch.rs). */

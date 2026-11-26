@@ -77,7 +77,13 @@ pub struct AppSettings {
     /// (core's `hooks.post_record`). "" turns it off.
     #[serde(default)]
     pub post_record: Option<String>,
+    /// Core's speaker model set: "legacy" or "community-1" (D72).
+    #[serde(default)]
+    pub speaker_model: Option<String>,
 }
+
+/// Speaker model sets core supports.
+pub const SPEAKER_MODELS: &[&str] = &["legacy", "community-1"];
 
 /// Adapters core's knowledge wiki accepts.
 pub const KNOWLEDGE_ADAPTERS: &[&str] = &["obsidian", "wiki", "para"];
@@ -217,6 +223,7 @@ pub fn settings(cfg: &Config) -> AppSettings {
         knowledge_adapter: Some(cfg.knowledge.adapter.clone()),
         knowledge_path: Some(cfg.knowledge.path.display().to_string()),
         post_record: Some(cfg.hooks.post_record.clone().unwrap_or_default()),
+        speaker_model: Some(cfg.diarization.model.clone()),
     }
 }
 
@@ -254,6 +261,12 @@ pub fn apply(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
     apply_languages(cfg, s)?;
     if let Some(on) = s.speaker_separation {
         cfg.diarization.engine = if on { "auto" } else { "none" }.into();
+    }
+    if let Some(model) = s.speaker_model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        if !SPEAKER_MODELS.contains(&model) {
+            return Err(format!("Unknown speaker model {model}"));
+        }
+        cfg.diarization.model = model.into();
     }
     if let Some(days) = s.keep_audio_days {
         apply_keep_audio(cfg, days)?;
@@ -439,6 +452,17 @@ mod tests {
         apply(&mut cfg, &off).unwrap();
         assert!(!cfg.calendar.enabled);
         assert_eq!(cfg.hooks.post_record, None, "an empty command turns the hook off");
+    }
+
+    #[test]
+    fn the_speaker_model_round_trips_and_is_checked() {
+        let (mut cfg, mut s) = base();
+        s.speaker_model = Some("community-1".into());
+        apply(&mut cfg, &s).unwrap();
+        assert_eq!(cfg.diarization.model, "community-1");
+        assert_eq!(settings(&cfg).speaker_model.as_deref(), Some("community-1"));
+        s.speaker_model = Some("pyannote-cloud".into());
+        assert!(apply(&mut cfg, &s).is_err());
     }
 
     #[test]

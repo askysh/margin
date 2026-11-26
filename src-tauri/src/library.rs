@@ -686,9 +686,73 @@ pub fn meeting_files(path: &Path) -> Vec<PathBuf> {
     items
 }
 
+/// Whisper gets a prompt from core: "Names and terms that may appear in this audio: <title,
+/// names>. Preserve spelling exactly when heard." On room noise Whisper often reads it back,
+/// and the transcript gets lines nobody said (benchmark 26 Nov 2026: 8 echoes in 225 s of
+/// room tone). These lines are removed from `## Transcript`:
+/// - a line that contains the prompt's fixed words ("preserve spelling exactly",
+///   "names and terms that may appear");
+/// - a line that is only the meeting title, when it occurs at least twice. One title-only
+///   line can be real speech.
+/// Every other byte stays. Returns the cleaned content and the number of lines removed.
+pub fn scrub_prompt_echo_text(content: &str, title: &str) -> (String, usize) {
+    let norm = |s: &str| s.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+    let spoken = |line: &str| -> Option<String> {
+        let rest = line.strip_prefix('[')?;
+        let close = rest.find(']')?;
+        Some(rest[close + 1..].trim().to_string())
+    };
+    let title_n = norm(title);
+    let Some(start) = content.find("\n## Transcript") else { return (content.to_string(), 0) };
+    let (head, tail) = content.split_at(start);
+    let title_lines = tail.lines().filter(|l| spoken(l).is_some_and(|t| !title_n.is_empty() && norm(&t) == title_n)).count();
+    let mut removed = 0;
+    let kept: Vec<&str> = tail
+        .split_inclusive('\n')
+        .filter(|l| {
+            let Some(text) = spoken(l.trim_end()) else { return true };
+            let t = norm(&text);
+            let echo = t.contains("preserve spelling exactly") || t.contains("names and terms that may appear")
+                || (title_lines >= 2 && !title_n.is_empty() && t == title_n);
+            if echo { removed += 1; }
+            !echo
+        })
+        .collect();
+    (format!("{head}{}", kept.concat()), removed)
+}
+
+/// `scrub_prompt_echo_text` on a meeting file, under its lock. Writes only when a line goes.
+pub fn scrub_prompt_echo(path: &Path) -> Result<usize, String> {
+    crate::fsutil::with_file_lock(path, || {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let (fm, _) = split_frontmatter(&content);
+        let title = serde_yaml::from_str::<minutes_core::markdown::Frontmatter>(fm).map(|f| f.title).unwrap_or_default();
+        let (cleaned, removed) = scrub_prompt_echo_text(&content, &title);
+        if removed > 0 {
+            crate::fsutil::write_atomic(path, cleaned.as_bytes(), None).map_err(|e| e.to_string())?;
+        }
+        Ok(removed)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_echoes_leave_the_transcript_and_real_speech_stays() {
+        let md = "---\ntitle: Silence test\n---\n\n## Notes\n\nPreserve spelling exactly when heard is in my notes.\n\n## Transcript\n\n[SPEAKER_1 0:00] Hello everyone.\n[UNKNOWN 1:15] Silence test. Preserve spelling exactly when hearing.\n[UNKNOWN 1:20] Names and terms that may appear in this audio: Mohan.\n[UNKNOWN 4:45] Silence test.\n[SPEAKER_1 5:00] Thanks, bye.\n";
+        let (out, n) = scrub_prompt_echo_text(md, "Silence test");
+        assert_eq!(n, 2);
+        assert!(out.contains("[SPEAKER_1 0:00] Hello everyone.") && out.contains("[SPEAKER_1 5:00] Thanks, bye."));
+        assert!(out.contains("[UNKNOWN 4:45] Silence test."), "one title-only line may be real speech");
+        assert!(out.contains("Preserve spelling exactly when heard is in my notes."), "notes are never touched");
+        let twice = "---\ntitle: Standup\n---\n## Transcript\n[A 0:01] Standup.\n[A 0:30] Standup.\n[B 0:40] Real words.\n";
+        let (out, n) = scrub_prompt_echo_text(twice, "Standup");
+        assert_eq!(n, 2);
+        assert!(out.ends_with("[B 0:40] Real words.\n"));
+        assert_eq!(scrub_prompt_echo_text("no transcript", "x"), ("no transcript".to_string(), 0));
+    }
 
     const FILE: &str = "---\ntitle: T\ntype: meeting\n---\n\n## Summary\n\nS\n\n## Notes\n\n- a\n\n## Transcript\n\n[SPEAKER_0 0:00] hi\n[Alice Smith 1:02] yo\n";
 
