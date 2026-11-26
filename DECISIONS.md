@@ -1312,3 +1312,70 @@ The full comparison is in `docs/parity/app.md`.
   Standard, so no one gets a 32 MB download or slower processing without asking. Margin
   downloads the chosen set through the existing model download.
 
+
+## Silence, titles, search and summaries (26 Nov 2026, Grug round)
+
+### D90. Lines Whisper makes up on silence are removed with the prompt echoes
+- New fact (Grug round H2): a 3-second near-silent recording came back as `[SPEAKER_1 0:00]
+  [SYSTEM] Продолжение следует...` ("To be continued") and `...of royal descent in zoos across
+  the world.`. The meeting got an invented title, a project page and a summary.
+- Options: a phrase list only (misses what nobody lists), a model that judges each line (slow,
+  and it would run on speech too), or the scrub that D71 already runs, with a few rules.
+- Pick: the D71 scrub also drops a line that is only markers (`[BLANK_AUDIO]`, `(music)`), holds
+  a known silence phrase (about 50, in 12 languages: "Thanks for watching", the Amara subtitle
+  credit, "Продолжение следует", ...), is a stray line in a script the rest of the transcript
+  does not use, or is a `...` fragment left in a transcript of 12 words or fewer after something
+  else went. "Thank you", "bye" and one-word lines go only when nothing else real is left.
+- The `[SYSTEM]` and `[MICROPHONE]` tags are core's capture-source tags on call lines, so a
+  line is judged by what follows the tag; tagged lines are not removed as a class.
+- Indic scripts (Devanagari, Kannada, Tamil, Telugu, ...) are mixed into English speech by real
+  speakers. A script that more than a tenth of the lines use stays. A single Indic line goes
+  only in a transcript of 20 lines or more. Other scripts need 3 lines or more, and one stray
+  line per ten.
+- Cost: a real "Thank you" as the only thing said is dropped, and a real 3-line meeting with one
+  Cyrillic line loses it. Whisper hallucinations that are plain English sentences in a longer
+  recording (a YouTube-style sentence in a 40-minute call) are not seen.
+
+### D91. A meeting with no speech says so, and gets no title or summary from nothing
+- When the scrub removed lines and no words are left, Margin writes `status: no-speech` (the
+  library already shows that), a `processing_warnings` entry (`step: transcribe`, `reason:
+  no_speech`), and, for a meeting that had no title at Stop, the title "No speech recorded" with
+  its entities cleared. A title that the user chose stays. No summary or title model runs.
+- The scrub's count gates this, so a transcript that was already empty for another reason is
+  not touched here. A meeting core already marked `no-speech` also gets no summary.
+
+### D92. A title is the event's, the user's, or the summary's, and never ends in "..."
+- Verified by reading: Start notes (D67) records under the calendar event's title, so the
+  job has a title at Stop and keeps it. Core titles an untitled meeting with the first words
+  spoken and cuts it at 57 characters plus "..." (`finalize_title`).
+- Renames are not tracked anywhere: `set_title` writes the frontmatter. D59's guard was "the
+  title still equals what Stop left", and it covered only the first summary after processing.
+- Pick: a title is replaced from the summary, after the first summary or after *Summarize
+  again*, when it is the Stop fallback, core's 60-character cut, or two or more words that are
+  the opening words of the transcript. A calendar meeting is never replaced, and the title is
+  checked again after the model runs. Margin cuts a title that core ended with "..." at a word
+  boundary (also when the summary engine is off), and also when the library shows it.
+- Cost: a user title that was typed as the opening words of the speech is taken for the
+  machine's. Prompt change not made: the summary prompt is core's (`build_base_system_prompt`)
+  and core already asks for a TITLE line, which `resummarize` keeps out of the file; the title
+  call (D59) stays the way to get one.
+
+### D93. Search tries the closest library word when nothing matches
+- New fact (Grug round L3): "warrnty" found nothing. Margin's search is its own substring scan,
+  not core's index, so the fallback is Margin's.
+- Pick: with no hits, each query word of 3 letters or more that is not a word in the library is
+  replaced by the closest library word within 2 edits (1 for words of 3 or 4 letters; a swap of
+  two letters is one edit; ties go to the more frequent word). The search runs again with that
+  query. The answer is `{ "hits": [...], "corrected": "warranty" | null }`.
+- This changes `search_meetings` from an array to an object. The window reads `hits`, and shows
+  "Showing results for “corrected”" when `corrected` is set. The extra pass reads every file
+  once more, and runs only on a search with no hits.
+
+### D94. A model's lead-in line is removed from the summary
+- New fact (Grug round L6): a summary began "Based on the transcript provided, here is a
+  structured summary of ...". The model answered in free text, and core stores that as
+  `## Summary`. The prompt is core's, so Margin does not edit it.
+- Pick: after each summary Margin removes the first line of `## Summary` when it reads as an
+  assistant's lead-in ("Based on the transcript...", "Here is...", "Sure..." and names a summary
+  or overview), and a last line that offers more ("Let me know if..."). Nothing else in the
+  summary changes.

@@ -420,15 +420,14 @@ fn finish(job: &JobView, announce: bool) {
     restore_notes(job, Path::new(output));
     let _ = std::fs::remove_file(live_draft_path(&job.id));
     let untitled = std::fs::remove_file(untitled_marker(&job.id)).is_ok();
-    // Before the summary reads it (D71).
-    match library::scrub_prompt_echo(Path::new(output)) {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(removed = n, "removed Whisper prompt echoes from the transcript"),
-        Err(error) => tracing::warn!(%error, "could not check the transcript for prompt echoes"),
-    }
+    let no_speech = clean_transcript(Path::new(output), untitled);
     if announce {
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
-        crate::summaries::summarize_in_background(output.to_string(), untitled);
+        if no_speech {
+            tracing::info!("no speech in the meeting; no summary or title is made from nothing");
+        } else {
+            crate::summaries::summarize_in_background(output.to_string(), untitled);
+        }
         // Settings → "Keep audio": a good moment to drop audio that is now too old.
         std::thread::spawn(|| corecfg::audio_cleanup(&corecfg::load()));
         events::notify(events::Notice {
@@ -441,6 +440,27 @@ fn finish(job: &JobView, announce: bool) {
         // A new meeting for the menu bar's recent list.
         events::refresh_tray();
     }
+}
+
+/// Before the summary reads the transcript: remove what Whisper made up (D71, D90), say so
+/// when nothing real is left (D91), and cut a title that core ended with "..." (D92).
+/// Returns true for a meeting with no speech, which gets no summary.
+fn clean_transcript(path: &Path, untitled: bool) -> bool {
+    let removed = library::scrub_prompt_echo(path).unwrap_or_else(|error| {
+        tracing::warn!(%error, "could not check the transcript for lines Whisper made up");
+        0
+    });
+    if removed > 0 {
+        tracing::info!(removed, "removed lines Whisper made up from the transcript");
+    }
+    let no_speech = library::mark_no_speech(path, untitled, removed).unwrap_or_else(|error| {
+        tracing::warn!(%error, "could not check the meeting for speech");
+        false
+    });
+    if let Err(error) = library::tidy_title_in_file(path) {
+        tracing::warn!(%error, "could not cut the title at a word");
+    }
+    no_speech
 }
 
 /// Put the notes draft (the exact notes, with edits made during processing) into the

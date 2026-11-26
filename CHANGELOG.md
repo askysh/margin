@@ -29,6 +29,16 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 - Lines that Whisper made up from its own prompt during room noise, such as "Preserve
   spelling exactly when heard", no longer appear in the transcript (D71).
+- Lines that Whisper makes up on silence, such as "Продолжение следует..." or "Thanks for
+  watching", are removed from the transcript. A recording with nothing real left is marked
+  *no speech* and named "No speech recorded", instead of getting an invented title and
+  summary (D90, D91).
+- Meeting titles no longer end with "...": they are cut at a word. A meeting named from the
+  first words spoken is renamed from its summary, also after *Summarize again*, unless it
+  came from your calendar or you named it (D92).
+- Search finds "warranty" for "warrnty": when nothing matches, it looks for the closest word
+  in your meetings and says what it searched for (D93).
+- A summary no longer opens with "Based on the transcript provided, here is..." (D94).
 
 ## [0.0.11] - 2026-11-17
 

@@ -360,7 +360,7 @@ pub mod ops {
         Ok(())
     }
 
-    pub fn search_meetings(query: String) -> Res<Vec<library::SearchHit>> {
+    pub fn search_meetings(query: String) -> Res<library::SearchResults> {
         Ok(library::search(&query))
     }
 
@@ -421,13 +421,14 @@ pub mod ops {
     }
 
     pub fn summarize_meeting(path: String) -> Res<()> {
-        summarize_meeting_with(path, false)
+        summarize_meeting_with(path, false, None)
     }
 
     /// `ingest_knowledge`: also update the knowledge wiki from the new summary. Only the
     /// first summary after processing does this; core appends a log entry on every ingest,
-    /// so Summarize again would add a duplicate line.
-    pub fn summarize_meeting_with(path: String, ingest_knowledge: bool) -> Res<()> {
+    /// so Summarize again would add a duplicate line. `fallback_title`: the title Stop left on
+    /// a meeting that had none (D59).
+    pub fn summarize_meeting_with(path: String, ingest_knowledge: bool, fallback_title: Option<String>) -> Res<()> {
         let p = PathBuf::from(path);
         library::ensure_inside_output(&p)?;
         processing::ensure_not_processing(&p)?;
@@ -473,6 +474,7 @@ pub mod ops {
         if !report.applied {
             return Err("The summary engine returned nothing. Check that it's running, then try again.".into());
         }
+        summaries::finish_summary(&p, fallback_title.as_deref());
         Ok(())
     }
 
@@ -668,7 +670,7 @@ pub mod tauri_cmds {
     cmd!(list_meetings() -> Vec<library::MeetingSummary>);
     cmd!(read_meeting(path: String) -> library::MeetingDetail);
     cmd!(save_notes(path: String, notes: String) -> ());
-    cmd!(search_meetings(query: String) -> Vec<library::SearchHit>);
+    cmd!(search_meetings(query: String) -> library::SearchResults);
     cmd!(set_meeting_title(path: String, title: String) -> ());
     cmd!(trash_meeting(path: String) -> ());
     cmd!(reveal_in_finder(path: String) -> ());

@@ -218,7 +218,7 @@ fn summarize_file(path: &Path) -> Option<MeetingSummary> {
         .unwrap_or_default();
     Some(MeetingSummary {
         path: path.display().to_string(),
-        title: str_field(&fm, "title").unwrap_or_else(|| file_title(path)),
+        title: str_field(&fm, "title").map_or_else(|| file_title(path), |t| if is_core_cut_title(&t) { tidy_title(&t) } else { t }),
         date: str_field(&fm, "date"),
         duration: str_field(&fm, "duration"),
         kind: str_field(&fm, "type").unwrap_or_else(|| "meeting".into()),
@@ -284,7 +284,7 @@ fn turn_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^\[(?:(.+?) )?(\d+:\d{2}(?::\d{2})?)\]\s?(.*)$").unwrap())
 }
 
-fn parse_transcript(body: &str) -> Vec<Turn> {
+pub(crate) fn parse_transcript(body: &str) -> Vec<Turn> {
     let re = turn_re();
     let mut turns: Vec<Turn> = Vec::new();
     for line in body.lines() {
@@ -575,7 +575,8 @@ pub fn splice_notes(content: &str, notes: &str) -> String {
 /// keep working.
 pub fn set_title(path: &Path, title: &str) -> Result<(), String> {
     ensure_inside_output(path)?;
-    let title = title.trim();
+    let title = tidy_title(title);
+    let title = title.as_str();
     if title.is_empty() {
         return Err("A meeting needs a title.".into());
     }
@@ -592,24 +593,127 @@ pub struct SearchHit {
     pub excerpt: String,
 }
 
-/// Case-insensitive search over whole files. Fine for thousands of meetings, and it takes
-/// no lock, unlike core's per-query FTS index. Files are read on a few threads.
-pub fn search(query: &str) -> Vec<SearchHit> {
+/// What a search answers: the hits, and when the query found nothing and a near-miss
+/// spelling did, the query that was used instead (D93). The window shows "Showing results
+/// for ...". Serialized as `{ "hits": [...], "corrected": "warranty" | null }`.
+#[derive(Debug, Serialize)]
+pub struct SearchResults {
+    pub hits: Vec<SearchHit>,
+    pub corrected: Option<String>,
+}
+
+/// Case-insensitive search over whole files, with a typo fallback when nothing matches.
+pub fn search(query: &str) -> SearchResults {
+    let hits = search_exact(query);
+    if !hits.is_empty() {
+        return SearchResults { hits, corrected: None };
+    }
+    let corrected = corrected_query(query).filter(|c| c != &query.trim().to_lowercase());
+    let hits = corrected.as_deref().map(search_exact).unwrap_or_default();
+    SearchResults { corrected: (!hits.is_empty()).then_some(corrected).flatten(), hits }
+}
+
+/// Runs `f` over the meetings on a few threads. Results keep the library's order.
+fn par_filter_map<T: Send>(meetings: &[MeetingSummary], f: impl Fn(&MeetingSummary) -> Option<T> + Sync) -> Vec<T> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let chunk = meetings.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = meetings.chunks(chunk).map(|part| scope.spawn(|| part.iter().filter_map(&f).collect::<Vec<_>>())).collect();
+        parts.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
+}
+
+/// Substring search over whole files. Fine for thousands of meetings, and it takes no lock,
+/// unlike core's per-query FTS index. Files are read on a few threads.
+fn search_exact(query: &str) -> Vec<SearchHit> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return vec![];
     }
-    let meetings = list();
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
-    let chunk = meetings.len().div_ceil(threads).max(1);
-    std::thread::scope(|scope| {
-        let parts: Vec<_> = meetings
-            .chunks(chunk)
-            .map(|part| scope.spawn(|| part.iter().filter_map(|m| search_file(m, &q)).collect::<Vec<_>>()))
-            .collect();
-        // Chunks are joined in order, so hits keep the library's order.
-        parts.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    par_filter_map(&list(), |m| search_file(m, &q))
+}
+
+/// Every word in the library with the number of times it occurs, titles and bodies.
+fn corpus_words() -> HashMap<String, usize> {
+    let per_meeting = par_filter_map(&list(), |m| {
+        let content = std::fs::read_to_string(&m.path).ok()?;
+        let (_, body) = split_frontmatter(&content);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for word in format!("{} {body}", m.title).to_lowercase().split(|c: char| !c.is_alphabetic()) {
+            if (3..=24).contains(&word.chars().count()) {
+                *counts.entry(word.to_string()).or_default() += 1;
+            }
+        }
+        Some(counts)
+    });
+    per_meeting.into_iter().fold(HashMap::new(), |mut all, counts| {
+        for (word, n) in counts {
+            *all.entry(word).or_default() += n;
+        }
+        all
     })
+}
+
+/// The query with each unknown word swapped for the closest word in the library, within two
+/// edits (one for words of 3 or 4 letters). None when no word changed.
+fn corrected_query(query: &str) -> Option<String> {
+    corrected_query_in(query, &corpus_words())
+}
+
+fn corrected_query_in(query: &str, corpus: &HashMap<String, usize>) -> Option<String> {
+    let lowered = query.trim().to_lowercase();
+    let mut changed = false;
+    let fixed: Vec<String> = lowered
+        .split_whitespace()
+        .map(|w| match closest_word(w, corpus) {
+            Some(c) => {
+                changed = true;
+                c.to_string()
+            }
+            None => w.to_string(),
+        })
+        .collect();
+    changed.then(|| fixed.join(" "))
+}
+
+/// The corpus word nearest to an unknown `word` within the edit limit. None for a known
+/// word, a short one or one with a digit. Ties go to the word that occurs more, then
+/// alphabetical order, so the answer is the same on every run.
+fn closest_word<'a>(word: &str, corpus: &'a HashMap<String, usize>) -> Option<&'a str> {
+    let chars: Vec<char> = word.chars().collect();
+    if chars.len() < 3 || !chars.iter().all(|c| c.is_alphabetic()) || corpus.contains_key(word) {
+        return None;
+    }
+    let limit = if chars.len() <= 4 { 1 } else { 2 };
+    corpus
+        .iter()
+        .filter(|(c, _)| c.chars().count().abs_diff(chars.len()) <= limit)
+        .filter_map(|(c, n)| edit_distance(&chars, &c.chars().collect::<Vec<_>>(), limit).map(|d| (d, std::cmp::Reverse(*n), c.as_str())))
+        .min()
+        .map(|(_, _, c)| c)
+}
+
+/// Optimal string alignment distance (a swap of two neighbours is one edit, as in
+/// "waranty"/"warrnty"), or None above `limit`.
+fn edit_distance(a: &[char], b: &[char], limit: usize) -> Option<usize> {
+    let mut prev2: Vec<usize> = vec![0; b.len() + 1];
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        let mut cur = vec![i; b.len() + 1];
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                cur[j] = cur[j].min(prev2[j - 2] + 1);
+            }
+        }
+        if cur.iter().min().is_some_and(|m| *m > limit) {
+            return None;
+        }
+        prev2 = prev;
+        prev = cur;
+    }
+    Some(prev[b.len()]).filter(|d| *d <= limit)
 }
 
 fn search_file(m: &MeetingSummary, q: &str) -> Option<SearchHit> {
@@ -699,8 +803,15 @@ pub fn meeting_files(path: &Path) -> Vec<PathBuf> {
 ///   "names and terms that may appear");
 /// - a line that is only the meeting title, when it occurs at least twice. One title-only
 ///   line can be real speech.
+/// - silence hallucinations (D90), see `drop_silence_hallucinations`.
 /// Every other byte stays. Returns the cleaned content and the number of lines removed.
 pub fn scrub_prompt_echo_text(content: &str, title: &str) -> (String, usize) {
+    let (without_echoes, echoes) = drop_prompt_echoes(content, title);
+    let (clean, hallucinations) = drop_silence_hallucinations(&without_echoes);
+    (clean, echoes + hallucinations)
+}
+
+fn drop_prompt_echoes(content: &str, title: &str) -> (String, usize) {
     let norm = |s: &str| s.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
     let spoken = |line: &str| -> Option<String> {
         let rest = line.strip_prefix('[')?;
@@ -732,6 +843,325 @@ pub fn scrub_prompt_echo_text(content: &str, title: &str) -> (String, usize) {
         })
         .collect();
     (format!("{head}{}", kept.concat()), removed)
+}
+
+/// Lines Whisper writes on silence, hum and noise because its training data held them as
+/// subtitles. Compared after `normalise`. A line that contains one of these is never speech
+/// in a meeting. Multilingual on purpose: the Russian "to be continued" came from a quiet
+/// microphone in an English meeting (26 Nov 2026).
+const SILENCE_PHRASES: &[&str] = &[
+    "thanks for watching", "thank you for watching", "thanks for listening", "thank you for listening",
+    "please subscribe", "like and subscribe", "don t forget to subscribe", "subscribe to my channel",
+    "see you in the next video", "amara org",
+    "продолжение следует", "спасибо за просмотр", "подписывайтесь на канал", "субтитры сделал", "субтитры создавал",
+    "редактор субтитров",
+    "untertitel der amara org", "untertitel im auftrag des zdf", "vielen dank fürs zuschauen",
+    "sous titres", "sous titrage", "merci d avoir regardé", "merci d avoir regarde",
+    "subtítulos realizados por la comunidad", "subtitulos realizados por la comunidad", "gracias por ver el video", "suscríbete", "suscribete",
+    "legendas pela comunidade", "obrigado por assistir",
+    "sottotitoli creati dalla comunità", "sottotitoli creati dalla comunita", "grazie per la visione",
+    "ondertitels ingediend door de amara", "bedankt voor het kijken",
+    "ご視聴ありがとうございました", "チャンネル登録", "字幕由", "请不要忘记订阅", "谢谢观看", "感谢观看", "謝謝觀看", "시청해 주셔서 감사합니다",
+    "اشتركوا في القناة", "ترجمة نانسي قنقر",
+];
+
+/// Short lines that Whisper also writes on silence but that a person can say. They go only
+/// when nothing else real is in the transcript.
+const WEAK_PHRASES: &[&str] = &[
+    "thank you", "thanks", "thank you very much", "thank you so much", "bye", "bye bye", "goodbye", "you", "okay", "ok",
+    "yeah", "yes", "no", "so", "hmm", "mm", "uh", "um", "oh", "music", "applause", "спасибо", "музыка",
+];
+
+/// Core tags a call line's text with its capture source, `[SYSTEM] text`. That tag is real
+/// (a call's remote side), so a line is judged by what follows it.
+fn strip_source_tag(text: &str) -> &str {
+    let text = text.trim();
+    ["[MICROPHONE]", "[SYSTEM]"].iter().find_map(|tag| text.strip_prefix(tag)).unwrap_or(text).trim()
+}
+
+fn normalise(s: &str) -> String {
+    s.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `[BLANK_AUDIO]`, `(music)`, `♪`: markers and no words.
+fn is_marker_only(text: &str) -> bool {
+    let mut rest = text.trim();
+    while let Some(first) = rest.chars().next() {
+        let close = match first {
+            '[' => ']',
+            '(' => ')',
+            '♪' | '♫' | '*' | '.' | '…' => {
+                rest = rest[first.len_utf8()..].trim_start();
+                continue;
+            }
+            _ => return false,
+        };
+        match rest.find(close) {
+            Some(i) => rest = rest[i + 1..].trim_start(),
+            None => return false,
+        }
+    }
+    true
+}
+
+fn is_silence_phrase(text: &str) -> bool {
+    let n = normalise(text);
+    !n.is_empty() && SILENCE_PHRASES.iter().any(|p| n.contains(&normalise(p)))
+}
+
+fn is_weak_phrase(text: &str) -> bool {
+    WEAK_PHRASES.contains(&normalise(text).as_str())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Script {
+    Latin,
+    Cyrillic,
+    Greek,
+    Hebrew,
+    Arabic,
+    Thai,
+    Hangul,
+    Cjk,
+    Indic,
+}
+
+fn script_of(c: char) -> Option<Script> {
+    if !c.is_alphabetic() {
+        return None;
+    }
+    Some(match c as u32 {
+        0..=0x024F | 0x1E00..=0x1EFF => Script::Latin,
+        0x0370..=0x03FF => Script::Greek,
+        0x0400..=0x052F => Script::Cyrillic,
+        0x0590..=0x05FF => Script::Hebrew,
+        0x0600..=0x06FF => Script::Arabic,
+        // Devanagari, Bengali, Gurmukhi, Gujarati, Odia, Tamil, Telugu, Kannada, Malayalam.
+        0x0900..=0x0D7F => Script::Indic,
+        0x0E00..=0x0E7F => Script::Thai,
+        0x1100..=0x11FF | 0xAC00..=0xD7AF => Script::Hangul,
+        0x3040..=0x30FF | 0x4E00..=0x9FFF => Script::Cjk,
+        _ => return None,
+    })
+}
+
+fn script_letters(text: &str) -> HashMap<Script, usize> {
+    let mut counts = HashMap::new();
+    for script in text.chars().filter_map(script_of) {
+        *counts.entry(script).or_default() += 1;
+    }
+    counts
+}
+
+/// The script that holds at least 60% of a text's letters.
+fn line_script(text: &str) -> Option<Script> {
+    let counts = script_letters(text);
+    let total: usize = counts.values().sum();
+    let (script, n) = counts.into_iter().max_by_key(|&(_, n)| n)?;
+    (n * 10 >= total * 6).then_some(script)
+}
+
+/// Indexes of lines in a script that the rest of the transcript does not use. A hallucination
+/// is one stray line (a lone Cyrillic or Chinese line in an English meeting). People do mix
+/// Indic scripts (Devanagari, Kannada, Tamil, Telugu, ...) into English speech, so a line in
+/// one goes only when it is the single stray line of a transcript of 20 lines or more. A
+/// script that more than a tenth of the lines use is a real share and stays. Latin is never
+/// foreign: English words are everywhere in speech in other languages.
+fn foreign_script_lines(texts: &[(usize, String)]) -> Vec<usize> {
+    let mut letters: HashMap<Script, usize> = HashMap::new();
+    for (_, text) in texts {
+        for (script, n) in script_letters(text) {
+            *letters.entry(script).or_default() += n;
+        }
+    }
+    let Some((&dominant, _)) = letters.iter().max_by_key(|&(script, n)| (*n, *script == Script::Latin)) else { return vec![] };
+    let mut by_script: HashMap<Script, Vec<usize>> = HashMap::new();
+    for (i, text) in texts {
+        if let Some(script) = line_script(text).filter(|s| *s != dominant && *s != Script::Latin) {
+            by_script.entry(script).or_default().push(*i);
+        }
+    }
+    let n = texts.len();
+    by_script
+        .into_iter()
+        .filter(|(script, lines)| {
+            let allowed = match (*script == Script::Indic, n) {
+                (true, n) => usize::from(n >= 20),
+                (false, n) if n >= 3 => n.div_ceil(10),
+                _ => 0,
+            };
+            lines.len() <= allowed
+        })
+        .flat_map(|(_, lines)| lines)
+        .collect()
+}
+
+fn word_count(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
+/// Whisper writes lines nobody said when the microphone hears silence or noise. This removes
+/// them from `## Transcript` (D90). A transcript line goes when:
+/// - it is only markers (`[BLANK_AUDIO]`, `(music)`, a bare `[SYSTEM]`);
+/// - it holds a known silence phrase ("Thanks for watching", "Продолжение следует", the
+///   Amara subtitle credit, in many languages);
+/// - it is a stray line in a script the rest of the transcript does not use;
+/// - it is a dangling fragment that starts with "..." in a transcript of at most 12 words
+///   in which something else was just removed (a silent recording yields a subtitle credit
+///   and a half sentence together);
+/// - it is a "thank you" or one-word line, and nothing real is left (silence often becomes
+///   a lone "Thank you").
+/// Every other byte stays. Returns the cleaned content and the number of lines removed.
+fn drop_silence_hallucinations(content: &str) -> (String, usize) {
+    let Some(start) = content.find("\n## Transcript") else { return (content.to_string(), 0) };
+    let (head, tail) = content.split_at(start);
+    let lines: Vec<&str> = tail.split_inclusive('\n').collect();
+    let spoken: Vec<Option<String>> = lines
+        .iter()
+        .map(|l| turn_re().captures(l.trim()).map(|c| strip_source_tag(&c[3]).to_string()))
+        .collect();
+    let mut dropped: Vec<bool> = spoken.iter().map(|t| t.as_deref().is_some_and(|t| is_marker_only(t) || is_silence_phrase(t))).collect();
+    let live = |dropped: &[bool]| -> Vec<(usize, String)> {
+        spoken.iter().enumerate().filter(|(i, _)| !dropped[*i]).filter_map(|(i, t)| t.clone().map(|t| (i, t))).collect()
+    };
+    for i in foreign_script_lines(&live(&dropped)) {
+        dropped[i] = true;
+    }
+    let remaining = live(&dropped);
+    if dropped.iter().any(|d| *d) && remaining.iter().map(|(_, t)| word_count(t)).sum::<usize>() <= 12 {
+        for (i, t) in &remaining {
+            if t.starts_with("...") || t.starts_with('…') {
+                dropped[*i] = true;
+            }
+        }
+    }
+    let remaining = live(&dropped);
+    if remaining.iter().all(|(_, t)| is_weak_phrase(t)) {
+        for (i, _) in &remaining {
+            dropped[*i] = true;
+        }
+    }
+    let mut removed = 0;
+    let mut last_dropped = false;
+    let kept: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| {
+            let marker = l.trim_start().starts_with("[...] [repeated audio removed");
+            let drop = if marker { last_dropped } else { dropped[*i] };
+            if marker || spoken[*i].is_some() {
+                last_dropped = drop;
+            }
+            removed += usize::from(drop);
+            !drop
+        })
+        .map(|(_, l)| *l)
+        .collect();
+    (format!("{head}{}", kept.concat()), removed)
+}
+
+/// Words left in `## Transcript`, not counting source tags.
+fn transcript_words(content: &str) -> usize {
+    let (_, body) = split_frontmatter(content);
+    let Some(at) = body.find("## Transcript") else { return 0 };
+    parse_transcript(&body[at..]).iter().map(|t| word_count(&t.text)).sum()
+}
+
+const NO_SPEECH_TITLE: &str = "No speech recorded";
+
+/// After the scrub (D91): when the transcript has no words left, say so in the file. The
+/// status becomes `no-speech` (the library already shows that), a `processing_warnings`
+/// entry says why, and an untitled meeting gets a plain title and loses the entities that
+/// were guessed from invented words. `removed` is how many lines the scrub took out: with
+/// none, an empty transcript is not this function's to judge. Returns true when the meeting
+/// has no speech, whether core already knew or this call found out. A title the user chose
+/// stays.
+pub fn mark_no_speech(path: &Path, untitled: bool, removed: usize) -> Result<bool, String> {
+    let marked = crate::fsutil::with_file_lock(path, || write_no_speech(path, untitled, removed))?;
+    if marked {
+        let _ = minutes_core::derived::refresh_derived_views(path, &corecfg::load(), &Default::default());
+    }
+    Ok(marked)
+}
+
+fn write_no_speech(path: &Path, untitled: bool, removed: usize) -> Result<bool, String> {
+    use minutes_core::markdown::{Frontmatter, OutputStatus, ProcessingWarning};
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let (fm_text, _) = split_frontmatter(&content);
+    let fm: Frontmatter = serde_yaml::from_str(fm_text).map_err(|e| e.to_string())?;
+    if fm.status == Some(OutputStatus::NoSpeech) {
+        return Ok(true);
+    }
+    if removed == 0 || transcript_words(&content) > 0 {
+        return Ok(false);
+    }
+    minutes_core::markdown::update_frontmatter(path, |fm| {
+        fm.status = Some(OutputStatus::NoSpeech);
+        if untitled {
+            fm.title = NO_SPEECH_TITLE.to_string();
+            fm.entities = Default::default();
+        }
+        fm.processing_warnings.push(ProcessingWarning {
+            step: "transcribe".into(),
+            reason: "no_speech".into(),
+            timeout_secs: None,
+            message: Some("Only lines that Whisper makes up on silence were heard, so Margin removed them.".into()),
+        });
+    })
+    .map_err(|e| format!("Couldn't mark the meeting as having no speech: {e}"))?;
+    Ok(true)
+}
+
+/// Core cuts a title at 57 characters and adds "..." (60 in all), in the middle of a word.
+const CORE_CUT_TITLE_CHARS: usize = 60;
+
+const TITLE_TAIL_WORDS: &[&str] = &["a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "with", "i", "you", "is", "am", "but", "so"];
+
+pub fn is_core_cut_title(title: &str) -> bool {
+    title.chars().count() == CORE_CUT_TITLE_CHARS && title.ends_with("...")
+}
+
+/// A title never ends with "..." (D92). Core's own cut (exactly 60 characters ending in
+/// "...") leaves half a word, so that word goes, and then dangling "in", "a", "the", so
+/// "...Giving You a Split in Ca..." reads "...Giving You a Split". Any other ellipsis is
+/// only removed.
+pub fn tidy_title(title: &str) -> String {
+    let title = title.trim();
+    let Some(body) = title.strip_suffix("...").or_else(|| title.strip_suffix('…')) else { return title.to_string() };
+    if !is_core_cut_title(title) {
+        return body.trim().trim_end_matches([',', ';', ':', '-', '.']).to_string();
+    }
+    let mut words: Vec<&str> = body.split_whitespace().collect();
+    if !body.ends_with(char::is_whitespace) {
+        words.pop();
+    }
+    let dangling = |w: &&str| {
+        let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        bare.is_empty() || TITLE_TAIL_WORDS.contains(&bare.as_str())
+    };
+    while words.last().is_some_and(dangling) {
+        words.pop();
+    }
+    let tidy = words.join(" ");
+    match tidy.trim_end_matches([',', ';', ':', '-', ' ']) {
+        "" => body.trim().to_string(),
+        cut => cut.to_string(),
+    }
+}
+
+/// A title that core cut and ended with "..." is rewritten at a word boundary (D92).
+pub fn tidy_title_in_file(path: &Path) -> Result<bool, String> {
+    crate::fsutil::with_file_lock(path, || {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let (fm_text, _) = split_frontmatter(&content);
+        let fm: minutes_core::markdown::Frontmatter = serde_yaml::from_str(fm_text).map_err(|e| e.to_string())?;
+        let tidy = tidy_title(&fm.title);
+        if tidy == fm.title || tidy.is_empty() {
+            return Ok(false);
+        }
+        minutes_core::markdown::update_frontmatter(path, |fm| fm.title = tidy).map_err(|e| e.to_string())?;
+        Ok(true)
+    })
 }
 
 /// `scrub_prompt_echo_text` on a meeting file, under its lock. Writes only when a line goes.
@@ -912,5 +1342,185 @@ mod tests {
         assert_eq!(turns[1].ts, "100:00");
         assert_eq!(turns[1].text, "two");
         assert_eq!(turns[2].ts, "1000:05");
+    }
+
+    const HALLUCINATION_MEETING: &str = "---\ntitle: Royal Descents Global Zoos Update\ntype: meeting\ndate: 2026-11-26T20:57:34+05:30\nduration: 3s\nstatus: complete\nentities:\n  projects:\n  - slug: royal-descent-zoos-across\n    label: Royal Descent Zoos Across\n    aliases:\n    - royal descent zoos across\n---\n\n## Notes\n\nmy note\n\n## Transcript\n\n[MICROPHONE 0:00] ...of royal descent in zoos across the world.\n[SPEAKER_1 0:00] [SYSTEM] Продолжение следует...\n";
+
+    fn spoken_lines(content: &str) -> Vec<String> {
+        let (_, body) = split_frontmatter(content);
+        parse_transcript(body).into_iter().map(|t| t.text).collect()
+    }
+
+    fn temp_meeting(name: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("margin-halluc-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("m.md");
+        std::fs::write(&file, content).unwrap();
+        file
+    }
+
+    #[test]
+    fn the_silence_hallucination_meeting_loses_both_lines() {
+        let (out, n) = scrub_prompt_echo_text(HALLUCINATION_MEETING, "Royal Descents Global Zoos Update");
+        assert_eq!(n, 2);
+        assert!(spoken_lines(&out).is_empty());
+        assert!(out.contains("## Notes\n\nmy note"));
+    }
+
+    #[test]
+    fn a_meeting_with_nothing_real_left_is_marked_no_speech_with_a_plain_title() {
+        let file = temp_meeting("mark", HALLUCINATION_MEETING);
+        let removed = scrub_prompt_echo(&file).unwrap();
+        assert_eq!(removed, 2);
+        assert!(write_no_speech(&file, true, removed).unwrap());
+        let content = std::fs::read_to_string(&file).unwrap();
+        let fm: minutes_core::markdown::Frontmatter = serde_yaml::from_str(split_frontmatter(&content).0).unwrap();
+        assert_eq!(fm.title, "No speech recorded");
+        assert_eq!(fm.status, Some(minutes_core::markdown::OutputStatus::NoSpeech));
+        assert_eq!(fm.processing_warnings.len(), 1);
+        assert_eq!(fm.processing_warnings[0].reason, "no_speech");
+        assert!(fm.entities.is_empty());
+        assert!(content.contains("## Notes\n\nmy note"));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_user_title_survives_the_no_speech_mark() {
+        let file = temp_meeting("kept", &HALLUCINATION_MEETING.replace("Royal Descents Global Zoos Update", "Standup"));
+        let removed = scrub_prompt_echo(&file).unwrap();
+        assert!(write_no_speech(&file, false, removed).unwrap());
+        let content = std::fs::read_to_string(&file).unwrap();
+        let fm: minutes_core::markdown::Frontmatter = serde_yaml::from_str(split_frontmatter(&content).0).unwrap();
+        assert_eq!(fm.title, "Standup");
+        assert_eq!(fm.status, Some(minutes_core::markdown::OutputStatus::NoSpeech));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_meeting_with_real_speech_is_not_marked() {
+        let md = "---\ntitle: Planning\ntype: meeting\ndate: 2026-11-26\nduration: 10m\n---\n\n## Transcript\n\n[SPEAKER_1 0:00] We ship on Friday.\n[SPEAKER_1 0:05] Продолжение следует...\n";
+        let file = temp_meeting("real", md);
+        let removed = scrub_prompt_echo(&file).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!write_no_speech(&file, true, removed).unwrap());
+        assert!(std::fs::read_to_string(&file).unwrap().contains("title: Planning"));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn an_empty_transcript_that_the_scrub_did_not_touch_is_left_alone() {
+        let md = "---\ntitle: Planning\ntype: meeting\ndate: 2026-11-26\nduration: 10m\n---\n\n## Transcript\n\n";
+        let file = temp_meeting("empty", md);
+        assert!(!write_no_speech(&file, true, 0).unwrap());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_lone_thank_you_is_silence_but_a_thank_you_in_a_real_meeting_stays() {
+        let silent = "---\ntitle: T\n---\n\n## Transcript\n\n[SPEAKER_1 0:00] Thank you.\n";
+        let (out, n) = scrub_prompt_echo_text(silent, "T");
+        assert_eq!((n, spoken_lines(&out).len()), (1, 0));
+        let real = "---\ntitle: T\n---\n\n## Transcript\n\n[SPEAKER_1 0:00] We are done with the budget.\n[SPEAKER_2 0:09] Thank you.\n";
+        let (out, n) = scrub_prompt_echo_text(real, "T");
+        assert_eq!((n, spoken_lines(&out).len()), (0, 2));
+    }
+
+    #[test]
+    fn known_phrases_and_markers_go_in_any_language() {
+        let md = "---\ntitle: T\n---\n\n## Transcript\n\n[A 0:00] Let us start with the roadmap.\n[A 0:10] Thanks for watching!\n[A 0:12] Субтитры сделал DimaTorzok\n[A 0:14] [BLANK_AUDIO]\n[A 0:16] (music)\n[A 0:18] 字幕由 Amara.org 社区提供\n[A 0:20] [SYSTEM] [BLANK_AUDIO]\n[A 0:22] Then we agree on Friday.\n";
+        let (out, n) = scrub_prompt_echo_text(md, "T");
+        assert_eq!(n, 6);
+        assert_eq!(spoken_lines(&out), ["Let us start with the roadmap.", "Then we agree on Friday."]);
+    }
+
+    #[test]
+    fn a_source_tag_is_not_a_hallucination() {
+        let md = "---\ntitle: T\n---\n\n## Transcript\n\n[SPEAKER_0 0:00] [MICROPHONE] Can you hear me?\n[SPEAKER_1 0:03] [SYSTEM] Yes, loud and clear.\n";
+        assert_eq!(scrub_prompt_echo_text(md, "T").1, 0);
+    }
+
+    #[test]
+    fn a_stray_line_in_a_foreign_script_goes_and_a_real_share_stays() {
+        let english: String = (0..9).map(|i| format!("[A 0:{i:02}] This is a sentence number {i} about the launch.\n")).collect();
+        let stray = format!("---\ntitle: T\n---\n\n## Transcript\n\n{english}[A 0:30] Это совсем другой язык.\n");
+        let (out, n) = scrub_prompt_echo_text(&stray, "T");
+        assert_eq!((n, spoken_lines(&out).len()), (1, 9));
+
+        let mixed = format!("---\ntitle: T\n---\n\n## Transcript\n\n{english}[A 0:30] यह पूरी बात ठीक है।\n[A 0:31] ಇದು ಸರಿಯಾಗಿದೆ.\n[A 0:32] இது சரி.\n");
+        assert_eq!(scrub_prompt_echo_text(&mixed, "T").1, 0);
+
+        let one_hindi_line = format!("---\ntitle: T\n---\n\n## Transcript\n\n{english}[A 0:30] धन्यवाद सब लोग।\n");
+        assert_eq!(scrub_prompt_echo_text(&one_hindi_line, "T").1, 0, "ten lines is too few to call one Devanagari line stray");
+
+        let mostly_telugu: String = (0..6).map(|i| format!("[A 1:{i:02}] ఇది సమావేశం భాగం {i}.\n")).collect();
+        let md = format!("---\ntitle: T\n---\n\n## Transcript\n\n{mostly_telugu}[A 2:00] Okay.\n");
+        assert_eq!(scrub_prompt_echo_text(&md, "T").1, 0);
+    }
+
+    #[test]
+    fn titles_never_end_with_dots() {
+        let cut = "I Have Kept People in Love, I Am Giving You a Split in Ca...";
+        assert!(is_core_cut_title(cut));
+        assert_eq!(tidy_title(cut), "I Have Kept People in Love, I Am Giving You a Split");
+        assert_eq!(tidy_title("Wait for it..."), "Wait for it");
+        assert_eq!(tidy_title("Warranty flow…"), "Warranty flow");
+        assert_eq!(tidy_title("Q3 Pricing Review"), "Q3 Pricing Review");
+        assert_eq!(tidy_title("..."), "");
+        assert!(!tidy_title(cut).ends_with('.'));
+    }
+
+    #[test]
+    fn a_core_cut_title_reads_whole_in_the_library_and_in_the_file() {
+        let cut = "I Have Kept People in Love, I Am Giving You a Split in Ca...";
+        let md = format!("---\ntitle: {cut}\ntype: meeting\ndate: 2026-11-26\nduration: 1m\n---\n\n## Transcript\n\n[A 0:00] hello there\n");
+        let file = temp_meeting("cut", &md);
+        assert_eq!(summarize_file(&file).unwrap().title, "I Have Kept People in Love, I Am Giving You a Split");
+        assert!(tidy_title_in_file(&file).unwrap());
+        assert!(std::fs::read_to_string(&file).unwrap().contains("Giving You a Split\n"));
+        assert!(!tidy_title_in_file(&file).unwrap());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    fn corpus(words: &[(&str, usize)]) -> HashMap<String, usize> {
+        words.iter().map(|(w, n)| (w.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn a_misspelled_word_finds_the_closest_library_word() {
+        let c = corpus(&[("warranty", 5), ("warrant", 1), ("pricing", 3), ("launch", 2), ("wiring", 1)]);
+        assert_eq!(corrected_query_in("warrnty", &c).as_deref(), Some("warranty"));
+        assert_eq!(corrected_query_in("waranty flow", &c).as_deref(), Some("warranty flow"));
+        assert_eq!(corrected_query_in("prcing", &c).as_deref(), Some("pricing"));
+        assert_eq!(corrected_query_in("WARRNTY", &c).as_deref(), Some("warranty"));
+    }
+
+    #[test]
+    fn a_word_too_far_off_or_too_short_or_known_is_not_corrected() {
+        let c = corpus(&[("warranty", 5), ("pricing", 3), ("the", 9)]);
+        assert_eq!(corrected_query_in("zebra", &c), None);
+        assert_eq!(corrected_query_in("warrxxxy", &c), None);
+        assert_eq!(corrected_query_in("pricing", &c), None);
+        assert_eq!(corrected_query_in("tha", &c).as_deref(), Some("the"));
+        assert_eq!(corrected_query_in("th", &c), None);
+        assert_eq!(corrected_query_in("q3", &c), None);
+    }
+
+    #[test]
+    fn edit_distance_counts_swaps_once_and_stops_at_the_limit() {
+        let d = |a: &str, b: &str, l| edit_distance(&a.chars().collect::<Vec<_>>(), &b.chars().collect::<Vec<_>>(), l);
+        assert_eq!(d("warranty", "warranty", 2), Some(0));
+        assert_eq!(d("warrnty", "warranty", 2), Some(1));
+        assert_eq!(d("wrarnty", "warranty", 2), Some(2));
+        assert_eq!(d("abcdef", "uvwxyz", 2), None);
+        assert_eq!(d("pricnig", "pricing", 1), Some(1));
+    }
+
+    #[test]
+    fn search_results_serialize_with_a_corrected_field() {
+        let none = serde_json::to_value(SearchResults { hits: vec![], corrected: None }).unwrap();
+        assert_eq!(none, serde_json::json!({ "hits": [], "corrected": null }));
+        let some = serde_json::to_value(SearchResults { hits: vec![SearchHit { path: "/a.md".into(), excerpt: "x".into() }], corrected: Some("warranty".into()) }).unwrap();
+        assert_eq!(some["corrected"], "warranty");
+        assert_eq!(some["hits"][0]["path"], "/a.md");
     }
 }
