@@ -247,6 +247,7 @@ fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
         Vec::new()
     };
     cfg.diarization.model_path = paths::diarization_models_dir();
+    pin_measured_transcription_defaults(&mut cfg.transcription);
     cfg.vault.enabled = false;
     cfg.live_transcript.recording_sidecar = true;
     cfg.live_transcript.model = live_model(&cfg.transcription.model);
@@ -258,6 +259,26 @@ fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
     cfg.summarization.no_lead_in = true;
     if cfg.summarization.engine.trim().is_empty() {
         cfg.summarization.engine = "none".into();
+    }
+}
+
+// Measured on AMI ES2004a and TS3003a (D82): core's meeting chunker dropped 6–16% of the
+// reference speech before Whisper, and conditioning on earlier text added errors. Together
+// these settings cut WER from 26.6/26.2% to 21.8/20.5%, with diarization unchanged. Only
+// core's own defaults are replaced, so a value someone set in config.toml stays.
+const MEETING_CHUNK_NOISE_MULTIPLIER: f32 = 2.5;
+const MEETING_CHUNK_PAD_MS: u32 = 300;
+
+fn pin_measured_transcription_defaults(t: &mut minutes_core::config::TranscriptionConfig) {
+    let core = minutes_core::config::TranscriptionConfig::default();
+    if t.meeting_chunk_noise_multiplier == core.meeting_chunk_noise_multiplier {
+        t.meeting_chunk_noise_multiplier = MEETING_CHUNK_NOISE_MULTIPLIER;
+    }
+    if t.meeting_chunk_pad_ms == core.meeting_chunk_pad_ms {
+        t.meeting_chunk_pad_ms = MEETING_CHUNK_PAD_MS;
+    }
+    if t.n_max_text_ctx.is_none() {
+        t.n_max_text_ctx = Some(0);
     }
 }
 
@@ -767,5 +788,21 @@ mod tests {
         s.transcription_language = None;
         s.silence_stop_minutes = Some(7);
         assert!(apply(&mut cfg, &s).is_err());
+    }
+
+    #[test]
+    fn measured_transcription_defaults_replace_only_cores_defaults() {
+        let mut t = minutes_core::config::TranscriptionConfig::default();
+        pin_measured_transcription_defaults(&mut t);
+        assert_eq!(t.meeting_chunk_noise_multiplier, MEETING_CHUNK_NOISE_MULTIPLIER);
+        assert_eq!(t.meeting_chunk_pad_ms, MEETING_CHUNK_PAD_MS);
+        assert_eq!(t.n_max_text_ctx, Some(0));
+
+        let mut chosen = minutes_core::config::TranscriptionConfig::default();
+        chosen.meeting_chunk_noise_multiplier = 3.0;
+        chosen.meeting_chunk_pad_ms = 150;
+        chosen.n_max_text_ctx = Some(64);
+        pin_measured_transcription_defaults(&mut chosen);
+        assert_eq!((chosen.meeting_chunk_noise_multiplier, chosen.meeting_chunk_pad_ms, chosen.n_max_text_ctx), (3.0, 150, Some(64)));
     }
 }

@@ -228,7 +228,7 @@ impl Worker {
                 .sources
                 .iter()
                 .enumerate()
-                .filter_map(|(i, t)| Some((t.next_start, i, piece_cut::cut(&t.pending, self.piece)?)))
+                .filter_map(|(i, t)| Some((t.next_start, i, piece_cut::cut(&t.pending, self.piece, piece_cut::Rules::of(&self.cfg.transcription))?)))
                 .min();
             let outcome = match ready {
                 Some((_, i, cut)) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.transcribe_next(i, cut))),
@@ -513,7 +513,7 @@ pub fn bench(cfg: &Config, args: &[String]) -> Result<(), String> {
     let mut segments = Vec::new();
     for (stem, path) in [("MICROPHONE", &stems.voice), ("SYSTEM", &stems.system)] {
         let samples = read_i16(path)?;
-        for (start, end) in cut_points(&samples, (segment_secs * SR as f64) as usize) {
+        for (start, end) in cut_points(&samples, (segment_secs * SR as f64) as usize, piece_cut::Rules::of(&cfg.transcription)) {
             let piece = tmp.join(format!("{}-{start}.wav", stem.to_lowercase()));
             write_i16(&piece, &samples[start..end])?;
             let t = Instant::now();
@@ -569,9 +569,9 @@ pub fn bench(cfg: &Config, args: &[String]) -> Result<(), String> {
 }
 
 /// Segment boundaries, as the rolling thread cuts them (piece_cut.rs).
-fn cut_points(samples: &[i16], target: usize) -> Vec<(usize, usize)> {
+fn cut_points(samples: &[i16], target: usize, rules: piece_cut::Rules) -> Vec<(usize, usize)> {
     let samples: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
-    piece_cut::pieces(&samples, target, READ_EVERY.as_secs() as usize * SR)
+    piece_cut::pieces(&samples, target, READ_EVERY.as_secs() as usize * SR, rules)
 }
 
 /// `[m:ss] text` → (seconds + offset, text).

@@ -1443,6 +1443,44 @@ The full comparison is in `docs/parity/app.md`.
 - Core needs no patch: it loads `models_dir/ggml-<model>.bin` for any name
   (UPSTREAM-PATCHES #32 asks for a model file path and download spec).
 
+### D82. Meeting chunks: speech threshold 2.5, 300 ms padding, no text conditioning
+- New fact (AMI ES2004a and TS3003a, 27 Nov 2026): core's meeting chunker, which decides
+  which audio Whisper sees, dropped 5.9% / 15.8% of the reference speech. Quiet speech
+  stayed under 4 × the noise floor, and word onsets fell outside the chunks. With 2.5 and
+  300 ms of padding it drops 0.2% / 4.3% (a Node port of the chunker, scratchpad
+  chunkprobe). Core got both as settings, defaulting to upstream (UPSTREAM-PATCHES #34).
+- Measured, ES2004a / TS3003a:
+
+  | variant | ES2004a WER | TS3003a WER | line DER strict ES/TS | RTTM strict ES/TS |
+  |---|---|---|---|---|
+  | core defaults | 26.6% | 26.2% | 61.4/60.5 | 32.2/33.3 |
+  | chunk 2.5/300 | 25.1% | 21.8% | 64.3/52.6 | same |
+  | chunk 3/300 | 25.6% | 22.6% | 65.2/56.6 | same |
+  | ctx0 | 23.4% | 25.5% | 52.7/53.7 | same |
+  | chunk 2.5/300 + ctx0 | 21.8% | 20.5% | 52.6/52.7 | same |
+
+  "chunk m/p" is `meeting_chunk_noise_multiplier` m and `meeting_chunk_pad_ms` p; "ctx0"
+  is `n_max_text_ctx = 0`. The ctx0 rows ran on the build before the round-4 fixes, the
+  chunk rows on 1e32585. RTTM DER comes from diarization alone, which these settings
+  don't touch.
+- Pick: **2.5 / 300 ms and `n_max_text_ctx = 0`**, the best row on both meetings. 3/300
+  keeps less quiet speech for no gain. Conditioning off stops one bad window from
+  repeating into the next ones.
+  - `corecfg::pin_measured_transcription_defaults` replaces only core's own defaults, so
+    a value set in config.toml stays.
+- Rolling pieces (D49) must keep the whole-file chunks. Core pads each piece's chunks
+  inside the piece, so padding never pulls audio from the next piece, and at Stop core
+  reuses a piece whose audio digest and settings match, without comparing chunks. A cut
+  that a padded chunk would cross in the whole file therefore gives a transcript that
+  differs from the non-rolling one near the cut: the text fits the piece's audio, but up
+  to 300 ms of a word onset is missing. So `piece_cut` reads the multiplier and padding
+  from the effective config, and cuts only at a reset point that padding reaches from
+  neither side: at least 1.1 s from one chunk's voiced end to the next chunk, against
+  800 ms before. A 45 s split is never a cut with padding. Where there is no such point,
+  the existing quietest-window fallback applies, which was never exact. The parity tests
+  compile core's chunker and padding from the vendored source and check both 4.0/0 and
+  2.5/300.
+
 ### D83. Hinglish: which language each model runs with, and what the notices say
 - New fact (review of D81, 27 Nov 2026): core read `transcription.language` (`hi`) where
   the Hinglish model never runs: the live transcript, which uses `small`, and the process
