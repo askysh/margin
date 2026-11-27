@@ -291,6 +291,9 @@ fn title_from_summary(path: &std::path::Path, fallback: Option<&str>) {
         };
         let mut cfg = crate::corecfg::load();
         let _forwarder = crate::ollama_proxy::fast_ollama(&mut cfg);
+        // The title is in the language the transcript was written in (D83).
+        let fallback = minutes_core::transcribe::ModelFallback::recorded_in(&fm.processing_warnings);
+        let cfg = minutes_core::summarize::config_for_transcript(&cfg, fallback.as_ref());
         let answer = minutes_core::summarize::refine_title(&text, &summary, &fm.entities, &cfg).map_err(|e| e.to_string())?;
         Ok(clean_title(&answer.title).map(|title| (fm.title, title)))
     })();

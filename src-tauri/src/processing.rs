@@ -354,10 +354,11 @@ pub fn spawn_watcher() {
                     let views = job_views();
                     let mut changed = false;
                     for view in &views {
-                        if last.get(&view.id) != Some(view) {
+                        let previous = last.get(&view.id);
+                        if previous != Some(view) {
                             changed = true;
                             if view.state.is_terminal() {
-                                finish(view, !first);
+                                finish(view, !first && newly_finished(previous.map(|p| p.state), view.state));
                             }
                         }
                     }
@@ -393,8 +394,16 @@ fn change_key(active: &[jobs::ProcessingJob]) -> String {
     )
 }
 
+/// A finished job's view can change again (its title, say), and each change calls
+/// `finish`. Only the change into a terminal state announces, so "Meeting ready" and its
+/// notices come once per run; a retry passes through the active states and announces again.
+fn newly_finished(previous: Option<JobState>, now: JobState) -> bool {
+    now.is_terminal() && !previous.is_some_and(JobState::is_terminal)
+}
+
 /// `announce` is false on the first poll, so old jobs from the archive don't each fire
-/// "meeting-ready". Their leftover drafts are still restored.
+/// "meeting-ready", and false for a job that had already finished (`newly_finished`).
+/// Leftover drafts are still restored.
 fn finish(job: &JobView, announce: bool) {
     if announce && job.state == JobState::Failed {
         events::notify(events::Notice {
@@ -422,6 +431,8 @@ fn finish(job: &JobView, announce: bool) {
     let untitled = std::fs::remove_file(untitled_marker(&job.id)).is_ok();
     let no_speech = clean_transcript(Path::new(output), untitled);
     if announce {
+        // Before the summary rewrites the file.
+        let fallback_notice = std::fs::read_to_string(output).ok().and_then(|content| model_fallback_notice(output, &content));
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
         if no_speech {
             tracing::info!("no speech in the meeting; no summary or title is made from nothing");
@@ -437,6 +448,9 @@ fn finish(job: &JobView, announce: bool) {
             call_app: None,
             calendar: None,
         });
+        if let Some(notice) = fallback_notice {
+            events::notify(notice);
+        }
         // A new meeting for the menu bar's recent list.
         events::refresh_tray();
     }
@@ -461,6 +475,29 @@ fn clean_transcript(path: &Path, untitled: bool) -> bool {
         tracing::warn!(%error, "could not cut the title at a word");
     }
     no_speech
+}
+
+/// Core transcribed the meeting with a fallback model (its `model_fallback` processing
+/// warning). Margin's size check passes a large file that then fails to load, so only
+/// the meeting file can say which model ran.
+fn model_fallback_notice(output: &str, content: &str) -> Option<events::Notice> {
+    use minutes_core::transcribe::{ModelFallback, ModelUnavailable};
+    let (frontmatter, _) = minutes_core::markdown::split_frontmatter(content);
+    let frontmatter: minutes_core::markdown::Frontmatter = serde_yaml::from_str(frontmatter).ok()?;
+    let fallback = ModelFallback::recorded_in(&frontmatter.processing_warnings)?;
+    let model = if fallback.requested == "hinglish" { "Hindi + English model".to_string() } else { format!("The {} model", fallback.requested) };
+    let what = match fallback.cause {
+        ModelUnavailable::FailedToLoad => "failed to load",
+        ModelUnavailable::Missing => "file was missing",
+        ModelUnavailable::Empty => "file was empty",
+    };
+    Some(events::Notice {
+        title: format!("{model} {what}"),
+        body: format!("This meeting used {}.", fallback.used),
+        meeting: Some(output.to_string()),
+        call_app: None,
+        calendar: None,
+    })
 }
 
 /// Put the notes draft (the exact notes, with edits made during processing) into the
@@ -514,6 +551,29 @@ fn core_wrote_these_notes(written: &str, queued: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_finished_job_is_announced_once_per_run() {
+        use minutes_core::jobs::JobState::{Complete, Failed, NeedsReview, Queued, Transcribing};
+        assert!(super::newly_finished(Some(Transcribing), Complete));
+        assert!(super::newly_finished(None, Complete), "finished between two polls");
+        assert!(!super::newly_finished(Some(Complete), Complete), "a retitle is not a new meeting");
+        assert!(!super::newly_finished(Some(Complete), NeedsReview));
+        assert!(!super::newly_finished(Some(Failed), Failed));
+        assert!(super::newly_finished(Some(Queued), Complete), "a retry announces again");
+        assert!(!super::newly_finished(Some(Complete), Queued));
+    }
+
+    #[test]
+    fn a_fallback_model_is_announced_from_the_meeting_file() {
+        let file = "---\ntitle: Standup\ntype: meeting\ndate: 2026-11-27T10:00:00+05:30\nduration: 5m\nstatus: degraded\nprocessing_warnings:\n  - step: transcribe\n    reason: model_fallback\n    message: used large-v3-turbo because hinglish failed to load\n---\n\n## Transcript\n\nHello.\n";
+        let notice = super::model_fallback_notice("/m/standup.md", file).expect("a notice");
+        assert_eq!(notice.title, "Hindi + English model failed to load");
+        assert_eq!(notice.body, "This meeting used large-v3-turbo.");
+        assert_eq!(notice.meeting.as_deref(), Some("/m/standup.md"));
+        let plain = file.replace("reason: model_fallback", "reason: summarize_failed");
+        assert!(super::model_fallback_notice("/m/standup.md", &plain).is_none());
+    }
+
     #[test]
     fn quit_message_names_the_meeting() {
         let one = super::quit_message(&[Some("Weekly".into())]);

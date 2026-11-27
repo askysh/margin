@@ -1,0 +1,6551 @@
+use crate::config::Config;
+use crate::error::TranscribeError;
+#[cfg(test)]
+use crate::transcription_coordinator::{
+    collapse_noise_markers, dedup_interleaved, dedup_segments, strip_foreign_script,
+    trim_trailing_noise,
+};
+use crate::transcription_coordinator::{run_transcript_cleanup_pipeline, TranscriptCleanupStage};
+#[cfg(feature = "parakeet")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "parakeet")]
+use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::path::Path;
+#[cfg(any(feature = "parakeet", feature = "whisper"))]
+use std::path::PathBuf;
+#[cfg(feature = "parakeet")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "parakeet")]
+use std::sync::{Mutex, OnceLock};
+#[cfg(feature = "parakeet")]
+use std::time::Instant;
+use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(all(feature = "parakeet", not(feature = "whisper")))]
+compile_error!("the parakeet feature requires whisper because Whisper is its runtime fallback");
+
+// Re-export from whisper-guard for public API compatibility
+pub use whisper_guard::audio::{normalize_audio, resample, strip_silence};
+#[cfg(feature = "whisper")]
+pub use whisper_guard::params::{
+    default_whisper_params, set_abort_callback, streaming_whisper_params,
+};
+pub use whisper_guard::segments::{clean_transcript, CleanStats};
+
+/// Diagnostics from the transcription filtering pipeline.
+/// Tracks how many segments survived each anti-hallucination layer,
+/// so blank transcripts can be diagnosed.
+#[derive(Debug, Clone, Default)]
+pub struct FilterStats {
+    /// Total audio duration in seconds (after loading)
+    pub audio_duration_secs: f64,
+    /// Samples after silence stripping (0 = all silence)
+    pub samples_after_silence_strip: usize,
+    /// Raw segments from whisper/parakeet before any filtering
+    pub raw_segments: usize,
+    /// Segments skipped by whisper's no_speech_prob > 0.8
+    pub skipped_no_speech: usize,
+    /// Segments with non-empty text after no_speech filter
+    pub after_no_speech_filter: usize,
+    /// After consecutive dedup
+    pub after_dedup: usize,
+    /// After interleaved dedup
+    pub after_interleaved: usize,
+    /// After foreign-script filter
+    pub after_script_filter: usize,
+    /// After noise marker collapse
+    pub after_noise_markers: usize,
+    /// After trailing noise trim
+    pub after_trailing_trim: usize,
+    /// Segments rescued from the no_speech filter (would have been blank otherwise)
+    pub rescued_no_speech: usize,
+    /// Final word count
+    pub final_words: usize,
+    /// Set when a `missing_model_fallbacks` entry transcribed instead of
+    /// `transcription.model`.
+    pub model_fallback: Option<ModelFallback>,
+}
+
+/// Why `transcription.model` did not transcribe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelUnavailable {
+    Missing,
+    Empty,
+    FailedToLoad,
+}
+
+impl ModelUnavailable {
+    const ALL: [Self; 3] = [Self::Missing, Self::Empty, Self::FailedToLoad];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Empty => "empty",
+            Self::FailedToLoad => "failed to load",
+        }
+    }
+}
+
+/// A `missing_model_fallbacks` entry (`used`) transcribed instead of
+/// `transcription.model` (`requested`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFallback {
+    pub requested: String,
+    pub used: String,
+    pub cause: ModelUnavailable,
+}
+
+impl ModelFallback {
+    pub const WARNING_REASON: &'static str = "model_fallback";
+
+    /// The meeting file's record: `{step: transcribe, reason: model_fallback,
+    /// message: "used <used> because <requested> <missing|empty|failed to load>"}`.
+    pub fn warning(&self) -> crate::markdown::ProcessingWarning {
+        crate::markdown::ProcessingWarning {
+            step: "transcribe".into(),
+            reason: Self::WARNING_REASON.into(),
+            timeout_secs: None,
+            message: Some(format!(
+                "used {} because {} {}",
+                self.used,
+                self.requested,
+                self.cause.as_str()
+            )),
+        }
+    }
+
+    /// The fallback recorded among a meeting's processing warnings, if any.
+    pub fn recorded_in(warnings: &[crate::markdown::ProcessingWarning]) -> Option<Self> {
+        warnings.iter().find_map(Self::from_warning)
+    }
+
+    /// The fallback that [`Self::warning`] recorded, so hosts read it back
+    /// without knowing the message format. `None` for any other warning.
+    pub fn from_warning(warning: &crate::markdown::ProcessingWarning) -> Option<Self> {
+        if warning.step != "transcribe" || warning.reason != Self::WARNING_REASON {
+            return None;
+        }
+        let (used, rest) = warning
+            .message
+            .as_deref()?
+            .strip_prefix("used ")?
+            .split_once(" because ")?;
+        ModelUnavailable::ALL.into_iter().find_map(|cause| {
+            let requested = rest.strip_suffix(cause.as_str())?.strip_suffix(' ')?;
+            Some(Self {
+                requested: requested.into(),
+                used: used.into(),
+                cause,
+            })
+        })
+    }
+}
+
+impl FilterStats {
+    /// Human-readable summary of what each layer removed.
+    pub fn diagnosis(&self) -> String {
+        let mut parts = Vec::new();
+        parts.push(format!("audio: {:.1}s", self.audio_duration_secs));
+        if self.samples_after_silence_strip == 0 {
+            parts.push("silence strip removed ALL audio".into());
+            return parts.join(", ");
+        }
+        parts.push(format!("whisper produced {} segments", self.raw_segments));
+        if self.raw_segments == 0 {
+            return parts.join(", ");
+        }
+        if self.rescued_no_speech > 0 {
+            parts.push(format!(
+                "no_speech rescue: {} segments saved (would have been blank)",
+                self.rescued_no_speech
+            ));
+        } else if self.skipped_no_speech > 0 {
+            parts.push(format!(
+                "no_speech filter: -{} → {}",
+                self.skipped_no_speech, self.after_no_speech_filter
+            ));
+        }
+        if self.after_dedup < self.after_no_speech_filter {
+            parts.push(format!(
+                "dedup: -{} → {}",
+                self.after_no_speech_filter - self.after_dedup,
+                self.after_dedup
+            ));
+        }
+        if self.after_interleaved < self.after_dedup {
+            parts.push(format!(
+                "interleaved: -{} → {}",
+                self.after_dedup - self.after_interleaved,
+                self.after_interleaved
+            ));
+        }
+        if self.after_script_filter < self.after_interleaved {
+            parts.push(format!(
+                "script filter: -{} → {}",
+                self.after_interleaved - self.after_script_filter,
+                self.after_script_filter
+            ));
+        }
+        if self.after_noise_markers < self.after_script_filter {
+            parts.push(format!(
+                "noise markers: -{} → {}",
+                self.after_script_filter - self.after_noise_markers,
+                self.after_noise_markers
+            ));
+        }
+        if self.after_trailing_trim < self.after_noise_markers {
+            parts.push(format!(
+                "trailing trim: -{} → {}",
+                self.after_noise_markers - self.after_trailing_trim,
+                self.after_trailing_trim
+            ));
+        }
+        parts.push(format!("final: {} words", self.final_words));
+        parts.join(", ")
+    }
+}
+
+/// A single timestamped segment from the transcription pipeline.
+///
+/// `start` and `end` are in seconds with sub-second (centisecond) precision
+/// for the whisper engine. The sherpa engine provides start only; end is
+/// inferred from the next segment's start (or total audio duration for the
+/// final segment).
+#[derive(Debug, Clone)]
+pub struct TranscriptSegment {
+    /// Segment start time in seconds.
+    pub start: f64,
+    /// Segment end time in seconds.
+    pub end: f64,
+    /// Segment text, without any `[m:ss]` timestamp prefix.
+    pub text: String,
+}
+
+/// Result from the transcription pipeline, including filter diagnostics.
+#[derive(Debug, Clone)]
+pub struct TranscribeResult {
+    pub text: String,
+    pub stats: FilterStats,
+    /// Per-segment timing and clean text. Populated by the whisper and sherpa
+    /// engines; empty for parakeet (which uses a subprocess-based format) and
+    /// for chunked whisper paths (where segments are aggregated into lines).
+    pub segments: Vec<TranscriptSegment>,
+    /// Language code detected by the ASR engine (e.g. `"en"`, `"es"`).
+    /// `None` when the engine did not report a language or when the whisper
+    /// feature is disabled.
+    pub detected_language: Option<String>,
+}
+
+#[cfg(any(feature = "whisper", test))]
+fn prepare_whisper_samples(
+    samples: Vec<f32>,
+    integrated_vad: bool,
+    hints: &DecodeHints,
+) -> Vec<f32> {
+    if integrated_vad || hints.preserve_source_timeline {
+        samples
+    } else {
+        strip_silence(&samples, 16000)
+    }
+}
+
+#[cfg(any(feature = "whisper", test))]
+fn source_clock_prefix_samples(samples: &[f32], hints: &DecodeHints) -> usize {
+    if hints.preserve_source_timeline {
+        // Trim only exact digital silence, never a quiet phoneme or noise.
+        // Whisper can place the opening segment at zero even with several
+        // seconds of zero padding. Restore this known offset after recognition.
+        samples
+            .iter()
+            .position(|sample| *sample != 0.0)
+            .unwrap_or(samples.len())
+    } else {
+        0
+    }
+}
+
+#[cfg(any(feature = "whisper", test))]
+fn restore_source_clock(result: &mut TranscribeResult, offset: f64) {
+    if offset == 0.0 {
+        return;
+    }
+    for segment in &mut result.segments {
+        segment.start += offset;
+        segment.end += offset;
+    }
+    let lines: Vec<_> = result.text.lines().collect();
+    // Prefer exact timings over adding an offset to an already rounded label.
+    let exact = lines.len() == result.segments.len()
+        && lines.iter().zip(&result.segments).all(|(line, segment)| {
+            line.split_once(']')
+                .is_some_and(|(_, text)| text.trim() == segment.text)
+        });
+    let adjusted = if exact {
+        result
+            .segments
+            .iter()
+            .map(|segment| {
+                let secs = segment.start.floor() as u64;
+                format!("[{}:{:02}] {}", secs / 60, secs % 60, segment.text)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        offset_timestamped_lines(lines.into_iter(), offset, 0)
+    };
+    result.text = format!("{}\n", adjusted.join("\n"));
+}
+
+/// Meeting-local lexical hints that can safely inform batch decoding.
+///
+/// These are intentionally narrower than the global graph-derived phrase set:
+/// the goal is to bias decoding toward names and terms that are plausible in
+/// this specific recording, without dragging in the user's full history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecodeHints {
+    priority_phrases: Vec<String>,
+    contextual_phrases: Vec<String>,
+    // A descriptor-backed process input has no filename extension. Keep the
+    // already-authorized original format alongside lexical hints so decoder
+    // selection never has to reopen a mutable pathname merely to infer it.
+    audio_format_extension: Option<String>,
+    // Independent capture sources must share their original clock. Removing
+    // quiet intervals from just one source would make timestamp merging wrong.
+    preserve_source_timeline: bool,
+}
+
+impl DecodeHints {
+    pub fn from_candidates(priority: &[String], contextual: &[String]) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let mut priority_phrases = Vec::new();
+        let mut contextual_phrases = Vec::new();
+
+        for candidate in priority {
+            if let Some(normalized) = normalize_decode_hint_candidate(candidate, true) {
+                let key = normalized.to_ascii_lowercase();
+                if seen.insert(key) {
+                    priority_phrases.push(normalized);
+                }
+            }
+            if priority_phrases.len() >= 8 {
+                break;
+            }
+        }
+
+        for candidate in contextual {
+            if let Some(normalized) = normalize_decode_hint_candidate(candidate, false) {
+                let key = normalized.to_ascii_lowercase();
+                if seen.insert(key) {
+                    contextual_phrases.push(normalized);
+                }
+            }
+            if contextual_phrases.len() >= 6 {
+                break;
+            }
+        }
+
+        Self {
+            priority_phrases,
+            contextual_phrases,
+            audio_format_extension: None,
+            preserve_source_timeline: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.priority_phrases.is_empty() && self.contextual_phrases.is_empty()
+    }
+
+    pub fn with_additional_candidates(&self, priority: &[String], contextual: &[String]) -> Self {
+        let mut merged_priority = self.priority_phrases.clone();
+        merged_priority.extend(priority.iter().cloned());
+
+        let mut merged_contextual = self.contextual_phrases.clone();
+        merged_contextual.extend(contextual.iter().cloned());
+
+        let mut merged = Self::from_candidates(&merged_priority, &merged_contextual);
+        merged.audio_format_extension = self.audio_format_extension.clone();
+        merged.preserve_source_timeline = self.preserve_source_timeline;
+        merged
+    }
+
+    pub(crate) fn with_audio_format_extension(mut self, extension: &str) -> Self {
+        self.audio_format_extension = Some(extension.to_string());
+        self
+    }
+
+    pub(crate) fn with_source_timeline(mut self) -> Self {
+        self.preserve_source_timeline = true;
+        self
+    }
+
+    pub(crate) fn audio_format_extension(&self) -> Option<&str> {
+        self.audio_format_extension.as_deref()
+    }
+
+    /// The hints that change decoding. The format extension only selects a
+    /// decoder, so a checkpoint fingerprint leaves it out.
+    pub(crate) fn without_audio_format_extension(&self) -> Self {
+        let mut hints = self.clone();
+        hints.audio_format_extension = None;
+        hints
+    }
+
+    pub(crate) fn debug_priority_phrases(&self) -> Vec<String> {
+        self.priority_phrases.clone()
+    }
+
+    pub(crate) fn debug_contextual_phrases(&self) -> Vec<String> {
+        self.contextual_phrases.clone()
+    }
+
+    fn combined_phrases(&self, limit: usize) -> Vec<String> {
+        self.priority_phrases
+            .iter()
+            .chain(self.contextual_phrases.iter())
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub fn whisper_initial_prompt(&self) -> Option<String> {
+        let phrases = self.combined_phrases(12);
+        if phrases.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Names and terms that may appear in this audio: {}. Preserve spelling exactly when heard.",
+            phrases.join(", ")
+        ))
+    }
+
+    /// The terms alone, comma-separated (`transcription.prompt_terms_only`).
+    /// Whisper's prompt is earlier "transcript" that conditions spelling and
+    /// style, not an instruction it follows, so the instruction sentence can be
+    /// read back on noise. But a bare, unpunctuated list also conditions an
+    /// unpunctuated style: on AMI it raised WER (UPSTREAM-PATCHES #26 in Margin).
+    pub fn whisper_terms_prompt(&self) -> Option<String> {
+        let phrases = self.combined_phrases(12);
+        if phrases.is_empty() {
+            return None;
+        }
+        Some(phrases.join(", "))
+    }
+
+    #[cfg(feature = "parakeet")]
+    fn parakeet_local_boost_phrases(&self) -> Vec<String> {
+        self.priority_phrases
+            .iter()
+            .take(8)
+            .filter(|&phrase| {
+                let has_digit = phrase.chars().any(|c| c.is_ascii_digit());
+                let token_count = phrase.split_whitespace().count();
+                has_digit || token_count > 1
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn normalize_decode_hint_candidate(
+    candidate: &str,
+    allow_short_single_token: bool,
+) -> Option<String> {
+    let trimmed = candidate
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'')
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "unknown"
+            | "unknown speaker"
+            | "speaker 0"
+            | "speaker 1"
+            | "speaker 2"
+            | "speaker 3"
+            | "unassigned"
+    ) {
+        return None;
+    }
+    if let Some((local, domain)) = trimmed.split_once('@') {
+        if !local.is_empty() && domain.contains('.') {
+            return None;
+        }
+    }
+
+    let word_count = trimmed.split_whitespace().count();
+    let has_signal = trimmed
+        .chars()
+        .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    if word_count == 1 {
+        let len = trimmed.chars().count();
+        if len < 3 && !trimmed.chars().any(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        if !allow_short_single_token && len < 5 && !trimmed.chars().any(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        if !has_signal && trimmed.chars().all(|c| c.is_ascii_lowercase()) {
+            return None;
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+// ──────────────────────────────────────────────────────────────
+// Transcription pipeline:
+//
+//   Input audio (.wav, .m4a, .mp3, .ogg)
+//        │
+//        ├─ .wav ──────────────────────────────────▶ engine
+//        │
+//        └─ .m4a/.mp3/.ogg ─▶ bounded ffmpeg decode ─▶ engine
+//                                (to 16kHz mono PCM)
+//
+// Engines:
+//   - auto (default): sherpa Parakeet v3 on ready Apple Silicon builds, else whisper
+//   - whisper: whisper.cpp via whisper-rs, Apple Accelerate on M-series
+//   - sherpa: in-process Parakeet v3 via the isolated sherpa plugin
+//   - parakeet (retained): dormant parakeet.cpp subprocess preference
+//
+// Engine is selected via config.transcription.engine.
+// Model must be downloaded first via `minutes setup`.
+// ──────────────────────────────────────────────────────────────
+
+/// Transcribe an audio file to text.
+///
+/// Dispatches to the engine configured in `config.transcription.engine`:
+/// - `"auto"` (default): sherpa on ready Apple Silicon builds, else whisper
+/// - `"whisper"`: whisper.cpp via whisper-rs
+/// - `"sherpa"`: in-process Parakeet v3 via the isolated sherpa plugin
+/// - `"parakeet"`: parakeet.cpp via subprocess
+/// - `"apple-speech"`: currently live-transcript-only; batch/default paths
+///   fall back to whisper until the experiment graduates
+///
+/// Handles ambient format conversion (m4a/mp3/ogg → PCM) via ffmpeg.
+/// Both engines produce identical output format: `[M:SS] text` lines.
+pub fn transcribe(audio_path: &Path, config: &Config) -> Result<TranscribeResult, TranscribeError> {
+    transcribe_with_hints(audio_path, config, &DecodeHints::default())
+}
+
+pub fn transcribe_with_hints(
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    ensure_ambient_audio_path(audio_path)?;
+    transcribe_dispatch(audio_path, config, hints)
+}
+
+pub(crate) fn ensure_ambient_audio_path(audio_path: &Path) -> Result<(), TranscribeError> {
+    if crate::pipeline::is_reserved_private_audio_path(audio_path) {
+        return Err(TranscribeError::UnsupportedFormat(
+            "private audio tokens require the typed authorized entry point".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn transcribe_authorized_with_hints(
+    input: &crate::pipeline::AuthorizedProcessAudioInput,
+    content_type: crate::markdown::ContentType,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    input.verify_pipeline_binding().map_err(|error| {
+        TranscribeError::UnsupportedFormat(format!("authorized audio failed revalidation: {error}"))
+    })?;
+    if input.format_extension() != "wav" {
+        return Err(TranscribeError::UnsupportedFormat(
+            "authorized private processing currently supports bounded WAV input only".into(),
+        ));
+    }
+    match content_type {
+        crate::markdown::ContentType::Meeting => {
+            transcribe_meeting_with_hints_inner(input.processing_path(), config, hints)
+        }
+        _ => transcribe_dispatch(input.processing_path(), config, hints),
+    }
+}
+
+fn transcribe_dispatch(
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    BatchTranscriptionSession::new(config).transcribe(audio_path, hints)
+}
+
+/// Owns model state for one batch operation, never across meetings or configs.
+/// Each plugin decode still creates a fresh stream; only model weights are reused.
+struct BatchTranscriptionSession<'a> {
+    config: &'a Config,
+    #[cfg(feature = "engine-sherpa")]
+    sherpa: Option<crate::sherpa_plugin::PluginRecognizer>,
+}
+
+impl<'a> BatchTranscriptionSession<'a> {
+    fn new(config: &'a Config) -> Self {
+        Self {
+            config,
+            #[cfg(feature = "engine-sherpa")]
+            sherpa: None,
+        }
+    }
+
+    fn transcribe(
+        &mut self,
+        audio_path: &Path,
+        hints: &DecodeHints,
+    ) -> Result<TranscribeResult, TranscribeError> {
+        let config = self.config;
+        let requested_engine = config.transcription.engine.as_str();
+        let effective_engine = effective_batch_engine(config);
+        if requested_engine != effective_engine && !requested_engine.eq_ignore_ascii_case("auto") {
+            tracing::warn!(
+                requested_engine,
+                effective_engine,
+                "requested batch transcription engine is unavailable; using fallback"
+            );
+        }
+        match effective_engine {
+            "whisper" => transcribe_whisper_dispatch(audio_path, config, hints),
+            "parakeet" => transcribe_parakeet_dispatch(audio_path, config, hints),
+            "sherpa" => {
+                // Whisper auto-fallback: sherpa is opt-in and needs its model. If the
+                // engine isn't compiled in, or the model isn't installed, never break
+                // the recording -- fall back to whisper (the bundled default). The
+                // `sherpa_engine` path helpers are always compiled, so this check
+                // works in any build.
+                let model_dir = crate::sherpa_engine::model_dir(config);
+                if !sherpa_selectable(config) {
+                    tracing::warn!(
+                        model_dir = %model_dir.display(),
+                        compiled = cfg!(feature = "engine-sherpa"),
+                        reason = sherpa_unavailable_reason(config),
+                        "engine = \"sherpa\" selected but unavailable; falling back to whisper"
+                    );
+                    return transcribe_whisper_dispatch(audio_path, config, hints);
+                }
+                // Passing the preflight is not the same as succeeding. The model
+                // files clear a size floor rather than a hash, so a corrupt or
+                // incompatible model loads the plugin fine and then fails inside
+                // it, and an individual decode window can fail too. Those used to
+                // surface as a failed transcription, which loses a recording; the
+                // rule here is that whisper answers whenever sherpa cannot.
+                match self.transcribe_sherpa(audio_path, hints) {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        #[cfg(feature = "engine-sherpa")]
+                        {
+                            self.sherpa = None;
+                        }
+                        tracing::warn!(
+                            model_dir = %model_dir.display(),
+                            %error,
+                            "sherpa transcription failed after loading; falling back to whisper"
+                        );
+                        transcribe_whisper_dispatch(audio_path, config, hints)
+                    }
+                }
+            }
+            "apple-speech" => {
+                tracing::warn!(
+                "apple-speech is experimental and live-transcript-only today — falling back to whisper for batch/default transcription"
+            );
+                transcribe_whisper_dispatch(audio_path, config, hints)
+            }
+            other => {
+                tracing::warn!(
+                    engine = other,
+                    "unknown transcription engine — falling back to whisper"
+                );
+                transcribe_whisper_dispatch(audio_path, config, hints)
+            }
+        }
+    }
+}
+
+/// Resolve retained or unavailable engine selections before either dispatch or
+/// meeting chunk planning. Keeping this decision in one place prevents a stale
+/// `engine = "parakeet"` setting from selecting Parakeet-specific chunking and
+/// only falling back after model or transport work has begun.
+pub(crate) fn effective_batch_engine(config: &Config) -> &str {
+    let requested = config.transcription.engine.as_str();
+    if requested.eq_ignore_ascii_case("auto") {
+        return auto_transcription_engine_resolution(config).engine;
+    }
+    if (requested.eq_ignore_ascii_case("parakeet")
+        && !crate::pipeline::parakeet_capability(cfg!(feature = "parakeet")).selectable)
+        || requested.eq_ignore_ascii_case("apple-speech")
+        // Sherpa was missing from this list, so a sherpa-to-whisper
+        // substitution stayed invisible in the desktop artifact: the detector
+        // in pipeline.rs compares the requested engine against this function,
+        // and sherpa always answered "sherpa" no matter what actually ran.
+        || (requested.eq_ignore_ascii_case("sherpa") && !sherpa_selectable(config))
+    {
+        "whisper"
+    } else {
+        requested
+    }
+}
+
+/// Return the transcription engine that batch/default transcription will
+/// actually use after resolving unavailable or unsupported configured engines.
+pub fn effective_transcription_engine(config: &Config) -> &str {
+    effective_batch_engine(config)
+}
+
+/// The effective engine and stable, user-facing reason reported by health and
+/// desktop settings. Auto resolution only checks build/platform flags, plugin
+/// presence, and model files; it never loads a plugin or model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptionEngineResolution<'a> {
+    pub engine: &'a str,
+    pub reason: &'static str,
+}
+
+fn resolve_auto_transcription_engine(
+    sherpa_compiled: bool,
+    apple_silicon: bool,
+    plugin_present: bool,
+    model_present: bool,
+) -> TranscriptionEngineResolution<'static> {
+    if !sherpa_compiled {
+        TranscriptionEngineResolution {
+            engine: "whisper",
+            reason: "whisper: sherpa not compiled",
+        }
+    } else if !apple_silicon {
+        TranscriptionEngineResolution {
+            engine: "whisper",
+            reason: "whisper: sherpa auto-selection requires Apple Silicon",
+        }
+    } else if !plugin_present {
+        TranscriptionEngineResolution {
+            engine: "whisper",
+            reason: "whisper: sherpa plugin not found beside the binary — install the macOS sherpa archive or the desktop app",
+        }
+    } else if !model_present {
+        TranscriptionEngineResolution {
+            engine: "whisper",
+            reason: "whisper: parakeet model missing — run minutes setup",
+        }
+    } else {
+        TranscriptionEngineResolution {
+            engine: "sherpa",
+            reason: "sherpa: model present",
+        }
+    }
+}
+
+/// Resolve what `engine = "auto"` would choose for this config, regardless of
+/// the currently configured explicit engine. This is also used to label the
+/// desktop's Auto option accurately.
+pub fn auto_transcription_engine_resolution(
+    config: &Config,
+) -> TranscriptionEngineResolution<'static> {
+    resolve_auto_transcription_engine(
+        cfg!(feature = "engine-sherpa"),
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        sherpa_plugin_present(config),
+        crate::sherpa_engine::model_files_present(&crate::sherpa_engine::model_dir(config)),
+    )
+}
+
+/// Whether the desktop app should offer to install Parakeet v3: this build and
+/// Mac can run it, the stock model is the only thing missing, the configured
+/// engine would use it (`auto`, `sherpa`, or a saved `whisper` that installing
+/// moves to `auto`), and Parakeet v3 covers the transcription language.
+pub fn parakeet_install_offered(config: &Config) -> bool {
+    parakeet_install_offered_for(
+        &config.transcription.engine,
+        cfg!(feature = "engine-sherpa") && cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        sherpa_plugin_present(config),
+        crate::sherpa_engine::model_dir(config) == crate::sherpa_engine::default_model_dir(config),
+        crate::sherpa_engine::model_files_present(&crate::sherpa_engine::model_dir(config)),
+        crate::sherpa_engine::parakeet_v3_fits_language(
+            config.transcription.language.as_deref(),
+            &config.ui.language,
+        ),
+    )
+}
+
+fn parakeet_install_offered_for(
+    engine: &str,
+    runnable_here: bool,
+    plugin_present: bool,
+    default_model_dir: bool,
+    model_present: bool,
+    language_fits: bool,
+) -> bool {
+    ["auto", "whisper", "sherpa"]
+        .iter()
+        .any(|candidate| engine.eq_ignore_ascii_case(candidate))
+        && runnable_here
+        && plugin_present
+        && default_model_dir
+        && !model_present
+        && language_fits
+}
+
+pub fn transcription_engine_resolution(config: &Config) -> TranscriptionEngineResolution<'_> {
+    let requested = config.transcription.engine.as_str();
+    if requested.eq_ignore_ascii_case("auto") {
+        return auto_transcription_engine_resolution(config);
+    }
+
+    let engine = effective_batch_engine(config);
+    let reason = if requested.eq_ignore_ascii_case("whisper") {
+        "whisper: configured"
+    } else if requested.eq_ignore_ascii_case("sherpa") && engine == "sherpa" {
+        "sherpa: configured and available"
+    } else if requested.eq_ignore_ascii_case("sherpa") && !cfg!(feature = "engine-sherpa") {
+        "whisper: configured sherpa not compiled"
+    } else if requested.eq_ignore_ascii_case("sherpa") && !sherpa_plugin_present(config) {
+        "whisper: configured sherpa plugin missing"
+    } else if requested.eq_ignore_ascii_case("sherpa")
+        && !crate::sherpa_engine::model_files_present(&crate::sherpa_engine::model_dir(config))
+    {
+        "whisper: configured sherpa model missing"
+    } else if requested.eq_ignore_ascii_case("sherpa") {
+        "whisper: configured sherpa plugin could not be loaded"
+    } else if engine == "whisper" {
+        "whisper: configured engine unavailable"
+    } else {
+        "configured engine selected"
+    };
+    TranscriptionEngineResolution { engine, reason }
+}
+
+#[cfg(feature = "parakeet")]
+const PARAKEET_LONG_AUDIO_CHUNK_THRESHOLD_SECS: f64 = 60.0;
+#[cfg(feature = "parakeet")]
+const PARAKEET_LONG_AUDIO_CHUNK_SECS: usize = 45;
+#[cfg(feature = "parakeet")]
+const PARAKEET_NATIVE_VAD_CHUNK_THRESHOLD_SECS: f64 = 240.0;
+#[cfg(feature = "parakeet")]
+const PARAKEET_NATIVE_VAD_CHUNK_SECS: usize = 180;
+#[cfg(feature = "parakeet")]
+const PARAKEET_NATIVE_VAD_THRESHOLD: f32 = 0.5;
+
+#[cfg(feature = "parakeet")]
+fn fixed_length_chunks(total_samples: usize, max_chunk_samples: usize) -> Vec<(usize, usize)> {
+    if total_samples == 0 || max_chunk_samples == 0 {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < total_samples {
+        let end = (start + max_chunk_samples).min(total_samples);
+        chunks.push((start, end));
+        start = end;
+    }
+    chunks
+}
+
+#[cfg(feature = "parakeet")]
+fn parakeet_chunk_ranges(
+    total_samples: usize,
+    audio_duration_secs: f64,
+    has_native_vad: bool,
+) -> Option<Vec<(usize, usize)>> {
+    // Native Parakeet VAD lets us keep moderately long files intact, but the
+    // offline models still become unreliable beyond roughly 4-5 minutes.
+    let (threshold_secs, chunk_secs) = if has_native_vad {
+        (
+            PARAKEET_NATIVE_VAD_CHUNK_THRESHOLD_SECS,
+            PARAKEET_NATIVE_VAD_CHUNK_SECS,
+        )
+    } else {
+        (
+            PARAKEET_LONG_AUDIO_CHUNK_THRESHOLD_SECS,
+            PARAKEET_LONG_AUDIO_CHUNK_SECS,
+        )
+    };
+
+    if audio_duration_secs <= threshold_secs {
+        return None;
+    }
+
+    Some(fixed_length_chunks(total_samples, 16000 * chunk_secs))
+}
+
+fn transcribe_chunk_ranges(
+    samples: &[f32],
+    chunk_ranges: &[(usize, usize)],
+    audio_duration_secs: f64,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<Option<TranscribeResult>, TranscribeError> {
+    let mut chunks = transcribe_chunk_lines(samples, chunk_ranges, 0, config, hints)?;
+    chunks.stats.audio_duration_secs = audio_duration_secs;
+    Ok(finish_chunk_lines(chunks))
+}
+
+/// Timestamped lines from VAD chunks, before the transcript cleanup pipeline.
+/// Line times are on the source clock: `clock_offset` is the source sample at
+/// which `samples` starts. Cleanup looks across chunk boundaries, so it
+/// runs once over the whole recording in [`finish_chunk_lines`].
+pub(crate) struct ChunkLines {
+    pub(crate) lines: Vec<String>,
+    pub(crate) stats: FilterStats,
+}
+
+impl ChunkLines {
+    pub(crate) fn add_stats(&mut self, other: &FilterStats) {
+        self.stats.samples_after_silence_strip += other.samples_after_silence_strip;
+        self.stats.raw_segments += other.raw_segments;
+        self.stats.skipped_no_speech += other.skipped_no_speech;
+        self.stats.after_no_speech_filter += other.after_no_speech_filter;
+        self.stats.rescued_no_speech += other.rescued_no_speech;
+        if self.stats.model_fallback.is_none() {
+            self.stats.model_fallback = other.model_fallback.clone();
+        }
+    }
+}
+
+pub(crate) fn transcribe_chunk_lines(
+    samples: &[f32],
+    chunk_ranges: &[(usize, usize)],
+    clock_offset: usize,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<ChunkLines, TranscribeError> {
+    #[cfg(feature = "whisper")]
+    if chunk_transcription_strategy(config) == ChunkTranscriptionStrategy::SharedWhisperContext {
+        return transcribe_whisper_chunk_lines(samples, chunk_ranges, clock_offset, config, hints);
+    }
+
+    let mut session = BatchTranscriptionSession::new(config);
+    let mut out = ChunkLines {
+        lines: Vec::new(),
+        stats: FilterStats::default(),
+    };
+
+    for (chunk_index, (start_sample, end_sample)) in chunk_ranges.iter().enumerate() {
+        let chunk_samples = &samples[*start_sample..*end_sample];
+        if chunk_samples.is_empty() {
+            continue;
+        }
+
+        let mut tmp_wav =
+            crate::pipeline::PrivateAudioTempFile::new("minutes-meeting-chunk-", ".wav")
+                .map_err(TranscribeError::Io)?;
+        write_wav_16k_mono_to_writer(tmp_wav.prepare_for_write()?, chunk_samples)?;
+        tmp_wav.finish_write().map_err(TranscribeError::Io)?;
+        let processing_path = tmp_wav.processing_path();
+        let chunk_hints = hints.clone().with_audio_format_extension("wav");
+
+        let chunk_result = match session.transcribe(&processing_path, &chunk_hints) {
+            Ok(result) => result,
+            Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => {
+                tracing::debug!(
+                    chunk_index,
+                    start_sample,
+                    end_sample,
+                    "skipping empty VAD chunk"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let chunk_offset_secs = (clock_offset + *start_sample) as f64 / 16000.0;
+        let offset_lines =
+            offset_timestamped_lines(chunk_result.text.lines(), chunk_offset_secs, chunk_index);
+        out.add_stats(&chunk_result.stats);
+        out.lines.extend(offset_lines);
+    }
+
+    Ok(out)
+}
+
+/// Run the transcript cleanup pipeline over all chunk lines. `None` when no
+/// chunk produced text, so the caller can fall back to the whole file.
+pub(crate) fn finish_chunk_lines(chunks: ChunkLines) -> Option<TranscribeResult> {
+    let ChunkLines {
+        lines: all_lines,
+        stats: mut aggregate,
+    } = chunks;
+    if all_lines.is_empty() {
+        return None;
+    }
+
+    let cleanup = run_transcript_cleanup_pipeline(all_lines);
+    aggregate.after_dedup = cleanup.after(TranscriptCleanupStage::DedupSegments);
+    aggregate.after_interleaved = cleanup.after(TranscriptCleanupStage::DedupInterleaved);
+    aggregate.after_script_filter = cleanup.after(TranscriptCleanupStage::StripForeignScript);
+    aggregate.after_noise_markers = cleanup.after(TranscriptCleanupStage::CollapseNoiseMarkers);
+    aggregate.after_trailing_trim = cleanup.after(TranscriptCleanupStage::TrimTrailingNoise);
+
+    let text = if cleanup.lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", cleanup.lines.join("\n"))
+    };
+    aggregate.final_words = text.split_whitespace().count();
+
+    Some(TranscribeResult {
+        text,
+        stats: aggregate,
+        segments: vec![],
+        detected_language: None,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
+enum ChunkTranscriptionStrategy {
+    SharedWhisperContext,
+    DispatchPerChunk,
+}
+
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
+fn chunk_transcription_strategy(config: &Config) -> ChunkTranscriptionStrategy {
+    if cfg!(feature = "whisper") && effective_batch_engine(config) == "whisper" {
+        ChunkTranscriptionStrategy::SharedWhisperContext
+    } else {
+        ChunkTranscriptionStrategy::DispatchPerChunk
+    }
+}
+
+pub(crate) fn should_bypass_meeting_chunk_rotation(
+    config: &Config,
+    private_audio_available: bool,
+) -> bool {
+    !private_audio_available
+        && chunk_transcription_strategy(config) == ChunkTranscriptionStrategy::DispatchPerChunk
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_whisper_chunk_lines(
+    samples: &[f32],
+    chunk_ranges: &[(usize, usize)],
+    clock_offset: usize,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<ChunkLines, TranscribeError> {
+    let LoadedWhisper {
+        ctx,
+        config,
+        fallback,
+    } = load_whisper_context(config)?;
+    let config = config.as_ref();
+    let mut out = ChunkLines {
+        lines: Vec::new(),
+        stats: FilterStats {
+            model_fallback: fallback,
+            ..Default::default()
+        },
+    };
+
+    for (chunk_index, (start_sample, end_sample)) in chunk_ranges.iter().enumerate() {
+        let chunk_samples = &samples[*start_sample..*end_sample];
+        if chunk_samples.is_empty() {
+            continue;
+        }
+
+        let chunk_result = match transcribe_whisper_samples(
+            &ctx,
+            chunk_samples,
+            Path::new("<vad-chunk>"),
+            config,
+            hints,
+        ) {
+            Ok(result) => result,
+            Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => {
+                tracing::debug!(
+                    chunk_index,
+                    start_sample,
+                    end_sample,
+                    "skipping empty VAD chunk"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let chunk_offset_secs = (clock_offset + *start_sample) as f64 / 16000.0;
+        let offset_lines =
+            offset_timestamped_lines(chunk_result.text.lines(), chunk_offset_secs, chunk_index);
+        out.add_stats(&chunk_result.stats);
+        out.lines.extend(offset_lines);
+    }
+
+    Ok(out)
+}
+
+/// Meeting-specialized transcription path that can split long recordings at
+/// natural pauses before dispatching to the active ASR backend.
+pub fn transcribe_meeting(
+    audio_path: &Path,
+    config: &Config,
+) -> Result<TranscribeResult, TranscribeError> {
+    transcribe_meeting_with_hints(audio_path, config, &DecodeHints::default())
+}
+
+pub fn transcribe_meeting_with_hints(
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    ensure_ambient_audio_path(audio_path)?;
+    transcribe_meeting_with_hints_inner(audio_path, config, hints)
+}
+
+fn transcribe_meeting_with_hints_inner(
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    let samples =
+        load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
+    transcribe_meeting_samples(audio_path, &samples, config, hints)
+}
+
+/// The meeting path after decode. `samples` are `audio_path`'s canonical
+/// 16 kHz mono samples; the whole-file fallbacks still read `audio_path`.
+pub(crate) fn transcribe_meeting_samples(
+    audio_path: &Path,
+    samples: &[f32],
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    const MIN_MEETING_CHUNKS: usize = 2;
+
+    let audio_duration_secs = samples.len() as f64 / 16000.0;
+    let vad_chunks = detect_meeting_vad_chunks(samples);
+
+    if vad_chunks.len() < MIN_MEETING_CHUNKS {
+        return transcribe_dispatch(audio_path, config, hints);
+    }
+
+    // Per-chunk subprocess dispatch needs an exact anonymous-audio capability.
+    // Windows deliberately has no named-plaintext substitute. In-process
+    // engines such as Sherpa can safely consume the already-authorized source
+    // as one recording, so bypass rotation instead of failing before decode.
+    if should_bypass_meeting_chunk_rotation(
+        config,
+        crate::pipeline::private_audio_processing_available(),
+    ) {
+        tracing::info!(
+            engine = %config.transcription.engine,
+            "secure private-audio chunk rotation is unavailable; transcribing the original recording"
+        );
+        return transcribe_dispatch(audio_path, config, hints);
+    }
+
+    tracing::info!(
+        chunks = vad_chunks.len(),
+        audio_secs = format!("{:.1}", audio_duration_secs),
+        "meeting transcription using VAD-driven chunk rotation"
+    );
+
+    if let Some(result) =
+        transcribe_chunk_ranges(samples, &vad_chunks, audio_duration_secs, config, hints)?
+    {
+        return Ok(result);
+    }
+
+    transcribe_dispatch(audio_path, config, hints)
+}
+
+/// Whisper transcription path (existing behavior).
+fn transcribe_whisper_dispatch(
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    // Step 1: Load audio as 16kHz mono f32 PCM samples
+    let samples =
+        load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
+
+    // Step 3: Transcribe
+    #[cfg(feature = "whisper")]
+    {
+        let loaded = load_whisper_context(config)?;
+        let mut result =
+            transcribe_whisper_samples(&loaded.ctx, &samples, audio_path, &loaded.config, hints)?;
+        result.stats.model_fallback = loaded.fallback;
+        Ok(result)
+    }
+
+    #[cfg(not(feature = "whisper"))]
+    {
+        // `parakeet` implies `whisper`, so a retained Parakeet preference can
+        // never reach the featureless placeholder path. Keep the longstanding
+        // no-engine diagnostic for deliberately featureless development builds.
+        let stats = FilterStats {
+            audio_duration_secs: samples.len() as f64 / 16000.0,
+            ..Default::default()
+        };
+        let _ = config;
+        let _ = hints;
+        let duration_secs = samples.len() as f64 / 16000.0;
+        let text = format!(
+            "[Transcription placeholder — whisper feature not enabled]\n\
+             Audio file: {}\n\
+             Duration: {:.1}s ({} samples at 16kHz)\n\
+             \n\
+             Build with `cargo build --features whisper` and download a model\n\
+             via `minutes setup` to enable real transcription.",
+            crate::pipeline::private_audio_diagnostic_label(audio_path),
+            duration_secs,
+            samples.len(),
+        );
+        Ok(TranscribeResult {
+            text,
+            stats,
+            segments: vec![],
+            detected_language: None,
+        })
+    }
+}
+
+/// Parakeet transcription path (subprocess-based).
+fn transcribe_parakeet_dispatch(
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    #[cfg(feature = "parakeet")]
+    {
+        if !crate::pipeline::private_audio_processing_supported() {
+            tracing::warn!(
+                "Parakeet cannot receive secure private audio on this platform; falling back to Whisper"
+            );
+            return transcribe_whisper_dispatch(audio_path, config, hints);
+        }
+        if !crate::pipeline::parakeet_private_audio_transport_supported() {
+            tracing::warn!(
+                "Parakeet's pathname-only CLI cannot receive secure private audio on this platform; falling back to Whisper"
+            );
+            return transcribe_whisper_dispatch(audio_path, config, hints);
+        }
+        if !crate::pipeline::private_audio_processing_available() {
+            tracing::warn!(
+                "Parakeet cannot create secure private audio at runtime; falling back to Whisper"
+            );
+            return transcribe_whisper_dispatch(audio_path, config, hints);
+        }
+        if !crate::parakeet::valid_model(&config.transcription.parakeet_model) {
+            return Err(TranscribeError::ParakeetFailed(format!(
+                "unknown parakeet model '{}'. Valid: {}",
+                config.transcription.parakeet_model,
+                crate::config::VALID_PARAKEET_MODELS.join(", ")
+            )));
+        }
+        let samples =
+            load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
+        let audio_duration_secs = samples.len() as f64 / 16000.0;
+        let native_vad_path = resolve_parakeet_native_vad_path(config);
+        let chunk_ranges = crate::pipeline::parakeet_private_audio_transport_supported()
+            .then(|| {
+                parakeet_chunk_ranges(
+                    samples.len(),
+                    audio_duration_secs,
+                    native_vad_path.is_some(),
+                )
+            })
+            .flatten();
+        if let Some(chunk_ranges) = chunk_ranges {
+            let chunk_secs = if native_vad_path.is_some() {
+                PARAKEET_NATIVE_VAD_CHUNK_SECS
+            } else {
+                PARAKEET_LONG_AUDIO_CHUNK_SECS
+            };
+            tracing::info!(
+                chunks = chunk_ranges.len(),
+                audio_secs = format!("{:.1}", audio_duration_secs),
+                chunk_secs,
+                native_vad = native_vad_path.is_some(),
+                "chunking long parakeet transcription to avoid monolithic decode"
+            );
+            if let Some(result) = transcribe_chunk_ranges(
+                &samples,
+                &chunk_ranges,
+                audio_duration_secs,
+                config,
+                hints,
+            )? {
+                return Ok(result);
+            }
+            return Err(TranscribeError::EmptyTranscript(
+                config.transcription.min_words,
+            ));
+        }
+        transcribe_with_parakeet(audio_path, config, hints)
+    }
+
+    #[cfg(not(feature = "parakeet"))]
+    {
+        tracing::warn!("Parakeet is not compiled into this build; falling back to Whisper");
+        transcribe_whisper_dispatch(audio_path, config, hints)
+    }
+}
+
+/// Whether sherpa can actually run: compiled in, model installed, plugin
+/// loadable.
+///
+/// Since #685 the engine lives in a dlopened plugin, so being compiled in no
+/// longer implies being runnable. This is the single predicate behind both the
+/// dispatch and `effective_batch_engine`, so planning, the transcript, and the
+/// artifact warning cannot disagree about which engine ran.
+pub fn sherpa_selectable(config: &Config) -> bool {
+    cfg!(feature = "engine-sherpa")
+        && crate::sherpa_engine::model_files_present(&crate::sherpa_engine::model_dir(config))
+        && sherpa_plugin_unavailable_reason(config).is_none()
+}
+
+#[cfg(feature = "engine-sherpa")]
+pub(crate) fn sherpa_plugin_present(config: &Config) -> bool {
+    crate::sherpa_plugin::plugin_available_with_config(config)
+}
+
+#[cfg(not(feature = "engine-sherpa"))]
+pub(crate) fn sherpa_plugin_present(_config: &Config) -> bool {
+    false
+}
+
+/// Why sherpa is unavailable, phrased for the processing artifact.
+pub(crate) fn sherpa_unavailable_reason(config: &Config) -> &'static str {
+    if !cfg!(feature = "engine-sherpa") {
+        "this build was compiled without the sherpa engine"
+    } else if !sherpa_plugin_present(config) {
+        "the sherpa plugin is not installed"
+    } else if !crate::sherpa_engine::model_files_present(&crate::sherpa_engine::model_dir(config)) {
+        "the sherpa model is not installed"
+    } else {
+        "the sherpa plugin could not be loaded"
+    }
+}
+
+/// Why the sherpa plugin cannot be used, or `None` when it loads.
+///
+/// Always `None` without the engine feature, where the caller's `cfg!` check
+/// already decided the question.
+#[cfg(feature = "engine-sherpa")]
+fn sherpa_plugin_unavailable_reason(config: &Config) -> Option<String> {
+    crate::sherpa_plugin::unavailable_reason(config)
+}
+
+#[cfg(not(feature = "engine-sherpa"))]
+fn sherpa_plugin_unavailable_reason(_config: &Config) -> Option<String> {
+    None
+}
+
+impl BatchTranscriptionSession<'_> {
+    /// Dispatch for the opt-in sherpa-onnx engine (parakeet-tdt-0.6b-v3, multilingual).
+    /// In-process via `sherpa_engine`; off by default behind `engine-sherpa`.
+    fn transcribe_sherpa(
+        &mut self,
+        audio_path: &Path,
+        hints: &DecodeHints,
+    ) -> Result<TranscribeResult, TranscribeError> {
+        let config = self.config;
+        #[cfg(feature = "engine-sherpa")]
+        {
+            // Decode-hint biasing for sherpa is a future follow-up.
+            let _ = hints;
+            let samples =
+                load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
+            if samples.is_empty() {
+                return Err(TranscribeError::EmptyAudio);
+            }
+            let audio_duration_secs = samples.len() as f64 / 16_000.0;
+
+            // Windowed segments carry a start time, so we emit `[m:ss] text` lines
+            // (the same shape the parakeet path produces) -- this makes the sherpa
+            // transcript diarization-compatible and renders in the timestamped
+            // transcript format, rather than one untimed blob.
+            //
+            // sherpa exposes start_ms only; end is inferred from the next segment's
+            // start (or audio_duration_secs for the final segment).
+            if self.sherpa.is_none() {
+                self.sherpa = Some(
+                    crate::sherpa_engine::build_recognizer(config)
+                        .map_err(TranscribeError::TranscriptionFailed)?,
+                );
+            }
+            let raw_segs = crate::sherpa_engine::transcribe_segments_with_recognizer(
+                &samples,
+                config,
+                self.sherpa.as_mut().expect("recognizer initialized above"),
+            )
+            .map_err(TranscribeError::TranscriptionFailed)?;
+            // Build parallel (line, start_secs, end_secs, text) data
+            let n_raw = raw_segs.len();
+            let sherpa_seg_data: Vec<(String, f64, f64, String)> = raw_segs
+                .iter()
+                .enumerate()
+                .map(|(i, (start_ms, text))| {
+                    let start_secs = *start_ms as f64 / 1000.0;
+                    let end_secs = if i + 1 < n_raw {
+                        raw_segs[i + 1].0 as f64 / 1000.0
+                    } else {
+                        audio_duration_secs
+                    };
+                    let secs_int = *start_ms / 1000;
+                    let line = format!("[{}:{:02}] {}", secs_int / 60, secs_int % 60, text);
+                    (line, start_secs, end_secs, text.clone())
+                })
+                .collect();
+            let lines: Vec<String> = sherpa_seg_data
+                .iter()
+                .map(|(l, _, _, _)| l.clone())
+                .collect();
+            let raw_segments = lines.len();
+
+            // Run the shared whisper-guard cleanup (dedups any window-boundary
+            // repeats); its output lines are the transcript.
+            let cleanup = run_transcript_cleanup_pipeline(lines.clone());
+            let transcript = cleanup.lines.join("\n");
+            let transcript = if transcript.is_empty() {
+                transcript
+            } else {
+                format!("{transcript}\n")
+            };
+            let word_count = transcript.split_whitespace().count();
+            if word_count < config.transcription.min_words {
+                return Err(TranscribeError::EmptyTranscript(
+                    config.transcription.min_words,
+                ));
+            }
+            let stats = FilterStats {
+                audio_duration_secs,
+                // Sherpa receives the complete decoded source; it does not
+                // run the Whisper silence-strip stage. Zero would falsely
+                // diagnose successful recognition as all audio removed.
+                samples_after_silence_strip: samples.len(),
+                raw_segments,
+                after_no_speech_filter: raw_segments,
+                after_dedup: cleanup.after(TranscriptCleanupStage::DedupSegments),
+                after_interleaved: cleanup.after(TranscriptCleanupStage::DedupInterleaved),
+                after_script_filter: cleanup.after(TranscriptCleanupStage::StripForeignScript),
+                after_noise_markers: cleanup.after(TranscriptCleanupStage::CollapseNoiseMarkers),
+                after_trailing_trim: cleanup.after(TranscriptCleanupStage::TrimTrailingNoise),
+                final_words: word_count,
+                ..Default::default()
+            };
+            // Correlate surviving lines back to their timing data
+            let transcript_segments =
+                correlate_sherpa_segments(&cleanup.lines, &lines, &sherpa_seg_data);
+            Ok(TranscribeResult {
+                text: transcript,
+                stats,
+                segments: transcript_segments,
+                detected_language: None, // sherpa does not report detected language
+            })
+        }
+
+        #[cfg(not(feature = "engine-sherpa"))]
+        {
+            let _ = (audio_path, config, hints);
+            Err(TranscribeError::EngineNotAvailable("engine-sherpa".into()))
+        }
+    }
+}
+
+/// Correlate cleanup-surviving lines back to sherpa segment timing data.
+///
+/// `cleanup_lines` is a subsequence of `all_lines` (same order, some removed
+/// by dedup). For each surviving line we find the earliest matching entry in
+/// `all_seg_data` (which is parallel to `all_lines`) and emit a
+/// [`TranscriptSegment`] with the real start/end times.
+#[cfg(feature = "engine-sherpa")]
+fn correlate_sherpa_segments(
+    cleanup_lines: &[String],
+    all_lines: &[String],
+    all_seg_data: &[(String, f64, f64, String)],
+) -> Vec<TranscriptSegment> {
+    let mut si = 0usize;
+    let mut result = Vec::new();
+    for cleaned in cleanup_lines {
+        while si < all_lines.len() {
+            if &all_lines[si] == cleaned {
+                let (_, start, end, text) = &all_seg_data[si];
+                result.push(TranscriptSegment {
+                    start: *start,
+                    end: *end,
+                    text: text.clone(),
+                });
+                si += 1;
+                break;
+            }
+            si += 1;
+        }
+    }
+    result
+}
+
+/// Correlate cleanup-surviving whisper lines back to raw segment timing data.
+///
+/// `cleanup_lines` is a subsequence of `all_lines` (same order, some removed).
+/// `seg_data` is parallel to `all_lines`: `(start_secs, end_secs, clean_text)`.
+#[cfg(feature = "whisper")]
+fn correlate_whisper_segments(
+    cleanup_lines: &[String],
+    all_lines: &[String],
+    seg_data: &[(f64, f64, String)],
+) -> Vec<TranscriptSegment> {
+    let mut si = 0usize;
+    let mut result = Vec::new();
+    for cleaned in cleanup_lines {
+        while si < all_lines.len() {
+            if &all_lines[si] == cleaned {
+                let (start, end, text) = &seg_data[si];
+                result.push(TranscriptSegment {
+                    start: *start,
+                    end: *end,
+                    text: text.clone(),
+                });
+                si += 1;
+                break;
+            }
+            si += 1;
+        }
+    }
+    result
+}
+
+/// Build `WhisperContextParameters` with GPU explicitly enabled when a GPU
+/// backend was compiled in. All call sites should use this instead of
+/// `WhisperContextParameters::default()`.
+#[cfg(feature = "whisper")]
+pub(crate) fn whisper_context_params() -> whisper_rs::WhisperContextParameters<'static> {
+    let mut params = whisper_rs::WhisperContextParameters::default();
+
+    let gpu_compiled = cfg!(any(
+        feature = "coreml",
+        feature = "cuda",
+        feature = "hipblas",
+        feature = "metal",
+        feature = "vulkan",
+    ));
+    params.use_gpu = gpu_compiled;
+
+    let backend = if cfg!(feature = "metal") {
+        "metal"
+    } else if cfg!(feature = "cuda") {
+        "cuda"
+    } else if cfg!(feature = "coreml") {
+        "coreml"
+    } else if cfg!(feature = "hipblas") {
+        "hipblas"
+    } else if cfg!(feature = "vulkan") {
+        "vulkan"
+    } else {
+        "cpu"
+    };
+    tracing::debug!(
+        use_gpu = gpu_compiled,
+        backend = backend,
+        "whisper context params"
+    );
+
+    params
+}
+
+#[cfg(feature = "whisper")]
+struct LoadedWhisper<'a> {
+    ctx: whisper_rs::WhisperContext,
+    /// The caller's config, or with a fallback, a copy that names it and
+    /// carries its language.
+    config: std::borrow::Cow<'a, Config>,
+    fallback: Option<ModelFallback>,
+}
+
+#[cfg(feature = "whisper")]
+/// The whisper context for `transcription.model`, or for the first entry of
+/// `missing_model_fallbacks` that loads when the model's file is missing,
+/// empty or unloadable. A fallback runs with its own language
+/// (`TranscriptionConfig::language_for`), and the process trace says so.
+fn load_whisper_context(config: &Config) -> Result<LoadedWhisper<'_>, TranscribeError> {
+    let mut first_failure = None;
+    let names = std::iter::once(&config.transcription.model)
+        .chain(&config.transcription.missing_model_fallbacks);
+    for (index, name) in names.enumerate() {
+        match load_named_whisper_model(name, config) {
+            Ok(ctx) if index == 0 => {
+                return Ok(LoadedWhisper {
+                    ctx,
+                    config: std::borrow::Cow::Borrowed(config),
+                    fallback: None,
+                })
+            }
+            Ok(ctx) => {
+                tracing::warn!(
+                    model = %config.transcription.model,
+                    fallback = %name,
+                    "whisper model unavailable; transcribing with the fallback model"
+                );
+                let mut fallback_config = config.clone();
+                fallback_config.transcription.model = name.clone();
+                fallback_config.transcription.language = config.transcription.language_for(name);
+                crate::process_trace::update_language(
+                    fallback_config.transcription.language.as_deref(),
+                );
+                let (_, cause) = first_failure.expect("the configured model failed first");
+                return Ok(LoadedWhisper {
+                    ctx,
+                    config: std::borrow::Cow::Owned(fallback_config),
+                    fallback: Some(ModelFallback {
+                        requested: config.transcription.model.clone(),
+                        used: name.clone(),
+                        cause,
+                    }),
+                });
+            }
+            Err((error, cause)) => {
+                if index == 0 && !config.transcription.missing_model_fallbacks.is_empty() {
+                    tracing::warn!(model = %name, %error, "whisper model unavailable");
+                }
+                first_failure.get_or_insert((error, cause));
+            }
+        }
+    }
+    let (error, _) = first_failure.expect("the configured model is always tried");
+    Err(error)
+}
+
+#[cfg(feature = "whisper")]
+fn load_named_whisper_model(
+    name: &str,
+    config: &Config,
+) -> Result<whisper_rs::WhisperContext, (TranscribeError, ModelUnavailable)> {
+    let path = resolve_named_model_path(name, config).map_err(|error| {
+        let cause = match error {
+            TranscribeError::ModelNotFound(_) => ModelUnavailable::Missing,
+            _ => ModelUnavailable::FailedToLoad,
+        };
+        (error, cause)
+    })?;
+    load_whisper_model(&path).map_err(|error| {
+        let empty = std::fs::metadata(&path).is_ok_and(|meta| meta.len() == 0);
+        let cause = if empty {
+            ModelUnavailable::Empty
+        } else {
+            ModelUnavailable::FailedToLoad
+        };
+        (error, cause)
+    })
+}
+
+#[cfg(feature = "whisper")]
+fn load_whisper_model(model_path: &Path) -> Result<whisper_rs::WhisperContext, TranscribeError> {
+    if std::fs::metadata(model_path).map(|m| m.len() == 0).unwrap_or(false) {
+        return Err(TranscribeError::ModelLoadError(format!(
+            "model file {} is empty",
+            model_path.display()
+        )));
+    }
+    crate::process_trace::update_model_path(model_path);
+    crate::process_trace::stage("whisper.model_load.start");
+    tracing::info!(model = %model_path.display(), "loading whisper model");
+
+    let ctx = whisper_rs::WhisperContext::new_with_params(
+        model_path
+            .to_str()
+            .ok_or_else(|| TranscribeError::ModelLoadError("invalid model path encoding".into()))?,
+        whisper_context_params(),
+    )
+    .map_err(|e| TranscribeError::ModelLoadError(format!("{}", e)))?;
+    crate::process_trace::stage("whisper.model_load.done");
+    Ok(ctx)
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_whisper_samples(
+    ctx: &whisper_rs::WhisperContext,
+    samples: &[f32],
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    let mut stats = FilterStats {
+        audio_duration_secs: samples.len() as f64 / 16000.0,
+        ..Default::default()
+    };
+
+    if samples.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    // Noise reduction (requires denoise feature + config enabled).
+    #[cfg(feature = "denoise")]
+    let samples = if config.transcription.noise_reduction {
+        denoise_audio(samples, 16000)
+    } else {
+        samples.to_vec()
+    };
+    #[cfg(not(feature = "denoise"))]
+    let samples = samples.to_vec();
+
+    // If Silero VAD model is available, whisper handles silence internally via
+    // integrated VAD (set in default_whisper_params). Otherwise, fall back to
+    // energy-based silence stripping to prevent hallucination loops (issue #21).
+    let use_integrated_vad = resolve_vad_model_path(config).is_some();
+
+    let prefix_samples = source_clock_prefix_samples(&samples, hints);
+    let samples = samples[prefix_samples..].to_vec();
+    let samples = prepare_whisper_samples(samples, use_integrated_vad, hints);
+    stats.samples_after_silence_strip = samples.len();
+
+    if samples.is_empty() {
+        tracing::warn!(
+            audio_duration_secs = stats.audio_duration_secs,
+            "silence stripping removed all audio — entire recording was below energy threshold"
+        );
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    // Retain Whisper's minimum decode window for a brief response following
+    // digital silence. Padding changes neither content nor the source offset.
+    let mut samples = samples;
+    if hints.preserve_source_timeline && samples.len() < 16_000 {
+        samples.resize(16_000, 0.0);
+    }
+    let mut result =
+        transcribe_with_whisper(ctx, &samples, audio_path, config, stats, false, hints)?;
+
+    // Auto-retry without VAD if the first attempt blanked on long audio.
+    // Silero VAD can be too aggressive on certain acoustic profiles or non-English
+    // audio, causing whisper to see almost no speech segments. Retrying with
+    // energy-based silence stripping gives whisper the full audio.
+    if result.stats.final_words == 0
+        && use_integrated_vad
+        && result.stats.audio_duration_secs > 60.0
+    {
+        tracing::warn!(
+            audio_secs = format!("{:.0}", result.stats.audio_duration_secs),
+            raw_segments = result.stats.raw_segments,
+            "blank transcript from long audio with VAD — retrying without VAD"
+        );
+        let mut retry_stats = FilterStats {
+            audio_duration_secs: result.stats.audio_duration_secs,
+            ..Default::default()
+        };
+        let stripped = prepare_whisper_samples(samples.clone(), false, hints);
+        retry_stats.samples_after_silence_strip = stripped.len();
+        if !stripped.is_empty() {
+            result = transcribe_with_whisper(
+                ctx,
+                &stripped,
+                audio_path,
+                config,
+                retry_stats,
+                true,
+                hints,
+            )?;
+        }
+    }
+
+    restore_source_clock(&mut result, prefix_samples as f64 / 16_000.0);
+    Ok(result)
+}
+
+/// Real transcription using whisper.cpp via whisper-rs.
+///
+/// When `force_disable_vad` is true, Silero VAD is not passed to whisper even if
+/// the model exists. Used for retry after VAD-enabled transcription produced a blank.
+/// Whisper made no decoding progress for this long: the pass is hung, not
+/// slow. One 30 s decode window on a CPU-only machine running large-v3
+/// finishes in a few minutes, so 20 minutes leaves a wide margin while still
+/// bounding a genuine hang.
+#[cfg(feature = "whisper")]
+const WHISPER_PROGRESS_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Stall detector for a batch whisper pass.
+///
+/// The progress callback stamps the elapsed time on every completed decode
+/// window; the abort callback aborts once that stamp is older than
+/// [`WHISPER_PROGRESS_STALL_LIMIT`]. Both callbacks read shared atomics, so
+/// the watchdog itself lives on the caller's stack for the duration of
+/// `WhisperState::full` (required by `set_abort_callback`).
+#[cfg(feature = "whisper")]
+struct WhisperWatchdog {
+    started: std::time::Instant,
+    last_progress_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    warned: std::sync::atomic::AtomicBool,
+}
+
+/// The half of the watchdog handed to whisper's progress callback, which
+/// whisper-rs requires to be `'static`.
+#[cfg(feature = "whisper")]
+struct WhisperProgressMarker {
+    started: std::time::Instant,
+    last_progress_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "whisper")]
+impl WhisperProgressMarker {
+    fn mark(&self) {
+        self.last_progress_ms.store(
+            self.started.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+#[cfg(feature = "whisper")]
+impl WhisperWatchdog {
+    fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            last_progress_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn progress_marker(&self) -> WhisperProgressMarker {
+        WhisperProgressMarker {
+            started: self.started,
+            last_progress_ms: std::sync::Arc::clone(&self.last_progress_ms),
+        }
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    fn since_progress(&self) -> std::time::Duration {
+        let last = std::time::Duration::from_millis(
+            self.last_progress_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        self.elapsed().saturating_sub(last)
+    }
+
+    /// Polled by ggml from whisper's compute threads; `true` aborts the pass.
+    fn should_abort(&self) -> bool {
+        let stalled = whisper_pass_stalled(self.since_progress(), WHISPER_PROGRESS_STALL_LIMIT);
+        if stalled && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let running_secs = self.elapsed().as_secs();
+            tracing::warn!(
+                stall_limit_secs = WHISPER_PROGRESS_STALL_LIMIT.as_secs(),
+                running_secs,
+                "whisper made no decoding progress; aborting the pass"
+            );
+            // The desktop app has no tracing subscriber; persist the abort.
+            crate::logging::append_log(&serde_json::json!({
+                "ts": chrono::Local::now().to_rfc3339(),
+                "level": "warn",
+                "step": "whisper_batch_stalled",
+                "file": "",
+                "message": "whisper made no decoding progress; aborting the transcription pass",
+                "extra": {
+                    "stall_limit_secs": WHISPER_PROGRESS_STALL_LIMIT.as_secs(),
+                    "running_secs": running_secs,
+                },
+            }))
+            .ok();
+        }
+        stalled
+    }
+}
+
+/// The VAD values the config sets, over whisper.cpp's defaults. `None` when the
+/// config sets none, so `default_whisper_params`' VAD settings stay untouched.
+#[cfg(feature = "whisper")]
+fn configured_vad_params(
+    transcription: &crate::config::TranscriptionConfig,
+) -> Option<whisper_rs::WhisperVadParams> {
+    let threshold = transcription.vad_threshold.filter(|t| {
+        let valid = t.is_finite() && *t > 0.0 && *t < 1.0;
+        if !valid {
+            tracing::warn!(vad_threshold = t, "ignoring vad_threshold outside (0, 1)");
+        }
+        valid
+    });
+    let ms = |value: u32| i32::try_from(value).unwrap_or(i32::MAX);
+    if threshold.is_none()
+        && transcription.vad_min_speech_ms.is_none()
+        && transcription.vad_min_silence_ms.is_none()
+        && transcription.vad_speech_pad_ms.is_none()
+    {
+        return None;
+    }
+    let mut vad = whisper_rs::WhisperVadParams::default();
+    if let Some(threshold) = threshold {
+        vad.set_threshold(threshold);
+    }
+    if let Some(value) = transcription.vad_min_speech_ms {
+        vad.set_min_speech_duration(ms(value));
+    }
+    if let Some(value) = transcription.vad_min_silence_ms {
+        vad.set_min_silence_duration(ms(value));
+    }
+    if let Some(value) = transcription.vad_speech_pad_ms {
+        vad.set_speech_pad(ms(value));
+    }
+    Some(vad)
+}
+
+/// The batch pass's VAD and decoding knobs from `TranscriptionConfig`. With
+/// none of them set, the parameters are exactly `default_whisper_params`'.
+#[cfg(feature = "whisper")]
+fn apply_whisper_tuning(
+    params: &mut whisper_rs::FullParams<'_, '_>,
+    transcription: &crate::config::TranscriptionConfig,
+    vad_enabled: bool,
+) {
+    if vad_enabled {
+        if let Some(vad) = configured_vad_params(transcription) {
+            params.set_vad_params(vad);
+        }
+    }
+    if let Some(tokens) = transcription.n_max_text_ctx {
+        params.set_n_max_text_ctx(i32::try_from(tokens).unwrap_or(i32::MAX));
+    }
+    params.set_suppress_nst(transcription.suppress_nst);
+}
+
+/// Pure decision so the stall policy is testable without a model.
+#[cfg(feature = "whisper")]
+fn whisper_pass_stalled(since_progress: std::time::Duration, limit: std::time::Duration) -> bool {
+    since_progress >= limit
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_with_whisper(
+    ctx: &whisper_rs::WhisperContext,
+    samples: &[f32],
+    _audio_path: &Path,
+    config: &Config,
+    mut stats: FilterStats,
+    force_disable_vad: bool,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    tracing::info!(
+        samples = samples.len(),
+        duration_secs = samples.len() as f64 / 16000.0,
+        vad_disabled = force_disable_vad,
+        "starting whisper transcription"
+    );
+
+    let mut state = ctx
+        .create_state()
+        .map_err(|e| TranscribeError::TranscriptionFailed(format!("create state: {}", e)))?;
+
+    // Resolve VAD model path and convert to string for FullParams lifetime.
+    // Skip VAD on retry — it may have been too aggressive on this audio.
+    crate::process_trace::stage("whisper.vad_setup.start");
+    let vad_path = if force_disable_vad {
+        None
+    } else {
+        resolve_vad_model_path(config)
+    };
+    crate::process_trace::update_vad_enabled(vad_path.is_some());
+    crate::process_trace::stage("whisper.vad_setup.done");
+    let vad_path_str = vad_path.as_ref().and_then(|p| p.to_str());
+    let mut params = default_whisper_params(vad_path_str);
+    apply_whisper_tuning(&mut params, &config.transcription, vad_path_str.is_some());
+    params.set_n_threads(num_cpus());
+    params.set_language(config.transcription.language.as_deref());
+    params.set_token_timestamps(true);
+    let initial_prompt = if config.transcription.prompt_terms_only {
+        hints.whisper_terms_prompt()
+    } else {
+        hints.whisper_initial_prompt()
+    };
+    if let Some(initial_prompt) = initial_prompt {
+        tracing::debug!(
+            phrases = hints.combined_phrases(12).len(),
+            "applying whisper decode hints"
+        );
+        params.set_initial_prompt(&initial_prompt);
+    }
+
+    // Watchdog: abort only when whisper stops making progress, never merely
+    // because the machine is slow. The previous deadline (5 min + 3x audio,
+    // capped at 1 h) was installed through whisper-rs's unsound
+    // `set_abort_callback_safe` and never fired (see `set_abort_callback`);
+    // wiring it correctly would have started aborting long recordings on
+    // CPU-only devices with large models, which is slow, not hung. A pass
+    // that reports no decoding progress for `WHISPER_PROGRESS_STALL_LIMIT`
+    // is hung.
+    let audio_duration_secs = samples.len() as f64 / 16000.0;
+    let watchdog = WhisperWatchdog::start();
+    let progress_marker = watchdog.progress_marker();
+    params.set_progress_callback_safe(move |_progress: i32| progress_marker.mark());
+    let abort_when_stalled = || watchdog.should_abort();
+    set_abort_callback(&mut params, &abort_when_stalled);
+
+    crate::process_trace::stage_with_extra(
+        "whisper.full.start",
+        serde_json::json!({"stall_limit_secs": WHISPER_PROGRESS_STALL_LIMIT.as_secs()}),
+    );
+    state.full(params, samples).map_err(|e| {
+        let msg = format!("{}", e);
+        if msg.contains("abort") {
+            TranscribeError::TranscriptionFailed(format!(
+                "transcription stalled: whisper made no decoding progress for {}s \
+                     (audio was {:.0}s, pass ran for {:.0}s). \
+                     Try a smaller model or ensure Silero VAD is installed: minutes setup",
+                WHISPER_PROGRESS_STALL_LIMIT.as_secs(),
+                audio_duration_secs,
+                watchdog.elapsed().as_secs_f64()
+            ))
+        } else {
+            TranscribeError::TranscriptionFailed(msg)
+        }
+    })?;
+    crate::process_trace::stage("whisper.full.done");
+
+    let num_segments = state.full_n_segments();
+    stats.raw_segments = num_segments as usize;
+
+    // Collect segments, filtering by no_speech probability.
+    // We keep two lists: filtered (normal path) and rescued (all segments with text).
+    // If the filter would produce 0 lines, we rescue the unfiltered segments instead
+    // of producing a blank transcript — a noisy transcript beats nothing for long recordings.
+    //
+    // Each list has a parallel segment-data vec (start_secs, end_secs, clean_text) so
+    // that after whisper-guard cleanup we can correlate surviving lines back to their
+    // real centisecond-precision timestamps without re-parsing the [m:ss] prefix.
+    let mut lines: Vec<String> = Vec::new();
+    let mut seg_data: Vec<(f64, f64, String)> = Vec::new(); // parallel to lines
+    let mut rescued_lines: Vec<String> = Vec::new();
+    let mut rescued_seg_data: Vec<(f64, f64, String)> = Vec::new(); // parallel to rescued_lines
+    let mut skipped_no_speech = 0u32;
+    for i in 0..num_segments {
+        let segment = match state.get_segment(i) {
+            Some(seg) => seg,
+            None => continue,
+        };
+
+        let start_ts = segment.start_timestamp();
+        let end_ts = segment.end_timestamp();
+        let text = segment
+            .to_str_lossy()
+            .map_err(|e| TranscribeError::TranscriptionFailed(format!("get text: {}", e)))?;
+
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let mins = start_ts / 6000;
+        let secs = (start_ts % 6000) / 100;
+        let line = format!("[{}:{:02}] {}", mins, secs, text);
+
+        // Centiseconds → seconds (centisecond precision)
+        let start_secs = start_ts as f64 / 100.0;
+        let end_secs = end_ts as f64 / 100.0;
+        let seg_tuple = (start_secs, end_secs, text.to_string());
+
+        // Layer 3: Skip segments with high no_speech probability (likely hallucination)
+        let no_speech_prob = segment.no_speech_probability();
+        if no_speech_prob > 0.8 {
+            skipped_no_speech += 1;
+            tracing::debug!(
+                segment = i,
+                no_speech_prob = format!("{:.2}", no_speech_prob),
+                "flagged segment — high no_speech probability"
+            );
+            rescued_lines.push(line);
+            rescued_seg_data.push(seg_tuple);
+            continue;
+        }
+
+        rescued_lines.push(line.clone());
+        rescued_seg_data.push(seg_tuple.clone());
+        lines.push(line);
+        seg_data.push(seg_tuple);
+    }
+
+    // Rescue: if ALL segments were filtered out but some had text, keep them.
+    // This prevents blank transcripts from long recordings where the no_speech
+    // detector was wrong (common with non-English audio or unusual acoustics).
+    if lines.is_empty() && !rescued_lines.is_empty() {
+        let rescued_count = rescued_lines.len();
+        tracing::warn!(
+            rescued = rescued_count,
+            skipped_no_speech = skipped_no_speech,
+            audio_secs = format!("{:.0}", stats.audio_duration_secs),
+            "no_speech filter would blank the transcript — rescuing all segments"
+        );
+        lines = rescued_lines;
+        seg_data = rescued_seg_data;
+        stats.rescued_no_speech = rescued_count;
+        // Don't count these as skipped since we rescued them
+        skipped_no_speech = 0;
+    }
+
+    stats.skipped_no_speech = skipped_no_speech as usize;
+    stats.after_no_speech_filter = lines.len();
+
+    if skipped_no_speech > 0 {
+        tracing::info!(
+            skipped = skipped_no_speech,
+            remaining = lines.len(),
+            "filtered segments with high no_speech probability"
+        );
+    }
+
+    // Capture detected language before cleanup consumes the state.
+    // full_lang_id_from_state() returns -1 when no language was set or detected.
+    let detected_language = {
+        let lang_id = state.full_lang_id_from_state();
+        if lang_id >= 0 {
+            whisper_rs::get_lang_str(lang_id).map(str::to_owned)
+        } else {
+            None
+        }
+    };
+
+    let cleanup = run_transcript_cleanup_pipeline(lines.clone());
+    stats.after_dedup = cleanup.after(TranscriptCleanupStage::DedupSegments);
+    stats.after_interleaved = cleanup.after(TranscriptCleanupStage::DedupInterleaved);
+    stats.after_script_filter = cleanup.after(TranscriptCleanupStage::StripForeignScript);
+    stats.after_noise_markers = cleanup.after(TranscriptCleanupStage::CollapseNoiseMarkers);
+    stats.after_trailing_trim = cleanup.after(TranscriptCleanupStage::TrimTrailingNoise);
+
+    // Correlate surviving lines back to their real timestamps
+    let segments = correlate_whisper_segments(&cleanup.lines, &lines, &seg_data);
+
+    let surviving_lines = cleanup.lines;
+    let transcript = surviving_lines.join("\n");
+    let transcript = if transcript.is_empty() {
+        transcript
+    } else {
+        format!("{}\n", transcript)
+    };
+
+    let word_count = transcript.split_whitespace().count();
+    stats.final_words = word_count;
+
+    tracing::info!(
+        segments = num_segments,
+        words = word_count,
+        diagnosis = stats.diagnosis(),
+        "transcription complete"
+    );
+
+    if word_count == 0 && num_segments > 0 {
+        tracing::warn!(
+            diagnosis = stats.diagnosis(),
+            "all segments filtered out — transcript is blank"
+        );
+    }
+
+    Ok(TranscribeResult {
+        text: transcript,
+        stats,
+        segments,
+        detected_language,
+    })
+}
+
+/// Load audio from any supported format as 16kHz mono f32 samples.
+///
+/// Non-WAV formats (m4a, mp3, ogg, etc.) use ffmpeg. Symphonia 0.5.5
+/// demuxers allocate attacker-controlled container table counts while probing,
+/// before a decoder budget can run, so there is deliberately no in-process
+/// compressed-container fallback.
+pub(crate) fn load_audio_samples_with_format(
+    path: &Path,
+    format_extension: Option<&str>,
+    config: &Config,
+) -> Result<Vec<f32>, TranscribeError> {
+    let ext = format_extension
+        .map(str::to_string)
+        .or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+        .to_lowercase();
+
+    // Resolve opaque private authority once. The typed authorization boundary
+    // admits bounded WAV only; private bytes are never offered to an ordinary
+    // exec child.
+    let private_source = crate::pipeline::authorized_audio_stdin(path)?;
+    let samples = match (ext.as_str(), private_source) {
+        ("wav", source) => {
+            crate::process_trace::stage_with_extra(
+                "decode.start",
+                serde_json::json!({"decoder": "wav"}),
+            );
+            let samples = match source {
+                Some(reader) => load_wav_stream(reader)?,
+                None => load_wav(path)?,
+            };
+            crate::process_trace::update_audio(samples.len());
+            crate::process_trace::stage_with_extra(
+                "decode.done",
+                serde_json::json!({"decoder": "wav"}),
+            );
+            samples
+        }
+        (other, Some(_)) if other != "wav" => {
+            return Err(TranscribeError::UnsupportedFormat(
+                "authorized private processing currently supports bounded WAV input only".into(),
+            ));
+        }
+        (other, None) if !other.is_empty() => {
+            // Prefer ffmpeg — its resampler and AAC decoder produce samples that
+            // whisper transcribes correctly across all languages. Symphonia's AAC
+            // decoder produces subtly different samples that trigger hallucination
+            // loops on non-English audio (confirmed in issue #21).
+            // Record which decoder actually ran, not which one was preferred.
+            // Attributing a bounded-worker decode to ffmpeg would misdirect
+            // issue-#21-class quality reports in support traces.
+            let planned = if crate::ffmpeg::resolve_launchable_ffmpeg().is_ok() {
+                "ffmpeg"
+            } else {
+                "bounded-worker"
+            };
+            crate::process_trace::stage_with_extra(
+                "decode.start",
+                serde_json::json!({"decoder": planned}),
+            );
+            let samples = decode_with_ffmpeg(path, config)?;
+            crate::process_trace::update_audio(samples.len());
+            crate::process_trace::stage_with_extra(
+                "decode.done",
+                serde_json::json!({"decoder": planned}),
+            );
+            samples
+        }
+        (other, _) => return Err(TranscribeError::UnsupportedFormat(other.to_string())),
+    };
+    Ok(samples)
+}
+
+/// Load WAV file as f32 samples, converting to 16kHz mono if needed.
+fn load_wav(path: &Path) -> Result<Vec<f32>, TranscribeError> {
+    if let Some(file) = crate::pipeline::authorized_audio_stdin(path)? {
+        return load_wav_stream(file);
+    }
+    let reader = hound::WavReader::open(path).map_err(|e| {
+        if e.to_string().contains("Not a WAVE file") || e.to_string().contains("unexpected EOF") {
+            TranscribeError::UnsupportedFormat("corrupt or invalid WAV file".into())
+        } else {
+            TranscribeError::Io(std::io::Error::other(e.to_string()))
+        }
+    })?;
+
+    load_wav_reader(reader)
+}
+
+fn load_wav_stream<R: Read>(file: R) -> Result<Vec<f32>, TranscribeError> {
+    let reader = hound::WavReader::new(file).map_err(|e| {
+        if e.to_string().contains("Not a WAVE file") || e.to_string().contains("unexpected EOF") {
+            TranscribeError::UnsupportedFormat("corrupt or invalid WAV file".into())
+        } else {
+            TranscribeError::Io(std::io::Error::other(e.to_string()))
+        }
+    })?;
+    load_wav_reader(reader)
+}
+
+fn load_wav_reader<R: Read>(reader: hound::WavReader<R>) -> Result<Vec<f32>, TranscribeError> {
+    let spec = reader.spec();
+    let sample_rate = spec.sample_rate;
+    let channels = spec.channels as usize;
+    let budget = crate::audio_budget::AudioWorkBudget::new();
+    budget.validate_stream(sample_rate, channels)?;
+
+    let bits = spec.bits_per_sample;
+    if bits == 0 || bits > 32 {
+        return Err(TranscribeError::UnsupportedFormat(
+            "WAV bit depth exceeds the resource budget".into(),
+        ));
+    }
+    let max_val = (1_i64 << (bits - 1)) as f32; // e.g. 16-bit → 32768.0
+    let mut resampler = crate::audio_budget::StreamingMonoResampler::new(
+        sample_rate,
+        crate::audio_budget::CANONICAL_SAMPLE_RATE,
+        budget,
+        crate::audio_budget::MAX_CANONICAL_SAMPLES,
+    )?;
+    let mut channel_index = 0_usize;
+    let mut frame_sum = 0.0_f64;
+    {
+        let mut accept_sample = |sample: f32| -> Result<(), TranscribeError> {
+            if !sample.is_finite() {
+                frame_sum.zeroize();
+                return Err(TranscribeError::UnsupportedFormat(
+                    "WAV contains a non-finite floating-point sample".into(),
+                ));
+            }
+            frame_sum += f64::from(sample);
+            channel_index += 1;
+            if channel_index == channels {
+                let mono = frame_sum / channels as f64;
+                if !mono.is_finite() || mono.abs() > f64::from(f32::MAX) {
+                    frame_sum.zeroize();
+                    return Err(TranscribeError::UnsupportedFormat(
+                        "WAV channel downmix exceeds the finite floating-point range".into(),
+                    ));
+                }
+                let mono = mono as f32;
+                if !mono.is_finite() {
+                    frame_sum.zeroize();
+                    return Err(TranscribeError::UnsupportedFormat(
+                        "WAV channel downmix is not finite".into(),
+                    ));
+                }
+                resampler.push_mono_sample(mono)?;
+                channel_index = 0;
+                frame_sum = 0.0;
+            }
+            Ok(())
+        };
+        match spec.sample_format {
+            hound::SampleFormat::Int => {
+                for sample in reader.into_samples::<i32>() {
+                    let sample = sample.map_err(|error| {
+                        TranscribeError::Io(std::io::Error::other(format!(
+                            "authenticated WAV sample read failed: {error}"
+                        )))
+                    })?;
+                    accept_sample(sample as f32 / max_val)?;
+                }
+            }
+            hound::SampleFormat::Float => {
+                for sample in reader.into_samples::<f32>() {
+                    let sample = sample.map_err(|error| {
+                        TranscribeError::Io(std::io::Error::other(format!(
+                            "authenticated WAV sample read failed: {error}"
+                        )))
+                    })?;
+                    accept_sample(sample)?;
+                }
+            }
+        }
+    }
+    if channel_index != 0 {
+        return Err(TranscribeError::UnsupportedFormat(
+            "WAV ended inside an interleaved frame".into(),
+        ));
+    }
+    if resampler.source_frames() == 0 {
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    let mut resampled = resampler.finish()?;
+    crate::audio_budget::normalize_in_place(&mut resampled);
+    Ok(resampled)
+}
+
+/// Decode audio with ffmpeg (preferred for non-WAV formats).
+///
+struct SensitiveDecodedSamples(Vec<f32>);
+
+impl SensitiveDecodedSamples {
+    fn into_inner(mut self) -> Vec<f32> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for SensitiveDecodedSamples {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Read the bounded decode worker's PCM back as samples, for consumers outside
+/// this module that need canonical audio rather than a transcript.
+pub(crate) fn load_pcm_s16le_for_diarization(
+    pcm: &mut crate::pipeline::PrivateAudioTempFile,
+) -> Result<Vec<f32>, String> {
+    let reader = pcm
+        .try_clone_reader()
+        .map_err(|error| format!("decoded audio could not be reopened: {error}"))?;
+    let mut samples = load_pcm_s16le_stream_with_limit(
+        reader,
+        crate::audio_budget::MAX_CANONICAL_SAMPLES,
+        crate::audio_budget::AudioWorkBudget::new(),
+    )
+    .map_err(|error| format!("decoded audio could not be read: {error}"))?;
+    crate::audio_budget::normalize_in_place(&mut samples);
+    Ok(samples)
+}
+
+fn load_pcm_s16le_stream_with_limit<R: Read>(
+    mut reader: R,
+    max_samples: usize,
+    budget: crate::audio_budget::AudioWorkBudget,
+) -> Result<Vec<f32>, TranscribeError> {
+    let mut decoded = SensitiveDecodedSamples(Vec::new());
+    let mut buffer = Zeroizing::new([0_u8; 64 * 1024]);
+    let mut pending_low_byte = None;
+
+    loop {
+        let read = reader.read(&mut buffer[..])?;
+        if read == 0 {
+            break;
+        }
+        budget.check_deadline()?;
+
+        let mut offset = 0;
+        if let Some(low) = pending_low_byte.take() {
+            push_pcm_s16le_sample(
+                &mut decoded.0,
+                i16::from_le_bytes([low, buffer[0]]),
+                max_samples,
+            )?;
+            offset = 1;
+        }
+
+        let samples_end = offset + ((read - offset) / 2) * 2;
+        for bytes in buffer[offset..samples_end].chunks_exact(2) {
+            push_pcm_s16le_sample(
+                &mut decoded.0,
+                i16::from_le_bytes([bytes[0], bytes[1]]),
+                max_samples,
+            )?;
+        }
+        if samples_end < read {
+            pending_low_byte = Some(buffer[samples_end]);
+        }
+    }
+
+    if pending_low_byte.is_some() {
+        return Err(TranscribeError::UnsupportedFormat(
+            "ffmpeg returned a truncated s16le PCM sample".into(),
+        ));
+    }
+    if decoded.0.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+    Ok(decoded.into_inner())
+}
+
+fn push_pcm_s16le_sample(
+    samples: &mut Vec<f32>,
+    sample: i16,
+    max_samples: usize,
+) -> Result<(), TranscribeError> {
+    if samples.len() >= max_samples {
+        return Err(crate::audio_budget::resource_error(
+            "decoded audio exceeds the resource budget",
+        )
+        .into());
+    }
+    if samples.len() == samples.capacity() {
+        let remaining = max_samples.saturating_sub(samples.len());
+        samples
+            .try_reserve(remaining.min(16_384))
+            .map_err(|_| crate::audio_budget::resource_error("decoded audio allocation failed"))?;
+    }
+    samples.push(sample as f32 / 32_768.0);
+    Ok(())
+}
+
+/// Shells out to `ffmpeg` to convert any supported audio to 16kHz mono s16le PCM.
+/// This matches exactly what whisper-cli does and produces samples that
+/// whisper transcribes correctly across all languages.
+///
+/// Returns an error only when ffmpeg cannot decode the input *and* the bounded
+/// decode worker is disabled or also fails. There is still deliberately no
+/// *in-process* compressed-container fallback: Symphonia 0.5.5 can allocate
+/// attacker-declared tables before resource limits run. The fallback below runs
+/// Symphonia only inside a child whose address-space ceiling is installed before
+/// the decoder reads a byte.
+///
+/// The fallback covers a broken ffmpeg as well as a missing one, matching
+/// upstream. A resolvable-but-unusable ffmpeg is a common real state, for
+/// instance after an upgrade leaves a dangling dylib, and gating the fallback on
+/// resolution alone left those users with a hard failure.
+fn decode_with_ffmpeg(path: &Path, config: &Config) -> Result<Vec<f32>, TranscribeError> {
+    // resolve_launchable_ffmpeg proves the binary actually starts, matching what
+    // the watcher and desktop preflights ask. resolve_ffmpeg alone accepted
+    // images that fail at decode time, so the two surfaces disagreed.
+    let unavailable = match crate::ffmpeg::resolve_launchable_ffmpeg() {
+        Ok(ffmpeg) => {
+            match decode_with_ffmpeg_binary(
+                path,
+                &ffmpeg,
+                crate::audio_budget::MAX_CANONICAL_SAMPLES,
+                crate::audio_budget::AUDIO_DECODE_DEADLINE,
+            ) {
+                Ok(samples) => return Ok(samples),
+                Err(error) => {
+                    if !crate::audio_decode_worker::bounded_decode_fallback_enabled(config) {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        source = %crate::pipeline::private_audio_diagnostic_label(path),
+                        "ffmpeg resolved but failed to decode this import; retrying in the \
+                         bounded decode worker: {error}"
+                    );
+                    // Keep ffmpeg's diagnosis when the retry also fails.
+                    // Reporting only the fallback's error would discard the
+                    // reason the preferred decoder rejected the file, which is
+                    // usually the more actionable of the two.
+                    return decode_with_bounded_worker(path).map_err(|fallback| {
+                        TranscribeError::UnsupportedFormat(format!("{error}; {fallback}"))
+                    });
+                }
+            }
+        }
+        Err(error) => error,
+    };
+    if !crate::audio_decode_worker::bounded_decode_fallback_enabled(config) {
+        return Err(TranscribeError::CompressedDecoderUnavailable(format!(
+            "ffmpeg is required for compressed audio but is not available: {unavailable}"
+        )));
+    }
+    tracing::warn!(
+        source = %crate::pipeline::private_audio_diagnostic_label(path),
+        "ffmpeg is unavailable; decoding this compressed import in the bounded worker. \
+         Install ffmpeg for the higher-fidelity decode (issue #21)"
+    );
+    decode_with_bounded_worker(path)
+}
+
+/// Exercise the real compressed-decode entry point from another module's
+/// tests, so the fallback is covered end to end rather than only at the
+/// worker's internal boundary.
+#[cfg(test)]
+pub(crate) fn decode_compressed_for_test(
+    path: &Path,
+    config: &Config,
+) -> Result<Vec<f32>, TranscribeError> {
+    decode_with_ffmpeg(path, config)
+}
+
+/// Decode a compressed import in the bounded Symphonia worker.
+///
+/// Mirrors [`decode_with_ffmpeg_binary`]'s contract exactly: the child emits
+/// 16 kHz mono `s16le` PCM into a private file that never has a pathname the
+/// child can reach, and the same reader converts it.
+fn decode_with_bounded_worker(path: &Path) -> Result<Vec<f32>, TranscribeError> {
+    let mut tmp_pcm = crate::pipeline::PrivateAudioTempFile::new("minutes-decode-", ".s16le")
+        .map_err(TranscribeError::Io)?;
+    let authorized_input = crate::pipeline::authorized_audio_stdin(path).map_err(|error| {
+        TranscribeError::TranscriptionFailed(format!("authorized audio input unavailable: {error}"))
+    })?;
+    if authorized_input.is_some() {
+        return Err(TranscribeError::TranscriptionFailed(
+            "private audio requires an in-process decoder".into(),
+        ));
+    }
+    crate::audio_decode_worker::decode_to_private_pcm(
+        path,
+        &mut tmp_pcm,
+        crate::audio_budget::AudioWorkBudget::max_pcm_s16le_bytes(),
+        crate::audio_budget::AUDIO_DECODE_DEADLINE,
+    )
+    .map_err(TranscribeError::CompressedDecoderUnavailable)?;
+    tracing::info!(
+        source = %crate::pipeline::private_audio_diagnostic_label(path),
+        "decoded audio with the bounded decode worker (16kHz mono s16le PCM)"
+    );
+    let budget = crate::audio_budget::AudioWorkBudget::new();
+    let mut samples = load_pcm_s16le_stream_with_limit(
+        tmp_pcm.try_clone_reader().map_err(TranscribeError::Io)?,
+        crate::audio_budget::MAX_CANONICAL_SAMPLES,
+        budget,
+    )?;
+    crate::audio_budget::normalize_in_place(&mut samples);
+    Ok(samples)
+}
+
+fn ffmpeg_decode_command(ffmpeg: &Path, path: &Path) -> crate::bounded_child::BoundedCommand {
+    let mut command = crate::bounded_child::BoundedCommand::new(ffmpeg);
+    command
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(path)
+        .arg("-ar")
+        .arg("16000")
+        .arg("-ac")
+        .arg("1")
+        .arg("-c:a")
+        .arg("pcm_s16le")
+        .arg("-f")
+        .arg("s16le")
+        .arg("pipe:1");
+    command
+}
+
+fn decode_with_ffmpeg_binary(
+    path: &Path,
+    ffmpeg: &Path,
+    max_samples: usize,
+    wall_clock: std::time::Duration,
+) -> Result<Vec<f32>, TranscribeError> {
+    let mut tmp_pcm = crate::pipeline::PrivateAudioTempFile::new("minutes-ffmpeg-", ".s16le")
+        .map_err(TranscribeError::Io)?;
+
+    let authorized_input = crate::pipeline::authorized_audio_stdin(path).map_err(|e| {
+        TranscribeError::TranscriptionFailed(format!("authorized audio input unavailable: {e}"))
+    })?;
+    if authorized_input.is_some() {
+        return Err(TranscribeError::TranscriptionFailed(
+            "private audio requires an in-process decoder".into(),
+        ));
+    }
+    let max_output_bytes = if max_samples == crate::audio_budget::MAX_CANONICAL_SAMPLES {
+        crate::audio_budget::AudioWorkBudget::max_pcm_s16le_bytes()
+    } else {
+        u64::try_from(max_samples)
+            .ok()
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<i16>() as u64))
+            .ok_or_else(|| crate::audio_budget::resource_error("decoded audio size overflowed"))?
+    };
+    let mut command = ffmpeg_decode_command(ffmpeg, path);
+    let output = crate::pipeline::output_with_authorized_audio_stdin_to_private_file_with_budget(
+        &mut command,
+        None,
+        &mut tmp_pcm,
+        max_output_bytes,
+        wall_clock,
+    )
+    .map_err(|error| {
+        if crate::bounded_child::is_spawn_failure(&error) {
+            TranscribeError::CompressedDecoderUnavailable(format!(
+                "ffmpeg was resolved but could not be started: {error}"
+            ))
+        } else {
+            TranscribeError::Io(error)
+        }
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(TranscribeError::UnsupportedFormat(format!(
+            "ffmpeg rejected or could not decode the input audio: {}",
+            stderr.lines().last().unwrap_or("unknown error")
+        )));
+    }
+    tracing::info!(
+        source = %crate::pipeline::private_audio_diagnostic_label(path),
+        "decoded audio with ffmpeg (16kHz mono s16le PCM)"
+    );
+
+    let budget = crate::audio_budget::AudioWorkBudget::new();
+    let mut samples = load_pcm_s16le_stream_with_limit(
+        tmp_pcm.try_clone_reader().map_err(TranscribeError::Io)?,
+        max_samples,
+        budget,
+    )?;
+    crate::audio_budget::normalize_in_place(&mut samples);
+    Ok(samples)
+}
+
+// resample() and normalize_audio() are provided by whisper_guard::audio
+// and re-exported at the top of this file.
+
+pub(crate) fn detect_meeting_vad_chunks(samples: &[f32]) -> Vec<(usize, usize)> {
+    const SAMPLE_RATE: usize = 16_000;
+    const WINDOW_SAMPLES: usize = 1_600; // 100ms
+    const ROTATE_SILENCE_MS: u64 = 800;
+    const MIN_CHUNK_SAMPLES: usize = SAMPLE_RATE; // 1s
+    const MAX_CHUNK_SAMPLES: usize = SAMPLE_RATE * 45;
+    const NOISE_FLOOR_MIN: f32 = 0.0001;
+    const NOISE_FLOOR_MAX: f32 = 0.02;
+    const NOISE_MULTIPLIER: f32 = 4.0;
+    const HANGOVER_CHUNKS: u32 = 5;
+    const ADAPT_RATE: f32 = 0.02;
+
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let mut noise_floor = 0.001f32;
+    let mut speaking = false;
+    let mut hangover_remaining = 0u32;
+    let mut silence_ms = 0u64;
+    let mut chunks = Vec::new();
+    let mut chunk_start: Option<usize> = None;
+    let mut last_voice_end = 0usize;
+
+    for (window_index, window) in samples.chunks(WINDOW_SAMPLES).enumerate() {
+        let window_start = window_index * WINDOW_SAMPLES;
+        let window_end = (window_start + window.len()).min(samples.len());
+        let rms = (window
+            .iter()
+            .map(|sample| (*sample as f64) * (*sample as f64))
+            .sum::<f64>()
+            / window.len().max(1) as f64)
+            .sqrt() as f32;
+
+        let threshold = noise_floor * NOISE_MULTIPLIER;
+        if rms > threshold {
+            speaking = true;
+            hangover_remaining = HANGOVER_CHUNKS;
+            silence_ms = 0;
+        } else if hangover_remaining > 0 {
+            hangover_remaining -= 1;
+            silence_ms = 0;
+        } else {
+            speaking = false;
+            silence_ms += 100;
+            if rms > noise_floor {
+                noise_floor += (rms - noise_floor) * ADAPT_RATE;
+            } else {
+                noise_floor += (rms - noise_floor) * (ADAPT_RATE * 3.0);
+            }
+            noise_floor = noise_floor.clamp(NOISE_FLOOR_MIN, NOISE_FLOOR_MAX);
+        }
+
+        if speaking {
+            if chunk_start.is_none() {
+                chunk_start = Some(window_start);
+            }
+            last_voice_end = window_end;
+        }
+
+        if let Some(start) = chunk_start {
+            let chunk_len = last_voice_end.saturating_sub(start);
+            if chunk_len >= MAX_CHUNK_SAMPLES {
+                chunks.push((start, last_voice_end.max(window_end)));
+                chunk_start = None;
+                last_voice_end = 0;
+                noise_floor = 0.001;
+                speaking = false;
+                hangover_remaining = 0;
+                silence_ms = 0;
+                continue;
+            }
+
+            if !speaking && silence_ms >= ROTATE_SILENCE_MS && chunk_len >= MIN_CHUNK_SAMPLES {
+                chunks.push((start, last_voice_end));
+                chunk_start = None;
+                last_voice_end = 0;
+                noise_floor = 0.001;
+                speaking = false;
+                hangover_remaining = 0;
+                silence_ms = 0;
+            }
+        }
+    }
+
+    if let Some(start) = chunk_start {
+        let end = if last_voice_end > start {
+            last_voice_end
+        } else {
+            samples.len()
+        };
+        if end > start {
+            chunks.push((start, end));
+        }
+    }
+
+    chunks
+}
+
+fn offset_timestamped_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    offset_secs: f64,
+    _chunk_index: usize,
+) -> Vec<String> {
+    lines
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix('[')?;
+            let close = rest.find(']')?;
+            let timestamp = &rest[..close];
+            let text = rest[close + 1..].trim();
+            let (mins, secs) = timestamp.split_once(':')?;
+            let total_secs = mins.parse::<u64>().ok()? * 60 + secs.parse::<u64>().ok()?;
+            let adjusted = total_secs as f64 + offset_secs;
+            let adjusted_mins = (adjusted / 60.0).floor() as u64;
+            let adjusted_secs = (adjusted % 60.0).floor() as u64;
+            Some(format!("[{}:{:02}] {}", adjusted_mins, adjusted_secs, text))
+        })
+        .collect()
+}
+
+// ── Noise reduction ──────────────────────────────────────────
+
+/// Apply RNNoise-based noise reduction to audio samples.
+///
+/// nnnoiseless requires 48kHz f32 audio in 480-sample frames with values
+/// in i16 range (-32768 to 32767). This function handles resampling to/from
+/// 48kHz and the scaling automatically.
+///
+/// Primes the DenoiseState with a silence frame to avoid first-frame
+/// fade-in artifacts.
+#[cfg(feature = "denoise")]
+fn denoise_audio(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    use nnnoiseless::{DenoiseState, FRAME_SIZE};
+
+    if samples.is_empty() {
+        return samples.to_vec();
+    }
+
+    // Resample to 48kHz if needed (nnnoiseless requires exactly 48kHz)
+    let (samples_48k, original_rate) = if sample_rate != 48000 {
+        (resample(samples, sample_rate, 48000), Some(sample_rate))
+    } else {
+        (samples.to_vec(), None)
+    };
+
+    // Scale to i16 range as nnnoiseless expects
+    let scaled: Vec<f32> = samples_48k.iter().map(|s| s * 32767.0).collect();
+
+    let mut state = DenoiseState::new();
+    let mut output = Vec::with_capacity(scaled.len());
+    let mut frame_out = [0.0f32; FRAME_SIZE];
+
+    // Prime with a silence frame to avoid first-frame fade-in artifact
+    let silence = [0.0f32; FRAME_SIZE];
+    state.process_frame(&mut frame_out, &silence);
+
+    for chunk in scaled.chunks(FRAME_SIZE) {
+        if chunk.len() == FRAME_SIZE {
+            state.process_frame(&mut frame_out, chunk);
+            output.extend_from_slice(&frame_out);
+        } else {
+            // Pad last frame with zeros
+            let mut padded = [0.0f32; FRAME_SIZE];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            state.process_frame(&mut frame_out, &padded);
+            output.extend_from_slice(&frame_out[..chunk.len()]);
+        }
+    }
+
+    // Scale back to -1.0..1.0 range
+    let denoised: Vec<f32> = output.iter().map(|s| s / 32767.0).collect();
+
+    // Resample back to original rate if we upsampled
+    let denoised = if let Some(orig) = original_rate {
+        resample(&denoised, 48000, orig)
+    } else {
+        denoised
+    };
+
+    let original_rms: f32 =
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+    let denoised_rms: f32 =
+        (denoised.iter().map(|s| s * s).sum::<f32>() / denoised.len() as f32).sqrt();
+
+    tracing::info!(
+        original_rms = format!("{:.4}", original_rms),
+        denoised_rms = format!("{:.4}", denoised_rms),
+        reduction_db = format!(
+            "{:.1}",
+            20.0 * (denoised_rms / original_rms.max(0.0001)).log10()
+        ),
+        "noise reduction applied"
+    );
+
+    denoised
+}
+
+/// Conservative lower bound on the on-disk size of each whisper.cpp ggml
+/// model from `huggingface.co/ggerganov/whisper.cpp`. Used to detect
+/// truncated downloads (issue #229: an interrupted download left a
+/// `ggml-medium.bin` at 221 MB instead of ~1.5 GB; `minutes setup` happily
+/// reported it as "already downloaded" and whisper-rs aborted parsing the
+/// truncated GGML header on the next transcription).
+///
+/// Numbers are set at roughly 90% of the canonical artifact size so a
+/// legitimate file passes comfortably and only a partial download fails
+/// the check. Out of scope here: per-model SHA256 manifests, which would
+/// catch corruption as well as truncation.
+///
+/// Returns `None` for unknown / custom model names; callers should treat
+/// that as "no check available" and skip size validation.
+pub fn expected_whisper_model_size_bytes(model_name: &str) -> Option<u64> {
+    // Real Content-Length values from the canonical URL the CLI downloads
+    // (`huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin`)
+    // as of 2026-05-11:
+    //   tiny      ~74.1 MB
+    //   base     ~141.1 MB
+    //   small    ~465.0 MB
+    //   medium  ~1462.7 MB
+    //   large-v3 ~2951.7 MB
+    // Thresholds sit roughly 5% below those numbers so a real file passes
+    // and only a meaningfully truncated file is rejected.
+    //
+    // Quantized variants (`ggml-medium-q5_0.bin` and friends) have
+    // different sizes and intentionally aren't in this table; the parser
+    // in `validate_whisper_model_size` strips only the canonical
+    // `ggml-{name}.bin` shape, so quantized files resolve to a name like
+    // `medium-q5_0` that hits the `None` arm and skips validation.
+    match model_name {
+        "tiny" | "tiny.en" => Some(70 * 1024 * 1024),
+        "base" | "base.en" => Some(135 * 1024 * 1024),
+        "small" | "small.en" => Some(440 * 1024 * 1024),
+        "medium" | "medium.en" => Some(1_400 * 1024 * 1024),
+        "large-v1" | "large-v2" | "large-v3" | "large" => Some(2_800 * 1024 * 1024),
+        _ => None,
+    }
+}
+
+/// If the resolved path looks like a known `ggml-{name}.bin` artifact,
+/// check its on-disk size against `expected_whisper_model_size_bytes` and
+/// return `Err(ModelTruncated { .. })` if it falls short. Otherwise
+/// returns `Ok(path)` unchanged.
+///
+/// We only validate when the filename matches the canonical pattern so a
+/// user-supplied custom model path (e.g. a fine-tune in a non-standard
+/// location) is never falsely rejected.
+#[cfg(feature = "whisper")]
+fn validate_whisper_model_size(path: PathBuf) -> Result<PathBuf, TranscribeError> {
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(path);
+    };
+    let model_name = match file_name
+        .strip_prefix("ggml-")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+    {
+        Some(name) => name,
+        None => return Ok(path),
+    };
+    let Some(expected_min) = expected_whisper_model_size_bytes(model_name) else {
+        return Ok(path);
+    };
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return Ok(path),
+    };
+    let actual = metadata.len();
+    if actual >= expected_min {
+        return Ok(path);
+    }
+    Err(TranscribeError::ModelTruncated {
+        path: path.display().to_string(),
+        model_name: model_name.to_string(),
+        actual_mb: actual as f64 / (1024.0 * 1024.0),
+        expected_min_mb: expected_min as f64 / (1024.0 * 1024.0),
+    })
+}
+
+/// Resolve the whisper model file path for dictation (uses dictation.model config).
+#[cfg(feature = "whisper")]
+pub fn resolve_model_path_for_dictation(config: &Config) -> Result<PathBuf, TranscribeError> {
+    let model_name = &config.dictation.model;
+    let model_dir = &config.transcription.model_path;
+
+    let candidates = [
+        model_dir.join(format!("ggml-{}.bin", model_name)),
+        model_dir.join(format!("whisper-{}.bin", model_name)),
+        model_dir.join(format!("{}.bin", model_name)),
+    ];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return validate_whisper_model_size(candidate.clone());
+        }
+    }
+
+    let direct = PathBuf::from(model_name);
+    if direct.exists() {
+        return validate_whisper_model_size(direct);
+    }
+
+    Err(TranscribeError::ModelNotFound(format!(
+        "Expected model file \"ggml-{}.bin\" in {}.\n\nTo fix this, run:\n\n    minutes setup --model {}\n",
+        model_name,
+        model_dir.display(),
+        model_name,
+    )))
+}
+
+/// Resolve a whisper model file path by explicit model name.
+/// Falls back to the dictation model if the given name doesn't resolve.
+#[cfg(feature = "whisper")]
+pub fn resolve_model_path_by_name(
+    model_name: &str,
+    config: &Config,
+) -> Result<PathBuf, TranscribeError> {
+    let model_dir = &config.transcription.model_path;
+
+    let candidates = [
+        model_dir.join(format!("ggml-{}.bin", model_name)),
+        model_dir.join(format!("whisper-{}.bin", model_name)),
+        model_dir.join(format!("{}.bin", model_name)),
+    ];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return validate_whisper_model_size(candidate.clone());
+        }
+    }
+
+    let direct = PathBuf::from(model_name);
+    if direct.exists() {
+        return validate_whisper_model_size(direct);
+    }
+
+    // Fall back to dictation model with a warning
+    let model_dir_display = model_dir.display().to_string();
+    let requested = model_name.to_string();
+    let dictation_model = &config.dictation.model;
+    tracing::warn!(
+        requested = %requested,
+        fallback = %dictation_model,
+        "live transcript model not found, falling back to dictation model"
+    );
+    resolve_model_path_for_dictation(config).map_err(|_| {
+        TranscribeError::ModelNotFound(format!(
+            "Expected model file \"ggml-{}.bin\" in {}.\n\nTo fix this, run:\n\n    minutes setup --model {}\n",
+            requested, model_dir_display, requested,
+        ))
+    })
+}
+
+/// Resolve the whisper model file path.
+#[cfg(all(feature = "whisper", test))]
+fn resolve_model_path(config: &Config) -> Result<PathBuf, TranscribeError> {
+    resolve_named_model_path(&config.transcription.model, config)
+}
+
+#[cfg(feature = "whisper")]
+fn resolve_named_model_path(model_name: &str, config: &Config) -> Result<PathBuf, TranscribeError> {
+    let model_dir = &config.transcription.model_path;
+
+    // Try common naming patterns
+    let candidates = [
+        model_dir.join(format!("ggml-{}.bin", model_name)),
+        model_dir.join(format!("whisper-{}.bin", model_name)),
+        model_dir.join(format!("{}.bin", model_name)),
+    ];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return validate_whisper_model_size(candidate.clone());
+        }
+    }
+
+    // If model_name is an absolute path, try it directly
+    let direct = PathBuf::from(model_name);
+    if direct.exists() {
+        return validate_whisper_model_size(direct);
+    }
+
+    Err(TranscribeError::ModelNotFound(format!(
+        "Expected model file \"ggml-{}.bin\" in {}.\n\nTo fix this, run:\n\n    minutes setup --model {}\n",
+        model_name,
+        model_dir.display(),
+        model_name,
+    )))
+}
+
+/// Resolve the Silero VAD model path. Returns None if VAD is disabled or model not found.
+#[cfg(feature = "whisper")]
+pub(crate) fn resolve_vad_model_path(config: &Config) -> Option<PathBuf> {
+    let vad_model = &config.transcription.vad_model;
+    if vad_model.is_empty() {
+        return None;
+    }
+
+    let model_dir = &config.transcription.model_path;
+    let mut candidates = vec![
+        model_dir.join(format!("ggml-{}.bin", vad_model)),
+        model_dir.join(format!("{}.bin", vad_model)),
+    ];
+    // Fallback: accept old "ggml-silero-vad.bin" name for backward compatibility,
+    // but only when the config is using a silero-variant name (the default).
+    if vad_model.starts_with("silero") {
+        candidates.push(model_dir.join("ggml-silero-vad.bin"));
+    }
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Some(candidate.clone());
+        }
+    }
+
+    // Try as absolute path
+    let direct = PathBuf::from(vad_model);
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    tracing::debug!(
+        vad_model = vad_model,
+        "VAD model not found — falling back to energy-based silence stripping"
+    );
+    None
+}
+
+/// Resolve the Silero ONNX path used by the streaming `OrtSileroVad`
+/// engine. Returns None if the file is missing — caller falls back to
+/// whisper-Silero with an explicit warn-level log so the user knows
+/// they opted into ort-silero but didn't get it.
+///
+/// The file name mirrors `vad_model` (the ggml form) but with `.onnx`
+/// extension, so a single `vad_model = "silero-v6.2.0"` config drives
+/// both engines' resolution.
+#[cfg(all(feature = "whisper", feature = "vad-ort"))]
+pub(crate) fn resolve_silero_onnx_path(config: &Config) -> Option<PathBuf> {
+    let vad_model = &config.transcription.vad_model;
+    if vad_model.is_empty() {
+        return None;
+    }
+    let model_dir = &config.transcription.model_path;
+    let candidates = [
+        model_dir.join(format!("{}.onnx", vad_model)),
+        model_dir.join("silero-vad-v6.2.0.onnx"),
+        model_dir.join("silero_vad.onnx"),
+    ];
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+// default_whisper_params, streaming_whisper_params, and num_cpus
+// are re-exported from whisper_guard::params via `pub use` at the top of this file.
+#[cfg(feature = "whisper")]
+fn num_cpus() -> i32 {
+    whisper_guard::params::num_cpus()
+}
+
+// ──────────────────────────────────────────────────────────────
+// Parakeet engine (subprocess-based)
+//
+// Shells out to parakeet.cpp CLI, parses text output with
+// line-level timestamps, formats as [M:SS] lines to match
+// whisper output exactly. Pipeline/diarization/summarization
+// all work unchanged.
+// ──────────────────────────────────────────────────────────────
+
+/// Transcribe using parakeet.cpp as a subprocess.
+#[cfg(feature = "parakeet")]
+fn transcribe_with_parakeet(
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    let mut stats = FilterStats::default();
+
+    // Validate model name before doing any work
+    if !crate::parakeet::valid_model(&config.transcription.parakeet_model) {
+        return Err(TranscribeError::ParakeetFailed(format!(
+            "unknown parakeet model '{}'. Valid: {}",
+            config.transcription.parakeet_model,
+            crate::config::VALID_PARAKEET_MODELS.join(", ")
+        )));
+    }
+
+    // Step 1: Load audio and convert to 16kHz mono (reuse existing pipeline)
+    let samples =
+        load_audio_samples_with_format(audio_path, hints.audio_format_extension(), config)?;
+    stats.audio_duration_secs = samples.len() as f64 / 16000.0;
+    if samples.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    // Noise reduction is not yet supported for parakeet — warn if configured
+    if config.transcription.noise_reduction {
+        tracing::debug!(
+            "noise_reduction is enabled but not applied for parakeet engine \
+             (nnnoiseless only supports the whisper path)"
+        );
+    }
+
+    let native_vad_path = resolve_parakeet_native_vad_path(config);
+    let samples = if native_vad_path.is_some() {
+        tracing::debug!("native parakeet VAD available — skipping energy-based silence stripping");
+        samples
+    } else {
+        strip_silence(&samples, 16000)
+    };
+    stats.samples_after_silence_strip = samples.len();
+    if samples.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    // Step 2: supported secure Parakeet targets normalize into an anonymous
+    // WAV and grant only the selected child an inherited descriptor. macOS is
+    // routed to Whisper before this function because its pathname-only
+    // Parakeet CLI cannot receive sealed audio.
+    let mut tmp_wav = crate::pipeline::PrivateAudioTempFile::new("minutes-parakeet-", ".wav")
+        .map_err(TranscribeError::Io)?;
+    write_wav_16k_mono_to_writer(tmp_wav.prepare_for_write()?, &samples)?;
+    tmp_wav.finish_write().map_err(TranscribeError::Io)?;
+    let child_audio = tmp_wav.child_lease().map_err(TranscribeError::Io)?;
+    let child_audio_path = child_audio.path();
+
+    // Step 3: Resolve model and vocab paths
+    let model_path = resolve_parakeet_model_path(config)?;
+    let vocab_path = resolve_parakeet_vocab_path(config)?;
+    let sidecar_audio_duration_secs = samples.len() as f64 / 16000.0;
+    let resolved_binary = crate::parakeet::resolve_parakeet_binary(
+        &config.transcription.parakeet_binary,
+        crate::parakeet::ResolveParakeetBinaryMode::WarnAndFallback,
+    )
+    .map_err(|error| TranscribeError::ParakeetFailed(error.to_string()))?;
+    let resolved_binary_str = resolved_binary.to_str().ok_or_else(|| {
+        TranscribeError::ParakeetFailed("resolved parakeet binary path is not valid UTF-8".into())
+    })?;
+
+    #[cfg(unix)]
+    if !crate::parakeet_sidecar::private_audio_transport_available() {
+        if config.transcription.parakeet_sidecar_enabled == Some(true) {
+            tracing::warn!(
+                "parakeet-sidecar: configured warm server cannot receive the anonymous private-audio capability; using the supervised direct subprocess"
+            );
+        } else {
+            tracing::debug!(
+                "parakeet-sidecar: bypassing warm server for anonymous private audio capability"
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    if crate::parakeet_sidecar::sidecar_enabled_effective(config) {
+        match crate::parakeet_sidecar::transcribe_via_global_sidecar(
+            config,
+            &model_path,
+            &vocab_path,
+            native_vad_path.as_deref(),
+            child_audio_path,
+            sidecar_audio_duration_secs,
+            hints,
+        ) {
+            Ok(result) => {
+                tracing::info!(
+                    "parakeet-sidecar: using warm server path elapsed_ms={} first_request={} fp16={}",
+                    result.elapsed_ms,
+                    result.first_request_on_process,
+                    result.effective_fp16
+                );
+                return transcribe_result_from_parakeet_parsed(
+                    result.transcript,
+                    stats,
+                    result.first_request_on_process,
+                    result.elapsed_ms,
+                    config,
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "parakeet-sidecar: falling back to subprocess path: {}",
+                    error
+                );
+            }
+        }
+    }
+
+    // Step 4: Run parakeet subprocess
+    // CLI syntax: parakeet <model.safetensors> <audio.wav> --vocab <tokenizer.vocab>
+    // [--model type] [--timestamps] [--gpu]
+    tracing::info!(
+        binary = %resolved_binary.display(),
+        model = %model_path.display(),
+        vocab = %vocab_path.display(),
+        audio = %crate::pipeline::private_audio_diagnostic_label(audio_path),
+        "starting parakeet transcription"
+    );
+
+    let invocation_started = Instant::now();
+    let host_process_key = format!(
+        "{}::{}",
+        resolved_binary.display(),
+        config.transcription.parakeet_model.as_str()
+    );
+    let host_process_first_use = {
+        let mut seen = parakeet_seen_models()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        seen.insert(host_process_key)
+    };
+
+    let use_gpu = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let use_fp16 = use_gpu && config.transcription.parakeet_fp16;
+    // A helper process would inherit the descriptor correctly, but it then
+    // performs its own path-based timeout probe before spawning Parakeet. On
+    // macOS `/dev/fd` duplicates share the open-file offset, so that probe can
+    // advance the anonymous WAV past RIFF. Keep Unix private audio on the
+    // directly supervised path where pre-exec resets the exact descriptor.
+    let helper_allowed = !cfg!(unix)
+        && hints.is_empty()
+        && std::env::var_os("MINUTES_PARAKEET_FORCE_DIRECT").is_none()
+        && std::env::var_os("MINUTES_PARAKEET_HELPER_ACTIVE").is_none();
+    let parsed = if helper_allowed {
+        if let Some(helper_path) = resolve_minutes_parakeet_helper() {
+            let mut helper_command = crate::bounded_child::BoundedCommand::new(helper_path);
+            helper_command
+                .arg("parakeet-helper")
+                .args(["--binary", resolved_binary_str])
+                .args([
+                    "--model-path",
+                    model_path.to_str().ok_or_else(|| {
+                        TranscribeError::ParakeetFailed("model path is not valid UTF-8".into())
+                    })?,
+                ])
+                .args([
+                    "--audio-path",
+                    child_audio_path.to_str().ok_or_else(|| {
+                        TranscribeError::ParakeetFailed("temp WAV path is not valid UTF-8".into())
+                    })?,
+                ])
+                .args([
+                    "--vocab-path",
+                    vocab_path.to_str().ok_or_else(|| {
+                        TranscribeError::ParakeetFailed("vocab path is not valid UTF-8".into())
+                    })?,
+                ])
+                .args(["--model-id", &config.transcription.parakeet_model])
+                .args(if use_gpu { vec!["--gpu"] } else { Vec::new() })
+                .args(if use_fp16 { vec!["--fp16"] } else { Vec::new() })
+                .env("MINUTES_PARAKEET_HELPER_ACTIVE", "1");
+            if let Some(vad_path) = native_vad_path.as_ref().and_then(|path| path.to_str()) {
+                helper_command.args(["--vad-path", vad_path]).args([
+                    "--vad-threshold",
+                    &PARAKEET_NATIVE_VAD_THRESHOLD.to_string(),
+                ]);
+            }
+            child_audio
+                .configure_command(&mut helper_command)
+                .map_err(TranscribeError::Io)?;
+            let helper_output = match output_with_timeout(
+                helper_command,
+                parakeet_timeout_for_audio_secs(sidecar_audio_duration_secs),
+            ) {
+                Ok((output, false)) => Ok(output),
+                Ok((_output, true)) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "parakeet helper exceeded its wall-clock budget",
+                )),
+                Err(error) => Err(error),
+            };
+
+            match helper_output {
+                Ok(output) if output.status.success() => serde_json::from_slice(&output.stdout)
+                    .map_err(|error| {
+                        TranscribeError::ParakeetFailed(format!(
+                            "failed to parse helper JSON output: {}",
+                            error
+                        ))
+                    })?,
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log_parakeet_helper_failure_once(&output.status, &stderr);
+                    match run_parakeet_cli_structured_with_private_audio(
+                        resolved_binary_str,
+                        &model_path,
+                        child_audio_path,
+                        &vocab_path,
+                        &config.transcription.parakeet_model,
+                        use_gpu,
+                        native_vad_path.as_deref(),
+                        PARAKEET_NATIVE_VAD_THRESHOLD,
+                        config,
+                        hints,
+                        Some(&child_audio),
+                        Some(sidecar_audio_duration_secs),
+                    ) {
+                        Ok(parsed) => parsed,
+                        Err(error @ TranscribeError::EmptyAudio)
+                        | Err(error @ TranscribeError::EmptyTranscript(_)) => {
+                            return Err(error);
+                        }
+                        Err(_) => {
+                            return Err(TranscribeError::ParakeetFailed(
+                                stderr
+                                    .lines()
+                                    .last()
+                                    .unwrap_or("unknown helper error")
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                Err(spawn_error) => {
+                    log_parakeet_helper_spawn_failure_once(&spawn_error);
+                    run_parakeet_cli_structured_with_private_audio(
+                        resolved_binary_str,
+                        &model_path,
+                        child_audio_path,
+                        &vocab_path,
+                        &config.transcription.parakeet_model,
+                        use_gpu,
+                        native_vad_path.as_deref(),
+                        PARAKEET_NATIVE_VAD_THRESHOLD,
+                        config,
+                        hints,
+                        Some(&child_audio),
+                        Some(sidecar_audio_duration_secs),
+                    )?
+                }
+            }
+        } else {
+            run_parakeet_cli_structured_with_private_audio(
+                resolved_binary_str,
+                &model_path,
+                child_audio_path,
+                &vocab_path,
+                &config.transcription.parakeet_model,
+                use_gpu,
+                native_vad_path.as_deref(),
+                PARAKEET_NATIVE_VAD_THRESHOLD,
+                config,
+                hints,
+                Some(&child_audio),
+                Some(sidecar_audio_duration_secs),
+            )?
+        }
+    } else {
+        run_parakeet_cli_structured_with_private_audio(
+            resolved_binary_str,
+            &model_path,
+            child_audio_path,
+            &vocab_path,
+            &config.transcription.parakeet_model,
+            use_gpu,
+            native_vad_path.as_deref(),
+            PARAKEET_NATIVE_VAD_THRESHOLD,
+            config,
+            hints,
+            Some(&child_audio),
+            Some(sidecar_audio_duration_secs),
+        )?
+    };
+    let elapsed_ms = invocation_started.elapsed().as_millis() as u64;
+    transcribe_result_from_parakeet_parsed(
+        parsed,
+        stats,
+        host_process_first_use,
+        elapsed_ms,
+        config,
+    )
+}
+
+/// Parse parakeet.cpp text output into `[M:SS] text` lines matching whisper format.
+///
+/// parakeet.cpp with `--timestamps` outputs lines like:
+///   `[0.00 - 2.50] Hello world`
+///   `[2.80 - 5.10] How are you`
+///
+/// Applies the full anti-hallucination pipeline: dedup_segments, dedup_interleaved,
+/// and trim_trailing_noise — matching the whisper path exactly.
+#[cfg(feature = "parakeet")]
+#[derive(Debug)]
+struct ParakeetFilterStats {
+    raw_segments: usize,
+    after_dedup: usize,
+    after_interleaved: usize,
+    after_script_filter: usize,
+    after_noise_markers: usize,
+    after_trailing_trim: usize,
+}
+
+#[cfg(feature = "parakeet")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParakeetCliSegment {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub confidence: Option<f32>,
+    pub text: String,
+}
+
+#[cfg(feature = "parakeet")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParakeetCliTranscript {
+    pub raw_output: String,
+    pub segments: Vec<ParakeetCliSegment>,
+    pub transcript: String,
+}
+
+#[cfg(feature = "parakeet")]
+fn transcribe_result_from_parakeet_parsed(
+    parsed: ParakeetCliTranscript,
+    mut stats: FilterStats,
+    host_process_first_use: bool,
+    elapsed_ms: u64,
+    config: &Config,
+) -> Result<TranscribeResult, TranscribeError> {
+    let transcript = parsed.transcript.clone();
+    let pstats = {
+        let raw_segments = parsed.segments.len();
+        let lines: Vec<String> = parsed
+            .segments
+            .iter()
+            .map(|segment| {
+                let mins = (segment.start_secs / 60.0) as u64;
+                let secs = (segment.start_secs % 60.0) as u64;
+                format!("[{}:{:02}] {}", mins, secs, segment.text)
+            })
+            .collect();
+        let cleanup = run_transcript_cleanup_pipeline(lines);
+        ParakeetFilterStats {
+            raw_segments,
+            after_dedup: cleanup.after(TranscriptCleanupStage::DedupSegments),
+            after_interleaved: cleanup.after(TranscriptCleanupStage::DedupInterleaved),
+            after_script_filter: cleanup.after(TranscriptCleanupStage::StripForeignScript),
+            after_noise_markers: cleanup.after(TranscriptCleanupStage::CollapseNoiseMarkers),
+            after_trailing_trim: cleanup.after(TranscriptCleanupStage::TrimTrailingNoise),
+        }
+    };
+
+    stats.raw_segments = pstats.raw_segments;
+    stats.after_no_speech_filter = pstats.raw_segments;
+    stats.after_dedup = pstats.after_dedup;
+    stats.after_interleaved = pstats.after_interleaved;
+    stats.after_script_filter = pstats.after_script_filter;
+    stats.after_noise_markers = pstats.after_noise_markers;
+    stats.after_trailing_trim = pstats.after_trailing_trim;
+
+    let word_count = transcript.split_whitespace().count();
+    stats.final_words = word_count;
+    tracing::info!(
+        words = word_count,
+        segments = parsed.segments.len(),
+        host_process_first_use,
+        elapsed_ms,
+        diagnosis = stats.diagnosis(),
+        "parakeet transcription complete"
+    );
+    if let (Some(first), Some(last)) = (parsed.segments.first(), parsed.segments.last()) {
+        tracing::debug!(
+            first_segment_start_secs = first.start_secs,
+            first_segment_confidence = first.confidence.unwrap_or(-1.0),
+            last_segment_end_secs = last.end_secs,
+            last_segment_confidence = last.confidence.unwrap_or(-1.0),
+            sample_text = %first.text,
+            raw_output_len = parsed.raw_output.len(),
+            "structured parakeet transcript parsed"
+        );
+    }
+
+    if transcript.is_empty() {
+        return Err(TranscribeError::EmptyTranscript(
+            config.transcription.min_words,
+        ));
+    }
+
+    Ok(TranscribeResult {
+        text: transcript,
+        stats,
+        segments: vec![],
+        detected_language: None,
+    })
+}
+
+#[cfg(feature = "parakeet")]
+fn parakeet_seen_models() -> &'static Mutex<HashSet<String>> {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(feature = "parakeet")]
+pub(crate) fn combined_parakeet_boost_phrases(config: &Config, hints: &DecodeHints) -> Vec<String> {
+    let mut phrases = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for phrase in hints.parakeet_local_boost_phrases() {
+        let key = phrase.to_ascii_lowercase();
+        if seen.insert(key) {
+            phrases.push(phrase);
+        }
+    }
+
+    let limit = config.transcription.parakeet_boost_limit;
+    if limit > 0 {
+        #[cfg(test)]
+        let global_phrases = crate::graph::parakeet_boost_phrases(config, limit);
+        #[cfg(not(test))]
+        let global_phrases = crate::graph_worker::run_policy_projection_worker(
+            config,
+            crate::graph::PolicyProjectionRequest::ParakeetBoostPhrases { limit },
+        )
+        .and_then(|response| match response {
+            crate::graph::PolicyProjectionResponse::ParakeetBoostPhrases(phrases) => Ok(phrases),
+            _ => Err("policy graph worker returned the wrong boost-phrase response".into()),
+        })
+        .map_err(|error| crate::graph::GraphError::Io(std::io::Error::other(error)));
+        match global_phrases {
+            Ok(global_phrases) => {
+                for phrase in global_phrases {
+                    let key = phrase.to_ascii_lowercase();
+                    if seen.insert(key) {
+                        phrases.push(phrase);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "could not load parakeet boost phrases");
+            }
+        }
+    }
+
+    phrases
+}
+
+#[cfg(feature = "parakeet")]
+fn append_parakeet_boost_args(
+    command: &mut crate::bounded_child::BoundedCommand,
+    config: &Config,
+    hints: &DecodeHints,
+) {
+    let phrases = combined_parakeet_boost_phrases(config, hints);
+    if phrases.is_empty() {
+        return;
+    }
+
+    command.args([
+        "--boost-score",
+        &config.transcription.parakeet_boost_score.to_string(),
+    ]);
+    for phrase in &phrases {
+        command.args(["--boost", phrase]);
+    }
+    tracing::debug!(phrases = phrases.len(), "applied parakeet boost phrases");
+}
+
+#[cfg(feature = "parakeet")]
+fn parakeet_gpu_unavailable(stderr: &str) -> bool {
+    stderr.contains("Metal GPU not available")
+}
+
+#[cfg(feature = "parakeet")]
+#[allow(clippy::too_many_arguments)]
+fn build_parakeet_command(
+    binary: &str,
+    model_str: &str,
+    audio_args: &[&str],
+    vocab_str: &str,
+    model_id: &str,
+    use_gpu: bool,
+    use_fp16: bool,
+    vad_path: Option<&str>,
+    vad_threshold: f32,
+    config: &Config,
+    hints: &DecodeHints,
+) -> crate::bounded_child::BoundedCommand {
+    let mut command = crate::bounded_child::BoundedCommand::new(binary);
+    command.arg(model_str);
+    for audio_arg in audio_args {
+        command.arg(audio_arg);
+    }
+    command
+        .args(["--vocab", vocab_str])
+        .args(["--model", model_id])
+        .arg("--timestamps");
+    if use_gpu {
+        command.arg("--gpu");
+        if use_fp16 {
+            command.arg("--fp16");
+        }
+    }
+    if let Some(vad_path) = vad_path {
+        command
+            .args(["--vad", vad_path])
+            .args(["--vad-threshold", &vad_threshold.to_string()]);
+    }
+    append_parakeet_boost_args(&mut command, config, hints);
+    command
+}
+
+/// Hard ceiling on a single parakeet subprocess invocation. Scaled to 3× the
+/// audio duration so batch jobs on long recordings never trip it, with a floor
+/// generous enough to absorb a cold model load. Without this, a wedged
+/// subprocess blocks its caller forever — the live recording sidecar froze for
+/// 27 minutes mid-meeting on exactly this path (2026-06-10).
+#[cfg(feature = "parakeet")]
+const PARAKEET_SUBPROCESS_TIMEOUT_FLOOR_SECS: u64 = 90;
+#[cfg(feature = "parakeet")]
+const PARAKEET_SUBPROCESS_TIMEOUT_CEIL_SECS: u64 = 1800;
+
+#[cfg(feature = "parakeet")]
+fn parakeet_subprocess_timeout(audio_args: &[&str]) -> std::time::Duration {
+    let audio_secs = audio_args
+        .iter()
+        .filter_map(|arg| estimate_wav_secs(Path::new(arg)))
+        .fold(0.0_f64, f64::max);
+    if audio_secs == 0.0 {
+        // Duration unknown (non-WAV input or unreadable header). Killing a
+        // legitimate long job is worse than waiting longer to declare a wedge,
+        // so fall to the ceiling, not the floor.
+        return std::time::Duration::from_secs(PARAKEET_SUBPROCESS_TIMEOUT_CEIL_SECS);
+    }
+    parakeet_timeout_for_audio_secs(audio_secs)
+}
+
+#[cfg(feature = "parakeet")]
+fn parakeet_timeout_for_audio_secs(audio_secs: f64) -> std::time::Duration {
+    let scaled = (audio_secs * 3.0).ceil() as u64;
+    std::time::Duration::from_secs(scaled.clamp(
+        PARAKEET_SUBPROCESS_TIMEOUT_FLOOR_SECS,
+        PARAKEET_SUBPROCESS_TIMEOUT_CEIL_SECS,
+    ))
+}
+
+#[cfg(feature = "parakeet")]
+fn estimate_wav_secs(path: &Path) -> Option<f64> {
+    match crate::pipeline::authorized_audio_stdin(path) {
+        Ok(Some(file)) => estimate_wav_reader_secs(hound::WavReader::new(file).ok()?),
+        Ok(None) => estimate_wav_reader_secs(hound::WavReader::open(path).ok()?),
+        Err(_) => None,
+    }
+}
+
+#[cfg(feature = "parakeet")]
+fn estimate_wav_reader_secs<R: Read>(reader: hound::WavReader<R>) -> Option<f64> {
+    let spec = reader.spec();
+    if spec.sample_rate == 0 {
+        return None;
+    }
+    Some(reader.duration() as f64 / spec.sample_rate as f64)
+}
+
+/// Run a command to completion like `Command::output()`, but kill the child
+/// if it exceeds `timeout`. Pipes are drained on dedicated threads so a child
+/// that fills stdout/stderr can't deadlock against the wait loop. Returns the
+/// output plus whether the child was killed by the timeout.
+#[cfg(feature = "parakeet")]
+fn output_with_timeout(
+    mut command: crate::bounded_child::BoundedCommand,
+    timeout: std::time::Duration,
+) -> std::io::Result<(std::process::Output, bool)> {
+    let run = crate::bounded_child::run(
+        &mut command,
+        None,
+        crate::bounded_child::StdoutTarget::Capture {
+            max_bytes: crate::bounded_child::DEFAULT_STDOUT_LIMIT,
+        },
+        crate::bounded_child::ChildBudget {
+            wall_clock: timeout,
+            stderr_tail: crate::bounded_child::DEFAULT_STDERR_TAIL,
+        },
+    )?;
+    Ok((run.output, run.timed_out))
+}
+
+#[cfg(feature = "parakeet")]
+#[allow(clippy::too_many_arguments)]
+fn run_parakeet_command_with_cpu_fallback(
+    binary: &str,
+    model_str: &str,
+    audio_args: &[&str],
+    vocab_str: &str,
+    model_id: &str,
+    use_gpu: bool,
+    use_fp16: bool,
+    vad_path: Option<&str>,
+    vad_threshold: f32,
+    config: &Config,
+    hints: &DecodeHints,
+    private_audio: Option<&crate::pipeline::PrivateAudioChildLease>,
+    known_audio_duration_secs: Option<f64>,
+) -> Result<(std::process::Output, bool), TranscribeError> {
+    let mut attempted_gpu = use_gpu;
+    let timeout = known_audio_duration_secs
+        .map(parakeet_timeout_for_audio_secs)
+        .unwrap_or_else(|| parakeet_subprocess_timeout(audio_args));
+    loop {
+        let mut command = build_parakeet_command(
+            binary,
+            model_str,
+            audio_args,
+            vocab_str,
+            model_id,
+            attempted_gpu,
+            use_fp16 && attempted_gpu,
+            vad_path,
+            vad_threshold,
+            config,
+            hints,
+        );
+        if let Some(private_audio) = private_audio {
+            private_audio
+                .configure_command(&mut command)
+                .map_err(TranscribeError::Io)?;
+        }
+        let (output, timed_out) = output_with_timeout(command, timeout).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                TranscribeError::ParakeetNotFound
+            } else {
+                TranscribeError::ParakeetFailed(format!("spawn error: {}", e))
+            }
+        })?;
+
+        if timed_out {
+            tracing::error!(
+                timeout_secs = timeout.as_secs(),
+                gpu = attempted_gpu,
+                "parakeet subprocess exceeded timeout and was killed"
+            );
+            // A wedged GPU run gets the same one-shot CPU retry a crashed GPU
+            // run gets — a Metal hang shouldn't be a harder failure than a
+            // Metal crash.
+            if attempted_gpu {
+                tracing::warn!("parakeet GPU run timed out; retrying once on CPU");
+                attempted_gpu = false;
+                continue;
+            }
+            return Err(TranscribeError::ParakeetFailed(format!(
+                "parakeet subprocess exceeded {}s timeout and was killed",
+                timeout.as_secs()
+            )));
+        }
+
+        if output.status.success() {
+            return Ok((output, attempted_gpu));
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if attempted_gpu && parakeet_gpu_unavailable(&stderr) {
+            tracing::warn!("parakeet GPU path unavailable at runtime; retrying on CPU");
+            attempted_gpu = false;
+            continue;
+        }
+
+        return Err(TranscribeError::ParakeetFailed(
+            stderr.lines().last().unwrap_or("unknown error").to_string(),
+        ));
+    }
+}
+
+#[cfg(feature = "parakeet")]
+fn resolve_minutes_parakeet_helper() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("MINUTES_PARAKEET_HELPER") {
+        let path = PathBuf::from(explicit);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    if let Ok(current) = std::env::current_exe() {
+        if current
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value == "minutes")
+            .unwrap_or(false)
+        {
+            return Some(current);
+        }
+    }
+
+    which::which("minutes").ok()
+}
+
+#[cfg(feature = "parakeet")]
+#[derive(Debug, Clone)]
+pub struct ParakeetWarmupStats {
+    pub elapsed_ms: u64,
+    pub model: String,
+    pub used_gpu: bool,
+}
+
+// Word-to-sentence grouping is in crate::parakeet::group_word_segments
+
+/// Atomically take a one-shot "this is the first call" signal from a
+/// caller-owned gate. Returns `true` exactly once across the lifetime of
+/// the gate; subsequent calls return `false`.
+///
+/// Used by the parakeet-helper failure logging below to emit warn on the
+/// first failure of each kind per process and then go quiet so a long
+/// recording does not flood the log. Each distinct failure mode passes
+/// its own `static AtomicBool` so non-zero exit and spawn failure are
+/// gated independently.
+///
+/// Extracted as a free function (rather than inlined) so the
+/// loud-first-then-quiet semantics can be unit-tested with a non-static
+/// gate. The static gate would otherwise leak state across tests in the
+/// same process.
+#[cfg(feature = "parakeet")]
+fn loud_once(gate: &AtomicBool) -> bool {
+    !gate.swap(true, Ordering::Relaxed)
+}
+
+/// Classify a helper non-zero exit as either an argv/clap contract mismatch
+/// (the issue #163 failure mode) or an ordinary runtime outcome.
+///
+/// The distinction matters because the two demand opposite responses. A
+/// contract mismatch — `transcribe.rs` builds a flag the `ParakeetHelper` clap
+/// struct in `crates/cli/src/main.rs` doesn't accept — makes the helper reject
+/// *every* invocation, so the fast host-process path is silently dead and a
+/// maintainer must go re-sync the flags. clap signals this by exiting with code
+/// 2 and printing a `usage:` / `unexpected argument` / `required arguments`
+/// diagnostic. An ordinary runtime outcome — the helper parsed its args, ran,
+/// and simply produced nothing usable (silence, or a clip below the word
+/// minimum) — exits 1 with an `anyhow` `Error: ...` line and is usually benign.
+/// Only the former should send anyone hunting for flag drift.
+#[cfg(feature = "parakeet")]
+fn helper_failure_is_argv_mismatch(status: &std::process::ExitStatus, stderr: &str) -> bool {
+    if status.code() == Some(2) {
+        return true;
+    }
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("unexpected argument")
+        || lower.contains("following required arguments")
+        || lower.contains("usage:")
+}
+
+/// Log the FIRST helper-subprocess non-zero exit per process at warn level
+/// before falling back to direct invocation. Subsequent failures are
+/// silenced (debug only) to avoid log spam during a recording.
+///
+/// The message is tailored to the failure class (see
+/// [`helper_failure_is_argv_mismatch`]). An argv/clap contract mismatch is the
+/// issue #163 regression — the fast host-process path is dead for every
+/// utterance until the flags are re-synced — so that case points explicitly at
+/// the two structs to reconcile. A plain "ran but produced no usable transcript"
+/// exit is usually benign (silence / below word minimum) and must NOT masquerade
+/// as an argv bug, or it sends maintainers chasing a phantom flag drift. Either
+/// way the loud first occurrence forces the failure onto someone's screen
+/// instead of into the void.
+#[cfg(feature = "parakeet")]
+fn log_parakeet_helper_failure_once(status: &std::process::ExitStatus, stderr: &str) {
+    static GATE: AtomicBool = AtomicBool::new(false);
+    let last_line = stderr.lines().last().unwrap_or("").trim();
+    let argv_mismatch = helper_failure_is_argv_mismatch(status, stderr);
+    if loud_once(&GATE) {
+        if argv_mismatch {
+            tracing::warn!(
+                exit_status = ?status,
+                stderr_tail = %last_line,
+                "parakeet-helper rejected its arguments; falling back to direct \
+                 subprocess. This is an argv/clap contract drift: every flag built \
+                 in transcribe::transcribe_with_parakeet must be accepted by the \
+                 ParakeetHelper clap struct in crates/cli/src/main.rs (issue #163). \
+                 The fast host-process path stays dead until they are re-synced. \
+                 Logged once per process; subsequent failures are debug-level."
+            );
+        } else {
+            tracing::warn!(
+                exit_status = ?status,
+                stderr_tail = %last_line,
+                "parakeet-helper ran but returned no usable transcript; falling \
+                 back to direct subprocess. This is usually benign (silence or a \
+                 clip below the word minimum), NOT an argv mismatch. Investigate \
+                 only if it persists on audio with clear speech. Logged once per \
+                 process; subsequent failures are debug-level."
+            );
+        }
+    } else {
+        tracing::debug!(
+            exit_status = ?status,
+            stderr_tail = %last_line,
+            argv_mismatch,
+            "parakeet-helper exited non-zero (suppressed; first occurrence already logged)"
+        );
+    }
+}
+
+/// Companion to [`log_parakeet_helper_failure_once`] for the case where the
+/// helper subprocess could not be spawned at all (binary missing, permission
+/// denied, etc.). Same loud-first-then-quiet semantics.
+#[cfg(feature = "parakeet")]
+fn log_parakeet_helper_spawn_failure_once(error: &std::io::Error) {
+    static GATE: AtomicBool = AtomicBool::new(false);
+    if loud_once(&GATE) {
+        tracing::warn!(
+            error = %error,
+            "parakeet-helper spawn failed; falling back to direct subprocess. \
+             This message is logged once per process; subsequent failures will \
+             be debug-level."
+        );
+    } else {
+        tracing::debug!(
+            error = %error,
+            "parakeet-helper spawn failed (suppressed; first occurrence already logged)"
+        );
+    }
+}
+
+#[cfg(feature = "parakeet")]
+#[allow(clippy::too_many_arguments)]
+pub fn run_parakeet_cli_structured(
+    binary: &str,
+    model_path: &Path,
+    audio_path: &Path,
+    vocab_path: &Path,
+    model_id: &str,
+    use_gpu: bool,
+    vad_path: Option<&Path>,
+    vad_threshold: f32,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<ParakeetCliTranscript, TranscribeError> {
+    ensure_parakeet_cli_transport_available()?;
+    run_parakeet_cli_structured_with_private_audio(
+        binary,
+        model_path,
+        audio_path,
+        vocab_path,
+        model_id,
+        use_gpu,
+        vad_path,
+        vad_threshold,
+        config,
+        hints,
+        None,
+        None,
+    )
+}
+
+#[cfg(feature = "parakeet")]
+#[allow(clippy::too_many_arguments)]
+fn run_parakeet_cli_structured_with_private_audio(
+    binary: &str,
+    model_path: &Path,
+    audio_path: &Path,
+    vocab_path: &Path,
+    model_id: &str,
+    use_gpu: bool,
+    vad_path: Option<&Path>,
+    vad_threshold: f32,
+    config: &Config,
+    hints: &DecodeHints,
+    private_audio: Option<&crate::pipeline::PrivateAudioChildLease>,
+    known_audio_duration_secs: Option<f64>,
+) -> Result<ParakeetCliTranscript, TranscribeError> {
+    let model_str = model_path
+        .to_str()
+        .ok_or_else(|| TranscribeError::ParakeetFailed("model path is not valid UTF-8".into()))?;
+    let wav_str = audio_path
+        .to_str()
+        .ok_or_else(|| TranscribeError::ParakeetFailed("audio path is not valid UTF-8".into()))?;
+    let vocab_str = vocab_path
+        .to_str()
+        .ok_or_else(|| TranscribeError::ParakeetFailed("vocab path is not valid UTF-8".into()))?;
+
+    let use_fp16 = use_gpu && config.transcription.parakeet_fp16;
+    let (output, _used_gpu) = run_parakeet_command_with_cpu_fallback(
+        binary,
+        model_str,
+        &[wav_str],
+        vocab_str,
+        model_id,
+        use_gpu,
+        use_fp16,
+        vad_path.and_then(|path| path.to_str()),
+        vad_threshold,
+        config,
+        hints,
+        private_audio,
+        known_audio_duration_secs,
+    )?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (parsed, _transcript, _stats) = parse_parakeet_output(&stdout, config)?;
+    Ok(parsed)
+}
+
+#[cfg(feature = "parakeet")]
+#[allow(clippy::too_many_arguments)]
+pub fn run_parakeet_cli_structured_batch(
+    binary: &str,
+    model_path: &Path,
+    audio_paths: &[PathBuf],
+    vocab_path: &Path,
+    model_id: &str,
+    use_gpu: bool,
+    vad_path: Option<&Path>,
+    vad_threshold: f32,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<Vec<Result<ParakeetCliTranscript, TranscribeError>>, TranscribeError> {
+    ensure_parakeet_cli_transport_available()?;
+    if audio_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let model_str = model_path
+        .to_str()
+        .ok_or_else(|| TranscribeError::ParakeetFailed("model path is not valid UTF-8".into()))?;
+    let vocab_str = vocab_path
+        .to_str()
+        .ok_or_else(|| TranscribeError::ParakeetFailed("vocab path is not valid UTF-8".into()))?;
+
+    let use_fp16 = use_gpu && config.transcription.parakeet_fp16;
+    let audio_args = audio_paths
+        .iter()
+        .map(|audio_path| {
+            audio_path.to_str().ok_or_else(|| {
+                TranscribeError::ParakeetFailed("audio path is not valid UTF-8".into())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (output, _used_gpu) = run_parakeet_command_with_cpu_fallback(
+        binary,
+        model_str,
+        &audio_args,
+        vocab_str,
+        model_id,
+        use_gpu,
+        use_fp16,
+        vad_path.and_then(|path| path.to_str()),
+        vad_threshold,
+        config,
+        hints,
+        None,
+        None,
+    )?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_parakeet_batch_output(&stdout, audio_paths.len(), config)
+}
+
+#[cfg(feature = "parakeet")]
+fn ensure_parakeet_cli_transport_available() -> Result<(), TranscribeError> {
+    let capability = crate::pipeline::parakeet_capability(true);
+    if capability.selectable {
+        Ok(())
+    } else {
+        Err(TranscribeError::EngineNotAvailable(format!(
+            "parakeet {}",
+            capability.unavailable_reason()
+        )))
+    }
+}
+
+#[cfg(feature = "parakeet")]
+fn parse_parakeet_batch_output(
+    raw_output: &str,
+    expected_sections: usize,
+    config: &Config,
+) -> Result<Vec<Result<ParakeetCliTranscript, TranscribeError>>, TranscribeError> {
+    let mut sections: Vec<(bool, Vec<String>)> = Vec::new();
+    let mut current: Option<(bool, Vec<String>)> = None;
+
+    for line in raw_output.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("--- [") && trimmed.contains("] ") && trimmed.contains("tokens") {
+            if let Some(section) = current.take() {
+                sections.push(section);
+            }
+            let zero_tokens = trimmed.contains("(0 tokens)");
+            current = Some((zero_tokens, Vec::new()));
+            continue;
+        }
+
+        if let Some((_, body)) = current.as_mut() {
+            body.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(section) = current.take() {
+        sections.push(section);
+    }
+
+    if sections.len() != expected_sections {
+        return Err(TranscribeError::ParakeetFailed(format!(
+            "expected {} batched parakeet sections, found {}",
+            expected_sections,
+            sections.len()
+        )));
+    }
+
+    Ok(sections
+        .into_iter()
+        .map(|(zero_tokens, body)| {
+            if zero_tokens {
+                return Err(TranscribeError::EmptyTranscript(
+                    config.transcription.min_words,
+                ));
+            }
+            let section_output = body.join("\n");
+            parse_parakeet_output(&section_output, config).map(|(parsed, _, _)| parsed)
+        })
+        .collect())
+}
+
+#[cfg(feature = "parakeet")]
+fn parse_parakeet_output(
+    raw_output: &str,
+    config: &Config,
+) -> Result<(ParakeetCliTranscript, String, ParakeetFilterStats), TranscribeError> {
+    let raw = raw_output.trim();
+    if raw.is_empty() {
+        return Err(TranscribeError::EmptyTranscript(
+            config.transcription.min_words,
+        ));
+    }
+
+    let mut lines = Vec::new();
+    let mut segments = Vec::new();
+    let mut has_timestamps = false;
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Try to parse "[start - end] text" format
+        if let Some(rest) = line.strip_prefix('[') {
+            if let Some(bracket_end) = rest.find(']') {
+                let timestamp_part = &rest[..bracket_end];
+                let mut text = rest[bracket_end + 1..].trim();
+                // Strip optional confidence prefix: "(0.54) actual text"
+                if text.starts_with('(') {
+                    if let Some(paren_end) = text.find(')') {
+                        text = text[paren_end + 1..].trim();
+                    }
+                }
+
+                if let Some((start_str, _end_str)) = timestamp_part.split_once('-') {
+                    // Strip trailing 's' suffix (parakeet.cpp outputs "2.80s")
+                    let start_clean = start_str.trim().trim_end_matches('s');
+                    let end_clean = _end_str.trim().trim_end_matches('s');
+                    if let (Ok(start_secs), Ok(end_secs)) =
+                        (start_clean.parse::<f64>(), end_clean.parse::<f64>())
+                    {
+                        let mins = (start_secs / 60.0) as u64;
+                        let secs = (start_secs % 60.0) as u64;
+                        if !text.is_empty() {
+                            lines.push(format!("[{}:{:02}] {}", mins, secs, text));
+                            let confidence = rest[bracket_end + 1..]
+                                .trim()
+                                .strip_prefix('(')
+                                .and_then(|value| value.split_once(')'))
+                                .and_then(|(value, _)| value.parse::<f32>().ok());
+                            segments.push(ParakeetCliSegment {
+                                start_secs,
+                                end_secs,
+                                confidence,
+                                text: text.to_string(),
+                            });
+                            has_timestamps = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Non-timestamp line — skip (don't fake [0:00] timestamps)
+    }
+
+    if segments.is_empty() {
+        let zero_token_banner = raw
+            .lines()
+            .map(str::trim)
+            .any(|line| line == "--- Transcription (0 tokens) ---");
+        if zero_token_banner {
+            return Err(TranscribeError::EmptyTranscript(
+                config.transcription.min_words,
+            ));
+        }
+        if !has_timestamps {
+            // No parseable output at all — include a snippet in the error for debugging
+            let preview: String = raw.chars().take(200).collect();
+            return Err(TranscribeError::ParakeetFailed(format!(
+                "could not parse parakeet output (no [start - end] timestamps found). \
+                 First 200 chars: {}",
+                preview
+            )));
+        }
+    }
+
+    parakeet_transcript_from_segments_with_stats(raw, segments, config)
+}
+
+#[cfg(feature = "parakeet")]
+pub(crate) fn parakeet_transcript_from_segments(
+    raw_output: &str,
+    segments: Vec<ParakeetCliSegment>,
+    config: &Config,
+) -> Result<ParakeetCliTranscript, TranscribeError> {
+    let (parsed, _, _) =
+        parakeet_transcript_from_segments_with_stats(raw_output, segments, config)?;
+    Ok(parsed)
+}
+
+#[cfg(feature = "parakeet")]
+fn parakeet_transcript_from_segments_with_stats(
+    raw_output: &str,
+    segments: Vec<ParakeetCliSegment>,
+    config: &Config,
+) -> Result<(ParakeetCliTranscript, String, ParakeetFilterStats), TranscribeError> {
+    let segments = crate::parakeet::group_word_segments(&segments);
+    let lines: Vec<String> = segments
+        .iter()
+        .map(|segment| {
+            let mins = (segment.start_secs / 60.0) as u64;
+            let secs = (segment.start_secs % 60.0) as u64;
+            format!("[{}:{:02}] {}", mins, secs, segment.text)
+        })
+        .collect();
+    let raw_segments = lines.len();
+
+    if lines.is_empty() {
+        return Err(TranscribeError::EmptyTranscript(
+            config.transcription.min_words,
+        ));
+    }
+
+    let cleanup = run_transcript_cleanup_pipeline(lines);
+
+    let pstats = ParakeetFilterStats {
+        raw_segments,
+        after_dedup: cleanup.after(TranscriptCleanupStage::DedupSegments),
+        after_interleaved: cleanup.after(TranscriptCleanupStage::DedupInterleaved),
+        after_script_filter: cleanup.after(TranscriptCleanupStage::StripForeignScript),
+        after_noise_markers: cleanup.after(TranscriptCleanupStage::CollapseNoiseMarkers),
+        after_trailing_trim: cleanup.after(TranscriptCleanupStage::TrimTrailingNoise),
+    };
+
+    let transcript = cleanup.lines.join("\n");
+    if transcript.is_empty() {
+        return Err(TranscribeError::EmptyTranscript(
+            config.transcription.min_words,
+        ));
+    }
+
+    let transcript_with_newline = format!("{}\n", transcript);
+    Ok((
+        ParakeetCliTranscript {
+            raw_output: raw_output.to_string(),
+            segments,
+            transcript: transcript_with_newline.clone(),
+        },
+        transcript_with_newline,
+        pstats,
+    ))
+}
+
+/// Write f32 samples as a 16kHz mono 16-bit WAV file.
+///
+/// Used by Parakeet development helpers only after the shared
+/// secure-transport gate passes.
+#[cfg(feature = "parakeet")]
+pub(crate) fn write_wav_16k_mono(path: &Path, samples: &[f32]) -> Result<(), TranscribeError> {
+    let file = std::fs::File::create(path)?;
+    write_wav_16k_mono_to_writer(file, samples)
+}
+
+pub(crate) fn write_wav_16k_mono_to_writer<W: Write>(
+    writer: W,
+    samples: &[f32],
+) -> Result<(), TranscribeError> {
+    let data_bytes = samples
+        .len()
+        .checked_mul(2)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| {
+            TranscribeError::Io(std::io::Error::other(
+                "16 kHz WAV exceeds the RIFF byte limit",
+            ))
+        })?;
+    let riff_bytes = 36_u32
+        .checked_add(data_bytes)
+        .ok_or_else(|| TranscribeError::Io(std::io::Error::other("16 kHz WAV size overflowed")))?;
+    let mut writer = writer;
+    writer.write_all(b"RIFF")?;
+    writer.write_all(&riff_bytes.to_le_bytes())?;
+    writer.write_all(b"WAVEfmt ")?;
+    writer.write_all(&16_u32.to_le_bytes())?;
+    writer.write_all(&1_u16.to_le_bytes())?;
+    writer.write_all(&1_u16.to_le_bytes())?;
+    writer.write_all(&16_000_u32.to_le_bytes())?;
+    writer.write_all(&32_000_u32.to_le_bytes())?;
+    writer.write_all(&2_u16.to_le_bytes())?;
+    writer.write_all(&16_u16.to_le_bytes())?;
+    writer.write_all(b"data")?;
+    writer.write_all(&data_bytes.to_le_bytes())?;
+    for &s in samples {
+        let sample = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        writer.write_all(&sample.to_le_bytes())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+#[cfg(all(feature = "parakeet", feature = "streaming"))]
+pub(crate) fn stage_private_wav_16k_mono(
+    prefix: &str,
+    samples: &[f32],
+) -> Result<crate::pipeline::PrivateAudioTempFile, TranscribeError> {
+    let mut audio = crate::pipeline::PrivateAudioTempFile::new(prefix, ".wav")?;
+    write_wav_16k_mono_to_writer(audio.prepare_for_write()?, samples)?;
+    audio.finish_write()?;
+    Ok(audio)
+}
+
+/// Resolve the parakeet model file path.
+///
+/// Looks for `.safetensors` files in `~/.minutes/models/parakeet/`.
+#[cfg(feature = "parakeet")]
+pub(crate) fn resolve_parakeet_model_path(config: &Config) -> Result<PathBuf, TranscribeError> {
+    let model_name = &config.transcription.parakeet_model;
+    let model_dir = crate::parakeet::installs_root(config);
+
+    if let Some(candidate) = crate::parakeet::resolve_model_file(config, model_name) {
+        return Ok(candidate);
+    }
+
+    // Try as absolute path
+    let direct = PathBuf::from(model_name);
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    let mut message = format!(
+        "Expected parakeet model \"{}\" in {}.\n\nTo fix this, run:\n\n    minutes setup --parakeet\n",
+        model_name,
+        model_dir.display(),
+    );
+    if model_name == "tdt-600m"
+        && crate::parakeet::resolve_model_file(config, "tdt-ctc-110m").is_some()
+    {
+        message.push_str(
+            "\nIt looks like you still have the older English-only `tdt-ctc-110m` model installed.\n\
+             If you want to keep using it, add this to ~/.config/minutes/config.toml:\n\n\
+                 parakeet_model = \"tdt-ctc-110m\"\n\
+                 parakeet_vocab = \"tdt-ctc-110m.tokenizer.vocab\"\n",
+        );
+    }
+    Err(TranscribeError::ModelNotFound(message))
+}
+
+/// Resolve the parakeet SentencePiece vocab file path.
+///
+/// Looks for the vocab file in `~/.minutes/models/parakeet/` alongside the model.
+#[cfg(feature = "parakeet")]
+pub(crate) fn resolve_parakeet_vocab_path(config: &Config) -> Result<PathBuf, TranscribeError> {
+    let model_dir = crate::parakeet::installs_root(config);
+    let vocab_name = &config.transcription.parakeet_vocab;
+    if let Some(candidate) = crate::parakeet::resolve_tokenizer_file(
+        config,
+        &config.transcription.parakeet_model,
+        vocab_name,
+    ) {
+        return Ok(candidate);
+    }
+
+    // Try as absolute path
+    let direct = PathBuf::from(vocab_name);
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    Err(TranscribeError::ModelNotFound(format!(
+        "Expected parakeet vocab file \"{}\" in {}. Generated during model conversion.",
+        vocab_name,
+        model_dir.display(),
+    )))
+}
+
+#[cfg(feature = "parakeet")]
+pub(crate) fn resolve_parakeet_native_vad_path(config: &Config) -> Option<PathBuf> {
+    let mut candidates =
+        vec![crate::parakeet::installs_root(config).join("silero_vad_v5.safetensors")];
+
+    let configured_vad = PathBuf::from(&config.transcription.vad_model);
+    if configured_vad
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("safetensors"))
+        .unwrap_or(false)
+    {
+        candidates.push(configured_vad);
+    }
+
+    candidates.into_iter().find(|candidate| candidate.exists())
+}
+
+#[cfg(feature = "parakeet")]
+pub fn transcribe_parakeet_batch(
+    audio_paths: &[PathBuf],
+    config: &Config,
+) -> Result<Vec<Result<TranscribeResult, TranscribeError>>, TranscribeError> {
+    ensure_parakeet_cli_transport_available()?;
+    if audio_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !crate::pipeline::private_audio_processing_available() {
+        return Err(TranscribeError::EngineNotAvailable(
+            "parakeet-private-audio-runtime".into(),
+        ));
+    }
+
+    if !crate::parakeet::valid_model(&config.transcription.parakeet_model) {
+        return Err(TranscribeError::ParakeetFailed(format!(
+            "unknown parakeet model '{}'. Valid: {}",
+            config.transcription.parakeet_model,
+            crate::config::VALID_PARAKEET_MODELS.join(", ")
+        )));
+    }
+
+    let model_path = resolve_parakeet_model_path(config)?;
+    let vocab_path = resolve_parakeet_vocab_path(config)?;
+    let native_vad_path = resolve_parakeet_native_vad_path(config);
+    let resolved_binary = crate::parakeet::resolve_parakeet_binary(
+        &config.transcription.parakeet_binary,
+        crate::parakeet::ResolveParakeetBinaryMode::WarnAndFallback,
+    )
+    .map_err(|error| TranscribeError::ParakeetFailed(error.to_string()))?;
+    let resolved_binary_str = resolved_binary.to_str().ok_or_else(|| {
+        TranscribeError::ParakeetFailed("resolved parakeet binary path is not valid UTF-8".into())
+    })?;
+    let use_gpu = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let host_process_key = format!(
+        "{}::{}",
+        resolved_binary.display(),
+        config.transcription.parakeet_model.as_str()
+    );
+    let host_process_first_use = {
+        let mut seen = parakeet_seen_models()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        seen.insert(host_process_key)
+    };
+
+    let mut stats_per_file = Vec::with_capacity(audio_paths.len());
+    for audio_path in audio_paths {
+        let samples = load_audio_samples_with_format(audio_path, None, config)?;
+        if samples.is_empty() {
+            stats_per_file.push(Err(TranscribeError::EmptyAudio));
+            continue;
+        }
+
+        let stats = FilterStats {
+            audio_duration_secs: samples.len() as f64 / 16000.0,
+            samples_after_silence_strip: samples.len(),
+            ..Default::default()
+        };
+        stats_per_file.push(Ok(stats));
+    }
+
+    let invocation_started = Instant::now();
+    let parsed_batch = run_parakeet_cli_structured_batch(
+        resolved_binary_str,
+        &model_path,
+        audio_paths,
+        &vocab_path,
+        &config.transcription.parakeet_model,
+        use_gpu,
+        native_vad_path.as_deref(),
+        PARAKEET_NATIVE_VAD_THRESHOLD,
+        config,
+        &DecodeHints::default(),
+    )?;
+    let elapsed_ms = invocation_started.elapsed().as_millis() as u64;
+
+    Ok(parsed_batch
+        .into_iter()
+        .zip(stats_per_file)
+        .map(|(parsed, stats)| match (parsed, stats) {
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(_)) => Err(error),
+            (Ok(parsed), Ok(stats)) => transcribe_result_from_parakeet_parsed(
+                parsed,
+                stats,
+                host_process_first_use,
+                elapsed_ms,
+                config,
+            ),
+        })
+        .collect())
+}
+
+#[cfg(feature = "parakeet")]
+pub fn warmup_parakeet(config: &Config) -> Result<ParakeetWarmupStats, TranscribeError> {
+    ensure_parakeet_cli_transport_available()?;
+    let model_path = resolve_parakeet_model_path(config)?;
+    let vocab_path = resolve_parakeet_vocab_path(config)?;
+    let resolved_binary = crate::parakeet::resolve_parakeet_binary(
+        &config.transcription.parakeet_binary,
+        crate::parakeet::ResolveParakeetBinaryMode::WarnAndFallback,
+    )
+    .map_err(|error| TranscribeError::ParakeetFailed(error.to_string()))?;
+    let native_vad_path = resolve_parakeet_native_vad_path(config);
+
+    let tmp_wav = tempfile::Builder::new()
+        .prefix("minutes-parakeet-warmup-")
+        .suffix(".wav")
+        .tempfile()
+        .map_err(TranscribeError::Io)?;
+    let silence = vec![0.0f32; 16000];
+    write_wav_16k_mono(tmp_wav.path(), &silence)?;
+
+    let model_str = model_path
+        .to_str()
+        .ok_or_else(|| TranscribeError::ParakeetFailed("model path is not valid UTF-8".into()))?;
+    let wav_str = tmp_wav.path().to_str().ok_or_else(|| {
+        TranscribeError::ParakeetFailed("temp WAV path is not valid UTF-8".into())
+    })?;
+    let vocab_str = vocab_path
+        .to_str()
+        .ok_or_else(|| TranscribeError::ParakeetFailed("vocab path is not valid UTF-8".into()))?;
+
+    let used_gpu = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let used_fp16 = used_gpu && config.transcription.parakeet_fp16;
+    let started = Instant::now();
+    let resolved_binary_str = resolved_binary.to_str().ok_or_else(|| {
+        TranscribeError::ParakeetFailed("resolved parakeet binary path is not valid UTF-8".into())
+    })?;
+    let (_output, used_gpu) = run_parakeet_command_with_cpu_fallback(
+        resolved_binary_str,
+        model_str,
+        &[wav_str],
+        vocab_str,
+        &config.transcription.parakeet_model,
+        used_gpu,
+        used_fp16,
+        native_vad_path.as_ref().and_then(|path| path.to_str()),
+        PARAKEET_NATIVE_VAD_THRESHOLD,
+        config,
+        &DecodeHints::default(),
+        None,
+        None,
+    )?;
+
+    Ok(ParakeetWarmupStats {
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        model: config.transcription.parakeet_model.clone(),
+        used_gpu,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn vad_tuning_is_absent_by_default_and_follows_the_config() {
+        let mut transcription = Config::default().transcription;
+        assert!(configured_vad_params(&transcription).is_none());
+
+        transcription.vad_threshold = Some(0.35);
+        transcription.vad_min_speech_ms = Some(100);
+        transcription.vad_speech_pad_ms = Some(200);
+        let vad = format!("{:?}", configured_vad_params(&transcription).unwrap());
+        assert!(vad.contains("threshold: 0.35"), "{vad}");
+        assert!(vad.contains("min_speech_duration_ms: 100"), "{vad}");
+        assert!(vad.contains("speech_pad_ms: 200"), "{vad}");
+        assert!(vad.contains("min_silence_duration_ms: 100"), "unset keeps whisper.cpp's value: {vad}");
+
+        transcription.vad_threshold = Some(1.5);
+        let vad = format!("{:?}", configured_vad_params(&transcription).unwrap());
+        assert!(vad.contains("threshold: 0.5"), "an out-of-range threshold is ignored: {vad}");
+    }
+
+    #[test]
+    fn parakeet_install_is_offered_only_when_the_model_is_all_that_is_missing() {
+        let offered = |engine, runnable, plugin, default_dir, model, language| {
+            parakeet_install_offered_for(engine, runnable, plugin, default_dir, model, language)
+        };
+        assert!(offered("auto", true, true, true, false, true));
+        assert!(offered("Whisper", true, true, true, false, true));
+        assert!(offered("sherpa", true, true, true, false, true));
+        // Already installed, or a deliberate non-Whisper engine.
+        assert!(!offered("auto", true, true, true, true, true));
+        assert!(!offered("apple-speech", true, true, true, false, true));
+        assert!(!offered("parakeet", true, true, true, false, true));
+        // This Mac or build cannot run it, or the plugin is missing.
+        assert!(!offered("auto", false, true, true, false, true));
+        assert!(!offered("auto", true, false, true, false, true));
+        // A custom model directory, or a language Parakeet v3 lacks.
+        assert!(!offered("auto", true, true, false, false, true));
+        assert!(!offered("auto", true, true, true, false, false));
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn whisper_pass_stalls_only_after_the_progress_limit() {
+        use std::time::Duration;
+        let limit = WHISPER_PROGRESS_STALL_LIMIT;
+        assert!(!whisper_pass_stalled(Duration::ZERO, limit));
+        assert!(!whisper_pass_stalled(limit - Duration::from_secs(1), limit));
+        assert!(whisper_pass_stalled(limit, limit));
+        assert!(whisper_pass_stalled(limit * 3, limit));
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn watchdog_measures_from_the_last_progress_mark_not_the_start() {
+        let watchdog = WhisperWatchdog::start();
+        assert!(!watchdog.should_abort(), "a fresh pass is not stalled");
+
+        // A progress mark moves the reference point forward: the stall clock
+        // restarts at the mark rather than at the beginning of the pass.
+        let marker = watchdog.progress_marker();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        marker.mark();
+        assert!(watchdog.since_progress() < watchdog.elapsed());
+        assert!(watchdog.since_progress() < std::time::Duration::from_millis(20));
+        assert!(!watchdog.should_abort());
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn direct_parakeet_runner_rejects_unavailable_transport_before_spawn() {
+        let config = Config::default();
+        let error = run_parakeet_cli_structured(
+            "definitely-not-a-parakeet-binary",
+            Path::new("missing-model"),
+            Path::new("missing-audio.wav"),
+            Path::new("missing-vocab"),
+            "tdt-ctc-110m",
+            false,
+            None,
+            0.5,
+            &config,
+            &DecodeHints::default(),
+        )
+        .expect_err("the public pathname runner must fail at the transport gate");
+
+        assert!(matches!(
+            error,
+            TranscribeError::EngineNotAvailable(reason)
+                if reason.contains("cannot receive secure private audio")
+        ));
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn direct_parakeet_batch_runner_rejects_even_empty_bypass_calls() {
+        let error = run_parakeet_cli_structured_batch(
+            "definitely-not-a-parakeet-binary",
+            Path::new("missing-model"),
+            &[],
+            Path::new("missing-vocab"),
+            "tdt-ctc-110m",
+            false,
+            None,
+            0.5,
+            &Config::default(),
+            &DecodeHints::default(),
+        )
+        .expect_err("batch helpers must not bypass the transport gate");
+
+        assert!(matches!(error, TranscribeError::EngineNotAvailable(_)));
+    }
+
+    #[test]
+    fn wav_sample_decode_error_fails_the_entire_authenticated_read() {
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&40_u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&16_000_u32.to_le_bytes());
+        wav.extend_from_slice(&32_000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&4_u32.to_le_bytes());
+        wav.extend_from_slice(&1_i16.to_le_bytes());
+
+        let error = load_wav_stream(wav.as_slice())
+            .expect_err("a truncated authenticated sample stream must fail closed");
+        assert!(error
+            .to_string()
+            .contains("authenticated WAV sample read failed"));
+    }
+
+    #[test]
+    fn raw_s16le_parser_decodes_signed_samples_exactly() {
+        let mut pcm = Vec::new();
+        for sample in [i16::MIN, -1, 0, 1, i16::MAX] {
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+        let decoded = load_pcm_s16le_stream_with_limit(
+            pcm.as_slice(),
+            5,
+            crate::audio_budget::AudioWorkBudget::new(),
+        )
+        .unwrap();
+        assert_eq!(decoded.len(), 5);
+        assert_eq!(decoded[0], -1.0);
+        assert_eq!(decoded[1], -1.0 / 32_768.0);
+        assert_eq!(decoded[2], 0.0);
+        assert_eq!(decoded[3], 1.0 / 32_768.0);
+        assert_eq!(decoded[4], i16::MAX as f32 / 32_768.0);
+    }
+
+    #[test]
+    fn raw_s16le_parser_rejects_truncation_and_sample_limit() {
+        let truncated = load_pcm_s16le_stream_with_limit(
+            [0_u8].as_slice(),
+            1,
+            crate::audio_budget::AudioWorkBudget::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(truncated, TranscribeError::UnsupportedFormat(_)));
+
+        let over_limit = load_pcm_s16le_stream_with_limit(
+            [0_u8; 4].as_slice(),
+            1,
+            crate::audio_budget::AudioWorkBudget::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(over_limit, TranscribeError::Io(ref error)
+            if error.kind() == std::io::ErrorKind::OutOfMemory));
+    }
+
+    #[test]
+    fn ffmpeg_decode_argv_has_no_duration_truncation_and_preserves_path_argument() {
+        let input = Path::new("meeting input.m4a");
+        let command = ffmpeg_decode_command(Path::new("ffmpeg"), input);
+        let args = command.get_args().collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("-hide_banner"),
+                std::ffi::OsStr::new("-loglevel"),
+                std::ffi::OsStr::new("error"),
+                std::ffi::OsStr::new("-nostdin"),
+                std::ffi::OsStr::new("-i"),
+                input.as_os_str(),
+                std::ffi::OsStr::new("-ar"),
+                std::ffi::OsStr::new("16000"),
+                std::ffi::OsStr::new("-ac"),
+                std::ffi::OsStr::new("1"),
+                std::ffi::OsStr::new("-c:a"),
+                std::ffi::OsStr::new("pcm_s16le"),
+                std::ffi::OsStr::new("-f"),
+                std::ffi::OsStr::new("s16le"),
+                std::ffi::OsStr::new("pipe:1"),
+            ]
+        );
+        assert!(!args.iter().any(|arg| *arg == "-t"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ffmpeg_decode_argv_preserves_non_utf8_input_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let input =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"meeting-\xff.m4a".to_vec()));
+        let command = ffmpeg_decode_command(Path::new("ffmpeg"), &input);
+        let args = command.get_args().collect::<Vec<_>>();
+        let input_index = args.iter().position(|arg| *arg == "-i").unwrap() + 1;
+        assert_eq!(args[input_index], input.as_os_str());
+    }
+
+    #[cfg(unix)]
+    fn write_test_decoder_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ffmpeg_decode_output_cap_rejects_overflow_without_truncating_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let decoder = temp.path().join("oversize-decoder");
+        write_test_decoder_script(&decoder, "printf '\\001\\000\\002\\000'");
+
+        let error = decode_with_ffmpeg_binary(
+            &temp.path().join("input.m4a"),
+            &decoder,
+            1,
+            std::time::Duration::from_secs(2),
+        )
+        .expect_err("output beyond the exact PCM cap must fail, not truncate successfully");
+        assert!(
+            matches!(error, TranscribeError::Io(ref source)
+                if source.to_string().contains("resource budget exceeded")),
+            "unexpected over-cap error: {error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ffmpeg_decode_distinguishes_spawn_and_invalid_input_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("invalid.m4a");
+        let missing = temp.path().join("missing-ffmpeg");
+        let spawn_error =
+            decode_with_ffmpeg_binary(&input, &missing, 4, std::time::Duration::from_secs(2))
+                .unwrap_err();
+        assert!(
+            matches!(spawn_error, TranscribeError::CompressedDecoderUnavailable(ref detail)
+            if detail.contains("could not be started"))
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let busy_executable = temp.path().join("busy-executable");
+            std::fs::write(&busy_executable, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&busy_executable, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let _write_lease = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&busy_executable)
+                .unwrap();
+            let busy_error = decode_with_ffmpeg_binary(
+                &input,
+                &busy_executable,
+                4,
+                std::time::Duration::from_secs(2),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(busy_error, TranscribeError::CompressedDecoderUnavailable(ref detail)
+                if detail.contains("could not be started"))
+            );
+        }
+
+        let invalid_executable = temp.path().join("foreign-image.exe");
+        std::fs::write(&invalid_executable, b"MZ\x90\0synthetic foreign image").unwrap();
+        std::fs::set_permissions(&invalid_executable, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let bad_image_error = decode_with_ffmpeg_binary(
+            &input,
+            &invalid_executable,
+            4,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(bad_image_error, TranscribeError::CompressedDecoderUnavailable(ref detail)
+            if detail.contains("could not be started"))
+        );
+
+        let rejecting = temp.path().join("rejecting-decoder");
+        write_test_decoder_script(
+            &rejecting,
+            "printf 'fixture is not valid audio\\n' >&2; exit 7",
+        );
+        let conversion_error =
+            decode_with_ffmpeg_binary(&input, &rejecting, 4, std::time::Duration::from_secs(2))
+                .unwrap_err();
+        assert!(
+            matches!(conversion_error, TranscribeError::UnsupportedFormat(ref detail)
+            if detail.contains("fixture is not valid audio"))
+        );
+    }
+
+    #[test]
+    fn ffmpeg_m4a_decode_round_trip_uses_bounded_raw_pcm() {
+        let Ok(ffmpeg) = crate::ffmpeg::resolve_ffmpeg() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.wav");
+        let encoded = temp.path().join("synthetic.m4a");
+        let samples = (0..16_000)
+            .map(|index| ((index as f32 / 16_000.0) * std::f32::consts::TAU * 440.0).sin() * 0.25)
+            .collect::<Vec<_>>();
+        write_wav_16k_mono_to_writer(std::fs::File::create(&source).unwrap(), &samples).unwrap();
+
+        let output = crate::engine_process::command(&ffmpeg)
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&source)
+            .args(["-c:a", "aac"])
+            .arg(&encoded)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg AAC fixture creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let decoded = decode_with_ffmpeg(&encoded, &Config::default()).unwrap();
+        assert!((15_000..=17_000).contains(&decoded.len()));
+        assert!(decoded.iter().all(|sample| sample.is_finite()));
+        assert!(decoded.iter().any(|sample| sample.abs() > 0.1));
+    }
+
+    /// Exit-code classification for the parakeet helper fallback. Building a
+    /// real `ExitStatus` needs the Unix `from_raw` extension (raw wait status =
+    /// `code << 8`), so these are unix + parakeet gated.
+    #[cfg(all(unix, feature = "parakeet"))]
+    mod parakeet_helper_failure_classification {
+        use super::super::helper_failure_is_argv_mismatch;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        fn exit(code: i32) -> ExitStatus {
+            ExitStatus::from_raw(code << 8)
+        }
+
+        #[test]
+        fn clap_usage_error_code_two_is_argv_mismatch() {
+            let stderr = "error: unexpected argument '--fp16' found\n\nUsage: minutes parakeet-helper --binary <BINARY> ...";
+            assert!(helper_failure_is_argv_mismatch(&exit(2), stderr));
+        }
+
+        #[test]
+        fn missing_required_arg_is_argv_mismatch_even_if_code_is_one() {
+            // Some clap configurations surface required-arg errors on exit 1.
+            let stderr = "error: the following required arguments were not provided:\n  --model-id <MODEL_ID>";
+            assert!(helper_failure_is_argv_mismatch(&exit(1), stderr));
+        }
+
+        #[test]
+        fn no_text_runtime_error_is_not_argv_mismatch() {
+            // The helper parsed args and ran; the clip just had no usable speech.
+            let stderr = "Error: transcription produced no text (below 3 word minimum)";
+            assert!(!helper_failure_is_argv_mismatch(&exit(1), stderr));
+        }
+    }
+
+    /// A real ggml model for the fallback tests: `MINUTES_TEST_WHISPER_MODEL`, a path.
+    /// Without it these tests only check the failure side.
+    #[cfg(feature = "whisper")]
+    fn test_whisper_model() -> Option<PathBuf> {
+        std::env::var_os("MINUTES_TEST_WHISPER_MODEL").map(PathBuf::from).filter(|p| p.is_file())
+    }
+
+    #[test]
+    #[cfg(all(feature = "whisper", unix))]
+    fn missing_empty_or_broken_models_fall_back_with_the_fallback_language() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("ggml-empty.bin"), b"").unwrap();
+        std::fs::write(dir.path().join("ggml-broken.bin"), b"not a model").unwrap();
+        let mut config = Config::default();
+        config.transcription.model_path = dir.path().to_path_buf();
+        config.transcription.language = Some("hi".into());
+        for model in ["absent", "empty", "broken"] {
+            config.transcription.model = model.into();
+            config.transcription.missing_model_fallbacks = Vec::new();
+            assert!(load_whisper_context(&config).is_err(), "{model}: no fallbacks, an error as upstream");
+            config.transcription.missing_model_fallbacks = vec!["empty".into(), "broken".into()];
+            assert!(load_whisper_context(&config).is_err(), "{model}: no usable fallback");
+        }
+        let Some(real) = test_whisper_model() else { return };
+        std::os::unix::fs::symlink(&real, dir.path().join("ggml-good.bin")).unwrap();
+        let causes = [
+            ("absent", ModelUnavailable::Missing),
+            ("empty", ModelUnavailable::Empty),
+            ("broken", ModelUnavailable::FailedToLoad),
+        ];
+        for (model, cause) in causes {
+            config.transcription.model = model.into();
+            config.transcription.missing_model_fallbacks = vec!["empty".into(), "good".into()];
+            let loaded = load_whisper_context(&config).unwrap();
+            assert_eq!(loaded.config.transcription.model, "good", "{model}");
+            assert_eq!(loaded.config.transcription.language, None, "{model}: the fallback detects the language");
+            let expected = ModelFallback { requested: model.into(), used: "good".into(), cause };
+            assert_eq!(loaded.fallback, Some(expected), "{model}: the record names the model that ran");
+        }
+        config.transcription.model = "good".into();
+        let loaded = load_whisper_context(&config).unwrap();
+        assert_eq!(loaded.config.transcription.language.as_deref(), Some("hi"), "the model itself keeps its language");
+        assert_eq!(loaded.fallback, None);
+    }
+
+    #[test]
+    #[cfg(all(feature = "whisper", unix))]
+    fn the_process_trace_records_the_fallback_language() {
+        let Some(real) = test_whisper_model() else { return };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("ggml-good.bin")).unwrap();
+        let mut config = Config::default();
+        config.transcription.model_path = dir.path().to_path_buf();
+        config.transcription.model = "absent".into();
+        config.transcription.language = Some("hi".into());
+        config.transcription.missing_model_fallbacks = vec!["good".into()];
+        config.transcription.missing_model_fallback_language = Some("de".into());
+        let Some(_trace) = crate::process_trace::start_process_trace(
+            Path::new("meeting.wav"),
+            crate::markdown::ContentType::Meeting,
+            &config,
+        ) else {
+            return;
+        };
+        assert_eq!(crate::process_trace::language_for_tests().as_deref(), Some("hi"));
+        load_whisper_context(&config).unwrap();
+        assert_eq!(crate::process_trace::language_for_tests().as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn a_model_fallback_warning_reads_back() {
+        for cause in ModelUnavailable::ALL {
+            let fallback = ModelFallback { requested: "hinglish".into(), used: "large-v3-turbo".into(), cause };
+            let warning = fallback.warning();
+            assert_eq!((warning.step.as_str(), warning.reason.as_str()), ("transcribe", "model_fallback"));
+            assert_eq!(ModelFallback::from_warning(&warning), Some(fallback));
+        }
+        let warning = ModelFallback { requested: "hinglish".into(), used: "small".into(), cause: ModelUnavailable::FailedToLoad }.warning();
+        assert_eq!(warning.message.as_deref(), Some("used small because hinglish failed to load"));
+        let other = crate::markdown::ProcessingWarning { reason: "engine_fallback".into(), ..warning };
+        assert_eq!(ModelFallback::from_warning(&other), None);
+    }
+
+    #[test]
+    fn chunk_stats_keep_the_model_fallback() {
+        let fallback = ModelFallback { requested: "hinglish".into(), used: "small".into(), cause: ModelUnavailable::Missing };
+        let mut out = ChunkLines { lines: Vec::new(), stats: FilterStats::default() };
+        out.add_stats(&FilterStats { model_fallback: Some(fallback.clone()), ..Default::default() });
+        out.add_stats(&FilterStats::default());
+        assert_eq!(out.stats.model_fallback, Some(fallback));
+    }
+
+    #[test]
+    #[cfg(feature = "whisper")]
+    fn resolve_model_path_returns_error_for_missing() {
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model: "nonexistent".into(),
+                model_path: PathBuf::from("/tmp/no-such-dir"),
+                min_words: 10,
+                language: Some("en".into()),
+                vad_model: String::new(),
+                noise_reduction: false,
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+        let result = resolve_model_path(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("minutes setup --model nonexistent"),
+            "error should tell user how to fix it: {}",
+            err
+        );
+        assert!(
+            err.contains("ggml-nonexistent.bin"),
+            "error should include expected model filename: {}",
+            err
+        );
+        assert!(
+            err.contains("/tmp/no-such-dir"),
+            "error should include the model directory: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn expected_whisper_model_sizes_cover_canonical_names() {
+        for name in ["tiny", "base", "small", "medium", "large-v3"] {
+            assert!(
+                expected_whisper_model_size_bytes(name).is_some(),
+                "missing expected size for {}",
+                name
+            );
+        }
+        assert!(expected_whisper_model_size_bytes("nonexistent").is_none());
+        // Sanity: medium must be greater than small (catches regressions
+        // where someone confuses the rows of the size table).
+        assert!(
+            expected_whisper_model_size_bytes("medium").unwrap()
+                > expected_whisper_model_size_bytes("small").unwrap()
+        );
+    }
+
+    #[test]
+    fn chunk_strategy_reuses_context_only_for_whisper_builds() {
+        let mut config = Config::default();
+        config.transcription.engine = "whisper".into();
+        let expected = if cfg!(feature = "whisper") {
+            ChunkTranscriptionStrategy::SharedWhisperContext
+        } else {
+            ChunkTranscriptionStrategy::DispatchPerChunk
+        };
+        assert_eq!(chunk_transcription_strategy(&config), expected);
+    }
+
+    #[test]
+    fn retained_parakeet_uses_effective_whisper_chunk_strategy() {
+        let mut config = Config::default();
+        config.transcription.engine = "parakeet".into();
+        assert_eq!(effective_batch_engine(&config), "whisper");
+        let expected = if cfg!(feature = "whisper") {
+            ChunkTranscriptionStrategy::SharedWhisperContext
+        } else {
+            ChunkTranscriptionStrategy::DispatchPerChunk
+        };
+        assert_eq!(chunk_transcription_strategy(&config), expected);
+    }
+
+    #[test]
+    #[cfg(not(feature = "parakeet"))]
+    fn effective_transcription_engine_reports_resolved_engine() {
+        let mut config = Config::default();
+
+        config.transcription.engine = "parakeet".into();
+        assert_eq!(effective_transcription_engine(&config), "whisper");
+
+        config.transcription.engine = "whisper".into();
+        assert_eq!(effective_transcription_engine(&config), "whisper");
+
+        config.transcription.engine = "WHISPER".into();
+        assert_eq!(effective_transcription_engine(&config), "WHISPER");
+    }
+
+    #[test]
+    fn retained_apple_speech_uses_effective_whisper_chunk_strategy() {
+        let mut config = Config::default();
+        config.transcription.engine = "apple-speech".into();
+        assert_eq!(effective_batch_engine(&config), "whisper");
+        let expected = if cfg!(feature = "whisper") {
+            ChunkTranscriptionStrategy::SharedWhisperContext
+        } else {
+            ChunkTranscriptionStrategy::DispatchPerChunk
+        };
+        assert_eq!(chunk_transcription_strategy(&config), expected);
+    }
+
+    #[test]
+    fn per_chunk_backends_bypass_rotation_without_a_private_audio_capability() {
+        let mut config = Config::default();
+        config.transcription.engine = "sherpa".into();
+
+        assert!(should_bypass_meeting_chunk_rotation(&config, false));
+        assert!(!should_bypass_meeting_chunk_rotation(&config, true));
+
+        config.transcription.engine = "parakeet".into();
+        assert_eq!(
+            should_bypass_meeting_chunk_rotation(&config, false),
+            !cfg!(feature = "whisper")
+        );
+    }
+
+    #[test]
+    fn runtime_unavailable_private_audio_bypasses_multi_chunk_dispatch() {
+        let mut config = Config::default();
+        config.transcription.engine = "sherpa".into();
+
+        crate::pipeline::with_private_audio_processing_available_for_test(false, || {
+            assert!(should_bypass_meeting_chunk_rotation(
+                &config,
+                crate::pipeline::private_audio_processing_available()
+            ));
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_multi_chunk_sherpa_uses_sealed_private_rotation() {
+        let mut config = Config::default();
+        config.transcription.engine = "sherpa".into();
+        let representative_vad_chunks = [(0usize, 16_000usize), (20_000, 36_000)];
+
+        assert!(representative_vad_chunks.len() >= 2);
+        assert!(crate::pipeline::private_audio_processing_supported());
+        assert!(!should_bypass_meeting_chunk_rotation(
+            &config,
+            crate::pipeline::private_audio_processing_available()
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whisper")]
+    fn validate_whisper_model_size_rejects_truncated_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ggml-medium.bin");
+        // Reproduces issue #229: write a 221 MB file where ~1.5 GB is expected.
+        // We use a smaller stand-in (10 MB) since the validator only cares about
+        // the comparison against `expected_whisper_model_size_bytes("medium")`.
+        let truncated_bytes = 10 * 1024 * 1024;
+        std::fs::write(&path, vec![0u8; truncated_bytes]).unwrap();
+
+        let result = validate_whisper_model_size(path.clone());
+        let err = result.expect_err("a 10 MB ggml-medium.bin should be rejected");
+        match err {
+            TranscribeError::ModelTruncated {
+                model_name,
+                actual_mb,
+                expected_min_mb,
+                ..
+            } => {
+                assert_eq!(model_name, "medium");
+                assert!(actual_mb < expected_min_mb);
+            }
+            other => panic!("expected ModelTruncated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whisper")]
+    fn validate_whisper_model_size_accepts_full_size_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ggml-tiny.bin");
+        // A file at or above the tiny threshold should pass through.
+        let bytes = expected_whisper_model_size_bytes("tiny").unwrap() as usize + 1024;
+        std::fs::write(&path, vec![0u8; bytes]).unwrap();
+        let validated =
+            validate_whisper_model_size(path.clone()).expect("full-size tiny should pass");
+        assert_eq!(validated, path);
+    }
+
+    #[test]
+    #[cfg(feature = "whisper")]
+    fn validate_whisper_model_size_ignores_unknown_filenames() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("custom-finetune.bin");
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        // No `ggml-` prefix means no expected size; the validator must not
+        // reject otherwise legitimate user files in non-standard locations.
+        let validated = validate_whisper_model_size(path.clone()).unwrap();
+        assert_eq!(validated, path);
+    }
+
+    #[test]
+    fn load_wav_rejects_empty_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("empty.wav");
+        std::fs::write(&path, "").unwrap();
+        let result = load_wav(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_wav_reads_valid_wav() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.wav");
+
+        // Create a short WAV with hound
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..16000 {
+            let sample =
+                (10000.0 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin()) as i16;
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let samples = load_wav(&path).unwrap();
+        assert!(!samples.is_empty());
+        // 1 second at 16kHz = 16000 samples
+        assert_eq!(samples.len(), 16000);
+    }
+
+    #[test]
+    fn load_wav_streams_high_rate_input_to_canonical_rate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("high-rate.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for index in 0..48_000 {
+            let sample =
+                (8_000.0 * (std::f32::consts::TAU * 440.0 * index as f32 / 48_000.0).sin()) as i16;
+            writer.write_sample(sample).unwrap();
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let samples = load_wav(&path).unwrap();
+        assert_eq!(samples.len(), 16_000);
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn load_wav_rejects_non_finite_float_samples_at_decode_boundary() {
+        for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut wav = std::io::Cursor::new(Vec::new());
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            {
+                let mut writer = hound::WavWriter::new(&mut wav, spec).unwrap();
+                writer.write_sample(0.25_f32).unwrap();
+                writer.write_sample(sample).unwrap();
+                writer.write_sample(0.5_f32).unwrap();
+                writer.finalize().unwrap();
+            }
+
+            let error = load_wav_stream(wav.into_inner().as_slice()).unwrap_err();
+            assert!(
+                matches!(error, TranscribeError::UnsupportedFormat(ref detail)
+                if detail.contains("non-finite"))
+            );
+        }
+    }
+
+    #[test]
+    fn load_wav_downmixes_many_finite_float_channels_without_overflow() {
+        let mut wav = std::io::Cursor::new(Vec::new());
+        let spec = hound::WavSpec {
+            channels: 32,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        {
+            let mut writer = hound::WavWriter::new(&mut wav, spec).unwrap();
+            for _ in 0..32 {
+                writer.write_sample(f32::MAX).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let samples = load_wav_stream(wav.into_inner().as_slice()).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].is_finite());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn private_non_wav_hint_is_rejected_before_compressed_container_probe() {
+        let mut audio =
+            crate::pipeline::PrivateAudioTempFile::new("minutes-private-compressed-", ".mp3")
+                .unwrap();
+        let source = (0..1_600)
+            .map(|index| (index % 257) as f32 / 32768.0)
+            .collect::<Vec<_>>();
+        write_wav_16k_mono_to_writer(audio.prepare_for_write().unwrap(), &source).unwrap();
+        audio.finish_write().unwrap();
+
+        let error =
+            load_audio_samples_with_format(audio.as_path(), Some("mp3"), &Config::default())
+                .expect_err("private non-WAV routing must fail before container probing");
+        assert!(error.to_string().contains("bounded WAV input only"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "whisper"))]
+    fn traced_transcribe_path_writes_ordered_process_breadcrumbs() {
+        let _lock = crate::test_home_env_lock();
+        let old_minutes_home = std::env::var_os("MINUTES_HOME");
+        let old_minutes_trace = std::env::var_os("MINUTES_TRACE");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("MINUTES_HOME", dir.path().join("minutes-home"));
+        std::env::remove_var("MINUTES_TRACE");
+
+        let audio_path = dir.path().join("probe.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&audio_path, spec).unwrap();
+        for _ in 0..1600 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut config = Config::default();
+        config.transcription.language = Some("fr".into());
+        let _trace_guard = crate::process_trace::start_process_trace(
+            &audio_path,
+            crate::markdown::ContentType::Memo,
+            &config,
+        );
+        transcribe_with_hints(&audio_path, &config, &DecodeHints::default()).unwrap();
+        crate::process_trace::stage("process.done");
+
+        let trace_path = crate::process_trace::trace_file_path_for_tests().unwrap();
+        let trace = std::fs::read_to_string(trace_path).unwrap();
+        let events = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let stages = events
+            .iter()
+            .map(|event| event["stage"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                "process.start",
+                "decode.start",
+                "decode.done",
+                "process.done"
+            ]
+        );
+        assert!(events.iter().all(|event| event["ts"].is_string()));
+        assert_eq!(events[0]["input_path"], audio_path.display().to_string());
+        assert_eq!(events[0]["language"], "fr");
+        assert_eq!(events[0]["content_type"], "memo");
+        assert_eq!(events[2]["audio_samples"], 1600);
+
+        match old_minutes_home {
+            Some(value) => std::env::set_var("MINUTES_HOME", value),
+            None => std::env::remove_var("MINUTES_HOME"),
+        }
+        match old_minutes_trace {
+            Some(value) => std::env::set_var("MINUTES_TRACE", value),
+            None => std::env::remove_var("MINUTES_TRACE"),
+        }
+    }
+
+    #[test]
+    fn load_audio_routes_arbitrary_non_wav_extension_to_ffmpeg_boundary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.xyz");
+        std::fs::write(&path, "not audio").unwrap();
+        let error = load_audio_samples_with_format(&path, None, &Config::default()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                TranscribeError::UnsupportedFormat(detail) if detail.contains("ffmpeg")
+            ) || matches!(&error, TranscribeError::CompressedDecoderUnavailable(_))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn authorized_descriptor_format_hint_selects_wav_decoder_without_a_path_extension() {
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let named_path = dir.path().join("synthetic.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&named_path, spec).unwrap();
+        for _ in 0..160 {
+            writer.write_sample(1000_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let retained = std::fs::File::open(&named_path).unwrap();
+        let base = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        let descriptor_path = Path::new(base).join(retained.as_raw_fd().to_string());
+        assert!(descriptor_path.extension().is_none());
+        let samples =
+            load_audio_samples_with_format(&descriptor_path, Some("wav"), &Config::default())
+                .unwrap();
+        assert_eq!(samples.len(), 160);
+    }
+
+    #[test]
+    fn source_clock_removes_only_digital_zero_prefix_and_restores_precise_offsets() {
+        let hints = DecodeHints::default().with_source_timeline();
+        let samples = [0.0, -0.0, 0.000_000_001, 0.8, 0.0];
+        assert_eq!(
+            source_clock_prefix_samples(&samples, &hints),
+            2,
+            "even a very quiet nonzero sample must survive"
+        );
+        assert_eq!(
+            source_clock_prefix_samples(&samples, &DecodeHints::default()),
+            0
+        );
+        let mut result = TranscribeResult {
+            text: "[0:00] yes\n".into(),
+            stats: FilterStats::default(),
+            segments: vec![TranscriptSegment {
+                start: 0.75,
+                end: 1.5,
+                text: "yes".into(),
+            }],
+            detected_language: None,
+        };
+        restore_source_clock(&mut result, 4.5);
+        assert_eq!(result.text, "[0:05] yes\n");
+        assert_eq!(result.segments[0].start, 5.25);
+        assert_eq!(result.segments[0].end, 6.0);
+    }
+
+    #[test]
+    fn independent_sources_preserve_silence_and_the_original_clock_even_on_vad_retry() {
+        let mut samples = vec![0.0; 16000 * 4];
+        samples.extend(
+            (0..16000)
+                .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin()),
+        );
+        samples.extend(vec![0.0; 16000 * 4]);
+        let hints = DecodeHints::default()
+            .with_source_timeline()
+            .with_additional_candidates(&["Minutes".into()], &[]);
+        assert_eq!(
+            prepare_whisper_samples(samples.clone(), false, &hints),
+            samples
+        );
+        assert_eq!(
+            prepare_whisper_samples(samples.clone(), true, &hints),
+            samples
+        );
+        assert!(
+            prepare_whisper_samples(samples.clone(), false, &DecodeHints::default()).len()
+                < samples.len()
+        );
+    }
+
+    #[test]
+    fn strip_silence_preserves_speech() {
+        // 1s of "speech" (high energy sine wave)
+        let speech: Vec<f32> = (0..16000)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin())
+            .collect();
+        let result = strip_silence(&speech, 16000);
+        // All speech — nothing should be stripped
+        assert_eq!(result.len(), speech.len());
+    }
+
+    #[test]
+    fn strip_silence_trims_long_silence() {
+        let mut samples = Vec::new();
+        // 1s speech
+        for i in 0..16000 {
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin());
+        }
+        // 5s silence
+        samples.extend(vec![0.0f32; 16000 * 5]);
+        // 1s speech
+        for i in 0..16000 {
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin());
+        }
+
+        let result = strip_silence(&samples, 16000);
+        // Should be significantly shorter than 7s (5s of silence trimmed)
+        let original_secs = samples.len() as f64 / 16000.0;
+        let result_secs = result.len() as f64 / 16000.0;
+        assert!(
+            result_secs < original_secs * 0.7,
+            "expected significant trimming: {:.1}s → {:.1}s",
+            original_secs,
+            result_secs
+        );
+        // But should still have both speech segments + padding
+        assert!(
+            result_secs > 2.0,
+            "should preserve both speech segments: {:.1}s",
+            result_secs
+        );
+    }
+
+    #[test]
+    fn strip_silence_keeps_short_pauses() {
+        let mut samples = Vec::new();
+        // 1s speech
+        for i in 0..16000 {
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin());
+        }
+        // 400ms silence (short natural pause — should be kept)
+        samples.extend(vec![0.0f32; 6400]);
+        // 1s speech
+        for i in 0..16000 {
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin());
+        }
+
+        let result = strip_silence(&samples, 16000);
+        // Short pause should be preserved — output ≈ input length
+        let ratio = result.len() as f64 / samples.len() as f64;
+        assert!(
+            ratio > 0.9,
+            "short pauses should be preserved: ratio {:.2}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn strip_silence_handles_all_silence() {
+        let samples = vec![0.0f32; 16000 * 10]; // 10s of silence
+        let result = strip_silence(&samples, 16000);
+        // Should still produce something (short pad at minimum)
+        assert!(result.len() < samples.len() / 2, "should trim most silence");
+    }
+
+    #[test]
+    fn sinc_resample_no_aliasing() {
+        // Generate a 440Hz tone at 44100Hz, resample to 16000Hz.
+        // 440Hz is well below Nyquist (8000Hz), so it should survive.
+        let n = 44100;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let resampled = resample(&samples, 44100, 16000);
+
+        // Check the resampled signal has reasonable amplitude (not attenuated to nothing)
+        let peak = resampled.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(
+            peak > 0.8,
+            "440Hz tone should survive resampling with peak > 0.8, got {}",
+            peak
+        );
+    }
+
+    #[test]
+    fn dedup_no_repetition() {
+        let lines = vec![
+            "[0:00] Hello world".into(),
+            "[0:03] How are you".into(),
+            "[0:06] Fine thanks".into(),
+        ];
+        let result = dedup_segments(lines.clone());
+        assert_eq!(result, lines);
+    }
+
+    #[test]
+    fn dedup_collapses_exact_repetition() {
+        let lines = vec![
+            "[0:00] Hello world".into(),
+            "[0:03] Hello world".into(),
+            "[0:06] Hello world".into(),
+            "[0:09] Hello world".into(),
+            "[0:12] Something different".into(),
+        ];
+        let result = dedup_segments(lines);
+        assert_eq!(result.len(), 3); // first + marker + different
+        assert!(result[0].contains("Hello world"));
+        assert!(result[1].contains("repeated audio removed"));
+        assert!(result[2].contains("Something different"));
+    }
+
+    #[test]
+    fn dedup_collapses_near_identical() {
+        // Whisper often produces slight variations of the same repeated text
+        let lines = vec![
+            "[0:00] Ok bene le macedi diesel".into(),
+            "[0:03] Ok, bene le macedi diesel".into(),
+            "[0:06] Ok bene, le macedi diesel".into(),
+            "[0:09] Good morning".into(),
+        ];
+        let result = dedup_segments(lines);
+        assert_eq!(result.len(), 3); // first + marker + different
+        assert!(result[1].contains("repeated audio removed"));
+    }
+
+    #[test]
+    fn dedup_leaves_two_similar_alone() {
+        // Only 2 similar — below threshold of 3
+        let lines = vec![
+            "[0:00] Hello world".into(),
+            "[0:03] Hello world".into(),
+            "[0:06] Something else".into(),
+        ];
+        let result = dedup_segments(lines.clone());
+        assert_eq!(result, lines);
+    }
+
+    #[test]
+    fn transcript_cleanup_pipeline_matches_legacy_cleanup_behavior() {
+        let lines = vec![
+            "[0:00] Hello world".into(),
+            "[0:03] Hello world".into(),
+            "[0:06] Hello world".into(),
+            "[0:09] [music]".into(),
+        ];
+
+        let pipeline = run_transcript_cleanup_pipeline(lines.clone());
+        let legacy = trim_trailing_noise(collapse_noise_markers(strip_foreign_script(
+            dedup_interleaved(dedup_segments(lines)),
+        )));
+
+        assert_eq!(pipeline.lines, legacy);
+        assert_eq!(
+            pipeline
+                .stats
+                .iter()
+                .map(|stat| stat.stage)
+                .collect::<Vec<_>>(),
+            vec![
+                TranscriptCleanupStage::DedupSegments,
+                TranscriptCleanupStage::DedupInterleaved,
+                TranscriptCleanupStage::StripForeignScript,
+                TranscriptCleanupStage::CollapseNoiseMarkers,
+                TranscriptCleanupStage::TrimTrailingNoise,
+            ]
+        );
+        assert_eq!(
+            pipeline.after(TranscriptCleanupStage::TrimTrailingNoise),
+            pipeline.lines.len()
+        );
+    }
+
+    fn constant_samples(seconds: usize, amplitude: f32) -> Vec<f32> {
+        vec![amplitude; seconds * 16_000]
+    }
+
+    #[test]
+    fn meeting_vad_chunks_split_on_long_silence() {
+        let mut samples = constant_samples(2, 0.05);
+        samples.extend(constant_samples(2, 0.0));
+        samples.extend(constant_samples(2, 0.05));
+
+        let chunks = detect_meeting_vad_chunks(&samples);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected split around long silence: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn meeting_vad_chunks_keep_short_pause_inside_chunk() {
+        let mut samples = constant_samples(2, 0.05);
+        samples.extend(constant_samples(0, 0.0));
+        samples.extend(vec![0.0; 4_800]); // 300ms silence
+        samples.extend(constant_samples(2, 0.05));
+
+        let chunks = detect_meeting_vad_chunks(&samples);
+        assert_eq!(
+            chunks.len(),
+            1,
+            "short pause should stay in one chunk: {chunks:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn fixed_length_chunks_splits_audio_without_gaps() {
+        let chunks = fixed_length_chunks(16_000 * 95, 16_000 * 45);
+        assert_eq!(
+            chunks,
+            vec![
+                (0, 16_000 * 45),
+                (16_000 * 45, 16_000 * 90),
+                (16_000 * 90, 16_000 * 95)
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn fixed_length_chunks_handles_empty_audio() {
+        let chunks = fixed_length_chunks(0, 16_000 * 45);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn offset_timestamped_lines_applies_chunk_offset() {
+        let lines = offset_timestamped_lines(["[0:02] hello", "[0:07] world"].into_iter(), 10.0, 0);
+        assert_eq!(lines, vec!["[0:12] hello", "[0:17] world"]);
+    }
+
+    #[test]
+    fn dedup_handles_empty() {
+        let result = dedup_segments(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn dedup_handles_single_line() {
+        let lines = vec!["[0:00] Hello".into()];
+        let result = dedup_segments(lines.clone());
+        assert_eq!(result, lines);
+    }
+
+    #[test]
+    fn dedup_multiple_runs() {
+        let lines = vec![
+            "[0:00] First phrase".into(),
+            "[0:03] First phrase".into(),
+            "[0:06] First phrase".into(),
+            "[0:09] Second phrase".into(),
+            "[0:12] Second phrase".into(),
+            "[0:15] Second phrase".into(),
+            "[0:18] Second phrase".into(),
+            "[0:21] Normal text".into(),
+        ];
+        let result = dedup_segments(lines);
+        // Two collapsed runs + normal text
+        assert_eq!(result.len(), 5); // first + marker + second + marker + normal
+        assert!(result[1].contains("2 identical"));
+        assert!(result[3].contains("3 identical"));
+    }
+
+    #[test]
+    fn engine_defaults_to_auto() {
+        let config = Config::default();
+        assert_eq!(config.transcription.engine, "auto");
+    }
+
+    #[test]
+    fn resolve_auto_engine_covers_compiled_platform_plugin_and_model_table() {
+        for sherpa_compiled in [false, true] {
+            for apple_silicon in [false, true] {
+                for plugin_present in [false, true] {
+                    for model_present in [false, true] {
+                        let resolution = resolve_auto_transcription_engine(
+                            sherpa_compiled,
+                            apple_silicon,
+                            plugin_present,
+                            model_present,
+                        );
+                        let expected = if !sherpa_compiled {
+                            ("whisper", "whisper: sherpa not compiled")
+                        } else if !apple_silicon {
+                            (
+                                "whisper",
+                                "whisper: sherpa auto-selection requires Apple Silicon",
+                            )
+                        } else if !plugin_present {
+                            (
+                                "whisper",
+                                "whisper: sherpa plugin not found beside the binary — install the macOS sherpa archive or the desktop app",
+                            )
+                        } else if !model_present {
+                            (
+                                "whisper",
+                                "whisper: parakeet model missing — run minutes setup",
+                            )
+                        } else {
+                            ("sherpa", "sherpa: model present")
+                        };
+                        assert_eq!(
+                            (resolution.engine, resolution.reason),
+                            expected,
+                            "compiled={sherpa_compiled} apple_silicon={apple_silicon} plugin_present={plugin_present} model_present={model_present}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "engine-sherpa")]
+    #[test]
+    fn explicit_sherpa_resolution_distinguishes_plugin_and_model_failures() {
+        let _env_lock = crate::test_home_env_lock();
+        let previous = std::env::var_os("MINUTES_SHERPA_PLUGIN");
+        let temp = tempfile::TempDir::new().unwrap();
+        let plugin = temp.path().join("synthetic-sherpa-plugin");
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                engine: "sherpa".into(),
+                model_path: temp.path().join("models"),
+                ..Config::default().transcription
+            },
+            ..Config::default()
+        };
+
+        std::env::set_var("MINUTES_SHERPA_PLUGIN", temp.path().join("missing-plugin"));
+        let plugin_missing = transcription_engine_resolution(&config);
+        assert_eq!(
+            plugin_missing.reason,
+            "whisper: configured sherpa plugin missing"
+        );
+
+        std::fs::write(&plugin, b"presence is enough for the cheap probe").unwrap();
+        std::env::set_var("MINUTES_SHERPA_PLUGIN", &plugin);
+        let model_missing = transcription_engine_resolution(&config);
+
+        if let Some(previous) = previous {
+            std::env::set_var("MINUTES_SHERPA_PLUGIN", previous);
+        } else {
+            std::env::remove_var("MINUTES_SHERPA_PLUGIN");
+        }
+        assert_eq!(
+            model_missing.reason,
+            "whisper: configured sherpa model missing"
+        );
+    }
+
+    #[test]
+    fn retained_parakeet_resolves_to_whisper_in_every_build() {
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                engine: "parakeet".into(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(effective_batch_engine(&config), "whisper");
+    }
+
+    #[test]
+    fn retained_apple_speech_resolves_to_whisper_in_every_build() {
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                engine: "apple-speech".into(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(effective_batch_engine(&config), "whisper");
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_dispatch_resolves_transport_before_parakeet_io() {
+        let mut config = Config::default();
+        config.transcription.engine = "parakeet".into();
+        config.transcription.parakeet_model = "intentionally-invalid".into();
+        let result = transcribe_parakeet_dispatch(
+            Path::new("/nonexistent/transport-gate.wav"),
+            &config,
+            &DecodeHints::default(),
+        );
+        assert!(
+            !matches!(result, Err(TranscribeError::ParakeetFailed(_))),
+            "the unavailable transport must route to Whisper before Parakeet model or path I/O"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_batch_rejects_dispatch_when_transport_is_unavailable() {
+        let result = transcribe_parakeet_batch(
+            &[PathBuf::from("/nonexistent/transport-gate-batch.wav")],
+            &Config::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(TranscribeError::EngineNotAvailable(reason))
+                if reason.contains("cannot receive secure private audio")
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_text_basic() {
+        let text = "[0.00 - 2.50] Hello world\n[3.00 - 5.10] How are you\n";
+        let config = Config::default();
+        let (_parsed, result, _) = parse_parakeet_output(text, &config).unwrap();
+        let lines: Vec<&str> = result.trim().lines().collect();
+        assert_eq!(lines.len(), 2, "should have 2 lines: {:?}", lines);
+        assert!(
+            lines[0].contains("[0:00] Hello world"),
+            "first: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("[0:03] How are you"),
+            "second: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_empty_input() {
+        let config = Config::default();
+        let result = parse_parakeet_output("", &config);
+        assert!(result.is_err(), "empty input should fail");
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_plain_text_rejected() {
+        // Plain text without timestamps should be rejected (not faked as [0:00])
+        let text = "this is plain text output without timestamps";
+        let config = Config::default();
+        let result = parse_parakeet_output(text, &config);
+        assert!(result.is_err(), "plain text without timestamps should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no [start - end] timestamps"),
+            "error should explain the issue: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_zero_token_banner_is_empty_transcript() {
+        let text = "\
+Loading model: tdt-600m
+Model loaded (723 tensors)
+Model moved to GPU
+Encoder: 4 ms
+
+--- Transcription (0 tokens) ---
+
+--- Word Timestamps ---
+";
+        let config = Config::default();
+        let result = parse_parakeet_output(text, &config);
+        assert!(
+            matches!(result, Err(TranscribeError::EmptyTranscript(_))),
+            "zero-token banner should be treated as empty transcript: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_nonzero_banner_without_timestamps_still_fails() {
+        let text = "\
+Loading model: tdt-600m
+Model loaded (723 tensors)
+
+--- Transcription (3 tokens) ---
+hello there friend
+
+--- Word Timestamps ---
+";
+        let config = Config::default();
+        let result = parse_parakeet_output(text, &config);
+        assert!(
+            result.is_err(),
+            "nonzero banner without timestamps should fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no [start - end] timestamps"),
+            "nonzero malformed output should still surface parser failure: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_timestamp_formatting() {
+        // Verify that timestamps > 60s are formatted correctly
+        let text = "[125.00 - 126.00] late segment\n";
+        let config = Config::default();
+        let (_parsed, result, _) = parse_parakeet_output(text, &config).unwrap();
+        assert!(
+            result.contains("[2:05]"),
+            "125s should be [2:05]: {}",
+            result
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_dedup_applied() {
+        // Repeated lines should be collapsed by the anti-hallucination pipeline
+        let text = "[0.00 - 1.00] Hello world\n\
+                     [1.00 - 2.00] Hello world\n\
+                     [2.00 - 3.00] Hello world\n\
+                     [3.00 - 4.00] Hello world\n\
+                     [5.00 - 6.00] Something different\n";
+        let config = Config::default();
+        let (_parsed, result, _) = parse_parakeet_output(text, &config).unwrap();
+        let lines: Vec<&str> = result.trim().lines().collect();
+        assert!(
+            lines.len() < 5,
+            "dedup should collapse repetitions: {:?}",
+            lines
+        );
+        assert!(lines.last().unwrap().contains("Something different"));
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_groups_word_level_segments() {
+        let text = "\
+[0.00s - 0.10s] (0.90) Hello\n\
+[0.11s - 0.20s] (0.90) world.\n\
+[1.40s - 1.50s] (0.80) Next\n\
+[1.51s - 1.60s] (0.80) sentence\n";
+        let config = Config::default();
+        let (_parsed, result, _) = parse_parakeet_output(text, &config).unwrap();
+        let lines: Vec<&str> = result.trim().lines().collect();
+        assert_eq!(lines.len(), 2, "expected two grouped segments: {:?}", lines);
+        assert!(lines[0].contains("Hello world."));
+        assert!(lines[1].contains("Next sentence"));
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_transport_gate_precedes_model_and_path_validation() {
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                engine: "parakeet".into(),
+                parakeet_model: "totally-fake-model".into(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+        let error =
+            transcribe_parakeet_batch(&[PathBuf::from("/nonexistent.wav")], &config).unwrap_err();
+        assert!(matches!(
+            error,
+            TranscribeError::EngineNotAvailable(ref reason)
+                if reason.contains("cannot receive secure private audio")
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn write_wav_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.wav");
+
+        let samples: Vec<f32> = (0..16000)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin())
+            .collect();
+
+        write_wav_16k_mono(&path, &samples).unwrap();
+
+        let reader = hound::WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 16000);
+        assert_eq!(spec.bits_per_sample, 16);
+        let read_samples: Vec<i16> = reader.into_samples().filter_map(|s| s.ok()).collect();
+        assert_eq!(read_samples.len(), 16000);
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn resolve_parakeet_model_missing() {
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model_path: PathBuf::from("/tmp/no-such-dir"),
+                parakeet_model: "tdt-600m".into(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+        let result = resolve_parakeet_model_path(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("minutes setup --parakeet"),
+            "error should tell user how to fix it: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn resolve_parakeet_model_missing_suggests_pinning_110m_when_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let model_dir = dir.path().join("parakeet");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("tdt-ctc-110m.safetensors"), b"legacy").unwrap();
+        std::fs::write(
+            model_dir.join("tdt-ctc-110m.tokenizer.vocab"),
+            b"legacy-tokenizer",
+        )
+        .unwrap();
+
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model_path: dir.path().to_path_buf(),
+                parakeet_model: "tdt-600m".into(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let err = resolve_parakeet_model_path(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("tdt-ctc-110m"),
+            "should mention legacy 110m option: {}",
+            err
+        );
+        assert!(
+            err.contains("parakeet_vocab = \"tdt-ctc-110m.tokenizer.vocab\""),
+            "should show how to pin the old tokenizer too: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn resolve_parakeet_vocab_prefers_model_specific_tokenizer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let model_dir = dir.path().join("parakeet");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("tokenizer.vocab"), "wrong\t0\n").unwrap();
+        std::fs::write(model_dir.join("tdt-ctc-110m.tokenizer.vocab"), "right\t0\n").unwrap();
+
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model_path: dir.path().to_path_buf(),
+                parakeet_model: "tdt-ctc-110m".into(),
+                parakeet_vocab: "tokenizer.vocab".into(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let resolved = resolve_parakeet_vocab_path(&config).unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("tdt-ctc-110m.tokenizer.vocab")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn resolve_parakeet_native_vad_prefers_packaged_weights() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let model_dir = dir.path().join("parakeet");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("silero_vad_v5.safetensors"), "vad").unwrap();
+
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model_path: dir.path().to_path_buf(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let resolved = resolve_parakeet_native_vad_path(&config).unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("silero_vad_v5.safetensors")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_chunk_ranges_keep_shorter_audio_intact_with_native_vad() {
+        let total_samples = 16000 * 120;
+        let chunk_ranges = parakeet_chunk_ranges(total_samples, 120.0, true);
+        assert!(
+            chunk_ranges.is_none(),
+            "native VAD should avoid 45s hard chunking for 2 minute audio"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_chunk_ranges_raise_long_audio_boundary_with_native_vad() {
+        let total_samples = 16000 * 301;
+        let chunk_ranges = parakeet_chunk_ranges(total_samples, 301.0, true).unwrap();
+        assert_eq!(chunk_ranges.len(), 2);
+        assert_eq!(chunk_ranges[0], (0, 16000 * PARAKEET_NATIVE_VAD_CHUNK_SECS));
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_chunk_ranges_preserve_legacy_guardrails_without_native_vad() {
+        let total_samples = 16000 * 61;
+        let chunk_ranges = parakeet_chunk_ranges(total_samples, 61.0, false).unwrap();
+        assert_eq!(chunk_ranges.len(), 2);
+        assert_eq!(chunk_ranges[0], (0, 16000 * PARAKEET_LONG_AUDIO_CHUNK_SECS));
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_batch_output_splits_sections() {
+        let config = Config::default();
+        let raw = r#"
+Loading model: tdt-600m (batch mode, 2 files)
+Batch transcription: 2296 ms (2 files)
+
+--- [1/2] /tmp/a.wav (2 tokens) ---
+Hello there.
+
+--- Word Timestamps ---
+  [1.00s - 1.40s] (0.95) Hello
+  [1.50s - 1.90s] (0.93) there.
+
+--- [2/2] /tmp/b.wav (0 tokens) ---
+"#;
+
+        let parsed = parse_parakeet_batch_output(raw, 2, &config).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0]
+            .as_ref()
+            .unwrap()
+            .transcript
+            .contains("Hello there."));
+        assert!(matches!(
+            parsed[1],
+            Err(TranscribeError::EmptyTranscript(_))
+        ));
+    }
+
+    #[test]
+    fn diagnosis_shows_rescue_when_all_segments_would_be_filtered() {
+        let stats = FilterStats {
+            audio_duration_secs: 2585.0,
+            samples_after_silence_strip: 16000 * 2585,
+            raw_segments: 1,
+            skipped_no_speech: 0, // 0 because rescue set it to 0
+            after_no_speech_filter: 1,
+            after_dedup: 1,
+            after_interleaved: 1,
+            after_script_filter: 1,
+            after_noise_markers: 1,
+            after_trailing_trim: 1,
+            rescued_no_speech: 1,
+            final_words: 5,
+            model_fallback: None,
+        };
+        let d = stats.diagnosis();
+        assert!(
+            d.contains("no_speech rescue: 1 segments saved"),
+            "should report rescue: {}",
+            d
+        );
+        assert!(
+            !d.contains("no_speech filter:"),
+            "should not show filter when rescue happened: {}",
+            d
+        );
+        assert!(
+            d.contains("final: 5 words"),
+            "should show final words: {}",
+            d
+        );
+    }
+
+    #[test]
+    fn diagnosis_shows_normal_no_speech_filter_when_some_segments_survive() {
+        let stats = FilterStats {
+            audio_duration_secs: 300.0,
+            samples_after_silence_strip: 16000 * 300,
+            raw_segments: 50,
+            skipped_no_speech: 5,
+            after_no_speech_filter: 45,
+            after_dedup: 45,
+            after_interleaved: 45,
+            after_script_filter: 45,
+            after_noise_markers: 45,
+            after_trailing_trim: 45,
+            rescued_no_speech: 0,
+            final_words: 500,
+            model_fallback: None,
+        };
+        let d = stats.diagnosis();
+        assert!(
+            d.contains("no_speech filter: -5 → 45"),
+            "should show normal filter: {}",
+            d
+        );
+        assert!(!d.contains("rescue"), "should not mention rescue: {}", d);
+    }
+
+    #[test]
+    fn timeout_cap_limits_to_one_hour() {
+        // 43 minutes of audio: old formula gave 300 + 2580 * 10 = 26100s (7+ hours)
+        // New formula: min(300 + 2580 * 3, 3600) = 3600s (1 hour)
+        let audio_secs = 2580.0_f64;
+        let timeout = (300.0 + (audio_secs * 3.0)).min(3600.0);
+        assert_eq!(timeout, 3600.0, "should cap at 1 hour for long audio");
+
+        // Short audio: 30 seconds → 300 + 90 = 390s (no cap needed)
+        let short_audio = 30.0_f64;
+        let timeout = (300.0 + (short_audio * 3.0)).min(3600.0);
+        assert_eq!(timeout, 390.0, "short audio should not be capped");
+    }
+
+    #[test]
+    fn decode_hints_keep_priority_names_and_filter_weak_context() {
+        let hints = DecodeHints::from_candidates(
+            &[
+                "Mat".to_string(),
+                "Mathieu".to_string(),
+                "Mat".to_string(),
+                "alex@example.com".to_string(),
+            ],
+            &[
+                "X1 Integration".to_string(),
+                "Box".to_string(),
+                "plan".to_string(),
+                "AI".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            hints.combined_phrases(10),
+            vec![
+                "Mat".to_string(),
+                "Mathieu".to_string(),
+                "X1 Integration".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_hints_build_whisper_prompt() {
+        let hints = DecodeHints::from_candidates(
+            &["Mat".to_string(), "Alex Chen".to_string()],
+            &["X1 Planning".to_string()],
+        );
+
+        let prompt = hints.whisper_initial_prompt().expect("prompt");
+        assert!(prompt.contains("Mat"));
+        assert!(prompt.contains("Alex Chen"));
+        assert!(prompt.contains("X1 Planning"));
+        assert!(prompt.contains("Preserve spelling exactly"));
+        assert_eq!(
+            hints.whisper_terms_prompt().as_deref(),
+            Some("Mat, Alex Chen, X1 Planning")
+        );
+    }
+
+    #[test]
+    fn decode_hints_merge_additional_candidates() {
+        let base = DecodeHints::from_candidates(&["Mat".to_string()], &["X1 Planning".to_string()]);
+        let merged = base.with_additional_candidates(
+            &["Casey Rowan".to_string()],
+            &["Northstar Studio".to_string()],
+        );
+
+        assert_eq!(
+            merged.combined_phrases(10),
+            vec![
+                "Mat".to_string(),
+                "Casey Rowan".to_string(),
+                "X1 Planning".to_string(),
+                "Northstar Studio".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn local_parakeet_hints_apply_even_when_global_boost_disabled() {
+        let config = Config::default();
+        let hints = DecodeHints::from_candidates(
+            &["Mat".to_string(), "Alex Chen".to_string()],
+            &["X1 Planning".to_string()],
+        );
+
+        let phrases = combined_parakeet_boost_phrases(&config, &hints);
+        assert_eq!(phrases, vec!["Alex Chen".to_string(),]);
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn local_parakeet_hints_keep_priority_names_and_drop_context_terms() {
+        let config = Config::default();
+        let hints = DecodeHints::from_candidates(
+            &["Casey Rowan".to_string()],
+            &[
+                "Northstar Studio".to_string(),
+                "direct response projects".to_string(),
+            ],
+        );
+
+        let phrases = combined_parakeet_boost_phrases(&config, &hints);
+        assert_eq!(phrases, vec!["Casey Rowan".to_string()]);
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_gpu_unavailable_matches_runtime_error() {
+        assert!(parakeet_gpu_unavailable("Error: Metal GPU not available"));
+        assert!(!parakeet_gpu_unavailable("Error: tokenizer file missing"));
+    }
+
+    /// Regression guard for the loud-once log gate that
+    /// `log_parakeet_helper_failure_once` and its spawn-failure twin rely
+    /// on. The original issue #163 stayed invisible to maintainers
+    /// partly because every helper failure was silently swallowed; the
+    /// fix logs warn on first failure and debug afterward. If a future
+    /// change weakens the gate (e.g. swaps `swap` for `load+store`,
+    /// breaking atomicity) the log volume during a real recording goes
+    /// back to one warn per audio chunk. This test exercises the gate
+    /// with a non-static AtomicBool so test order does not interfere.
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn loud_once_gate_signals_first_call_only() {
+        let gate = AtomicBool::new(false);
+        assert!(loud_once(&gate), "first call must signal loud");
+        assert!(!loud_once(&gate), "second call must signal quiet");
+        assert!(!loud_once(&gate), "third call must signal quiet");
+    }
+
+    /// Confirms the function treats each caller-owned gate independently.
+    /// This is a property of `loud_once` itself; it does NOT catch a
+    /// hypothetical regression where the production helpers
+    /// (`log_parakeet_helper_failure_once`,
+    /// `log_parakeet_helper_spawn_failure_once`) collapse onto a shared
+    /// static gate, because that would require introspecting the
+    /// production statics rather than the function's argument behavior.
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn loud_once_gates_are_independent_per_instance() {
+        let gate_a = AtomicBool::new(false);
+        let gate_b = AtomicBool::new(false);
+        assert!(loud_once(&gate_a));
+        assert!(loud_once(&gate_b), "second gate must fire independently");
+        assert!(!loud_once(&gate_a));
+        assert!(!loud_once(&gate_b));
+    }
+}

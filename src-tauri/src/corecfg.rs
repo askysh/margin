@@ -14,7 +14,60 @@ pub const MODELS: &[(&str, &str, u64)] = &[
     ("base", "Fast", 147_951_465),
     ("small", "Balanced", 487_601_967),
     ("large-v3-turbo", "Best", 1_624_555_275),
+    ("hinglish", "Hindi + English (Devanagari)", 1_081_140_203),
 ];
+
+/// Models with no public download: the user puts `ggml-<id>.bin` in the models folder.
+/// "hinglish" is Trelis/whisper-hinglish-preview (Apache-2.0) converted to ggml q5_0.
+pub const LOCAL_ONLY_MODELS: &[&str] = &["hinglish"];
+
+/// Smallest local-only model file that counts as installed.
+pub const MIN_LOCAL_MODEL_BYTES: u64 = 500_000_000;
+
+/// What transcribes, in order, when a local-only model's file is missing.
+pub const MISSING_LOCAL_MODEL_FALLBACKS: &[&str] = &["large-v3-turbo", "small"];
+
+/// The language a model must run with. The Hinglish model writes Devanagari only, English
+/// words included, so it is for Hindi-heavy calls and always runs as Hindi (DECISIONS.md D81).
+pub fn model_language(model: &str) -> Option<&'static str> {
+    (model == "hinglish").then_some("hi")
+}
+
+/// Rolling transcription must use the final pass's model, or core rejects its pieces. The
+/// Hinglish model is large-v3 sized and cannot keep up during a meeting, so rolling is off
+/// with it (D81).
+pub fn rolling_supported(model: &str) -> bool {
+    model != "hinglish"
+}
+
+/// The language the user had before choosing a model with a fixed language. `save` keeps
+/// it here and puts it back when they choose another model.
+fn language_stash_path() -> PathBuf {
+    paths::config_path().with_file_name("language-before-hinglish")
+}
+
+/// Settles the transcription language on save. `previous` is the config on disk before
+/// this save and `stash` the remembered language (`Some(None)` is auto-detect). Returns
+/// the stash to keep: `None` deletes it.
+fn settle_language(cfg: &mut Config, previous: Option<&Config>, stash: Option<Option<String>>) -> Option<Option<String>> {
+    if let Some(forced) = model_language(&cfg.transcription.model) {
+        cfg.transcription.language = Some(forced.into());
+        let before = previous
+            .filter(|p| model_language(&p.transcription.model).is_none())
+            .map(|p| p.transcription.language.clone())
+            .unwrap_or(None);
+        return Some(stash.unwrap_or(before));
+    }
+    if let Some(before) = stash {
+        // Settings showed the forced language, so an unchanged "hi" is not a choice.
+        if previous.is_some_and(|p| model_language(&p.transcription.model).is_some())
+            && cfg.transcription.language == previous.and_then(|p| p.transcription.language.clone())
+        {
+            cfg.transcription.language = before;
+        }
+    }
+    None
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -137,7 +190,8 @@ pub fn load() -> Config {
 /// transcription (D52) needs the GPU too. Balanced is the next best model: 9.3% WER live,
 /// against 11.7% for Fast (docs/research/live-transcription.md).
 pub fn live_model(model: &str) -> String {
-    if model.starts_with("large") { "small".into() } else { model.into() }
+    // The Hinglish model is large-v3 sized: too slow live, as large is.
+    if model.starts_with("large") || model == "hinglish" { "small".into() } else { model.into() }
 }
 
 pub fn exists() -> bool {
@@ -164,6 +218,20 @@ pub fn fresh() -> Config {
 /// at the upstream app's directories.
 fn pin_owned_keys(cfg: &mut Config) {
     pin_with(cfg, &crate::prefs::load());
+    cfg.transcription.missing_model_fallback_language = fallback_language(&cfg.transcription.model, read_language_stash);
+}
+
+/// The language a fallback model runs with: never the forced language of the model it
+/// stands in for, but the user's own from before (`stash`), auto-detect by default.
+fn fallback_language(model: &str, stash: impl FnOnce() -> Option<Option<String>>) -> Option<String> {
+    model_language(model).and_then(|_| stash().flatten())
+}
+
+/// The remembered language (`Some(None)` is auto-detect), or `None` without one.
+fn read_language_stash() -> Option<Option<String>> {
+    std::fs::read_to_string(language_stash_path())
+        .ok()
+        .map(|code| Some(code.trim().to_string()).filter(|c| !c.is_empty() && c != "auto"))
 }
 
 fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
@@ -171,6 +239,13 @@ fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
     // says `true`, so the file cannot tell a choice from a default.
     cfg.privacy.hide_from_screen_share = prefs.hide_from_screen_share;
     cfg.transcription.model_path = paths::models_dir();
+    // A local-only model's file can go missing; core then transcribes with the first of
+    // these that is installed (UPSTREAM-PATCHES #33), and Start says so (commands.rs).
+    cfg.transcription.missing_model_fallbacks = if LOCAL_ONLY_MODELS.contains(&cfg.transcription.model.as_str()) {
+        MISSING_LOCAL_MODEL_FALLBACKS.iter().map(|m| m.to_string()).collect()
+    } else {
+        Vec::new()
+    };
     cfg.diarization.model_path = paths::diarization_models_dir();
     cfg.vault.enabled = false;
     cfg.live_transcript.recording_sidecar = true;
@@ -178,6 +253,9 @@ fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
     // Summaries run after the meeting is shown (D40), so a long one can take its time:
     // core's 5-minute default cut off Claude on an 80-minute meeting.
     cfg.summarization.agent_timeout_secs = cfg.summarization.agent_timeout_secs.max(900);
+    // Core's patch (UPSTREAM-PATCHES #31): no "Here is a summary" lead-in. Margin also
+    // strips such lines afterwards.
+    cfg.summarization.no_lead_in = true;
     if cfg.summarization.engine.trim().is_empty() {
         cfg.summarization.engine = "none".into();
     }
@@ -187,6 +265,16 @@ pub fn save(cfg: &mut Config) -> Result<(), String> {
     pin_owned_keys(cfg);
     if let Some(parent) = paths::config_path().parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let previous = Config::load_strict_from(&paths::config_path()).ok();
+    let stash_path = language_stash_path();
+    let stash = read_language_stash();
+    match settle_language(cfg, previous.as_ref(), stash) {
+        Some(language) => std::fs::write(&stash_path, language.unwrap_or_else(|| "auto".into()))
+            .map_err(|e| format!("Could not save settings: {e}"))?,
+        None => {
+            let _ = std::fs::remove_file(&stash_path);
+        }
     }
     cfg.save_to(&paths::config_path())
         .map_err(|e| format!("Could not save settings: {e}"))
@@ -236,6 +324,12 @@ pub fn apply(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
     if !MODELS.iter().any(|(id, _, _)| *id == s.model) {
         return Err(format!("Unknown model {}", s.model));
     }
+    if LOCAL_ONLY_MODELS.contains(&s.model.as_str()) && s.model != cfg.transcription.model {
+        let file = cfg.transcription.model_path.join(format!("ggml-{}.bin", s.model));
+        if !crate::models::local_model_installed(&file) {
+            return Err(format!("Copy ggml-{}.bin to {} first. This model has no download.", s.model, file.parent().unwrap_or(&file).display()));
+        }
+    }
     cfg.transcription.model = s.model.clone();
     match s.summary_engine.as_str() {
         "claude" => {
@@ -259,6 +353,10 @@ pub fn apply(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
     cfg.identity.name = (!name.is_empty()).then(|| name.to_string());
     apply_recording(cfg, s)?;
     apply_languages(cfg, s)?;
+    if let Some(language) = model_language(&cfg.transcription.model) {
+        // `save` remembers the language this replaces (settle_language).
+        cfg.transcription.language = Some(language.into());
+    }
     if let Some(on) = s.speaker_separation {
         cfg.diarization.engine = if on { "auto" } else { "none" }.into();
     }
@@ -439,6 +537,7 @@ mod tests {
         // A full path on each platform. The tests write nothing there.
         cfg.output_dir = PathBuf::from(if cfg!(windows) { r"C:\margin-test-meetings" } else { "/tmp/margin-test-meetings" });
         cfg.transcription.model = "small".into();
+        cfg.transcription.model_path = PathBuf::from(if cfg!(windows) { r"C:\margin-test-models" } else { "/tmp/margin-test-models" });
         cfg.summarization.engine = "none".into();
         let s = settings(&cfg);
         (cfg, s)
@@ -516,6 +615,89 @@ mod tests {
         assert_eq!(live_model("base"), "base");
         assert_eq!(live_model("small"), "small");
         assert_eq!(live_model("large-v3-turbo"), "small");
+        assert_eq!(live_model("hinglish"), "small");
+    }
+
+    #[test]
+    fn the_hinglish_model_needs_its_file_and_always_transcribes_hindi() {
+        let (mut cfg, mut s) = base();
+        s.model = "hinglish".into();
+        let err = apply(&mut cfg, &s).unwrap_err();
+        assert!(err.contains("ggml-hinglish.bin") && err.contains("no download"), "{err}");
+        assert_eq!(cfg.transcription.model, "small", "a refused choice changes nothing");
+        // Already selected (the file was there when it was chosen): kept, and Hindi.
+        cfg.transcription.model = "hinglish".into();
+        s.transcription_language = Some("en".into());
+        apply(&mut cfg, &s).unwrap();
+        assert_eq!(cfg.transcription.language.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn leaving_hinglish_gives_back_the_language_from_before() {
+        let with = |model: &str, language: Option<&str>| {
+            let mut cfg = Config::default();
+            cfg.transcription.model = model.into();
+            cfg.transcription.language = language.map(String::from);
+            cfg
+        };
+        // small (German) -> hinglish: Hindi, and German is remembered.
+        let mut cfg = with("hinglish", Some("de"));
+        let stash = settle_language(&mut cfg, Some(&with("small", Some("de"))), None);
+        assert_eq!(cfg.transcription.language.as_deref(), Some("hi"));
+        assert_eq!(stash, Some(Some("de".into())));
+        // Saved again while on hinglish: the stash stays.
+        let mut again = with("hinglish", Some("hi"));
+        assert_eq!(settle_language(&mut again, Some(&cfg), stash.clone()), stash);
+        // hinglish -> small, Settings still showing "hi": German comes back.
+        let mut back = with("small", Some("hi"));
+        assert_eq!(settle_language(&mut back, Some(&cfg), stash), None);
+        assert_eq!(back.transcription.language.as_deref(), Some("de"));
+        // From auto-detect, the default: auto comes back.
+        let mut cfg = with("hinglish", None);
+        let stash = settle_language(&mut cfg, Some(&with("small", None)), None);
+        let mut back = with("small", Some("hi"));
+        settle_language(&mut back, Some(&cfg), stash);
+        assert_eq!(back.transcription.language, None);
+        // A language picked while switching away is the user's choice.
+        let mut picked = with("small", Some("fr"));
+        settle_language(&mut picked, Some(&cfg), Some(None));
+        assert_eq!(picked.transcription.language.as_deref(), Some("fr"));
+    }
+
+    #[test]
+    fn an_empty_hinglish_file_is_not_installed_and_only_hinglish_gets_fallbacks() {
+        let dir = std::env::temp_dir().join(format!("margin-hinglish-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ggml-hinglish.bin"), b"").unwrap();
+        let (mut cfg, mut s) = base();
+        cfg.transcription.model_path = dir.clone();
+        s.model = "hinglish".into();
+        assert!(apply(&mut cfg, &s).is_err(), "an empty file is not installed, as in models.rs");
+        std::fs::write(dir.join("ggml-hinglish.bin"), b"ggml").unwrap();
+        assert!(apply(&mut cfg, &s).is_err(), "a half-copied file is not installed");
+        // Sparse: the size rule reads the length, not the blocks.
+        std::fs::File::options().write(true).open(dir.join("ggml-hinglish.bin")).unwrap().set_len(MIN_LOCAL_MODEL_BYTES).unwrap();
+        apply(&mut cfg, &s).unwrap();
+        pin_with(&mut cfg, &crate::prefs::Prefs::default());
+        assert_eq!(cfg.transcription.missing_model_fallbacks, vec!["large-v3-turbo", "small"]);
+        cfg.transcription.model = "small".into();
+        pin_with(&mut cfg, &crate::prefs::Prefs::default());
+        assert!(cfg.transcription.missing_model_fallbacks.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fallback_model_gets_the_users_language_not_hindi() {
+        assert_eq!(fallback_language("hinglish", || Some(Some("de".into()))).as_deref(), Some("de"));
+        assert_eq!(fallback_language("hinglish", || Some(None)), None, "auto-detect");
+        assert_eq!(fallback_language("hinglish", || None), None);
+        assert_eq!(fallback_language("small", || Some(Some("de".into()))), None);
+    }
+
+    #[test]
+    fn rolling_is_off_only_for_the_hinglish_model() {
+        assert!(rolling_supported("large-v3-turbo"));
+        assert!(!rolling_supported("hinglish"));
     }
 
     #[test]

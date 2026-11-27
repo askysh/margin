@@ -563,6 +563,36 @@ the transcript checkpoint patch, which upstream merged in
 it yet, so `src-tauri/Cargo.toml` pins minutes-core by commit `209265f` (upstream `main`
 with the patch). When upstream tags a release that contains the patch, move to that tag.
 
+### Margin's patches to core
+
+Margin builds core from `vendor/minutes-core/`, not from the git pin (DECISIONS.md D80).
+That folder holds the pinned commit's `crates/core` and `crates/whisper-guard`, plus
+Margin's patches, one commit each. UPSTREAM-PATCHES.md #25 onward lists them. A
+`[patch."https://github.com/silverstein/minutes"]` table in `src-tauri/Cargo.toml` swaps
+the copy in. The `minutes-core` lines keep the upstream `rev`, so the pin still says which
+upstream commit the copy came from.
+
+Core's own tests for a patched module run in the vendored workspace, with upstream's lock:
+
+```bash
+cd vendor/minutes-core
+CARGO_TARGET_DIR=$PWD/target cargo test -p minutes-core \
+  --no-default-features --features whisper,streaming,diarize,metal --lib -- diarize
+```
+
+To move to a new upstream ref while patches remain:
+
+1. `git log --oneline -- vendor/minutes-core` lists the patch commits.
+2. `scripts/bump-upstream.sh --no-build <ref>` moves the pin and re-seeds `Cargo.lock`.
+3. Copy the new ref's `crates/core`, `crates/whisper-guard`, `crates/assets/demo.wav`,
+   `crates/mcp/src/index.ts`, `tests/integration/pipeline_test.rs`,
+   `tests/fixtures/proper-name-eval.example.json` and `scripts/calendar-*` over the old
+   ones. Copy its `Cargo.lock` too, and its root manifest's `[workspace.package]` and
+   `[workspace.dependencies]`. Commit that alone.
+4. Cherry-pick each patch commit, then `cargo build && cargo test` in `src-tauri`.
+5. Drop the patches that upstream merged. With none left, delete `vendor/` and the
+   `[patch]` table.
+
 ```bash
 scripts/bump-upstream.sh v0.33.0      # an upstream tag (preferred)
 scripts/bump-upstream.sh <full-sha>   # or a full 40-character commit SHA

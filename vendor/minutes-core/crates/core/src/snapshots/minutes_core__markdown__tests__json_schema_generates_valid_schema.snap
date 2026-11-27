@@ -1,0 +1,895 @@
+---
+source: crates/core/src/markdown.rs
+expression: schema
+---
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Frontmatter",
+  "description": "Frontmatter for a corpus Markdown file.",
+  "type": "object",
+  "properties": {
+    "action_items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ActionItem"
+      }
+    },
+    "attendees": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "attendees_raw": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "calendar_event": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "capture": {
+      "description": "Capture mode for the artifact. Absent means a normal captured meeting.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CapturePolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "captured_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "consent": {
+      "description": "How consent to capture was obtained, if attested.\n\nPrivacy metadata only, not a determination about requirements. See\n[`crate::config::ConsentConfig`].",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConsentBasis"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "consent_notice": {
+      "description": "The exact disclosure the user gave or used, if any.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "context": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "date": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "debrief": {
+      "description": "Debrief completion state for no-capture meetings.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DebriefStatus"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Decision"
+      }
+    },
+    "device": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "duration": {
+      "type": "string",
+      "default": "0s"
+    },
+    "entities": {
+      "$ref": "#/$defs/EntityLinks"
+    },
+    "intents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Intent"
+      }
+    },
+    "name_corrections": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NameCorrection"
+      }
+    },
+    "people": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "processing_warnings": {
+      "description": "Per-step failure context when [`OutputStatus::Degraded`] applies.\nSkipped from serialization when empty so successful runs do not\nemit extra frontmatter noise. See issue #243.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ProcessingWarning"
+      }
+    },
+    "recorded_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recording_health": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RecordingHealth"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sensitivity": {
+      "description": "Sensitivity designation. Absent means the normal sensitivity policy.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Sensitivity"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "source": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "speaker_map": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SpeakerAttribution"
+      }
+    },
+    "speaker_mapping": {
+      "description": "Health of the Level-1 speaker-naming step. Lets a meeting be greppable for\n\"naming failed / incomplete\" instead of the failure living only in the JSON\nlog (#384). `None` for meetings processed before this field existed.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SpeakerMappingHealth"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "spelling_corrections": {
+      "description": "Listed vocabulary misspellings rewritten to their canonical spelling in\nthe transcript (acronyms and terms, e.g. \"Sok 2\" to \"SOC 2\").",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SpellingCorrection"
+      }
+    },
+    "status": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OutputStatus"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "summarization": {
+      "description": "Health of the most recent re-run of the AI pass (`minutes resummarize`).\n`None` for artifacts that have only been through the original pipeline.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SummarizationHealth"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "template": {
+      "description": "Slug of the template applied to this recording, if any.\nRecorded so a Phase 2 reprocessor knows which template produced the\nsummary. `None` means no template was passed (legacy / default flow).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "type": {
+      "$ref": "#/$defs/ContentType"
+    },
+    "visibility": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Visibility"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "title",
+    "type",
+    "date"
+  ],
+  "$defs": {
+    "ActionItem": {
+      "description": "A structured action item extracted from a meeting.\nQueryable via MCP tools: filter by assignee, status, due date.",
+      "type": "object",
+      "properties": {
+        "assignee": {
+          "type": "string"
+        },
+        "due": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "assignee",
+        "task",
+        "status"
+      ]
+    },
+    "AttributionSource": {
+      "description": "How the attribution was determined.",
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "deterministic",
+            "llm",
+            "enrollment",
+            "manual",
+            "ml-bleed-degraded",
+            "stem-recovery"
+          ]
+        },
+        {
+          "description": "A provenance label this build does not know, preserved verbatim.\n\nHand-edited files and `minutes import text` archives are supported\ninputs, so an unrecognized label must not make a meeting unreadable\n(#595). The raw string round-trips untouched rather than being\nnormalized away, so provenance survives a rewrite by a command that\nnever consumed it.",
+          "type": "string"
+        }
+      ]
+    },
+    "CapturePolicy": {
+      "description": "How a meeting artifact was captured.",
+      "oneOf": [
+        {
+          "description": "No audio was captured for this meeting artifact.",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
+    "CaptureSource": {
+      "type": "string",
+      "enum": [
+        "voice",
+        "system",
+        "both",
+        "backend"
+      ]
+    },
+    "CaptureWarning": {
+      "type": "object",
+      "properties": {
+        "diagnostic_confidence": {
+          "$ref": "#/$defs/DiagnosticConfidence"
+        },
+        "kind": {
+          "$ref": "#/$defs/FailureKind"
+        },
+        "message": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/CaptureSource"
+        }
+      },
+      "required": [
+        "kind",
+        "source",
+        "message",
+        "diagnostic_confidence"
+      ]
+    },
+    "Confidence": {
+      "description": "How confident we are that a speaker label maps to a real person.",
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "ConsentBasis": {
+      "description": "Attested basis for capturing a conversation.\n\nThis is privacy metadata only, not a determination about requirements.",
+      "type": "string",
+      "enum": [
+        "verbal_all_parties",
+        "notice_in_invite",
+        "recorded_disclosed",
+        "na",
+        "unattested"
+      ]
+    },
+    "ContentType": {
+      "description": "Content types for corpus artifacts.",
+      "type": "string",
+      "enum": [
+        "meeting",
+        "memo",
+        "dictation",
+        "note"
+      ]
+    },
+    "DebriefStatus": {
+      "description": "Human debrief state for no-capture meeting artifacts.",
+      "oneOf": [
+        {
+          "description": "The meeting was stopped without an interactive debrief.",
+          "type": "string",
+          "const": "pending"
+        },
+        {
+          "description": "A human supplied the debrief (at stop time or later via the\nassistant flow); the artifact is the finished record.",
+          "type": "string",
+          "const": "complete"
+        },
+        {
+          "description": "The human marked the debrief unnecessary (test run, accidental\ntrigger); nothing further is expected.",
+          "type": "string",
+          "const": "not-applicable"
+        }
+      ]
+    },
+    "Decision": {
+      "description": "A structured decision extracted from a meeting.\nQueryable via MCP tools: search across all meetings for decision history.\n\nFrontmatter v2 fields (optional, backward compatible):\n- `authority`: \"high\" | \"medium\" | \"low\" — the decision's weight. A CEO\n  commitment is high; a drive-by aside is low. Consumers can use this to\n  rank conflicting decisions or surface the authoritative one.\n- `supersedes`: free-text reference to the earlier decision this one\n  replaces. When set, the consistency report treats the topic conflict as\n  a documented supersession rather than an unresolved contradiction.",
+      "type": "object",
+      "properties": {
+        "authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effective_date": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supersedes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "topic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "DiagnosticConfidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "inferred"
+      ]
+    },
+    "DiarizationPath": {
+      "type": "string",
+      "enum": [
+        "stem-energy",
+        "ml",
+        "ml-bleed-degraded",
+        "none"
+      ]
+    },
+    "EntityLinks": {
+      "type": "object",
+      "properties": {
+        "people": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EntityRef"
+          }
+        },
+        "projects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EntityRef"
+          }
+        }
+      }
+    },
+    "EntityRef": {
+      "type": "object",
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "label": {
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "slug",
+        "label"
+      ]
+    },
+    "FailureKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "silent",
+            "sparse",
+            "missing",
+            "backend-unavailable",
+            "stream-error",
+            "source-starved",
+            "unsupported-format",
+            "misconfigured-route",
+            "permission-denied",
+            "route-unavailable"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "other": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "other"
+          ]
+        }
+      ]
+    },
+    "Intent": {
+      "type": "object",
+      "properties": {
+        "by_date": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/IntentKind"
+        },
+        "status": {
+          "type": "string"
+        },
+        "what": {
+          "type": "string"
+        },
+        "who": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "what",
+        "status"
+      ]
+    },
+    "IntentKind": {
+      "type": "string",
+      "enum": [
+        "action-item",
+        "decision",
+        "open-question",
+        "commitment"
+      ]
+    },
+    "NameCorrection": {
+      "description": "A single applied correction, surfaced for frontmatter provenance so the\nrewrite is auditable and reversible. The raw token is always preserved.",
+      "type": "object",
+      "properties": {
+        "corrected": {
+          "description": "The pool spelling it was rewritten to.",
+          "type": "string"
+        },
+        "raw": {
+          "description": "The token as transcribed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "raw",
+        "corrected"
+      ]
+    },
+    "OutputStatus": {
+      "description": "Output status markers.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "complete",
+            "no-speech",
+            "transcript-only"
+          ]
+        },
+        {
+          "description": "Transcription completed but one or more summarization-side steps\nfell back to empty output (e.g. agent timeout, empty summary).\nPer-step failures are recorded in [`Frontmatter::processing_warnings`].",
+          "type": "string",
+          "const": "degraded"
+        }
+      ]
+    },
+    "ProcessingWarning": {
+      "description": "A non-fatal failure of a post-transcript pipeline step.\n\nWhen any step degrades, the meeting's [`OutputStatus`] is promoted to\n[`OutputStatus::Degraded`] and the failure context is appended here so\nthe markdown is honest about what is missing. Files are then greppable\nfor \"what needs re-running\" (`status: degraded` in frontmatter).",
+      "type": "object",
+      "properties": {
+        "message": {
+          "description": "Optional human-readable detail.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Machine-readable failure reason (e.g. `agent_timeout`, `empty_output`).",
+          "type": "string"
+        },
+        "step": {
+          "description": "The pipeline step that produced the warning.",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "description": "For timeout reasons, the budget that was exceeded.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "step",
+        "reason"
+      ]
+    },
+    "RecordingHealth": {
+      "type": "object",
+      "properties": {
+        "call_audio_source": {
+          "description": "Which source recorded the other side of a native call (#1266):\n`core-audio-tap` (hears FaceTime and phone calls answered on the Mac),\n`screencapturekit` (cannot), or `mixed` when capture switched between\nthem. Absent for other capture paths.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capture_backend": {
+          "description": "Capture backend that produced the audio, when it is known at capture\ntime (for example `native-call` for ScreenCaptureKit call capture).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capture_warnings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CaptureWarning"
+          }
+        },
+        "diarization_path": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiarizationPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote_audio": {
+          "description": "Whether the remote side of a call reached the recording (#1266).\n\nOnly set when there is positive evidence that it did not: the live\nremote-silence detector fired, or a call-intent capture finished with a\nsilent system stem. Absent means \"no evidence of loss\", not \"verified\ncomplete\". Readers must not attribute transcript lines to remote\nparticipants when this is `missing`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteAudioStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "system_dominant_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "system_stem_active_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "voice_stem_active_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      }
+    },
+    "RemoteAudioStatus": {
+      "description": "Durable outcome of remote (call/system) audio coverage for a call.",
+      "oneOf": [
+        {
+          "description": "No sustained remote audio reached the recording. The transcript\nreflects only the local microphone.",
+          "type": "string",
+          "const": "missing"
+        },
+        {
+          "description": "Remote audio was heard for part of the call but went silent for an\nextended stretch while the local microphone had speech.",
+          "type": "string",
+          "const": "partial"
+        }
+      ]
+    },
+    "Sensitivity": {
+      "description": "Sensitivity designation for agent-facing policy layers.",
+      "oneOf": [
+        {
+          "description": "Standard meeting artifact.",
+          "type": "string",
+          "const": "normal"
+        },
+        {
+          "description": "Restricted artifact; agent surfaces exclude it unless an explicit,\nsurface-specific audited override exists.",
+          "type": "string",
+          "const": "restricted"
+        }
+      ]
+    },
+    "SpeakerAttribution": {
+      "description": "A mapping from an anonymous speaker label to a real person.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/AttributionSource"
+        },
+        "speaker_label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "speaker_label",
+        "name",
+        "confidence",
+        "source"
+      ]
+    },
+    "SpeakerMappingHealth": {
+      "description": "Health of the Level-1 speaker-naming (`speaker_mapping`) step, surfaced in\nfrontmatter so a meeting that shipped anonymous is greppable and re-runnable\n(#382/#384). Counts are recorded separately from confidence so \"a map exists\"\nis never confused with \"every speaker was named\".",
+      "type": "object",
+      "properties": {
+        "attendees": {
+          "description": "Size of the attendee pool offered to the mapper.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "diarized_speakers": {
+          "description": "Distinct diarization speaker labels present (proxy for the raw diarization\nspeaker count, which needs the audio and so isn't recoverable on a redo).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "duration_ms": {
+          "description": "Wall-clock of the mapping call.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_run": {
+          "description": "RFC3339 timestamp of the most recent mapping run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mapped_speakers": {
+          "description": "How many of those labels received a name.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "model": {
+          "description": "Engine/model hint used (e.g. `agent:claude`).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Machine-readable reason when `status` is not `ok`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "`ok` (some labels named), `empty` (ran, no confident matches), `skipped`\n(no anonymous labels or no attendees to map against). Mirrors the\n`speaker_mapping` JSONL `outcome` vocabulary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "diarized_speakers",
+        "mapped_speakers",
+        "attendees"
+      ]
+    },
+    "SpellingCorrection": {
+      "description": "One vocabulary spelling rewrite applied to a transcript, kept in the\nartifact's frontmatter so it stays auditable and reversible.",
+      "type": "object",
+      "properties": {
+        "corrected": {
+          "description": "The canonical spelling written in its place.",
+          "type": "string"
+        },
+        "count": {
+          "description": "How many times it was replaced.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "raw": {
+          "description": "The listed misspelling that was matched.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "raw",
+        "corrected",
+        "count"
+      ]
+    },
+    "SummarizationHealth": {
+      "description": "Health of the summarization stage, surfaced in frontmatter so a re-run of\nthe AI pass (`minutes resummarize`, #523) is greppable and auditable.\nShape mirrors [`SpeakerMappingHealth`] per maintainer guidance on #523.",
+      "type": "object",
+      "properties": {
+        "duration_ms": {
+          "description": "Wall-clock of the summarize stage.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_run": {
+          "description": "RFC3339 timestamp of the most recent resummarize run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Engine/model hint used (e.g. `agent:claude`, `apple-fm`).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Machine-readable context (reserved; `None` for successful runs).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "`ok` — resummarize refuses to write anything else (failed runs never\nmutate the file, so a failure can never appear here).",
+          "type": "string"
+        },
+        "template": {
+          "description": "Template slug applied to this run, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "Visibility": {
+      "type": "string",
+      "enum": [
+        "private",
+        "team"
+      ]
+    }
+  }
+}

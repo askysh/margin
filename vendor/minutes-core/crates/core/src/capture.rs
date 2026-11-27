@@ -1,0 +1,5182 @@
+use crate::config::Config;
+use crate::error::CaptureError;
+use crate::macos_permissions::{microphone_status, screen_recording_status, MacPermissionStatus};
+use crate::pid::CaptureMode;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+#[cfg(feature = "streaming")]
+use crate::streaming::AudioStream;
+
+/// Shared audio level (0–100 scale) for UI visualization.
+/// Updated ~10x per second from the cpal callback.
+static AUDIO_LEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// Count of audio chunks dropped by the live sidecar channel (buffer full).
+static SIDECAR_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Get the current audio input level (0–100).
+pub fn audio_level() -> u32 {
+    AUDIO_LEVEL.load(Ordering::Relaxed)
+}
+
+// ──────────────────────────────────────────────────────────────
+// Recording Safety Guard — protects against forgotten recordings
+// ──────────────────────────────────────────────────────────────
+
+/// Why the guard wants to stop the recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Silence,
+    TimeCapReached,
+    DiskSpaceLow,
+    StemSizeLimit,
+}
+
+/// Largest file a RIFF/WAVE header can describe: chunk sizes are u32.
+pub const WAV_STEM_BYTE_LIMIT: u64 = u32::MAX as u64;
+
+/// Headroom kept below [`WAV_STEM_BYTE_LIMIT`] when stopping, so stop
+/// latency and the helper's final flush cannot cross it. 64 MiB is about
+/// 2.9 minutes of the fastest stem format we write (96 kHz mono f32).
+const STEM_STOP_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Stops native call capture before a stem outgrows its WAV header (#1219).
+///
+/// Native stems are mono f32 at the device rate, so a time cap cannot stand
+/// in for a size cap: at 48 kHz the 4 GB limit arrives after ~6.2 h (below
+/// the 8 h default `max_duration_secs`), at 96 kHz after ~3.1 h. Past it the
+/// capture needs a manual `minutes recover-stem`. Warns at 90%, stops at the
+/// limit minus headroom, and lets normal finalization process the capture.
+#[derive(Debug, Default)]
+pub struct StemSizeGuard {
+    warned: bool,
+}
+
+impl StemSizeGuard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn check(&mut self, largest_stem_bytes: u64) -> SafetyAction {
+        let stop_at = WAV_STEM_BYTE_LIMIT - STEM_STOP_HEADROOM_BYTES;
+        if largest_stem_bytes >= stop_at {
+            return SafetyAction::Stop(
+                StopReason::StemSizeLimit,
+                "Call audio reached the 4 GB WAV file limit. Auto-stopped and processing.".into(),
+            );
+        }
+        if !self.warned && largest_stem_bytes >= stop_at / 10 * 9 {
+            self.warned = true;
+            return SafetyAction::Warning(
+                "Call audio is nearing the 4 GB WAV file limit; the recording will auto-stop soon."
+                    .into(),
+            );
+        }
+        SafetyAction::None
+    }
+}
+
+/// Action the caller should take after a safety check.
+#[derive(Debug)]
+pub enum SafetyAction {
+    /// No action needed.
+    None,
+    /// Show a non-urgent notification (silence nudge).
+    Nudge(String),
+    /// Show an urgent warning (auto-stop approaching).
+    Warning(String),
+    /// Stop the recording immediately.
+    Stop(StopReason, String),
+}
+
+/// Reusable guard that monitors recording health and signals when to nudge,
+/// warn, or auto-stop. Used by `record_to_wav`, native call capture, and
+/// live transcript (time cap + disk only).
+pub struct RecordingSafetyGuard {
+    silence_reminder_secs: u64,
+    silence_auto_stop_secs: u64,
+    silence_threshold: u32,
+    max_duration_secs: u64,
+    min_disk_space_mb: u64,
+    output_path: std::path::PathBuf,
+
+    recording_start: Instant,
+    silence_start: Option<Instant>,
+    nudge_count: u32,
+    grace_start: Option<Instant>,
+    last_disk_check: Instant,
+    last_available_mb: Option<u64>,
+    time_cap_warned: bool,
+    intent: Option<RecordingIntent>,
+    extended: bool,
+}
+
+/// Nudge schedule: 5 min, 15 min, 30 min, then every 30 min.
+fn nudge_threshold_secs(base: u64, count: u32) -> u64 {
+    match count {
+        0 => base,
+        1 => base * 3,
+        _ => base * 6,
+    }
+}
+
+/// Grace period before auto-stop: if audio resumes, defer.
+const GRACE_PERIOD_SECS: u64 = 60;
+
+impl RecordingSafetyGuard {
+    pub fn new(config: &crate::config::RecordingConfig, output_path: &Path) -> Self {
+        let now = Instant::now();
+        Self {
+            silence_reminder_secs: config.silence_reminder_secs,
+            silence_auto_stop_secs: config.silence_auto_stop_secs,
+            silence_threshold: config.silence_threshold,
+            max_duration_secs: config.max_duration_secs,
+            min_disk_space_mb: config.min_disk_space_mb,
+            output_path: output_path.to_path_buf(),
+            recording_start: now,
+            silence_start: None,
+            nudge_count: 0,
+            grace_start: None,
+            last_disk_check: now,
+            last_available_mb: None,
+            time_cap_warned: false,
+            intent: None,
+            extended: false,
+        }
+    }
+
+    pub fn with_intent(mut self, intent: RecordingIntent) -> Self {
+        self.intent = Some(intent);
+        self
+    }
+
+    /// Reset the silence timer (called when user clicks "Keep Recording").
+    pub fn extend(&mut self) {
+        self.silence_start = None;
+        self.nudge_count = 0;
+        self.grace_start = None;
+        self.extended = true;
+    }
+
+    /// Check all safety tiers. Call this every ~100ms from the capture loop.
+    pub fn check(&mut self, current_audio_level: u32, call_app_active: bool) -> SafetyAction {
+        // Tier 4: Disk space guard (checked first, most urgent)
+        if let Some(action) = self.check_disk_space() {
+            return action;
+        }
+
+        // Tier 3: Hard time cap
+        if let Some(action) = self.check_time_cap() {
+            return action;
+        }
+
+        // Tier 1+2: Silence detection (nudge + auto-stop)
+        self.check_silence(current_audio_level, call_app_active)
+    }
+
+    /// Check only time cap and disk space (native call capture and live transcript).
+    pub fn check_time_and_disk(&mut self) -> SafetyAction {
+        self.check_time_and_disk_at(Instant::now())
+    }
+
+    fn check_time_and_disk_at(&mut self, now: Instant) -> SafetyAction {
+        if let Some(action) = self.check_disk_space_at(now) {
+            return action;
+        }
+        if let Some(action) = self.check_time_cap_elapsed(
+            now.saturating_duration_since(self.recording_start)
+                .as_secs(),
+        ) {
+            return action;
+        }
+        SafetyAction::None
+    }
+
+    fn check_disk_space(&mut self) -> Option<SafetyAction> {
+        self.check_disk_space_at(Instant::now())
+    }
+
+    fn check_disk_space_at(&mut self, now: Instant) -> Option<SafetyAction> {
+        if self.min_disk_space_mb == 0 {
+            return None;
+        }
+
+        let check_interval = match self.last_available_mb {
+            Some(mb) if mb < 500 => std::time::Duration::from_secs(2),
+            Some(mb) if mb < 1000 => std::time::Duration::from_secs(10),
+            _ => std::time::Duration::from_secs(60),
+        };
+
+        if now.saturating_duration_since(self.last_disk_check) < check_interval {
+            return None;
+        }
+        self.last_disk_check = now;
+
+        match available_disk_space_mb(&self.output_path) {
+            Some(available_mb) => {
+                self.last_available_mb = Some(available_mb);
+                if available_mb < self.min_disk_space_mb {
+                    Some(SafetyAction::Stop(
+                        StopReason::DiskSpaceLow,
+                        format!(
+                            "Disk space critically low ({}MB remaining). Recording auto-stopped to prevent data loss.",
+                            available_mb
+                        ),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn check_time_cap(&mut self) -> Option<SafetyAction> {
+        self.check_time_cap_elapsed(self.recording_start.elapsed().as_secs())
+    }
+
+    fn check_time_cap_elapsed(&mut self, elapsed: u64) -> Option<SafetyAction> {
+        if self.max_duration_secs == 0 {
+            return None;
+        }
+
+        if elapsed >= self.max_duration_secs {
+            let hours = self.max_duration_secs / 3600;
+            return Some(SafetyAction::Stop(
+                StopReason::TimeCapReached,
+                format!(
+                    "Recording reached the {}-hour time limit. Auto-stopped and processing.",
+                    hours
+                ),
+            ));
+        }
+
+        // Warn at 90% of cap
+        let warn_at = self.max_duration_secs - self.max_duration_secs.div_ceil(10);
+        if elapsed >= warn_at && !self.time_cap_warned {
+            self.time_cap_warned = true;
+            let remaining_min = (self.max_duration_secs - elapsed) / 60;
+            return Some(SafetyAction::Warning(format!(
+                "Recording will auto-stop in {} minutes (time limit).",
+                remaining_min.max(1)
+            )));
+        }
+
+        None
+    }
+
+    fn check_silence(&mut self, current_audio_level: u32, call_app_active: bool) -> SafetyAction {
+        if self.silence_reminder_secs == 0 && self.silence_auto_stop_secs == 0 {
+            return SafetyAction::None;
+        }
+
+        if current_audio_level > self.silence_threshold {
+            // Audio resumed
+            if self.silence_start.is_some() {
+                self.silence_start = None;
+                self.nudge_count = 0;
+                self.grace_start = None;
+                self.extended = false;
+            }
+            return SafetyAction::None;
+        }
+
+        // Audio is silent
+        let start = self.silence_start.get_or_insert_with(Instant::now);
+        let silent_secs = start.elapsed().as_secs();
+
+        // Suppress silence actions for active calls (user is likely muted/listening)
+        let is_active_call = self.intent == Some(RecordingIntent::Call) && call_app_active;
+
+        // Tier 2: Auto-stop on prolonged silence
+        if self.silence_auto_stop_secs > 0 && !is_active_call {
+            let effective_limit = if self.intent == Some(RecordingIntent::Call) {
+                // Call intent but no active call app: use 2x threshold
+                self.silence_auto_stop_secs * 2
+            } else {
+                self.silence_auto_stop_secs
+            };
+
+            if silent_secs >= effective_limit {
+                // Grace period: check if audio just resumed
+                if let Some(grace) = self.grace_start {
+                    if grace.elapsed().as_secs() >= GRACE_PERIOD_SECS {
+                        // Grace period expired, still silent: stop
+                        let minutes = silent_secs / 60;
+                        return SafetyAction::Stop(
+                            StopReason::Silence,
+                            format!(
+                                "No audio for {} minutes. Recording auto-stopped and processing.",
+                                minutes
+                            ),
+                        );
+                    }
+                    // Still in grace period, wait
+                    return SafetyAction::None;
+                }
+                // Enter grace period
+                self.grace_start = Some(Instant::now());
+                let minutes = silent_secs / 60;
+                return SafetyAction::Warning(format!(
+                    "No audio for {} minutes. Auto-stopping in 1 minute unless audio resumes.",
+                    minutes
+                ));
+            }
+        }
+
+        // Tier 1: Silence nudges (escalating)
+        if self.silence_reminder_secs > 0 && !is_active_call {
+            let next_nudge_at = nudge_threshold_secs(self.silence_reminder_secs, self.nudge_count);
+            if silent_secs >= next_nudge_at {
+                self.nudge_count += 1;
+                let minutes = silent_secs / 60;
+                let msg = if minutes >= 2 {
+                    format!(
+                        "No audio detected for {} minutes. Still recording.",
+                        minutes
+                    )
+                } else {
+                    format!(
+                        "No audio detected for {} seconds. Still recording.",
+                        silent_secs
+                    )
+                };
+                return SafetyAction::Nudge(msg);
+            }
+        }
+
+        SafetyAction::None
+    }
+
+    /// Whether silence was detected long enough to trigger a device reconnect check.
+    pub fn silence_duration_secs(&self) -> Option<u64> {
+        self.silence_start.map(|start| start.elapsed().as_secs())
+    }
+}
+
+/// Get available disk space in MB for the filesystem containing the given path.
+#[allow(clippy::unnecessary_cast)] // statvfs field types vary across platforms
+pub fn available_disk_space_mb(path: &Path) -> Option<u64> {
+    let check_path = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(Path::new("/")).to_path_buf()
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut c_path = check_path.as_os_str().as_bytes().to_vec();
+        c_path.push(0);
+        unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(c_path.as_ptr() as *const libc::c_char, &mut stat) == 0 {
+                let available_bytes = (stat.f_bavail as u64) * (stat.f_frsize as u64);
+                return Some(available_bytes / (1024 * 1024));
+            }
+        }
+        None
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = check_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut free_bytes: u64 = 0;
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_bytes as *mut u64,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            return Some(free_bytes / (1024 * 1024));
+        }
+        None
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = check_path;
+        None
+    }
+}
+
+/// Check for an extend sentinel (used by CLI `minutes extend`).
+pub fn check_and_clear_extend_sentinel() -> bool {
+    let sentinel = crate::config::Config::minutes_dir().join("extend.sentinel");
+    if sentinel.exists() {
+        std::fs::remove_file(&sentinel).ok();
+        true
+    } else {
+        false
+    }
+}
+
+/// Write the extend sentinel (used by CLI `minutes extend` command).
+pub fn write_extend_sentinel() -> std::io::Result<()> {
+    let sentinel = crate::config::Config::minutes_dir().join("extend.sentinel");
+    std::fs::write(&sentinel, b"extend")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecordingIntent {
+    Memo,
+    Room,
+    Call,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapturePreflightBlockKind {
+    CallRoute,
+    Permission,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordingStartedContext {
+    pub session_id: Option<String>,
+    pub source: String,
+    pub capabilities: Vec<String>,
+}
+
+impl RecordingIntent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memo => "memo",
+            Self::Room => "room",
+            Self::Call => "call",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CapturePreflight {
+    pub intent: RecordingIntent,
+    pub inferred_call_app: Option<String>,
+    pub input_device: String,
+    pub system_audio_ready: bool,
+    pub allow_degraded: bool,
+    #[serde(default)]
+    pub microphone_permission: MacPermissionStatus,
+    #[serde(default)]
+    pub screen_recording_permission: MacPermissionStatus,
+    pub blocking_reason: Option<String>,
+    #[serde(default)]
+    pub blocking_kind: Option<CapturePreflightBlockKind>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionPreflight {
+    pub blocking_reason: Option<String>,
+    pub blocking_kind: Option<CapturePreflightBlockKind>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SingleCapturePlan {
+    device_override: Option<String>,
+    device_name: String,
+}
+
+#[cfg(feature = "streaming")]
+#[derive(Debug, Clone)]
+struct DualCapturePlan {
+    voice_override: Option<String>,
+    voice_device_name: String,
+    call_override: String,
+    call_device_name: String,
+    call_capture_backend: crate::system_audio_backend::CaptureBackendKind,
+}
+
+#[derive(Debug, Clone)]
+enum CapturePlan {
+    Single(SingleCapturePlan),
+    #[cfg(feature = "streaming")]
+    Dual(DualCapturePlan),
+}
+
+impl CapturePlan {
+    fn input_summary(&self) -> String {
+        match self {
+            Self::Single(plan) => plan.device_name.clone(),
+            #[cfg(feature = "streaming")]
+            Self::Dual(plan) => format!("{} + {}", plan.voice_device_name, plan.call_device_name),
+        }
+    }
+
+    /// `is_system_audio_device_name` only recognizes name patterns (BlackHole,
+    /// `.monitor`, etc). On PipeWire, a real speaker/headphone sink (including
+    /// Bluetooth A2DP sinks) is also a valid system-audio route — it has no
+    /// special name, but `categorize_device` already knows how to spot it via
+    /// the Duplex (supports_input && supports_output) shape. Without this,
+    /// `detect_loopback_device()` picks a PipeWire sink as the call route but
+    /// this check then rejects it, blocking every PipeWire call recording
+    /// that isn't routed through a virtual/monitor device.
+    fn system_audio_ready(&self, host: &cpal::Host) -> bool {
+        match self {
+            Self::Single(plan) => is_system_audio_route(host, &plan.device_name),
+            #[cfg(feature = "streaming")]
+            Self::Dual(plan) => match plan.call_capture_backend {
+                crate::system_audio_backend::CaptureBackendKind::Cpal => {
+                    is_system_audio_route(host, &plan.call_device_name)
+                }
+                crate::system_audio_backend::CaptureBackendKind::CoreAudioTap
+                | crate::system_audio_backend::CaptureBackendKind::PocketStation => true,
+            },
+        }
+    }
+}
+
+fn is_system_audio_route(host: &cpal::Host, name: &str) -> bool {
+    use cpal::traits::DeviceTrait;
+
+    if is_system_audio_device_name(name) {
+        return true;
+    }
+    if !is_pipewire_host(host.id()) {
+        return false;
+    }
+    let Some(device) = find_device_on_host(host, name) else {
+        return false;
+    };
+    device.supports_output()
+}
+
+const MISSING_DUAL_SOURCE_LOOPBACK_MESSAGE: &str =
+    "no loopback/system-audio device detected for dual-source capture";
+
+pub fn stem_paths_for(audio_path: &Path) -> Option<crate::diarize::StemPaths> {
+    let stem = audio_path.file_stem()?.to_str()?;
+    let dir = audio_path.parent()?;
+    Some(crate::diarize::StemPaths {
+        voice: dir.join(format!("{}.voice.wav", stem)),
+        system: dir.join(format!("{}.system.wav", stem)),
+    })
+}
+
+pub fn meeting_audio_artifact_paths(markdown_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    // Most library recordings preserve a mixed WAV beside the markdown, while
+    // native call captures preserve the MOV anchor/container so future
+    // reprocessing can rediscover sibling voice/system stems.
+    for ext in ["wav", "mov"] {
+        let audio_path = markdown_path.with_extension(ext);
+        push_unique_path(&mut paths, audio_path.clone());
+
+        if let Some(stems) = stem_paths_for(&audio_path) {
+            push_unique_path(&mut paths, stems.voice);
+            push_unique_path(&mut paths, stems.system);
+        }
+    }
+
+    push_unique_path(
+        &mut paths,
+        crate::voice::meeting_embeddings_sidecar_path(markdown_path),
+    );
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn normalize_source_name(value: Option<&str>) -> Option<String> {
+    match value.map(str::trim) {
+        Some("") | None => None,
+        Some(value) if value.eq_ignore_ascii_case("default") => None,
+        Some(value) => Some(value.to_string()),
+    }
+}
+
+fn select_device_with_override(
+    host: &cpal::Host,
+    device_override: Option<&str>,
+) -> Result<(cpal::Device, String), CaptureError> {
+    use cpal::traits::DeviceTrait;
+
+    let device = select_input_device(host, device_override)?;
+    let name = device
+        .description()
+        .map_or_else(|_| "unknown".to_string(), |d| d.name().to_string());
+    Ok((device, name))
+}
+
+fn resolve_capture_plan(config: &Config) -> Result<CapturePlan, CaptureError> {
+    let host = cached_default_host();
+    resolve_capture_plan_with_host(host, config)
+}
+
+pub fn resolve_system_audio_probe_device(config: &Config) -> Result<Option<String>, String> {
+    let capture_backend = crate::system_audio_backend::configured_capture_backend(config)?;
+    let Some(call_override) = config
+        .recording
+        .sources
+        .as_ref()
+        .and_then(|sources| sources.call.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if capture_backend == crate::system_audio_backend::CaptureBackendKind::CoreAudioTap {
+        if crate::system_audio_backend::core_audio_tap_source_is_supported(call_override) {
+            return Ok(Some(
+                crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND.to_string(),
+            ));
+        }
+        return Err(format!(
+            "recording.capture_backend = '{}' captures the default system output; set [recording.sources] call = \"auto\" instead of '{}'",
+            crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND,
+            call_override
+        ));
+    }
+
+    if capture_backend == crate::system_audio_backend::CaptureBackendKind::PocketStation {
+        if call_override.eq_ignore_ascii_case("auto") {
+            return Err(
+                "recording.capture_backend = 'pocketstation' requires an application name, application ID, or pid:<process id> in [recording.sources] call"
+                    .to_string(),
+            );
+        }
+        return Ok(Some(call_override.to_string()));
+    }
+
+    if call_override.eq_ignore_ascii_case("auto") {
+        detect_loopback_device()
+            .map(Some)
+            .ok_or_else(|| MISSING_DUAL_SOURCE_LOOPBACK_MESSAGE.to_string())
+    } else {
+        Ok(Some(call_override.to_string()))
+    }
+}
+
+fn resolve_capture_plan_with_host(
+    host: &cpal::Host,
+    config: &Config,
+) -> Result<CapturePlan, CaptureError> {
+    let voice_override = normalize_source_name(
+        config
+            .recording
+            .sources
+            .as_ref()
+            .and_then(|sources| sources.voice.as_deref()),
+    );
+    let call_override = config
+        .recording
+        .sources
+        .as_ref()
+        .and_then(|sources| sources.call.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    #[cfg(not(feature = "streaming"))]
+    if call_override.is_some() {
+        return Err(CaptureError::Io(std::io::Error::other(
+            "dual-source capture requires the streaming feature",
+        )));
+    }
+
+    #[cfg(feature = "streaming")]
+    if let Some(call_override) = call_override {
+        let (_, voice_name) = select_device_with_override(host, voice_override.as_deref())?;
+        let capture_backend = crate::system_audio_backend::configured_capture_backend(config)
+            .map_err(|error| CaptureError::Io(std::io::Error::other(error)))?;
+        if capture_backend == crate::system_audio_backend::CaptureBackendKind::CoreAudioTap {
+            if !crate::system_audio_backend::core_audio_tap_source_is_supported(call_override) {
+                return Err(CaptureError::Io(std::io::Error::other(format!(
+                    "recording.capture_backend = '{}' captures the default system output; set [recording.sources] call = \"auto\" instead of '{}'",
+                    crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND,
+                    call_override
+                ))));
+            }
+            return Ok(CapturePlan::Dual(DualCapturePlan {
+                voice_override,
+                voice_device_name: voice_name,
+                call_override: crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND.into(),
+                call_device_name: crate::system_audio_backend::CORE_AUDIO_TAP_ROUTE_NAME.into(),
+                call_capture_backend: capture_backend,
+            }));
+        }
+        if capture_backend == crate::system_audio_backend::CaptureBackendKind::PocketStation {
+            if call_override.eq_ignore_ascii_case("auto") {
+                return Err(CaptureError::Io(std::io::Error::other(
+                    "recording.capture_backend = 'pocketstation' requires an application name, application ID, or pid:<process id> in [recording.sources] call",
+                )));
+            }
+            return Ok(CapturePlan::Dual(DualCapturePlan {
+                voice_override,
+                voice_device_name: voice_name,
+                call_override: call_override.to_string(),
+                call_device_name: format!("PocketStation application: {call_override}"),
+                call_capture_backend: capture_backend,
+            }));
+        }
+        let resolved_call = if call_override.eq_ignore_ascii_case("auto") {
+            detect_loopback_device().ok_or_else(|| {
+                CaptureError::Io(std::io::Error::other(MISSING_DUAL_SOURCE_LOOPBACK_MESSAGE))
+            })?
+        } else {
+            call_override.to_string()
+        };
+        let (_, call_name) = select_device_with_override(host, Some(&resolved_call))?;
+        if voice_name == call_name {
+            return Err(CaptureError::Io(std::io::Error::other(
+                "voice and call sources resolved to the same device",
+            )));
+        }
+        return Ok(CapturePlan::Dual(DualCapturePlan {
+            voice_override,
+            voice_device_name: voice_name,
+            call_override: resolved_call,
+            call_device_name: call_name,
+            call_capture_backend: capture_backend,
+        }));
+    }
+
+    let single_override = voice_override.or_else(|| config.recording.device.clone());
+    let (_, device_name) = select_device_with_override(host, single_override.as_deref())?;
+    Ok(CapturePlan::Single(SingleCapturePlan {
+        device_override: single_override,
+        device_name,
+    }))
+}
+
+fn resolve_native_call_preflight_capture_plan_with_host(
+    host: &cpal::Host,
+    config: &Config,
+) -> Result<CapturePlan, CaptureError> {
+    let voice_override = normalize_source_name(
+        config
+            .recording
+            .sources
+            .as_ref()
+            .and_then(|sources| sources.voice.as_deref()),
+    );
+    let single_override = voice_override.or_else(|| config.recording.device.clone());
+    let (_, device_name) = select_device_with_override(host, single_override.as_deref())?;
+    Ok(CapturePlan::Single(SingleCapturePlan {
+        device_override: single_override,
+        device_name,
+    }))
+}
+
+fn configured_call_source_is_auto(config: &Config) -> bool {
+    config
+        .recording
+        .sources
+        .as_ref()
+        .and_then(|sources| sources.call.as_deref())
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("auto"))
+}
+
+fn should_bypass_loopback_preflight_for_native_call_capture(
+    intent: RecordingIntent,
+    native_call_capture_available: bool,
+    config: &Config,
+    error: &CaptureError,
+) -> bool {
+    if intent != RecordingIntent::Call
+        || !native_call_capture_available
+        || !configured_call_source_is_auto(config)
+    {
+        return false;
+    }
+
+    matches!(error, CaptureError::Io(io_error) if io_error.to_string() == MISSING_DUAL_SOURCE_LOOPBACK_MESSAGE)
+}
+
+const MIC_PERMISSION_BLOCKING_MESSAGE: &str = "Minutes does not have microphone permission, so this recording would capture silence. Grant Microphone access in System Settings > Privacy & Security > Microphone, then start the recording again.";
+const MIC_PERMISSION_DEGRADED_CALL_WARNING: &str = "Minutes does not have microphone permission, so this call recording will miss your side. The other side is still captured.";
+const MIC_PERMISSION_UNCONFIRMED_WARNING: &str = "macOS has not yet confirmed microphone access for Minutes (this happens after an app update or re-sign). If the first few seconds capture silence, approve the macOS prompt or grant Microphone access in System Settings > Privacy & Security > Microphone.";
+const SCREEN_PERMISSION_DENIED_WARNING: &str = "Heads up: Minutes does not have Screen Recording permission, so native call capture may not include system audio. Grant Screen Recording access in System Settings > Privacy & Security > Screen Recording, then start the recording again.";
+const SCREEN_PERMISSION_UNCONFIRMED_WARNING: &str = "macOS has not yet confirmed Screen Recording access for Minutes. Native call capture may need Screen Recording permission; if system audio is missing, approve the macOS prompt or grant Screen Recording access in System Settings > Privacy & Security > Screen Recording.";
+
+pub(crate) fn evaluate_microphone_only_permission_preflight(
+    mic: MacPermissionStatus,
+) -> PermissionPreflight {
+    let mut warnings = Vec::new();
+    let mut blocking_reason = None;
+    let mut blocking_kind = None;
+
+    match mic {
+        MacPermissionStatus::Denied => {
+            blocking_reason = Some(MIC_PERMISSION_BLOCKING_MESSAGE.into());
+            blocking_kind = Some(CapturePreflightBlockKind::Permission);
+        }
+        MacPermissionStatus::NotDetermined | MacPermissionStatus::StaleOrRestartNeeded => {
+            warnings.push(MIC_PERMISSION_UNCONFIRMED_WARNING.into());
+        }
+        MacPermissionStatus::Granted
+        | MacPermissionStatus::NotNeeded
+        | MacPermissionStatus::Unsupported
+        | MacPermissionStatus::Unknown => {}
+    }
+
+    PermissionPreflight {
+        blocking_reason,
+        blocking_kind,
+        warnings,
+    }
+}
+
+pub fn preflight_microphone_only() -> PermissionPreflight {
+    evaluate_microphone_only_permission_preflight(microphone_status())
+}
+
+pub(crate) fn evaluate_permission_preflight(
+    intent: RecordingIntent,
+    mic: MacPermissionStatus,
+    screen: MacPermissionStatus,
+    system_audio_ready: bool,
+) -> PermissionPreflight {
+    let mut warnings = Vec::new();
+    let mut blocking_reason = None;
+    let mut blocking_kind = None;
+    let call_has_recoverable_remote_audio = intent == RecordingIntent::Call && system_audio_ready;
+
+    match mic {
+        MacPermissionStatus::Denied if call_has_recoverable_remote_audio => {
+            warnings.push(MIC_PERMISSION_DEGRADED_CALL_WARNING.into());
+        }
+        MacPermissionStatus::Denied => {
+            blocking_reason = Some(MIC_PERMISSION_BLOCKING_MESSAGE.into());
+            blocking_kind = Some(CapturePreflightBlockKind::Permission);
+        }
+        MacPermissionStatus::NotDetermined | MacPermissionStatus::StaleOrRestartNeeded => {
+            warnings.push(MIC_PERMISSION_UNCONFIRMED_WARNING.into());
+        }
+        MacPermissionStatus::Granted
+        | MacPermissionStatus::NotNeeded
+        | MacPermissionStatus::Unsupported
+        | MacPermissionStatus::Unknown => {}
+    }
+
+    if intent == RecordingIntent::Call && system_audio_ready {
+        match screen {
+            MacPermissionStatus::Denied => {
+                warnings.push(SCREEN_PERMISSION_DENIED_WARNING.into());
+            }
+            MacPermissionStatus::NotDetermined | MacPermissionStatus::StaleOrRestartNeeded => {
+                warnings.push(SCREEN_PERMISSION_UNCONFIRMED_WARNING.into());
+            }
+            MacPermissionStatus::Granted
+            | MacPermissionStatus::NotNeeded
+            | MacPermissionStatus::Unsupported
+            | MacPermissionStatus::Unknown => {}
+        }
+    }
+
+    PermissionPreflight {
+        blocking_reason,
+        blocking_kind,
+        warnings,
+    }
+}
+
+pub fn should_bypass_preflight_block_for_native_call_capture(
+    preflight: &CapturePreflight,
+    native_call_capture_available: bool,
+) -> bool {
+    preflight.intent == RecordingIntent::Call
+        && native_call_capture_available
+        && preflight.blocking_kind == Some(CapturePreflightBlockKind::CallRoute)
+}
+
+// ──────────────────────────────────────────────────────────────
+// Audio capture using cpal (cross-platform audio I/O).
+//
+// Two modes:
+//   1. Default input device (built-in mic) — works out of the box
+//      Good for: voice memos, in-person meetings
+//   2. BlackHole virtual audio device — captures system audio
+//      Good for: Zoom/Meet/Teams calls
+//      Requires: brew install blackhole-2ch + Multi-Output Device setup
+//
+// The recording runs as a foreground process. On SIGTERM/SIGINT:
+//   stop capture → flush WAV → run pipeline → clean up → exit
+// ──────────────────────────────────────────────────────────────
+
+/// Seconds of silence before checking if the audio device changed.
+/// Shorter than silence_reminder_secs to enable fast reconnection.
+const DEVICE_CHECK_SILENCE_SECS: u64 = 5;
+
+/// Ten seconds of mono 16 kHz samples, allocated once before capture begins.
+/// A stalled disk may consume this headroom but can never block the realtime
+/// callback or grow memory without a bound. Exhaustion stops capture visibly.
+const CAPTURE_WRITE_QUEUE_SAMPLES: usize = 160_000;
+
+struct CaptureWriteQueue {
+    samples: crossbeam_queue::ArrayQueue<f32>,
+    finished: AtomicBool,
+    overrun: AtomicBool,
+}
+
+impl CaptureWriteQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            samples: crossbeam_queue::ArrayQueue::new(capacity),
+            finished: AtomicBool::new(false),
+            overrun: AtomicBool::new(false),
+        }
+    }
+
+    fn push_samples(&self, samples: &[f32]) {
+        if self.finished.load(Ordering::Acquire) || self.overrun.load(Ordering::Acquire) {
+            return;
+        }
+        for &sample in samples {
+            if self.samples.push(sample).is_err() {
+                self.overrun.store(true, Ordering::Release);
+                return;
+            }
+        }
+    }
+}
+
+// CoreAudio driver teardown can block inside AudioOutputUnitStop. Keep the
+// exact stream on a retiring worker and block another in-process capture until
+// it retires, instead of holding WAV finalization hostage to OS teardown.
+#[cfg(target_os = "macos")]
+static INPUT_SHUTDOWNS: std::sync::LazyLock<Arc<std::sync::atomic::AtomicUsize>> =
+    std::sync::LazyLock::new(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+
+#[cfg(any(target_os = "macos", test))]
+fn retire_resource_with_timeout<T: Send + 'static>(
+    resource: T,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    timeout: std::time::Duration,
+) -> bool {
+    struct RetirementGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for RetirementGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    pending.fetch_add(1, Ordering::AcqRel);
+    let worker = std::thread::spawn(move || {
+        let _retiring = RetirementGuard(pending);
+        drop(resource);
+    });
+    let deadline = Instant::now() + timeout;
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    worker.join().is_ok()
+}
+
+#[cfg(target_os = "macos")]
+fn retire_capture_resource<T: Send + 'static>(resource: T) {
+    if !retire_resource_with_timeout(
+        resource,
+        Arc::clone(&INPUT_SHUTDOWNS),
+        std::time::Duration::from_secs(2),
+    ) {
+        let message = "Audio capture has stopped, but the input device is still shutting down. Another recording in this process must wait for the device to finish.";
+        eprintln!("[minutes] {message}");
+        tracing::warn!("{message}");
+        crate::logging::append_log(&serde_json::json!({
+            "ts": chrono::Local::now().to_rfc3339(), "level": "warn",
+            "step": "audio_input_shutdown_pending", "message": message,
+        }))
+        .ok();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn retire_capture_resource<T>(resource: T) {
+    drop(resource);
+}
+
+struct CaptureWriterPump {
+    queue: Arc<CaptureWriteQueue>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CaptureWriterPump {
+    fn start<W: std::io::Write + std::io::Seek + Send + 'static>(
+        mut writer: hound::WavWriter<W>,
+        sample_count: Arc<std::sync::atomic::AtomicU64>,
+        storage_failed: Arc<AtomicBool>,
+        live_tx: Option<crate::live_audio_coverage::LiveAudioSender>,
+    ) -> Self {
+        let queue = Arc::new(CaptureWriteQueue::new(CAPTURE_WRITE_QUEUE_SAMPLES));
+        let worker_queue = Arc::clone(&queue);
+        let thread = std::thread::spawn(move || {
+            let mut batch = [0.0_f32; 1600];
+            loop {
+                let mut count = 0;
+                while count < batch.len() {
+                    let Some(sample) = worker_queue.samples.pop() else {
+                        break;
+                    };
+                    batch[count] = sample;
+                    count += 1;
+                }
+                if count > 0 {
+                    write_capture_samples(
+                        &mut writer,
+                        &batch[..count],
+                        &sample_count,
+                        &storage_failed,
+                    );
+                    if storage_failed.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Optional consumer allocation and channel operations also
+                    // run off the realtime callback, after the WAV writer.
+                    if let Some(tx) = &live_tx {
+                        if tx.try_send(batch[..count].to_vec()).is_err() {
+                            SIDECAR_DROPS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                } else if worker_queue.finished.load(Ordering::Acquire) {
+                    break;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            // Finalization can flush a partial BufWriter block to a stalled
+            // filesystem. Keep it inside the same deadline-supervised worker,
+            // rather than reintroducing an unbounded disk write on stop.
+            if let Err(error) = writer.finalize() {
+                storage_failed.store(true, Ordering::Release);
+                tracing::error!(%error, "recording WAV finalization failed");
+            }
+        });
+        Self {
+            queue,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), CaptureError> {
+        self.finish_with_timeout(std::time::Duration::from_secs(2))
+    }
+
+    fn finish_with_timeout(&mut self, timeout: std::time::Duration) -> Result<(), CaptureError> {
+        self.queue.finished.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let deadline = Instant::now() + timeout;
+            while !thread.is_finished() {
+                if Instant::now() >= deadline {
+                    // A kernel disk write cannot be cancelled safely. Leave its
+                    // exact file handle with the retiring worker; never block
+                    // stop indefinitely or unlink the preserved recording.
+                    return Err(CaptureError::StorageRetiring);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            thread.join().map_err(|_| {
+                CaptureError::Io(std::io::Error::other(
+                    "recording writer stopped unexpectedly; partial audio preserved",
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CaptureWriterPump {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+/// Build a cpal input stream that enqueues resampled 16kHz mono without disk I/O.
+/// Returns the stream handle and the device name string.
+///
+/// Delegates mono-downmix and band-limited resampling to the shared stream
+/// builder, updates the meter, then queues samples for the recording worker.
+fn build_capture_stream(
+    device: &cpal::Device,
+    queue: &Arc<CaptureWriteQueue>,
+    stop_flag: &Arc<AtomicBool>,
+    err_flag: &Arc<AtomicBool>,
+) -> Result<(cpal::Stream, Arc<crate::resample::InputStreamDiagnostics>), CaptureError> {
+    let queue = Arc::clone(queue);
+
+    // Level meter state — updated from the resampled samples (~10x/sec)
+    let mut level_accum: f64 = 0.0;
+    let mut level_count: u32 = 0;
+
+    // We'll set the level_interval once we know the native sample rate.
+    // For now, use a placeholder; it gets set after build_resampled_input_stream returns the config.
+    // Actually, the callback receives resampled 16kHz samples, so the interval should be
+    // based on 16kHz: ~1600 samples for 10 updates/sec.
+    let level_interval: u32 = 1600; // 16000 / 10
+
+    let (stream, _device_name, stream_config) = crate::resample::build_resampled_input_stream(
+        device,
+        stop_flag,
+        err_flag,
+        move |resampled: &[f32]| {
+            // Update audio level meter from resampled mono f32 samples
+            for &sample in resampled {
+                level_accum += (sample as f64) * (sample as f64);
+                level_count += 1;
+                if level_count >= level_interval {
+                    let rms = (level_accum / level_count as f64).sqrt();
+                    let level = (rms * 2000.0).min(100.0) as u32;
+                    AUDIO_LEVEL.store(level, Ordering::Relaxed);
+                    level_accum = 0.0;
+                    level_count = 0;
+                }
+            }
+
+            queue.push_samples(resampled);
+        },
+    )?;
+
+    Ok((stream, stream_config.diagnostics))
+}
+
+/// Latch a recording storage error, even if a later write could succeed.
+/// Count only accepted samples and leave finalization to the capture owner.
+fn write_capture_samples<W: std::io::Write + std::io::Seek>(
+    writer: &mut hound::WavWriter<W>,
+    samples: &[f32],
+    sample_count: &std::sync::atomic::AtomicU64,
+    storage_failed: &AtomicBool,
+) {
+    if storage_failed.load(Ordering::Acquire) {
+        return;
+    }
+    let mut written = 0;
+    for &sample in samples {
+        let sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        if writer.write_sample(sample).is_err() {
+            storage_failed.store(true, Ordering::Release);
+            break;
+        }
+        written += 1;
+    }
+    sample_count.fetch_add(written, Ordering::Relaxed);
+}
+
+/// Try to reconnect to the current default audio device.
+/// Returns the new stream and device name on success.
+fn try_reconnect(
+    host: &cpal::Host,
+    device_override: Option<&str>,
+    queue: &Arc<CaptureWriteQueue>,
+    stop_flag: &Arc<AtomicBool>,
+    err_flag: &Arc<AtomicBool>,
+) -> Option<(
+    cpal::Stream,
+    String,
+    Arc<crate::resample::InputStreamDiagnostics>,
+)> {
+    use cpal::traits::DeviceTrait;
+
+    // Reset error flag for the new stream
+    err_flag.store(false, Ordering::Relaxed);
+
+    let device = match select_input_device(host, device_override) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("reconnect: device selection failed: {}", e);
+            return None;
+        }
+    };
+
+    let name = device
+        .description()
+        .map_or_else(|_| "unknown".to_string(), |d| d.name().to_string());
+
+    match build_capture_stream(&device, queue, stop_flag, err_flag) {
+        Ok((stream, diagnostics)) => {
+            tracing::info!(device = %name, "audio stream reconnected");
+            Some((stream, name, diagnostics))
+        }
+        Err(e) => {
+            tracing::warn!(device = %name, "reconnect: build stream failed: {}", e);
+            None
+        }
+    }
+}
+
+/// One mixer slot is one `AudioChunk` from each source. Kept equal to
+/// `streaming::CHUNK_SAMPLES` by construction: `padded_slot` pads every slot
+/// to this length, so a producer emitting a different chunk size writes a
+/// zero-stuffed stem (#792).
+#[cfg(feature = "streaming")]
+const DUAL_SOURCE_SLOT_SAMPLES: usize = crate::streaming::CHUNK_SAMPLES;
+
+#[cfg(feature = "streaming")]
+struct DualCaptureWriters {
+    mixed: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    voice: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    system: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    mixed_sample_count: u64,
+    voice_content: StemContent,
+    system_content: StemContent,
+}
+
+fn wav_spec_16k_mono() -> hound::WavSpec {
+    hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    }
+}
+
+/// Size of the canonical 16-bit PCM WAV header that `hound` writes on creation.
+const WAV_HEADER_LEN: u64 = 44;
+
+/// True for a leftover from a capture that never recorded a sample. It holds
+/// no audio, so reusing it cannot destroy a recording.
+fn is_header_only_wav(file: &std::fs::File) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let is_header_sized = file
+        .metadata()
+        .map(|m| m.len() == WAV_HEADER_LEN)
+        .unwrap_or(false);
+    if !is_header_sized || (&*file).seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let is_empty = hound::WavReader::new(std::io::BufReader::new(file))
+        .map(|reader| reader.len() == 0)
+        .unwrap_or(false);
+    is_empty && (&*file).seek(SeekFrom::Start(0)).is_ok()
+}
+
+fn create_wav_writer(
+    output_path: &Path,
+) -> Result<hound::WavWriter<std::io::BufWriter<std::fs::File>>, CaptureError> {
+    let parent = output_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let parent = std::fs::canonicalize(parent)?;
+    let directory = crate::policy_fs::BoundRecoveryDirectory::bind_existing(&parent)?;
+    let name = output_path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "WAV path has no filename")
+    })?;
+    #[cfg(windows)]
+    let created = crate::overlays::create_owner_only_staged_file(&parent.join(name));
+    #[cfg(not(windows))]
+    let created = directory.create_new_exact_file(name);
+    let file = match created {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Accept only a private empty reservation. Tightening a public
+            // reservation now would not revoke readers that opened it earlier.
+            // Never truncate an earlier capture or follow a planted link.
+            let existing = directory.bind_exact_file(name)?;
+            let file = existing.try_clone_exact_file()?;
+            if file.metadata()?.len() != 0 && !is_header_only_wav(&file) {
+                return Err(CaptureError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "refusing to overwrite an existing recording",
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = file.metadata()?;
+                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o600
+                {
+                    return Err(CaptureError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "recording reservation is not private to the current user",
+                    )));
+                }
+            }
+            file
+        }
+        Err(error) => return Err(error.into()),
+    };
+    fs2::FileExt::try_lock_exclusive(&file)?;
+    if file.metadata()?.len() != 0 && !is_header_only_wav(&file) {
+        return Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "recording reservation is no longer empty",
+        )));
+    }
+    #[cfg(not(windows))]
+    crate::overlays::secure_private_file_handle(&file)?;
+    // Existing bound recovery handles intentionally lack WRITE_DAC and
+    // WRITE_OWNER. Verify their existing DACL instead of widening that shared
+    // capability just to support a recording reservation.
+    #[cfg(windows)]
+    crate::overlays::attest_owner_only_file_handle(&file)?;
+    directory.attest_for_source_cleanup()?;
+    let confirmed = directory.bind_exact_file(name)?;
+    if !crate::policy_fs::open_file_identity_matches(&file, &confirmed.try_clone_exact_file()?) {
+        return Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "recording destination changed during creation",
+        )));
+    }
+    // Reusing an empty header is a write too. Establish permissions and exact
+    // identity before truncating, including the Windows owner-only DACL check.
+    if is_header_only_wav(&file) {
+        file.set_len(0)?;
+    }
+    if file.metadata()?.len() != 0 {
+        return Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "recording reservation is no longer empty",
+        )));
+    }
+    // Retain the exact file; no pathname reopen occurs during capture.
+    hound::WavWriter::new(std::io::BufWriter::new(file), wav_spec_16k_mono())
+        .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV create: {}", e))))
+}
+
+#[cfg(feature = "streaming")]
+impl DualCaptureWriters {
+    fn new(output_path: &Path) -> Result<Self, CaptureError> {
+        let stems = stem_paths_for(output_path).ok_or_else(|| {
+            CaptureError::Io(std::io::Error::other(
+                "could not derive per-source stem paths for dual-source capture",
+            ))
+        })?;
+
+        Ok(Self {
+            mixed: create_wav_writer(output_path)?,
+            voice: create_wav_writer(&stems.voice)?,
+            system: create_wav_writer(&stems.system)?,
+            mixed_sample_count: 0,
+            voice_content: StemContent::default(),
+            system_content: StemContent::default(),
+        })
+    }
+
+    fn write_slot(
+        &mut self,
+        voice_samples: &[f32],
+        system_samples: &[f32],
+        live_tx: &Option<crate::live_audio_coverage::LiveAudioSender>,
+    ) -> Result<(), CaptureError> {
+        write_samples_to_wav(&mut self.voice, voice_samples, &mut self.voice_content)?;
+        write_samples_to_wav(&mut self.system, system_samples, &mut self.system_content)?;
+
+        let mixed = mix_dual_source_slot(voice_samples, system_samples);
+        update_audio_level_from_samples(&mixed);
+        let mut mixed_content = StemContent::default();
+        write_samples_to_wav(&mut self.mixed, &mixed, &mut mixed_content)?;
+        self.mixed_sample_count += mixed.len() as u64;
+
+        if let Some(ref tx) = live_tx {
+            if tx.try_send(mixed).is_err() {
+                SIDECAR_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finalize(self) -> Result<(u64, StemContentReport), CaptureError> {
+        let contents = [
+            ("voice", self.voice_content),
+            ("system", self.system_content),
+        ];
+        finalize_wav_writer(self.voice)?;
+        finalize_wav_writer(self.system)?;
+        let mixed_sample_count = self.mixed_sample_count;
+        finalize_wav_writer(self.mixed)?;
+        Ok((mixed_sample_count, contents))
+    }
+}
+
+#[cfg(feature = "streaming")]
+fn update_audio_level_from_samples(samples: &[f32]) {
+    if samples.is_empty() {
+        AUDIO_LEVEL.store(0, Ordering::Relaxed);
+        return;
+    }
+
+    let rms = (samples
+        .iter()
+        .map(|sample| (*sample as f64) * (*sample as f64))
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt();
+    let level = (rms * 2000.0).min(100.0) as u32;
+    AUDIO_LEVEL.store(level, Ordering::Relaxed);
+}
+
+/// Running tally of how much of a stem is actually audio.
+///
+/// Counted while the samples are already in hand. Reading the finished file
+/// back to measure this would be a second pass over hundreds of megabytes, and
+/// would happen after the point where the answer is useful.
+#[cfg(feature = "streaming")]
+#[derive(Default, Clone, Copy)]
+struct StemContent {
+    written: u64,
+    nonzero: u64,
+}
+
+/// Below this fraction of nonzero samples, a stem that contains *some* audio is
+/// treated as corrupted rather than quiet.
+///
+/// The zero-stuffing in #792 produced 7.9% to 10.7% nonzero. Real speech with
+/// long pauses sits far above this: the microphone stems in the same recordings
+/// measured 97% to 99.7%, because a live input delivers dither and noise rather
+/// than exact zeros even when nobody is talking.
+#[cfg(feature = "streaming")]
+const STEM_CORRUPTION_NONZERO_RATIO: f64 = 0.25;
+
+/// Per-source content tallies returned alongside the finalized sample
+/// count: the source name, and what was actually written to its stem.
+#[cfg(feature = "streaming")]
+type StemContentReport = [(&'static str, StemContent); 2];
+
+#[cfg(feature = "streaming")]
+impl StemContent {
+    fn record_sample(&mut self, sample: i16) {
+        self.written += 1;
+        self.nonzero += u64::from(sample != 0);
+    }
+
+    #[cfg(test)]
+    fn record(&mut self, samples: &[i16]) {
+        for &sample in samples {
+            self.record_sample(sample);
+        }
+    }
+
+    fn nonzero_ratio(&self) -> Option<f64> {
+        if self.written == 0 {
+            return None;
+        }
+        Some(self.nonzero as f64 / self.written as f64)
+    }
+
+    /// Whether this stem looks like the #792 failure: real audio present, but
+    /// most of the samples are exact zeros.
+    ///
+    /// Deliberately excludes the all-zero case. A stem with no nonzero samples
+    /// at all is a source that never delivered, which is a different fault with
+    /// a different message, already reported by the slot gap counters.
+    fn looks_zero_stuffed(&self) -> bool {
+        match self.nonzero_ratio() {
+            Some(ratio) => self.nonzero > 0 && ratio < STEM_CORRUPTION_NONZERO_RATIO,
+            None => false,
+        }
+    }
+}
+
+#[cfg(feature = "streaming")]
+fn write_samples_to_wav(
+    writer: &mut hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    samples: &[f32],
+    content: &mut StemContent,
+) -> Result<(), CaptureError> {
+    for &sample in samples {
+        let s16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        writer
+            .write_sample(s16)
+            .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV write: {}", e))))?;
+        content.record_sample(s16);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "streaming")]
+fn finalize_wav_writer(
+    writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+) -> Result<(), CaptureError> {
+    writer
+        .finalize()
+        .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV finalize: {}", e))))
+}
+
+#[cfg(feature = "streaming")]
+fn mix_dual_source_slot(voice_samples: &[f32], system_samples: &[f32]) -> Vec<f32> {
+    let slot_len = voice_samples
+        .len()
+        .max(system_samples.len())
+        .max(DUAL_SOURCE_SLOT_SAMPLES);
+    let mut mixed = vec![0.0f32; slot_len];
+
+    for (index, sample) in voice_samples.iter().enumerate() {
+        mixed[index] += *sample;
+    }
+    for (index, sample) in system_samples.iter().enumerate() {
+        mixed[index] += *sample;
+    }
+
+    for sample in &mut mixed {
+        *sample = sample.clamp(-1.0, 1.0);
+    }
+
+    mixed
+}
+
+#[cfg(feature = "streaming")]
+fn padded_slot(samples: Option<Vec<f32>>) -> Vec<f32> {
+    let mut padded = vec![0.0f32; DUAL_SOURCE_SLOT_SAMPLES];
+    if let Some(samples) = samples {
+        for (index, sample) in samples
+            .into_iter()
+            .enumerate()
+            .take(DUAL_SOURCE_SLOT_SAMPLES)
+        {
+            padded[index] = sample;
+        }
+    }
+    padded
+}
+
+#[cfg(feature = "streaming")]
+fn dual_source_slot_for_chunk(base_slot: u64, chunk: &crate::streaming::AudioChunk) -> u64 {
+    base_slot + chunk.index
+}
+
+/// Consecutive slots a source may be absent for before we call it a fault
+/// rather than jitter. 300 slots is 30 seconds.
+///
+/// A source that stops delivering is not the same as a source that is quiet.
+/// A quiet microphone still delivers chunks, they just contain low-amplitude
+/// samples, so these counters move only when a source produces nothing at all.
+#[cfg(feature = "streaming")]
+const SOURCE_GAP_FAULT_SLOTS: u64 = 300;
+
+#[cfg(feature = "streaming")]
+#[derive(Default)]
+struct DualSlotStats {
+    both: u64,
+    voice_only: u64,
+    system_only: u64,
+    voice_gap: u64,
+    voice_gap_longest: u64,
+    system_gap: u64,
+    system_gap_longest: u64,
+}
+
+#[cfg(feature = "streaming")]
+impl DualSlotStats {
+    /// Record one slot and track how long each source has been absent.
+    ///
+    /// The totals alone cannot see the failure in issue #792 bug 6, where the
+    /// microphone delivered normally for minutes and then stopped for good
+    /// after a device change. Cumulative counts stay healthy in that case
+    /// because most of the recording was fine. What is diagnostic is the
+    /// longest unbroken run with nothing from a source.
+    fn record(&mut self, has_voice: bool, has_system: bool) {
+        match (has_voice, has_system) {
+            (true, true) => self.both += 1,
+            (true, false) => self.voice_only += 1,
+            (false, true) => self.system_only += 1,
+            (false, false) => {}
+        }
+
+        if has_voice {
+            self.voice_gap = 0;
+        } else {
+            self.voice_gap += 1;
+            self.voice_gap_longest = self.voice_gap_longest.max(self.voice_gap);
+        }
+
+        if has_system {
+            self.system_gap = 0;
+        } else {
+            self.system_gap += 1;
+            self.system_gap_longest = self.system_gap_longest.max(self.system_gap);
+        }
+    }
+
+    /// Sources that went absent for long enough to call it a fault, with the
+    /// duration of the longest gap.
+    fn faults(&self) -> Vec<(&'static str, f64)> {
+        let mut faults = Vec::new();
+        for (name, longest) in [
+            ("voice", self.voice_gap_longest),
+            ("system", self.system_gap_longest),
+        ] {
+            if longest >= SOURCE_GAP_FAULT_SLOTS {
+                faults.push((name, longest as f64 / 10.0));
+            }
+        }
+        faults
+    }
+}
+
+#[cfg(feature = "streaming")]
+fn flush_dual_source_slots(
+    next_slot: &mut Option<u64>,
+    max_slot: Option<u64>,
+    pending_voice: &mut std::collections::BTreeMap<u64, Vec<f32>>,
+    pending_system: &mut std::collections::BTreeMap<u64, Vec<f32>>,
+    writers: &mut DualCaptureWriters,
+    live_tx: &Option<crate::live_audio_coverage::LiveAudioSender>,
+    slot_stats: &mut DualSlotStats,
+) -> Result<(), CaptureError> {
+    let (Some(current_slot), Some(max_slot)) = (*next_slot, max_slot) else {
+        return Ok(());
+    };
+    if current_slot > max_slot {
+        return Ok(());
+    }
+
+    let mut slot = current_slot;
+    while slot <= max_slot {
+        let has_voice = pending_voice.contains_key(&slot);
+        let has_system = pending_system.contains_key(&slot);
+        // Counts both sources and how long each has been absent. A slot with
+        // neither source is a silence slot: both stems get padding.
+        slot_stats.record(has_voice, has_system);
+        let voice = padded_slot(pending_voice.remove(&slot));
+        let system = padded_slot(pending_system.remove(&slot));
+        writers.write_slot(&voice, &system, live_tx)?;
+        slot += 1;
+    }
+    *next_slot = Some(slot);
+    Ok(())
+}
+
+#[cfg(feature = "streaming")]
+fn record_to_wav_dual_source(
+    output_path: &Path,
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    plan: DualCapturePlan,
+    started_context: Option<RecordingStartedContext>,
+    partial_publisher: Option<crate::live_partials::LivePartialPublisher>,
+) -> Result<(), CaptureError> {
+    crate::pid::check_and_clear_sentinel();
+    // Refresh the in-process mic-mute flag from the sentinel. The CLI
+    // `--mute-mic` flag writes the sentinel before getting here, and the
+    // loop below keeps re-reading it so Tauri/CLI toggles made during the
+    // recording take effect.
+    crate::streaming::refresh_mic_mute_from_sentinel();
+
+    let mut writers = DualCaptureWriters::new(output_path)?;
+    AUDIO_LEVEL.store(0, Ordering::Relaxed);
+
+    let (live_tx, sidecar_handle) = start_live_sidecar_with_source(
+        config,
+        &stop_flag,
+        partial_publisher,
+        crate::live_audio_coverage::AudioSource::Mixed,
+    );
+
+    // Screen context is an independent evidence lane. Start it before opening
+    // either audio stream so a slow or blocked microphone/system-audio setup
+    // cannot leave an opted-in session falsely reporting `off`.
+    let screen_context_session_id = started_context
+        .as_ref()
+        .and_then(|context| context.session_id.clone());
+    let _screen_handle = start_screen_capture_if_enabled(
+        config,
+        output_path,
+        &stop_flag,
+        screen_context_session_id.as_deref(),
+    );
+
+    let mut voice_stream = Some(AudioStream::start(plan.voice_override.as_deref())?);
+    let (system_tx, system_backend_rx) = crossbeam_channel::bounded(64);
+    let mut system_backend = crate::system_audio_backend::system_audio_backend_for_config(
+        config,
+        plan.call_override.clone(),
+    )?;
+    let mut system_stream = Some(system_backend.start(system_tx.clone())?);
+    let system_device_name = system_stream
+        .as_ref()
+        .and_then(|stream| stream.route().device_name)
+        .unwrap_or_else(|| plan.call_device_name.clone());
+    // Call side is always a pinned override; voice side is pinned iff the caller
+    // supplied an explicit override. Pinned sides skip default-device-change polling.
+    let voice_pinned = plan.voice_override.is_some();
+    let mut device_monitor = crate::device_monitor::MultiDeviceMonitor::with_pinned(
+        &voice_stream.as_ref().expect("voice stream").device_name,
+        voice_pinned,
+        &system_device_name,
+        true,
+    );
+
+    eprintln!(
+        "[minutes] Using voice input device: {}",
+        voice_stream.as_ref().expect("voice stream").device_name
+    );
+    eprintln!(
+        "[minutes] Using system audio device: {}",
+        system_device_name
+    );
+    tracing::info!(
+        voice = %voice_stream.as_ref().expect("voice stream").device_name,
+        system = %system_device_name,
+        "using dual-source audio input devices"
+    );
+    emit_recording_started(started_context);
+
+    let preflight_intent = config
+        .recording
+        .auto_call_intent
+        .then(|| detect_active_call_app(config).map(|_| RecordingIntent::Call))
+        .flatten();
+    let mut safety_guard = RecordingSafetyGuard::new(&config.recording, output_path);
+    if let Some(intent) = preflight_intent {
+        safety_guard = safety_guard.with_intent(intent);
+    }
+
+    let mut next_slot: Option<u64> = None;
+    let mut max_voice_slot: Option<u64> = None;
+    let mut max_system_slot: Option<u64> = None;
+    let mut pending_voice = std::collections::BTreeMap::<u64, Vec<f32>>::new();
+    let mut pending_system = std::collections::BTreeMap::<u64, Vec<f32>>::new();
+    let mut slot_base: u64 = 0;
+    // Mixer stats for diagnosing dual-source issues
+    let mut slot_stats = DualSlotStats::default();
+    let mut peak_level: u32 = 0;
+
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if crate::pid::check_and_clear_sentinel() {
+            tracing::info!("stop sentinel detected — stopping dual-source recording");
+            // Set the shared flag so everything watching it (screen capture,
+            // live sidecar, streams) winds down like on Ctrl+C (#423).
+            stop_flag.store(true, Ordering::Relaxed);
+            break;
+        }
+
+        if check_and_clear_extend_sentinel() {
+            tracing::info!("extend sentinel detected — resetting safety timers");
+            safety_guard.extend();
+        }
+
+        // Sync mute state from sentinel so CLI/Tauri toggles made in
+        // another process are picked up by this recording loop.
+        crate::streaming::refresh_mic_mute_from_sentinel();
+
+        let call_app_active = detect_active_call_app(config).is_some();
+        match safety_guard.check(audio_level(), call_app_active) {
+            SafetyAction::None => {}
+            SafetyAction::Nudge(msg) => {
+                tracing::info!("{}", msg);
+                send_silence_notification_msg(&msg);
+            }
+            SafetyAction::Warning(msg) => {
+                tracing::warn!("{}", msg);
+                send_silence_notification_msg(&msg);
+            }
+            SafetyAction::Stop(reason, msg) => {
+                tracing::warn!(reason = ?reason, "{}", msg);
+                send_silence_notification_msg(&msg);
+                break;
+            }
+        }
+
+        if voice_stream
+            .as_ref()
+            .is_some_and(crate::streaming::AudioStream::has_error)
+            || system_stream
+                .as_ref()
+                .is_some_and(|stream| stream.has_error())
+            || device_monitor.check_changes().is_some()
+        {
+            tracing::warn!("dual-source stream issue detected — attempting restart");
+            voice_stream.take();
+            system_stream.take();
+
+            match (
+                AudioStream::start(plan.voice_override.as_deref()),
+                system_backend.start(system_tx.clone()),
+            ) {
+                (Ok(new_voice), Ok(new_system)) => {
+                    let new_system_name = new_system
+                        .route()
+                        .device_name
+                        .unwrap_or_else(|| plan.call_device_name.clone());
+                    eprintln!(
+                        "[minutes] Dual-source capture reconnected: {} + {}",
+                        new_voice.device_name, new_system_name
+                    );
+                    device_monitor = crate::device_monitor::MultiDeviceMonitor::with_pinned(
+                        &new_voice.device_name,
+                        voice_pinned,
+                        &new_system_name,
+                        true,
+                    );
+                    slot_base = max_voice_slot
+                        .into_iter()
+                        .chain(max_system_slot)
+                        .max()
+                        .map_or(slot_base, |slot| slot.saturating_add(1));
+                    voice_stream = Some(new_voice);
+                    system_stream = Some(new_system);
+                    safety_guard.extend();
+                }
+                (voice_result, system_result) => {
+                    if let Err(error) = voice_result {
+                        tracing::error!(error = %error, "failed to restart voice stream");
+                    }
+                    if let Err(error) = system_result {
+                        tracing::error!(error = %error, "failed to restart system stream");
+                    }
+                    break;
+                }
+            }
+        }
+
+        let voice_rx = voice_stream
+            .as_ref()
+            .expect("voice stream should stay active")
+            .receiver
+            .clone();
+        let system_rx = system_stream
+            .as_ref()
+            .map(|_| system_backend_rx.clone())
+            .expect("system stream should stay active");
+
+        // Drain all available chunks from both channels before flushing.
+        // The old code used select! to grab ONE chunk per iteration, which
+        // on slower machines meant one source got flushed before the other
+        // source's chunk for that same slot arrived. (#118)
+        //
+        // Voice samples pass through `mute_voice_if_needed`: when the mic
+        // is muted, samples are zeroed but their length (and therefore the
+        // slot's sample count) is preserved so dual-source alignment and
+        // stem writers stay in lockstep.
+        let mute_voice_if_needed = |samples: Vec<f32>| -> Vec<f32> {
+            if crate::streaming::is_mic_muted() {
+                vec![0.0; samples.len()]
+            } else {
+                samples
+            }
+        };
+
+        let mut got_any = false;
+        while let Ok(chunk) = voice_rx.try_recv() {
+            let slot = dual_source_slot_for_chunk(slot_base, &chunk);
+            next_slot.get_or_insert(slot);
+            max_voice_slot = Some(max_voice_slot.map_or(slot, |s| s.max(slot)));
+            pending_voice.insert(slot, mute_voice_if_needed(chunk.samples));
+            got_any = true;
+        }
+        while let Ok(chunk) = system_rx.try_recv() {
+            let slot = dual_source_slot_for_chunk(slot_base, &chunk);
+            next_slot.get_or_insert(slot);
+            max_system_slot = Some(max_system_slot.map_or(slot, |s| s.max(slot)));
+            pending_system.insert(slot, chunk.samples);
+            got_any = true;
+        }
+
+        // If nothing was available, block briefly for the next chunk
+        if !got_any {
+            crossbeam_channel::select! {
+                recv(voice_rx) -> chunk => {
+                    if let Ok(chunk) = chunk {
+                        let slot = dual_source_slot_for_chunk(slot_base, &chunk);
+                        next_slot.get_or_insert(slot);
+                        max_voice_slot = Some(max_voice_slot.map_or(slot, |s| s.max(slot)));
+                        pending_voice.insert(slot, mute_voice_if_needed(chunk.samples));
+                    }
+                }
+                recv(system_rx) -> chunk => {
+                    if let Ok(chunk) = chunk {
+                        let slot = dual_source_slot_for_chunk(slot_base, &chunk);
+                        next_slot.get_or_insert(slot);
+                        max_system_slot = Some(max_system_slot.map_or(slot, |s| s.max(slot)));
+                        pending_system.insert(slot, chunk.samples);
+                    }
+                }
+                default(std::time::Duration::from_millis(50)) => {}
+            }
+        }
+
+        // Track peak audio level (actual peak, not just last value)
+        let current_level = audio_level();
+        if current_level > peak_level {
+            peak_level = current_level;
+        }
+
+        // Flush only slots where BOTH sources have had a chance to deliver.
+        // Use min(max_voice, max_system) - 1 so we never flush a slot before
+        // both sources have reached it.
+        let safe_slot = match (max_voice_slot, max_system_slot) {
+            (Some(v), Some(s)) => Some(v.min(s).saturating_sub(1)),
+            _ => None,
+        };
+        flush_dual_source_slots(
+            &mut next_slot,
+            safe_slot,
+            &mut pending_voice,
+            &mut pending_system,
+            &mut writers,
+            &live_tx,
+            &mut slot_stats,
+        )?;
+    }
+
+    // Final flush: write any remaining slots (pad with silence for missing sources)
+    let final_max = match (max_voice_slot, max_system_slot) {
+        (Some(v), Some(s)) => Some(v.max(s)),
+        (Some(v), None) => Some(v),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    };
+    flush_dual_source_slots(
+        &mut next_slot,
+        final_max,
+        &mut pending_voice,
+        &mut pending_system,
+        &mut writers,
+        &live_tx,
+        &mut slot_stats,
+    )?;
+
+    // Stop optional recognition before publication. Keep OS teardown after
+    // mixed WAV/stem sealing, just as in the single-source capture path.
+    stop_flag.store(true, Ordering::Release);
+
+    // Clear mute state so the next recording starts fresh.
+    crate::streaming::clear_mic_mute_for_new_recording();
+
+    let sidecar_drops = SIDECAR_DROPS.swap(0, Ordering::Relaxed);
+    if sidecar_drops > 0 {
+        tracing::warn!(
+            dropped_chunks = sidecar_drops,
+            "live transcript sidecar: chunks dropped (sidecar channel full, transcript may have gaps)"
+        );
+        // Persist as well: the desktop app has no tracing subscriber.
+        crate::logging::append_log(&serde_json::json!({
+            "ts": chrono::Local::now().to_rfc3339(),
+            "level": "warn",
+            "step": "live_sidecar_chunks_dropped",
+            "file": "",
+            "message": "live transcript sidecar dropped audio chunks because it could not keep up; the live transcript may have gaps (the recording is unaffected)",
+            "extra": {"dropped_chunks": sidecar_drops},
+        }))
+        .ok();
+    }
+
+    let finalized = writers.finalize();
+    retire_capture_resource(voice_stream.take());
+    retire_capture_resource(system_stream.take());
+    let (total_samples, stem_contents) = finalized?;
+
+    // Say it here, while the audio still exists. The #792 reporter lost three
+    // of four meetings in a day to a stem that was ~10% nonzero: the recording
+    // finished, the file looked plausible, and the only signal was a decode
+    // budget error hours later in another subsystem, about audio that was by
+    // then unrecoverable.
+    for (source, content) in stem_contents {
+        if content.looks_zero_stuffed() {
+            let percent = content.nonzero_ratio().unwrap_or(0.0) * 100.0;
+            eprintln!(
+                "[minutes] WARNING: the {source} stem is {percent:.1}% audio and the rest exact silence. That is the signature of a corrupted capture, not a quiet room. Keep the recording and report it."
+            );
+            tracing::error!(
+                source,
+                nonzero_percent = percent,
+                written_samples = content.written,
+                "stem finalized mostly zero-valued, which indicates capture corruption"
+            );
+        }
+    }
+    let duration_secs = total_samples as f64 / 16000.0;
+    let total_slots = slot_stats.both + slot_stats.voice_only + slot_stats.system_only;
+
+    drop(live_tx);
+    if let Some(handle) = sidecar_handle {
+        handle.join().ok();
+    }
+    // The disabled state has no sidecar thread to clear it; mirror the single-source path.
+    #[cfg(feature = "whisper")]
+    crate::live_transcript::clear_status_file();
+
+    eprintln!(
+        "[minutes] Captured {} mixed samples ({:.1}s), peak audio level: {}",
+        total_samples, duration_secs, peak_level
+    );
+    if total_slots > 0 {
+        let pct_both = (slot_stats.both as f64 / total_slots as f64 * 100.0) as u64;
+        eprintln!(
+            "[minutes] Mixer stats: {} slots total, {}% with both sources ({} both, {} voice-only, {} system-only)",
+            total_slots, pct_both, slot_stats.both, slot_stats.voice_only, slot_stats.system_only
+        );
+        tracing::info!(
+            total_slots,
+            slots_both = slot_stats.both,
+            slots_voice_only = slot_stats.voice_only,
+            slots_system_only = slot_stats.system_only,
+            pct_both,
+            "dual-source mixer stats"
+        );
+
+        // A source that stops delivering is written as silence, slot after
+        // slot, and the stem comes out the right length and completely empty.
+        // Every failure in issue #792 reached the user as either nothing at
+        // all or a transcript full of hallucinated sound effects, so say it
+        // here, where it is measured rather than guessed at later.
+        for (source, seconds) in slot_stats.faults() {
+            eprintln!(
+                "[minutes] WARNING: the {source} source stopped delivering audio for {seconds:.0}s during this recording. That part of the {source} stem is silence, not quiet audio."
+            );
+            tracing::warn!(
+                source,
+                longest_gap_secs = seconds,
+                "a capture source stopped delivering audio mid-recording"
+            );
+        }
+    }
+
+    if total_samples == 0 {
+        return Err(CaptureError::EmptyRecording);
+    }
+
+    Ok(())
+}
+
+/// Start recording audio from the default input device.
+/// Blocks until `stop_flag` is set to true (via signal handler) or a stop
+/// sentinel file is detected (from `minutes stop`).
+/// Writes raw PCM to a WAV file at the given path.
+/// If screen context is enabled, also captures periodic screenshots.
+/// Automatically reconnects if the audio device changes mid-recording.
+pub fn record_to_wav(
+    output_path: &Path,
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+) -> Result<(), CaptureError> {
+    record_to_wav_with_lifecycle(output_path, stop_flag, config, None)
+}
+
+pub fn record_to_wav_with_lifecycle(
+    output_path: &Path,
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    started_context: Option<RecordingStartedContext>,
+) -> Result<(), CaptureError> {
+    use cpal::traits::DeviceTrait;
+
+    #[cfg(target_os = "macos")]
+    if INPUT_SHUTDOWNS.load(Ordering::Acquire) != 0 {
+        return Err(CaptureError::CaptureOwnerBusy);
+    }
+    let capture_plan = resolve_capture_plan(config)?;
+    // The capture owner exposes finalized evidence plus one replaceable,
+    // in-memory current-speech draft over a transient local relay. The draft
+    // producer is bounded and optional; relay failure disables drafts without
+    // changing capture or the durable transcript path.
+    let relay_epoch = chrono::Utc::now().timestamp_millis().unsigned_abs().max(1);
+    // No sidecar means no partial producer, so the relay advertises final-only evidence.
+    let (mut recording_partial_publisher, recording_partial_subscriber) =
+        if cfg!(all(feature = "whisper", feature = "streaming"))
+            && config.live_transcript.recording_sidecar
+        {
+            let (publisher, subscriber) = crate::live_partials::channel_with_source(
+                relay_epoch,
+                crate::live_partials::DEFAULT_PARTIAL_CHANNEL_CAPACITY,
+                "recording-sidecar",
+            );
+            (Some(publisher), Some(subscriber))
+        } else {
+            (None, None)
+        };
+    let relay_evidence_mode = if recording_partial_subscriber.is_some() {
+        crate::copilot::CopilotEvidenceMode::CaptureRelayPartials
+    } else {
+        crate::copilot::CopilotEvidenceMode::FinalOnly
+    };
+    let _capture_relay = match crate::copilot::CaptureRelayServer::start(
+        relay_evidence_mode,
+        recording_partial_subscriber,
+    ) {
+        Ok(relay) => Some(relay),
+        Err(crate::copilot::CaptureRelayError::AlreadyOwned(owner_pid)) => {
+            eprintln!(
+                "[minutes] Another Minutes process (PID {owner_pid}) already owns capture. This process did not open a second microphone."
+            );
+            return Err(CaptureError::AlreadyRecording(owner_pid));
+        }
+        Err(crate::copilot::CaptureRelayError::OwnershipBusy) => {
+            eprintln!(
+                "[minutes] Another Minutes process is starting or stopping capture. This process did not open a second microphone."
+            );
+            return Err(CaptureError::CaptureOwnerBusy);
+        }
+        Err(error) => {
+            recording_partial_publisher = None;
+            eprintln!(
+                "[minutes] Live coaching attachment is unavailable for this recording: {error}. Recording continues; Minutes will not let another process silently open a second microphone."
+            );
+            tracing::warn!(error = %error, "capture attachment relay unavailable");
+            None
+        }
+    };
+    #[cfg(feature = "streaming")]
+    if let CapturePlan::Dual(plan) = capture_plan.clone() {
+        return record_to_wav_dual_source(
+            output_path,
+            stop_flag,
+            config,
+            plan,
+            started_context,
+            recording_partial_publisher,
+        );
+    }
+
+    // Clear any stale stop sentinel from a previous session
+    crate::pid::check_and_clear_sentinel();
+    // Single-source recording has no gate (muting a mic-only stream just
+    // produces silence, not a useful outcome), but we clear any stale
+    // mute sentinel so it doesn't leak into the next dual-source session.
+    #[cfg(feature = "streaming")]
+    crate::streaming::clear_mic_mute_for_new_recording();
+
+    let host = cached_default_host();
+    let device_override = match &capture_plan {
+        CapturePlan::Single(plan) => plan.device_override.as_deref(),
+        #[cfg(feature = "streaming")]
+        CapturePlan::Dual(_) => None,
+    };
+    let device = select_input_device(host, device_override)?;
+
+    let device_name = device
+        .description()
+        .map_or_else(|_| "unknown".to_string(), |d| d.name().to_string());
+    eprintln!("[minutes] Using input device: {}", device_name);
+    tracing::info!(device = %device_name, "using audio input device");
+
+    // Create WAV writer — always write as 16kHz mono 16-bit for whisper
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let writer = create_wav_writer(output_path)?;
+
+    let sample_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let err_flag = Arc::new(AtomicBool::new(false));
+    let storage_failed = Arc::new(AtomicBool::new(false));
+
+    // Reset audio level
+    AUDIO_LEVEL.store(0, Ordering::Relaxed);
+
+    // Start live transcript sidecar — streams real-time transcription to JSONL
+    // so agents can see what's being discussed during the recording.
+    let (live_tx, sidecar_handle) =
+        start_live_sidecar(config, &stop_flag, recording_partial_publisher);
+    let mut writer_pump = CaptureWriterPump::start(
+        writer,
+        Arc::clone(&sample_count),
+        Arc::clone(&storage_failed),
+        live_tx.clone(),
+    );
+
+    // Screen context is independent of microphone readiness. Start it before
+    // building the audio stream so permission prompts or a slow device cannot
+    // strand the observed state at `off` after the recording session starts.
+    let screen_context_session_id = started_context
+        .as_ref()
+        .and_then(|context| context.session_id.clone());
+    let _screen_handle = start_screen_capture_if_enabled(
+        config,
+        output_path,
+        &stop_flag,
+        screen_context_session_id.as_deref(),
+    );
+
+    // Build initial stream (wrapped in Option for reconnection)
+    let initial_stream = build_capture_stream(&device, &writer_pump.queue, &stop_flag, &err_flag);
+    let mut stream = Some(match initial_stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            // Sidecars may already be running. Retire them even when the
+            // microphone cannot start. Propagate pending finalization rather
+            // than hiding it behind a device error that permits temp cleanup.
+            stop_flag.store(true, Ordering::Release);
+            writer_pump.finish()?;
+            return Err(error);
+        }
+    });
+    tracing::info!("audio capture started");
+    emit_recording_started(started_context);
+
+    // Device change monitor. When the user pinned a specific device via config
+    // or --device, don't auto-switch on default-device changes — the override is
+    // explicit intent. Also avoids a spurious reconnect loop on Linux where
+    // cpal's "default" name doesn't match the pinned name (e.g. "pulse").
+    let mut device_monitor = if device_override.is_some() {
+        crate::device_monitor::DeviceMonitor::pinned(&device_name)
+    } else {
+        crate::device_monitor::DeviceMonitor::new(&device_name)
+    };
+    let mut current_device_name = device_name;
+
+    // Safety guard for auto-stop on silence, time cap, disk space
+    let preflight_intent = config
+        .recording
+        .auto_call_intent
+        .then(|| detect_active_call_app(config).map(|_| RecordingIntent::Call))
+        .flatten();
+    let mut safety_guard = RecordingSafetyGuard::new(&config.recording, output_path);
+    if let Some(intent) = preflight_intent {
+        safety_guard = safety_guard.with_intent(intent);
+    }
+    let mut peak_level = 0;
+
+    // Wait for stop signal (Ctrl+C sets stop_flag, `minutes stop` writes sentinel)
+    while !stop_flag.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        if crate::pid::check_and_clear_sentinel() {
+            tracing::info!("stop sentinel detected — stopping recording");
+            // Set the shared flag so everything watching it (screen capture,
+            // live sidecar, streams) winds down like on Ctrl+C (#423).
+            stop_flag.store(true, Ordering::Relaxed);
+            break;
+        }
+
+        if storage_failed.load(Ordering::Acquire)
+            || writer_pump.queue.overrun.load(Ordering::Acquire)
+        {
+            tracing::error!("recording storage failed; preserving the audio written so far");
+            send_silence_notification_msg("Recording stopped because audio could not be saved. The partial recording has been preserved.");
+            break;
+        }
+
+        // Check for extend sentinel from CLI `minutes extend`
+        if check_and_clear_extend_sentinel() {
+            tracing::info!("extend sentinel detected — resetting safety timers");
+            safety_guard.extend();
+        }
+
+        // Safety guard check (silence, time cap, disk space)
+        let call_app_active = detect_active_call_app(config).is_some();
+        let current_level = audio_level();
+        peak_level = peak_level.max(current_level);
+        match safety_guard.check(current_level, call_app_active) {
+            SafetyAction::None => {}
+            SafetyAction::Nudge(msg) => {
+                tracing::info!("{}", msg);
+                send_silence_notification_msg(&msg);
+            }
+            SafetyAction::Warning(msg) => {
+                tracing::warn!("{}", msg);
+                send_silence_notification_msg(&msg);
+            }
+            SafetyAction::Stop(reason, msg) => {
+                tracing::warn!(reason = ?reason, "{}", msg);
+                send_silence_notification_msg(&msg);
+                break;
+            }
+        }
+
+        if let Some((_, diagnostics)) = &stream {
+            diagnostics.report_pending();
+        }
+
+        // Check for stream error or device change → attempt reconnection
+        let should_reconnect = if err_flag.load(Ordering::Relaxed) {
+            tracing::warn!("audio stream error detected — checking for device change");
+            true
+        } else if device_monitor.has_device_changed() {
+            tracing::info!("default audio device changed — will reconnect");
+            true
+        } else {
+            false
+        };
+
+        // Also check for silence-triggered device change
+        let silence_triggered_reconnect = if !should_reconnect {
+            safety_guard
+                .silence_duration_secs()
+                .map(|secs| {
+                    secs >= DEVICE_CHECK_SILENCE_SECS && device_monitor.has_device_changed()
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if should_reconnect || silence_triggered_reconnect {
+            // Drop old stream before building a new one
+            stream.take();
+
+            // Try reconnecting (with one retry after 1s)
+            let reconnected = try_reconnect(
+                host,
+                device_override,
+                &writer_pump.queue,
+                &stop_flag,
+                &err_flag,
+            )
+            .or_else(|| {
+                tracing::info!("reconnect failed, retrying in 1s...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                try_reconnect(
+                    host,
+                    device_override,
+                    &writer_pump.queue,
+                    &stop_flag,
+                    &err_flag,
+                )
+            });
+
+            match reconnected {
+                Some((new_stream, new_name, diagnostics)) => {
+                    let old_name = current_device_name.clone();
+                    current_device_name = new_name;
+                    device_monitor.update_device(&current_device_name);
+                    stream = Some((new_stream, diagnostics));
+                    safety_guard.extend(); // reset silence timers after reconnect
+
+                    eprintln!(
+                        "[minutes] Audio device switched: {} → {}",
+                        old_name, current_device_name
+                    );
+                    send_device_change_notification(&old_name, &current_device_name);
+
+                    // Log event for agent reactivity
+                    crate::events::append_event(crate::events::MinutesEvent::DeviceChanged {
+                        old_device: old_name,
+                        new_device: current_device_name.clone(),
+                    });
+                }
+                None => {
+                    tracing::error!("could not reconnect to any audio device — stopping recording");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Stop and finalize. Report any final overloads outside the audio callback.
+    if let Some((_, diagnostics)) = &stream {
+        diagnostics.report_pending();
+    }
+    // Stop callbacks before closing the writer queue. Seal the WAV before
+    // touching OS teardown, which can block inside a driver.
+    stop_flag.store(true, Ordering::Release);
+    let finalized = writer_pump.finish();
+    retire_capture_resource(stream);
+    finalized?;
+    let total_samples = sample_count.load(Ordering::Relaxed);
+    let duration_secs = total_samples as f64 / 16000.0;
+    tracing::info!(
+        samples = total_samples,
+        duration_secs = format!("{:.1}", duration_secs),
+        "audio capture stopped"
+    );
+
+    // The supervised writer has already finalized its exact WAV handle.
+    drop(live_tx);
+    if let Some(handle) = sidecar_handle {
+        handle.join().ok();
+    }
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    crate::live_transcript::clear_status_file();
+    let sidecar_drops = SIDECAR_DROPS.swap(0, Ordering::Relaxed);
+    if sidecar_drops > 0 {
+        tracing::warn!(
+            dropped_chunks = sidecar_drops,
+            "live sidecar: audio chunks dropped (transcript may have gaps)"
+        );
+    }
+
+    eprintln!(
+        "[minutes] Captured {} samples ({:.1}s), peak audio level during recording: {}",
+        total_samples, duration_secs, peak_level
+    );
+
+    if storage_failed.load(Ordering::Acquire) || writer_pump.queue.overrun.load(Ordering::Acquire) {
+        return Err(CaptureError::Io(std::io::Error::other(
+            "recording storage failed; partial audio preserved",
+        )));
+    }
+    if total_samples == 0 {
+        return Err(CaptureError::EmptyRecording);
+    }
+
+    Ok(())
+}
+
+fn emit_recording_started(started_context: Option<RecordingStartedContext>) {
+    if let Some(context) = started_context {
+        crate::events::append_event(crate::events::recording_started_event(
+            context.session_id,
+            context.source,
+            context.capabilities,
+        ));
+    }
+}
+
+/// Start screen-context capture for a recording when enabled in config.
+/// Returns None (and reports the failure) when the Screen Recording
+/// permission probe fails; recording continues without screenshots.
+fn start_screen_capture_if_enabled(
+    config: &crate::config::Config,
+    output_path: &Path,
+    stop_flag: &Arc<AtomicBool>,
+    context_session_id: Option<&str>,
+) -> Option<crate::screen::ScreenCaptureHandle> {
+    if let Some(session_id) = context_session_id {
+        match crate::context_store::initialize_screen_context(
+            session_id,
+            config.screen_context.enabled,
+            config.screen_context.interval_secs,
+            config.screen_context.keep_after_summary,
+        ) {
+            Ok(status) => {
+                crate::screen::write_current_session_status(&status).ok();
+            }
+            Err(error) => {
+                tracing::warn!(session_id, error = %error, "failed to initialize screen context state");
+            }
+        }
+    }
+
+    if !config.screen_context.enabled {
+        return None;
+    }
+
+    if !crate::screen::check_screen_permission() {
+        if let Some(session_id) = context_session_id {
+            if let Ok(status) = crate::context_store::mark_screen_context_unavailable(
+                session_id,
+                "Screen Recording permission is unavailable",
+            ) {
+                crate::screen::write_current_session_status(&status).ok();
+            }
+        }
+        report_screen_permission_failure(output_path);
+        return None;
+    }
+
+    let screen_dir = crate::screen::screens_dir_for(output_path);
+    let event_sink = context_session_id.map(|session_id| {
+        let session_id = session_id.to_string();
+        std::sync::Arc::new(move |event| {
+            let update = match event {
+                crate::screen::ScreenCaptureEvent::Captured {
+                    path,
+                    observed_at,
+                    capture_index,
+                    elapsed_seconds,
+                    byte_size,
+                } => crate::context_store::record_screen_capture_success(
+                    &session_id,
+                    &path,
+                    observed_at,
+                    capture_index,
+                    elapsed_seconds,
+                    byte_size,
+                ),
+                crate::screen::ScreenCaptureEvent::Failed { observed_at, error } => {
+                    crate::context_store::record_screen_capture_failure(
+                        &session_id,
+                        observed_at,
+                        &error,
+                    )
+                }
+                crate::screen::ScreenCaptureEvent::Stopped { observed_at } => {
+                    crate::context_store::mark_screen_context_stopped(&session_id, observed_at)
+                }
+            };
+            match update {
+                Ok(status) => {
+                    crate::screen::write_current_session_status(&status).ok();
+                }
+                Err(error) => {
+                    tracing::warn!(session_id, error = %error, "failed to persist screen capture event");
+                }
+            }
+        }) as crate::screen::ScreenCaptureEventSink
+    });
+    match crate::screen::start_capture_with_events(
+        &screen_dir,
+        std::time::Duration::from_secs(config.screen_context.interval_secs.max(1)),
+        Arc::clone(stop_flag),
+        event_sink,
+    ) {
+        Ok(handle) => {
+            if let Some(session_id) = context_session_id {
+                match crate::context_store::mark_screen_context_waiting(session_id, &screen_dir) {
+                    Ok(status) => {
+                        crate::screen::write_current_session_status(&status).ok();
+                    }
+                    Err(error) => {
+                        tracing::warn!(session_id, error = %error, "failed to link screen capture directory");
+                    }
+                }
+            }
+            eprintln!(
+                "[minutes] Screen context capture enabled (every {}s)",
+                config.screen_context.interval_secs
+            );
+            Some(handle)
+        }
+        Err(e) => {
+            if let Some(session_id) = context_session_id {
+                if let Ok(status) = crate::context_store::record_screen_capture_failure(
+                    session_id,
+                    chrono::Local::now(),
+                    &e.to_string(),
+                ) {
+                    crate::screen::write_current_session_status(&status).ok();
+                }
+            }
+            tracing::warn!(
+                "screen capture init failed: {} — continuing without screen context",
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Surface a failed Screen Recording permission probe at recording start.
+/// stderr is discarded for GUI launches and System Settings can show a stale
+/// grant as enabled after the app's signature changes, so the failure must
+/// also reach the structured log, the event stream, and the desktop (#424).
+fn report_screen_permission_failure(output_path: &Path) {
+    let message = "Screen context is enabled but Screen Recording permission is unavailable — recording continues without screenshots. If System Settings already shows Minutes as enabled, the grant is stale: toggle it off and on under Privacy & Security > Screen & System Audio Recording, then restart the recording.";
+
+    eprintln!("[minutes] {}", message);
+    crate::logging::log_error(
+        "screen_context",
+        &output_path.display().to_string(),
+        message,
+    );
+    crate::events::append_event(crate::events::MinutesEvent::ScreenContextUnavailable {
+        reason: "screen-recording-permission".into(),
+        message: message.into(),
+    });
+    send_desktop_notification(
+        "Screen context is on, but Screen Recording permission is missing or stale — this recording will have no screenshots. Re-enable it in System Settings > Privacy & Security.",
+    );
+}
+
+/// Spawn a live transcript sidecar thread that receives audio samples and
+/// produces a JSONL transcript in real-time. Returns (sender, join_handle).
+/// When the whisper+streaming features are not available, returns (None, None).
+pub(crate) fn start_live_sidecar(
+    config: &Config,
+    stop_flag: &Arc<AtomicBool>,
+    partial_publisher: Option<crate::live_partials::LivePartialPublisher>,
+) -> (
+    Option<crate::live_audio_coverage::LiveAudioSender>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    start_live_sidecar_with_source(
+        config,
+        stop_flag,
+        partial_publisher,
+        crate::live_audio_coverage::AudioSource::Unknown,
+    )
+}
+
+#[cfg(all(feature = "whisper", feature = "streaming"))]
+pub(crate) fn start_live_sidecar_with_source(
+    config: &Config,
+    stop_flag: &Arc<AtomicBool>,
+    partial_publisher: Option<crate::live_partials::LivePartialPublisher>,
+    source: crate::live_audio_coverage::AudioSource,
+) -> (
+    Option<crate::live_audio_coverage::LiveAudioSender>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    if !config.live_transcript.recording_sidecar {
+        // Every recording path comes through here. Without a sender the pump
+        // never forwards audio, and no thread writes live status, so readers
+        // get the explicit disabled state instead of "failed to start".
+        crate::logging::log_step(
+            "live_sidecar_skipped",
+            "",
+            0,
+            serde_json::json!({ "reason": "live_transcript.recording_sidecar = false" }),
+        );
+        tracing::info!(
+            "live transcript sidecar is off (live_transcript.recording_sidecar = false); recording audio only"
+        );
+        crate::live_transcript::mark_recording_sidecar_disabled();
+        return (None, None);
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(200);
+    let tx = crate::live_audio_coverage::LiveAudioSender::new(tx, source)
+        .with_source_tracking(config.live_transcript.coverage_shadow);
+    let sidecar_config = config.clone();
+    let sidecar_stop = stop_flag.clone();
+    match std::thread::Builder::new()
+        .name("live-sidecar".into())
+        .spawn(move || {
+            crate::live_transcript::run_tracked_sidecar_mpsc(
+                rx,
+                sidecar_stop,
+                &sidecar_config,
+                partial_publisher,
+            );
+        }) {
+        Ok(handle) => (Some(tx), Some(handle)),
+        Err(e) => {
+            tracing::warn!("failed to spawn live sidecar thread: {}", e);
+            (None, None)
+        }
+    }
+}
+
+#[cfg(not(all(feature = "whisper", feature = "streaming")))]
+pub(crate) fn start_live_sidecar_with_source(
+    _config: &Config,
+    _stop_flag: &Arc<AtomicBool>,
+    _partial_publisher: Option<crate::live_partials::LivePartialPublisher>,
+    _source: crate::live_audio_coverage::AudioSource,
+) -> (
+    Option<crate::live_audio_coverage::LiveAudioSender>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    (None, None)
+}
+
+/// If `name` ends with the decorated format produced by [`list_input_devices`]
+/// (e.g. `"Ground Control (16000Hz, 1 ch)"`), return the bare device name.
+/// Otherwise, return the input unchanged.
+///
+/// This lets callers accept either form: saved configs that captured the
+/// decorated label from the Tauri picker still resolve to the bare CPAL name.
+pub fn strip_device_format_suffix(name: &str) -> &str {
+    let Some(open_idx) = name.rfind(" (") else {
+        return name;
+    };
+    let inside = &name[open_idx + 2..];
+    let Some(inside) = inside.strip_suffix(')') else {
+        return name;
+    };
+    let Some((hz_part, ch_part)) = inside.split_once(", ") else {
+        return name;
+    };
+    let Some(hz_num) = hz_part.strip_suffix("Hz") else {
+        return name;
+    };
+    let Some(ch_num) = ch_part.strip_suffix(" ch") else {
+        return name;
+    };
+    if hz_num.parse::<u32>().is_err() || ch_num.parse::<u16>().is_err() {
+        return name;
+    }
+    &name[..open_idx]
+}
+
+/// Normalize a persisted input-device setting to the canonical CPAL device
+/// name by trimming whitespace and stripping any UI decoration suffix like
+/// `" (16000Hz, 1 ch)"`.
+pub fn canonicalize_input_device_setting(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(strip_device_format_suffix(trimmed).to_string())
+}
+
+/// Select the best input device.
+///
+/// If `device_name` is provided, matches by name against available devices.
+/// The match first tries the exact string, then falls back to the bare name
+/// if `device_name` is in the decorated `"Name (NHz, N ch)"` format. That
+/// fallback is what lets legacy configs saved from the Tauri settings UI
+/// (which used to persist the decorated label) continue to resolve.
+/// Otherwise, queries the macOS system default (via `system_profiler`),
+/// then falls back to cpal's `default_input_device()`.
+///
+/// cpal's `default_input_device()` picks the first device in enumeration order,
+/// which on macOS is often a virtual device (Descript Loopback, Zoom Audio, etc.)
+/// rather than the actual system default.
+/// Remembers which cpal `HostId` successfully resolved a pinned device name
+/// this process. cpal's Linux `default_host()` is nondeterministic when PipeWire
+/// and ALSA are both compiled in (successive calls can return different hosts,
+/// and re-creating PipeWire via `host_from_id` sometimes enumerates zero
+/// devices). Caching the first host that works keeps later lookups stable.
+static PREFERRED_HOST: std::sync::OnceLock<std::sync::Mutex<Option<cpal::HostId>>> =
+    std::sync::OnceLock::new();
+
+/// AIDEV-NOTE: Keeps the cpal `Host` alive for the entire process lifetime.
+/// On Linux with the PipeWire backend, dropping a `cpal::Host` calls `pw_deinit()`,
+/// and re-creating one calls `pw_init()` again — but PipeWire's internal state is
+/// corrupted after deinit/reinit, causing a segfault in `pw_main_loop_new()`.
+/// By leaking the Host (intentionally never freeing it), we prevent Drop from
+/// running, so PipeWire stays initialized. The leak is negligible: one Host per
+/// process lifetime. This matches cpal's own `PwInitGuard` design intent (the
+/// Host holds the guard), but ensures the guard survives across multiple
+/// `default_host()` call sites within minutes.
+static HOST_CACHE: std::sync::OnceLock<&'static cpal::Host> = std::sync::OnceLock::new();
+
+/// Return a reference to the process-wide cached `cpal::Host`, creating it on
+/// first call. Uses `cpal::default_host()` internally, but ensures the Host
+/// (and its PipeWire init guard) is never dropped, preventing the segfault
+/// described in HOST_CACHE.
+pub fn cached_default_host() -> &'static cpal::Host {
+    HOST_CACHE.get_or_init(|| {
+        // Intentionally leak: Host must live for the process duration so that
+        // PipeWire's pw_deinit() is never called between enumeration and stream
+        // creation, which would corrupt PipeWire state and segfault on re-init.
+        Box::leak(Box::new(cpal::default_host()))
+    })
+}
+
+fn preferred_host_id() -> Option<cpal::HostId> {
+    *PREFERRED_HOST
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()?
+}
+
+fn set_preferred_host_id(id: cpal::HostId) {
+    if let Ok(mut guard) = PREFERRED_HOST
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+    {
+        *guard = Some(id);
+    }
+}
+
+/// Look up a device by exact name on the given host. Retries enumeration a few
+/// times because the PipeWire cpal backend occasionally reports zero devices on
+/// the first `input_devices()` call after a fresh `host_from_id`.
+fn find_device_on_host(host: &cpal::Host, requested: &str) -> Option<cpal::Device> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let bare = strip_device_format_suffix(requested);
+    for attempt in 0..3 {
+        if let Ok(devices) = host.input_devices() {
+            for device in devices {
+                if let Ok(desc) = device.description() {
+                    let name = desc.name();
+                    if name == requested || name == bare {
+                        tracing::info!(
+                            device = %name,
+                            host_id = ?host.id(),
+                            attempt,
+                            "using requested input device"
+                        );
+                        return Some(device);
+                    }
+                }
+            }
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    None
+}
+
+pub fn select_input_device(
+    host: &cpal::Host,
+    device_name: Option<&str>,
+) -> Result<cpal::Device, CaptureError> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    tracing::info!(host_id = ?host.id(), "cpal host for input device selection");
+
+    // If a specific device was requested, find it by name
+    if let Some(requested) = device_name {
+        // Fast path: previous call in this process already proved a host works.
+        // (Bare-name fallback for decorated device labels like "Mic (16000Hz, 1 ch)"
+        // is handled inside find_device_on_host via strip_device_format_suffix.)
+        if let Some(preferred) = preferred_host_id() {
+            if preferred == host.id() {
+                if let Some(device) = find_device_on_host(host, requested) {
+                    return Ok(device);
+                }
+            } else if let Ok(preferred_host) = cpal::host_from_id(preferred) {
+                if let Some(device) = find_device_on_host(&preferred_host, requested) {
+                    tracing::info!(
+                        device = %requested,
+                        from_host = ?preferred,
+                        called_with_host = ?host.id(),
+                        "using cached preferred cpal host"
+                    );
+                    return Ok(device);
+                }
+            }
+        }
+
+        // Try the host the caller handed us.
+        let primary_id = host.id();
+        if let Some(device) = find_device_on_host(host, requested) {
+            set_preferred_host_id(primary_id);
+            return Ok(device);
+        }
+
+        // Fallback: cpal's `default_host()` on Linux is nondeterministic when both
+        // PipeWire and ALSA are available — successive calls can return different
+        // hosts. Try every other compiled-in host before giving up so a pinned
+        // device name (e.g. "sink_default" on PipeWire, "pulse" on ALSA) keeps
+        // working regardless of which host was handed to us.
+        let mut searched_hosts = vec![format!("{:?}", primary_id)];
+        for host_id in cpal::available_hosts() {
+            if host_id == primary_id {
+                continue;
+            }
+            searched_hosts.push(format!("{:?}", host_id));
+            if let Ok(alt_host) = cpal::host_from_id(host_id) {
+                if let Some(device) = find_device_on_host(&alt_host, requested) {
+                    tracing::info!(
+                        device = %requested,
+                        from_host = ?host_id,
+                        primary_host = ?primary_id,
+                        "recovered pinned device from alternate cpal host"
+                    );
+                    set_preferred_host_id(host_id);
+                    return Ok(device);
+                }
+            }
+        }
+
+        let available: Vec<String> = host
+            .input_devices()
+            .map(|devs| {
+                devs.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tracing::error!(
+            requested = %requested,
+            searched_hosts = ?searched_hosts,
+            available = ?available,
+            "requested audio device not found"
+        );
+        return Err(CaptureError::Io(std::io::Error::other(format!(
+            "audio device '{}' not found. Available devices: {}",
+            requested,
+            if available.is_empty() {
+                "(none)".to_string()
+            } else {
+                available.join(", ")
+            }
+        ))));
+    }
+
+    // Try to get the macOS system default input device name
+    #[cfg(target_os = "macos")]
+    if let Some(system_default_name) = get_macos_default_input_name() {
+        // Search cpal's device list for a matching name
+        if let Ok(devices) = host.input_devices() {
+            for device in devices {
+                if let Ok(desc) = device.description() {
+                    let name = desc.name().to_string();
+                    if name == system_default_name {
+                        tracing::info!(
+                            device = %name,
+                            "matched macOS system default input device"
+                        );
+                        return Ok(device);
+                    }
+                }
+            }
+        }
+        tracing::warn!(
+            system_default = %system_default_name,
+            "could not find macOS default input in cpal devices, using cpal default"
+        );
+    }
+
+    // Fallback: cpal's default (works on all platforms)
+    host.default_input_device()
+        .ok_or(CaptureError::DeviceNotFound)
+}
+
+/// Query macOS for the actual system default input device name.
+/// Uses `system_profiler` which is more reliable than AppleScript for audio devices.
+#[cfg(target_os = "macos")]
+pub fn get_macos_default_input_name() -> Option<String> {
+    // Try AppleScript to get the system-level default input device
+    let output = crate::engine_process::command("system_profiler")
+        .args(["SPAudioDataType", "-json"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let items = json.get("SPAudioDataType")?.as_array()?;
+
+    // Devices are nested under _items in each top-level entry
+    for item in items {
+        if let Some(sub_items) = item.get("_items").and_then(|v| v.as_array()) {
+            for sub in sub_items {
+                let is_default_input = sub
+                    .get("coreaudio_default_audio_input_device")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "spaudio_yes")
+                    .unwrap_or(false);
+
+                if is_default_input {
+                    return sub
+                        .get("_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn detect_call_app_from_processes(
+    running: &[String],
+    config: &crate::config::CallDetectionConfig,
+) -> Option<String> {
+    for config_app in &config.apps {
+        let config_lower = config_app.to_lowercase();
+        if running.iter().any(|process_name| {
+            let process_lower = process_name.to_lowercase();
+            process_lower.contains(&config_lower) || config_lower.contains(&process_lower)
+        }) {
+            return Some(match config_app.as_str() {
+                "zoom.us" => "Zoom".into(),
+                "Microsoft Teams" | "Microsoft Teams (work or school)" => "Teams".into(),
+                "FaceTime" => "FaceTime".into(),
+                "Webex" => "Webex".into(),
+                "Slack" => "Slack".into(),
+                other => other.into(),
+            });
+        }
+    }
+    None
+}
+
+fn running_process_names() -> Vec<String> {
+    let output = crate::engine_process::command("ps")
+        .args(["-eo", "comm="])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                Some(trimmed.rsplit('/').next().unwrap_or(trimmed).to_string())
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn detect_active_call_app(config: &Config) -> Option<String> {
+    detect_call_app_from_processes(&running_process_names(), &config.call_detection)
+}
+
+/// True if the device name matches a known system audio capture driver.
+///
+/// Three groups of patterns, all substring-matched against the lowercased name:
+///
+/// 1. Generic loopback/aggregate drivers: `blackhole`, `loopback`, `soundflower`,
+///    `vb-cable`, `stereo mix`, `multi-output`, `aggregate`. These are the
+///    drivers most users install for system audio capture on macOS / Windows.
+///
+/// 2. App-installed virtual drivers on macOS: `mmaudio`, `loomaudio`,
+///    `zoomaudio`, `teams audio`. These are installed by Loom, Zoom, Microsoft
+///    Teams, and similar apps for screen-recording / call-capture and
+///    consistently report `supports_input == true && supports_output == true`
+///    on CoreAudio. Empirically verified on Mat's machine 2026-04-06.
+///    Substrings are chosen specifically enough to avoid false positives on
+///    real microphones (e.g., "Camo Microphone" is a real mic via a 2-way
+///    iPhone bridge that also reports as Duplex).
+///
+/// 3. PulseAudio monitor sources: anything containing `.monitor`. PulseAudio
+///    exposes monitor sources as `Device::Source` entries with names ending in
+///    `<sink_name>.monitor` (cpal/host/pulseaudio/mod.rs:107), so they pass
+///    through `host.input_devices()` like regular sources and would otherwise
+///    be lumped under Microphone. The PipeWire backend uses a different model
+///    (Sinks-as-Duplex, see `categorize_device` for the host-gated check),
+///    so this pattern only kicks in on PulseAudio.
+pub fn is_system_audio_device_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    [
+        // Generic loopback / aggregate
+        "blackhole",
+        "loopback",
+        "soundflower",
+        "vb-cable",
+        "stereo mix",
+        "multi-output",
+        "aggregate",
+        "core audio process tap",
+        // macOS app-installed virtual drivers (verified 2026-04-06)
+        "mmaudio",
+        "loomaudio",
+        "zoomaudio",
+        "teams audio",
+        // PulseAudio monitor source pattern
+        ".monitor",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+}
+
+/// Categorize a device into Microphone / SystemAudio / Virtual.
+///
+/// On PipeWire, `Audio/Sink` nodes (your speakers, headphones) are exposed
+/// with `direction = Duplex` so they appear in `host.input_devices()`. Recording
+/// from one transparently uses the sink's monitor port via `STREAM_CAPTURE_SINK`
+/// at stream creation. We surface that to users by categorizing them as
+/// `SystemAudio` rather than `Microphone`. The PipeWire-only gate is necessary
+/// because (a) ALSA backend Duplex devices are typically USB headsets where the
+/// user wants the mic, not the speaker monitor, and (b) on macOS, virtual
+/// drivers like Camo Microphone, Loom, Zoom, and Teams all report
+/// `supports_output() == true` and would be wrongly bucketed.
+///
+/// Test fixture for unit tests — pure function, no cpal dependency.
+fn categorize_device(
+    name: &str,
+    supports_input: bool,
+    supports_output: bool,
+    is_pipewire: bool,
+) -> DeviceCategory {
+    if is_pipewire && supports_input && supports_output {
+        // PipeWire sink with monitor port — see doc comment above.
+        return DeviceCategory::SystemAudio;
+    }
+    if is_system_audio_device_name(name) {
+        return DeviceCategory::SystemAudio;
+    }
+    let lower = name.to_lowercase();
+    if lower.contains("virtual") || lower.contains("pipewire") || lower.contains("pulse") {
+        return DeviceCategory::Virtual;
+    }
+    DeviceCategory::Microphone
+}
+
+/// True when the cpal default host is the PipeWire backend.
+///
+/// Compiles to a const `false` on platforms where cpal doesn't expose a
+/// `HostId::PipeWire` variant (macOS, Windows, etc.), so callers don't need
+/// their own cfg guards. The `#[cfg]` set matches cpal's own pipewire feature
+/// gate (`linux | dragonfly | freebsd | netbsd`) so BSD-with-PipeWire users
+/// get the fix too.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+))]
+fn is_pipewire_host(host_id: cpal::HostId) -> bool {
+    matches!(host_id, cpal::HostId::PipeWire)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+)))]
+fn is_pipewire_host(_: cpal::HostId) -> bool {
+    false
+}
+
+pub fn selected_input_device_name(config: &Config) -> Result<String, CaptureError> {
+    use cpal::traits::DeviceTrait;
+
+    let host = cached_default_host();
+    let device = select_input_device(host, config.recording.device.as_deref())?;
+    device
+        .description()
+        .map(|d| d.name().to_string())
+        .map_err(|error| CaptureError::Io(std::io::Error::other(error.to_string())))
+}
+
+fn infer_recording_intent(
+    mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    detected_call_app: Option<&str>,
+    config: &Config,
+) -> Result<RecordingIntent, String> {
+    if mode == CaptureMode::QuickThought {
+        if let Some(intent) = requested_intent {
+            if intent != RecordingIntent::Memo {
+                return Err(
+                    "Quick thoughts only support memo intent. Use meeting mode for room or call capture."
+                        .into(),
+                );
+            }
+        }
+        return Ok(RecordingIntent::Memo);
+    }
+
+    if let Some(intent) = requested_intent {
+        return Ok(intent);
+    }
+
+    if config.recording.auto_call_intent && detected_call_app.is_some() {
+        Ok(RecordingIntent::Call)
+    } else {
+        Ok(RecordingIntent::Room)
+    }
+}
+
+fn evaluate_capture_preflight(
+    mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    detected_call_app: Option<String>,
+    input_device: String,
+    allow_degraded: bool,
+    config: &Config,
+) -> Result<CapturePreflight, String> {
+    let intent =
+        infer_recording_intent(mode, requested_intent, detected_call_app.as_deref(), config)?;
+    let system_audio_ready = is_system_audio_device_name(&input_device);
+    let allow_degraded = allow_degraded || config.recording.allow_degraded_call_capture;
+    let mut warnings = Vec::new();
+    let mut blocking_reason = None;
+    let mut blocking_kind = None;
+
+    if intent == RecordingIntent::Call {
+        if let Some(app_name) = detected_call_app.as_deref() {
+            warnings.push(format!("Detected active {} call.", app_name));
+        }
+        if system_audio_ready {
+            warnings.push(format!(
+                "Using '{}' as the input route for call capture.",
+                input_device
+            ));
+        } else if allow_degraded {
+            warnings.push(format!(
+                "Starting degraded call capture from '{}'. This will likely miss the remote side of the call.",
+                input_device
+            ));
+        } else {
+            blocking_reason = Some(format!(
+                "Minutes inferred a call capture, but '{}' looks like a microphone input, not a call-audio route. To record both sides, use the desktop app's native call capture path or choose a system-audio device like BlackHole. If you intentionally want mic-only capture, explicitly allow degraded call capture.",
+                input_device
+            ));
+            blocking_kind = Some(CapturePreflightBlockKind::CallRoute);
+        }
+    }
+
+    Ok(CapturePreflight {
+        intent,
+        inferred_call_app: detected_call_app,
+        input_device,
+        system_audio_ready,
+        allow_degraded,
+        microphone_permission: MacPermissionStatus::Unknown,
+        screen_recording_permission: MacPermissionStatus::Unknown,
+        blocking_reason,
+        blocking_kind,
+        warnings,
+    })
+}
+
+pub fn preflight_recording(
+    mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    allow_degraded: bool,
+    config: &Config,
+) -> Result<CapturePreflight, String> {
+    preflight_recording_with_native_call_capture(
+        mode,
+        requested_intent,
+        allow_degraded,
+        false,
+        config,
+    )
+}
+
+pub fn preflight_recording_with_native_call_capture(
+    mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    allow_degraded: bool,
+    native_call_capture_available: bool,
+    config: &Config,
+) -> Result<CapturePreflight, String> {
+    let host = cached_default_host();
+    let detected_call_app = detect_active_call_app(config);
+    let intent =
+        infer_recording_intent(mode, requested_intent, detected_call_app.as_deref(), config)?;
+    let capture_plan = match resolve_capture_plan_with_host(host, config) {
+        Ok(plan) => plan,
+        Err(error)
+            if should_bypass_loopback_preflight_for_native_call_capture(
+                intent,
+                native_call_capture_available,
+                config,
+                &error,
+            ) =>
+        {
+            resolve_native_call_preflight_capture_plan_with_host(host, config)
+                .map_err(|fallback_error| fallback_error.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut preflight = evaluate_capture_preflight(
+        mode,
+        Some(intent),
+        detected_call_app,
+        capture_plan.input_summary(),
+        allow_degraded,
+        config,
+    )?;
+
+    preflight.system_audio_ready = capture_plan.system_audio_ready(host);
+    if preflight.intent == RecordingIntent::Call {
+        if preflight.system_audio_ready {
+            preflight.blocking_reason = None;
+            preflight.blocking_kind = None;
+            if preflight.warnings.is_empty() {
+                preflight.warnings.push(format!(
+                    "Using '{}' as the capture route for call recording.",
+                    preflight.input_device
+                ));
+            }
+        } else if !preflight.allow_degraded {
+            preflight.blocking_reason = Some(format!(
+                "Minutes inferred a call capture, but '{}' does not include a recognized system-audio route. To record both sides, choose a loopback/system-audio device like BlackHole for the call source or use the desktop app's native call capture path. If you intentionally want mic-only capture, explicitly allow degraded call capture.",
+                preflight.input_device
+            ));
+            preflight.blocking_kind = Some(CapturePreflightBlockKind::CallRoute);
+        }
+    }
+
+    let microphone_permission = microphone_status();
+    let screen_recording_permission = screen_recording_status();
+    let permission_system_audio_ready = preflight.system_audio_ready
+        || (preflight.intent == RecordingIntent::Call
+            && native_call_capture_available
+            && screen_recording_permission.is_granted());
+    let permission_preflight = evaluate_permission_preflight(
+        preflight.intent,
+        microphone_permission,
+        screen_recording_permission,
+        permission_system_audio_ready,
+    );
+    preflight.microphone_permission = microphone_permission;
+    preflight.screen_recording_permission = screen_recording_permission;
+    if permission_preflight.blocking_reason.is_some() {
+        preflight.blocking_reason = permission_preflight.blocking_reason;
+        preflight.blocking_kind = permission_preflight.blocking_kind;
+    }
+    preflight.warnings.extend(permission_preflight.warnings);
+
+    Ok(preflight)
+}
+
+/// Send a macOS notification when silence is detected during recording.
+fn send_silence_notification_msg(body: &str) {
+    send_desktop_notification(body);
+}
+
+/// Send a desktop notification (macOS notification center; stderr elsewhere).
+fn send_desktop_notification(body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification \"{}\" with title \"Minutes\" sound name \"Submarine\"",
+            body.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        match crate::engine_process::command("osascript")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(_) => tracing::debug!("desktop notification sent"),
+            Err(e) => tracing::warn!("failed to send notification: {}", e),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("[minutes] {}", body);
+    }
+}
+
+/// Send a macOS notification when the audio input device changes mid-recording.
+fn send_device_change_notification(old_device: &str, new_device: &str) {
+    let body = format!(
+        "Audio input switched from \"{}\" to \"{}\".",
+        old_device, new_device
+    );
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification \"{}\" with title \"Minutes\" sound name \"Blow\"",
+            body.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        match crate::engine_process::command("osascript")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(_) => tracing::debug!("device change notification sent"),
+            Err(e) => tracing::warn!("failed to send notification: {}", e),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("[minutes] {}", body);
+    }
+}
+
+/// An input device entry with both the canonical CPAL name and the
+/// human-readable label shown in diagnostics and device pickers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InputDeviceEntry {
+    /// Canonical device name as reported by CPAL. This is the string that
+    /// must be stored in `config.recording.device` so that capture can
+    /// match it back to a device later.
+    pub name: String,
+    /// Human-readable label (e.g. `"Ground Control (16000Hz, 1 ch)"`).
+    /// Suitable for UI display and `minutes devices` output.
+    pub label: String,
+}
+
+/// List available audio input devices with both canonical names and labels.
+///
+/// Prefer this over [`list_input_devices`] when building UIs or storing
+/// a device selection: save `name` into config, show `label` to the user.
+pub fn list_input_devices_detailed() -> Vec<InputDeviceEntry> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cached_default_host();
+    tracing::debug!(host_id = ?host.id(), "cpal host for input device listing");
+    let mut devices = Vec::new();
+
+    if let Ok(input_devices) = host.input_devices() {
+        for device in input_devices {
+            if let Ok(desc) = device.description() {
+                let name = desc.name().to_string();
+                let label = if let Ok(config) = device.default_input_config() {
+                    format!(
+                        "{} ({}Hz, {} ch)",
+                        name,
+                        config.sample_rate(),
+                        config.channels()
+                    )
+                } else {
+                    name.clone()
+                };
+                devices.push(InputDeviceEntry { name, label });
+            }
+        }
+    }
+
+    devices
+}
+
+/// List available audio input devices as decorated label strings.
+///
+/// Kept for backwards compatibility with existing diagnostics output
+/// (`minutes devices`, `minutes setup`). For UI pickers or any caller
+/// that will persist the selection, use [`list_input_devices_detailed`]
+/// so the canonical name can be stored separately from the label.
+pub fn list_input_devices() -> Vec<String> {
+    list_input_devices_detailed()
+        .into_iter()
+        .map(|entry| entry.label)
+        .collect()
+}
+
+/// Result of checking whether a configured input device is currently
+/// available on the host. Three-state because audio enumeration can
+/// itself fail (e.g. coreaudiod crashed mid-launch), and we don't want
+/// to clobber a real config based on a transient failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAvailability {
+    /// Device is present (or `name` is empty/whitespace, meaning "use default").
+    Available,
+    /// Enumeration succeeded and the device is definitely not present.
+    Missing,
+    /// Enumeration returned no devices at all — can't be sure.
+    Unknown,
+}
+
+/// Check whether a previously-configured input device name is currently
+/// resolvable. Empty/whitespace input is treated as "use default" and
+/// reported `Available`. Legacy decorated values like
+/// `"MacBook Pro Microphone (96000Hz, 1 ch)"` are accepted too —
+/// canonicalized via [`canonicalize_input_device_setting`] before lookup
+/// so older configs that persisted the picker label are not falsely
+/// flagged Missing.
+pub fn check_input_device_availability(name: &str) -> DeviceAvailability {
+    let Some(canonical) = canonicalize_input_device_setting(name) else {
+        return DeviceAvailability::Available;
+    };
+    let devices = list_input_devices_detailed();
+    if devices.is_empty() {
+        return DeviceAvailability::Unknown;
+    }
+    let matches = |entry: &InputDeviceEntry| {
+        entry.name == canonical || strip_device_format_suffix(entry.label.as_str()) == canonical
+    };
+    if devices.iter().any(matches) {
+        DeviceAvailability::Available
+    } else {
+        DeviceAvailability::Missing
+    }
+}
+
+/// Auto-heal a stale `recording.device` pin. Used at startup so that
+/// when a previously-pinned device (USB mixer, Bluetooth headset,
+/// virtual loopback) is unplugged before launch, we transparently fall
+/// back to the system default instead of failing recording start —
+/// historically a deterministic crash path on the desktop because the
+/// missing-device error reached call sites that aborted the process.
+///
+/// Returns `true` when the config was modified. Caller decides whether
+/// to persist (`Config::save`); leaving persistence to the caller keeps
+/// this function side-effect-free for tests.
+pub fn auto_heal_missing_recording_device(config: &mut crate::config::Config) -> bool {
+    let Some(name) = config
+        .recording
+        .device
+        .as_deref()
+        .map(|s| s.trim().to_string())
+    else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    match check_input_device_availability(&name) {
+        DeviceAvailability::Missing => {
+            tracing::warn!(
+                device = %name,
+                "configured recording.device is not available; clearing pin and falling back to system default. Re-pin via Settings when the device is reconnected."
+            );
+            config.recording.device = None;
+            true
+        }
+        DeviceAvailability::Available | DeviceAvailability::Unknown => false,
+    }
+}
+
+/// A device with its category for the `minutes sources` command.
+#[derive(Debug, Clone)]
+pub struct CategorizedDevice {
+    pub name: String,
+    pub category: DeviceCategory,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceCategory {
+    Microphone,
+    SystemAudio,
+    Virtual,
+}
+
+/// List audio input devices grouped by category.
+pub fn list_devices_categorized() -> Vec<CategorizedDevice> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cached_default_host();
+    let host_id = host.id();
+    tracing::debug!(host_id = ?host_id, "cpal host for categorized device listing");
+    let is_pipewire = is_pipewire_host(host_id);
+    let default_name = host
+        .default_input_device()
+        .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()))
+        .unwrap_or_default();
+
+    let mut devices = Vec::new();
+
+    if let Ok(input_devices) = host.input_devices() {
+        for device in input_devices {
+            let Ok(desc) = device.description() else {
+                continue;
+            };
+            let name = desc.name().to_string();
+            let (sample_rate, channels) = device
+                .default_input_config()
+                .map(|c| (c.sample_rate(), c.channels()))
+                .unwrap_or((0, 0));
+
+            // host.input_devices() already filters by supports_input, but we re-check
+            // supports_output here to detect Duplex devices (PipeWire sinks-as-inputs).
+            let supports_output = device.supports_output();
+            let category = categorize_device(&name, true, supports_output, is_pipewire);
+
+            devices.push(CategorizedDevice {
+                is_default: name == default_name,
+                name,
+                category,
+                sample_rate,
+                channels,
+            });
+        }
+    }
+
+    devices
+}
+
+/// Auto-detect a loopback/system-audio device for `--call` / `call = "auto"`.
+/// Returns the device name if found, None otherwise.
+pub fn detect_loopback_device() -> Option<String> {
+    let devices = list_devices_categorized();
+    devices
+        .into_iter()
+        .find(|d| d.category == DeviceCategory::SystemAudio)
+        .map(|d| d.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wav_bytes_are_identical_with_and_without_a_live_sidecar_sender() {
+        use std::sync::atomic::AtomicU64;
+        let dir = tempfile::tempdir().unwrap();
+        let samples: Vec<f32> = (0..48_000)
+            .map(|i| ((i as f32) * 0.01).sin() * 0.5)
+            .collect();
+
+        let record = |name: &str, live_tx: Option<crate::live_audio_coverage::LiveAudioSender>| {
+            let path = dir.path().join(name);
+            let count = Arc::new(AtomicU64::new(0));
+            let failed = Arc::new(AtomicBool::new(false));
+            let mut pump = CaptureWriterPump::start(
+                create_wav_writer(&path).unwrap(),
+                Arc::clone(&count),
+                Arc::clone(&failed),
+                live_tx,
+            );
+            pump.queue.push_samples(&samples);
+            // This checks WAV integrity, not stop latency. Hosted Windows file
+            // finalization can exceed the production two-second stop budget.
+            // The blocked-writer tests below exercise that deadline separately.
+            pump.finish_with_timeout(std::time::Duration::from_secs(15))
+                .unwrap();
+            assert!(!failed.load(Ordering::Acquire));
+            assert_eq!(count.load(Ordering::Relaxed), samples.len() as u64);
+            std::fs::read(path).unwrap()
+        };
+
+        // The pump drops chunks when a sidecar falls behind, by design. Room for
+        // every possible chunk keeps a slow runner's drain thread from turning
+        // that into a failure of this test, which is about WAV integrity.
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<crate::live_audio_coverage::AudioPacket>(samples.len());
+        let tx = crate::live_audio_coverage::LiveAudioSender::new(
+            tx,
+            crate::live_audio_coverage::AudioSource::Unknown,
+        );
+        let drain =
+            std::thread::spawn(move || rx.iter().map(|chunk| chunk.samples.len()).sum::<usize>());
+        let with_sidecar = record("with-sidecar.wav", Some(tx));
+        let forwarded = drain.join().unwrap();
+        let without_sidecar = record("without-sidecar.wav", None);
+
+        assert_eq!(forwarded, samples.len(), "the sender saw every sample");
+        assert_eq!(
+            with_sidecar, without_sidecar,
+            "the WAV must not depend on whether a sidecar consumer exists"
+        );
+        let reader = hound::WavReader::new(std::io::Cursor::new(&without_sidecar)).unwrap();
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        assert_eq!(reader.duration(), samples.len() as u32);
+    }
+
+    #[test]
+    fn wav_creation_preserves_existing_nonempty_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recording.wav");
+        std::fs::write(&path, b"previous recording").unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"previous recording");
+    }
+
+    #[test]
+    fn wav_creation_accepts_an_exclusive_empty_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reserved.wav");
+        #[cfg(windows)]
+        drop(crate::overlays::create_owner_only_staged_file(&path).unwrap());
+        #[cfg(not(windows))]
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            crate::overlays::secure_private_file_handle(&file).unwrap();
+        }
+        let mut writer = create_wav_writer(&path).unwrap();
+        writer.write_sample(123_i16).unwrap();
+        writer.finalize().unwrap();
+        let mut reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(reader.samples::<i16>().next().unwrap().unwrap(), 123);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wav_creation_refuses_a_public_empty_reservation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("public.wav");
+        std::fs::File::create(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn wav_creation_reuses_a_private_header_only_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leftover.wav");
+        let writer = create_wav_writer(&path).unwrap();
+        writer.finalize().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), WAV_HEADER_LEN);
+
+        let mut writer = create_wav_writer(&path).unwrap();
+        writer.write_sample(7_i16).unwrap();
+        writer.finalize().unwrap();
+        let mut reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(reader.len(), 1);
+        assert_eq!(reader.samples::<i16>().next().unwrap().unwrap(), 7);
+    }
+
+    #[test]
+    fn wav_creation_still_refuses_a_leftover_with_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recorded.wav");
+        let mut writer = create_wav_writer(&path).unwrap();
+        writer.write_sample(7_i16).unwrap();
+        writer.finalize().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn wav_creation_preserves_a_locked_header_only_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.wav");
+        create_wav_writer(&path).unwrap().finalize().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        drop(file);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wav_creation_preserves_a_public_header_only_leftover() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("public-header.wav");
+        create_wav_writer(&path).unwrap().finalize().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(create_wav_writer(&path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wav_is_private_while_recording_and_symlink_destination_is_refused() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.wav");
+        let writer = create_wav_writer(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let target = dir.path().join("untouched");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.path().join("link.wav");
+        symlink(&target, &link).unwrap();
+        assert!(create_wav_writer(&link).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"keep");
+        writer.finalize().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wav_has_owner_only_dacl_before_finalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.wav");
+        let writer = create_wav_writer(&path).unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        crate::overlays::attest_owner_only_file_handle(&file).unwrap();
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn transient_audio_write_failure_is_latched_and_preserves_sample_count() {
+        use std::io::{Cursor, Seek, SeekFrom, Write};
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        struct FailingWriter {
+            cursor: Cursor<Vec<u8>>,
+            writes_left: Arc<AtomicUsize>,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.writes_left.load(Ordering::Relaxed) == 0 {
+                    return Err(std::io::Error::other("injected storage failure"));
+                }
+                self.writes_left.fetch_sub(1, Ordering::Relaxed);
+                self.cursor.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Seek for FailingWriter {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.cursor.seek(position)
+            }
+        }
+        let writes_left = Arc::new(AtomicUsize::new(usize::MAX));
+        let mut writer = hound::WavWriter::new(
+            FailingWriter {
+                cursor: Cursor::new(Vec::new()),
+                writes_left: Arc::clone(&writes_left),
+            },
+            wav_spec_16k_mono(),
+        )
+        .unwrap();
+        writes_left.store(1, Ordering::Relaxed);
+        let count = AtomicU64::new(0);
+        let failed = AtomicBool::new(false);
+        write_capture_samples(&mut writer, &[0.1, 0.2, 0.3], &count, &failed);
+        assert!(failed.load(Ordering::Acquire));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        writes_left.store(100, Ordering::Relaxed);
+        write_capture_samples(&mut writer, &[0.4], &count, &failed);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "an intermittent failure must not resume silently"
+        );
+    }
+
+    #[test]
+    fn bounded_capture_queue_latches_overrun_without_losing_queued_prefix() {
+        let queue = CaptureWriteQueue::new(3);
+        queue.push_samples(&[1.0, 2.0, 3.0, 4.0]);
+        assert!(queue.overrun.load(Ordering::Acquire));
+        assert_eq!(queue.samples.len(), 3);
+        assert_eq!(queue.samples.pop(), Some(1.0));
+        queue.push_samples(&[5.0]);
+        assert_eq!(queue.samples.pop(), Some(2.0));
+        assert_eq!(queue.samples.pop(), Some(3.0));
+        assert!(queue.samples.is_empty(), "overrun must not silently resume");
+    }
+
+    #[test]
+    fn capture_writer_pump_drains_the_final_tail_before_finalization() {
+        use std::sync::atomic::AtomicU64;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail.wav");
+        let writer = create_wav_writer(&path).unwrap();
+        let count = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        let mut pump =
+            CaptureWriterPump::start(writer, Arc::clone(&count), Arc::clone(&failed), None);
+        let samples = vec![0.25_f32; 32_137];
+        pump.queue.push_samples(&samples);
+        let finish_started = Instant::now();
+        // Allow slow hosted filesystems to seal the file in this tail-integrity
+        // test; dedicated blocked-writer tests still enforce bounded stop.
+        pump.finish_with_timeout(std::time::Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+            panic!(
+                "capture writer stop failed: {error:?}; elapsed_us={}, accepted={}/{}, queued={}, storage_failed={}",
+                finish_started.elapsed().as_micros(),
+                count.load(Ordering::Relaxed),
+                samples.len(),
+                pump.queue.samples.len(),
+                failed.load(Ordering::Acquire),
+            )
+        });
+        assert!(!failed.load(Ordering::Acquire));
+        assert_eq!(count.load(Ordering::Relaxed), samples.len() as u64);
+        let reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(reader.duration(), samples.len() as u32);
+    }
+
+    #[test]
+    fn blocked_device_retirement_preserves_a_sealed_wav_and_pending_ownership() {
+        struct BlockedDevice(std::sync::mpsc::Receiver<()>);
+        impl Drop for BlockedDevice {
+            fn drop(&mut self) {
+                let _ = self.0.recv();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sealed.wav");
+        let samples = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        let mut pump =
+            CaptureWriterPump::start(create_wav_writer(&path).unwrap(), samples, failed, None);
+        pump.queue.push_samples(&vec![0.25; 1600]);
+        pump.finish().unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start = Instant::now();
+        assert!(!retire_resource_with_timeout(
+            BlockedDevice(blocked),
+            Arc::clone(&pending),
+            std::time::Duration::from_millis(10),
+        ));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert_eq!(hound::WavReader::open(&path).unwrap().duration(), 1600);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        while pending.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(retire_resource_with_timeout(
+            (),
+            pending,
+            std::time::Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn capture_writer_stop_deadline_does_not_wait_for_a_blocked_worker() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = blocked.recv();
+        });
+        let mut pump = CaptureWriterPump {
+            queue: Arc::new(CaptureWriteQueue::new(1)),
+            thread: Some(handle),
+        };
+        let start = Instant::now();
+        assert!(pump
+            .finish_with_timeout(std::time::Duration::from_millis(10))
+            .unwrap_err()
+            .storage_is_retiring());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(pump.queue.finished.load(Ordering::Acquire));
+        assert!(
+            pump.thread.is_none(),
+            "timeout must not join again during Drop"
+        );
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn capture_stop_deadline_also_bounds_wav_finalization() {
+        use std::io::{Cursor, Seek, SeekFrom, Write};
+        use std::sync::atomic::AtomicU64;
+        struct BlockedFlush {
+            cursor: Cursor<Vec<u8>>,
+            gate: Arc<AtomicBool>,
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Write for BlockedFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.cursor.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.gate.swap(false, Ordering::AcqRel) {
+                    self.entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(())
+            }
+        }
+        impl Seek for BlockedFlush {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.cursor.seek(position)
+            }
+        }
+        let gate = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = hound::WavWriter::new(
+            BlockedFlush {
+                cursor: Cursor::new(Vec::new()),
+                gate: Arc::clone(&gate),
+                entered: entered_tx,
+                release: release_rx,
+            },
+            wav_spec_16k_mono(),
+        )
+        .unwrap();
+        gate.store(true, Ordering::Release);
+        let mut pump = CaptureWriterPump::start(
+            writer,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        pump.queue.finished.store(true, Ordering::Release);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let started = Instant::now();
+        assert!(pump
+            .finish_with_timeout(std::time::Duration::from_millis(10))
+            .unwrap_err()
+            .storage_is_retiring());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn strip_device_format_suffix_strips_decorated_label() {
+        assert_eq!(
+            strip_device_format_suffix("Ground Control (16000Hz, 1 ch)"),
+            "Ground Control"
+        );
+        assert_eq!(
+            strip_device_format_suffix("MacBook Pro Microphone (48000Hz, 2 ch)"),
+            "MacBook Pro Microphone"
+        );
+    }
+
+    #[test]
+    fn strip_device_format_suffix_passes_through_bare_names() {
+        assert_eq!(
+            strip_device_format_suffix("Ground Control"),
+            "Ground Control"
+        );
+        assert_eq!(strip_device_format_suffix(""), "");
+    }
+
+    #[test]
+    fn strip_device_format_suffix_ignores_non_matching_parens() {
+        // Device names can legitimately contain parentheses; only the exact
+        // "(NHz, N ch)" format produced by list_input_devices should be
+        // stripped.
+        assert_eq!(
+            strip_device_format_suffix("USB Mic (rev 2)"),
+            "USB Mic (rev 2)"
+        );
+        assert_eq!(
+            strip_device_format_suffix("Mic (16000Hz, two ch)"),
+            "Mic (16000Hz, two ch)"
+        );
+        assert_eq!(
+            strip_device_format_suffix("Mic (abcHz, 1 ch)"),
+            "Mic (abcHz, 1 ch)"
+        );
+    }
+
+    #[test]
+    fn strip_device_format_suffix_roundtrips_list_output() {
+        // Anything list_input_devices_detailed produces as a label must
+        // strip back to the canonical name.
+        let entry = InputDeviceEntry {
+            name: "Ground Control".into(),
+            label: "Ground Control (16000Hz, 1 ch)".into(),
+        };
+        assert_eq!(strip_device_format_suffix(&entry.label), entry.name);
+    }
+
+    #[test]
+    fn canonicalize_input_device_setting_strips_picker_decoration() {
+        assert_eq!(
+            canonicalize_input_device_setting(" Ground Control (16000Hz, 1 ch) "),
+            Some("Ground Control".into())
+        );
+        assert_eq!(
+            canonicalize_input_device_setting("Ground Control"),
+            Some("Ground Control".into())
+        );
+        assert_eq!(canonicalize_input_device_setting("   "), None);
+    }
+
+    #[test]
+    fn meeting_audio_artifact_paths_include_stems_and_embeddings_sidecar() {
+        let markdown = Path::new("/tmp/meetings/2026-04-01-standup.md");
+        let artifacts = meeting_audio_artifact_paths(markdown);
+        let wav_path = markdown.with_extension("wav");
+        let wav_stems = stem_paths_for(&wav_path).expect("expected stem paths for meeting audio");
+        let mov_path = markdown.with_extension("mov");
+        let mov_stems =
+            stem_paths_for(&mov_path).expect("expected stem paths for native meeting audio");
+
+        assert_eq!(
+            artifacts,
+            vec![
+                wav_path,
+                wav_stems.voice,
+                wav_stems.system,
+                mov_path,
+                crate::voice::meeting_embeddings_sidecar_path(markdown),
+            ]
+        );
+        assert_eq!(
+            mov_stems.voice,
+            Path::new("/tmp/meetings/2026-04-01-standup.voice.wav")
+        );
+        assert_eq!(
+            mov_stems.system,
+            Path::new("/tmp/meetings/2026-04-01-standup.system.wav")
+        );
+    }
+
+    #[test]
+    fn is_system_audio_route_matches_known_name_regardless_of_host() {
+        // Fast path: a BlackHole-style name is recognized without needing to
+        // touch the pipewire-duplex fallback (and thus without needing a real
+        // cpal Host/device for the name to resolve on).
+        let host = cached_default_host();
+        assert!(is_system_audio_route(host, "BlackHole 2ch"));
+    }
+
+    #[test]
+    fn is_system_audio_route_rejects_unknown_name_on_non_pipewire_host() {
+        // Regression guard for the bug where a PipeWire Bluetooth/real
+        // speaker sink picked by detect_loopback_device() (via
+        // categorize_device's is_pipewire+Duplex check) was then rejected by
+        // this function because it only knew name patterns. On a host that
+        // ISN'T pipewire, an arbitrary device name must still be rejected —
+        // this function should not blanket-accept unknown names just because
+        // the pipewire fallback branch exists.
+        assert!(!is_system_audio_route(
+            cached_default_host(),
+            "__minutes_test_device_that_should_never_exist_12345__"
+        ));
+    }
+
+    #[test]
+    fn categorize_pipewire_sink_returns_system_audio() {
+        // PipeWire host: a sink (output device) appears in input_devices() with
+        // supports_output() == true. This is a "monitor source" and should be
+        // categorized as SystemAudio so users know they can record system audio
+        // from it.
+        let category = categorize_device(
+            "Built-in Audio Analog Stereo",
+            true, // supports_input (cpal already filtered)
+            true, // supports_output (the Duplex signal)
+            true, // is_pipewire
+        );
+        assert_eq!(category, DeviceCategory::SystemAudio);
+    }
+
+    #[test]
+    fn categorize_pipewire_real_microphone_returns_microphone() {
+        // PipeWire host: a real microphone (Audio/Source) only supports input.
+        let category = categorize_device(
+            "Built-in Audio Analog Mono",
+            true,
+            false, // input-only
+            true,
+        );
+        assert_eq!(category, DeviceCategory::Microphone);
+    }
+
+    #[test]
+    fn categorize_alsa_duplex_does_not_become_system_audio() {
+        // ALSA host: a USB headset that genuinely supports both directions on
+        // the same node. Without the host gate, this would be wrongly categorized
+        // as SystemAudio. This test pins the gate behavior — if it ever fails,
+        // someone removed the is_pipewire check and broke ALSA users.
+        let category = categorize_device(
+            "USB Headset Mono",
+            true,
+            true,
+            false, // NOT pipewire — this is the ALSA path
+        );
+        assert_eq!(category, DeviceCategory::Microphone);
+    }
+
+    #[test]
+    fn categorize_macos_camo_microphone_does_not_become_system_audio() {
+        // macOS-style false positive: Camo Microphone is a real mic that bridges
+        // to an iPhone, but CoreAudio reports it as Duplex (verified empirically
+        // on Mat's machine, see PLAN.md.cpal-pipewire-fix P2 results). The
+        // PipeWire-only gate prevents this false positive.
+        let category = categorize_device("Camo Microphone", true, true, false);
+        assert_eq!(category, DeviceCategory::Microphone);
+    }
+
+    #[test]
+    fn categorize_loopback_device_by_name_still_works() {
+        // Existing name-based heuristic still applies as a fallback.
+        let category = categorize_device("Descript Loopback Recorder", true, true, false);
+        assert_eq!(category, DeviceCategory::SystemAudio);
+    }
+
+    #[test]
+    fn categorize_virtual_device_by_name_still_works() {
+        let category = categorize_device("VirtualMicSomething", true, false, false);
+        assert_eq!(category, DeviceCategory::Virtual);
+    }
+
+    #[test]
+    fn categorize_blackhole_still_works() {
+        // BlackHole is an output-only loopback driver on macOS — supports_output
+        // is false from the input_devices() perspective in our existing setup,
+        // but the name heuristic catches it.
+        let category = categorize_device("BlackHole 2ch", true, false, false);
+        assert_eq!(category, DeviceCategory::SystemAudio);
+    }
+
+    #[test]
+    fn categorize_mmaudio_returns_system_audio() {
+        // MMAudio is a virtual loopback driver on macOS. Both the main device
+        // and the "(UI Sounds)" variant should be SystemAudio.
+        assert_eq!(
+            categorize_device("MMAudio Device", true, true, false),
+            DeviceCategory::SystemAudio
+        );
+        assert_eq!(
+            categorize_device("MMAudio Device (UI Sounds)", true, true, false),
+            DeviceCategory::SystemAudio
+        );
+    }
+
+    #[test]
+    fn categorize_loom_audio_device_returns_system_audio() {
+        // Loom installs LoomAudioDevice for screen-recording audio capture.
+        let category = categorize_device("LoomAudioDevice", true, true, false);
+        assert_eq!(category, DeviceCategory::SystemAudio);
+    }
+
+    #[test]
+    fn categorize_zoom_audio_device_returns_system_audio() {
+        // Zoom installs ZoomAudioDevice for screen-share audio capture.
+        let category = categorize_device("ZoomAudioDevice", true, true, false);
+        assert_eq!(category, DeviceCategory::SystemAudio);
+    }
+
+    #[test]
+    fn categorize_teams_audio_returns_system_audio() {
+        // Microsoft Teams installs "Microsoft Teams Audio" for call audio routing.
+        let category = categorize_device("Microsoft Teams Audio", true, true, false);
+        assert_eq!(category, DeviceCategory::SystemAudio);
+    }
+
+    #[test]
+    fn categorize_pulseaudio_monitor_source_returns_system_audio() {
+        // PulseAudio exposes monitor sources as separate Source devices with
+        // names ending in `.monitor`. They appear in input_devices() like real
+        // mics and were previously lumped into Microphone.
+        let category = categorize_device(
+            "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor",
+            true,
+            false, // PulseAudio Source has direction = Input, not Duplex
+            false, // not pipewire
+        );
+        assert_eq!(category, DeviceCategory::SystemAudio);
+    }
+
+    #[test]
+    fn core_audio_process_tap_route_counts_as_system_audio() {
+        assert!(is_system_audio_device_name(
+            crate::system_audio_backend::CORE_AUDIO_TAP_ROUTE_NAME
+        ));
+    }
+
+    #[test]
+    fn core_audio_tap_probe_route_does_not_require_loopback_device() {
+        let mut config = Config::default();
+        config.recording.capture_backend =
+            crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND.into();
+        config.recording.sources = Some(crate::config::SourcesConfig {
+            voice: Some("default".into()),
+            call: Some("auto".into()),
+        });
+
+        let route = resolve_system_audio_probe_device(&config).unwrap();
+
+        assert_eq!(
+            route.as_deref(),
+            Some(crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND)
+        );
+    }
+
+    #[test]
+    fn core_audio_tap_rejects_named_loopback_call_source() {
+        let mut config = Config::default();
+        config.recording.capture_backend =
+            crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND.into();
+        config.recording.sources = Some(crate::config::SourcesConfig {
+            voice: Some("default".into()),
+            call: Some("BlackHole 2ch".into()),
+        });
+
+        let error = resolve_system_audio_probe_device(&config).unwrap_err();
+
+        assert!(error.contains("call = \"auto\""));
+    }
+
+    #[test]
+    fn given_pocketstation_application_when_probe_route_resolves_then_value_is_preserved() {
+        let mut config = Config::default();
+        config.recording.capture_backend =
+            crate::system_audio_backend::POCKETSTATION_CAPTURE_BACKEND.into();
+        config.recording.sources = Some(crate::config::SourcesConfig {
+            voice: Some("default".into()),
+            call: Some("Zoom".into()),
+        });
+
+        let route = resolve_system_audio_probe_device(&config).unwrap();
+
+        assert_eq!(route.as_deref(), Some("Zoom"));
+    }
+
+    #[test]
+    fn given_pocketstation_auto_selection_when_probe_route_resolves_then_error_explains_choice() {
+        let mut config = Config::default();
+        config.recording.capture_backend =
+            crate::system_audio_backend::POCKETSTATION_CAPTURE_BACKEND.into();
+        config.recording.sources = Some(crate::config::SourcesConfig {
+            voice: Some("default".into()),
+            call: Some("auto".into()),
+        });
+
+        let error = resolve_system_audio_probe_device(&config).unwrap_err();
+
+        assert!(error.contains("application name"));
+    }
+
+    #[test]
+    fn categorize_camo_microphone_is_not_false_positive() {
+        // Critical regression test: Camo Microphone is a REAL microphone
+        // (via a 2-way iPhone bridge) that also reports as Duplex on macOS.
+        // None of the new hints should accidentally match it. If this test
+        // ever fails, someone added a hint that's too broad.
+        let category = categorize_device("Camo Microphone", true, true, false);
+        assert_eq!(category, DeviceCategory::Microphone);
+    }
+
+    #[test]
+    fn categorize_real_mic_named_with_monitor_substring_does_not_false_positive() {
+        // Edge case: a microphone named "Studio Monitor Microphone" or similar
+        // contains "monitor" but should NOT be SystemAudio. The PulseAudio
+        // pattern uses ".monitor" specifically (with the leading dot), so this
+        // should fall through to Microphone.
+        let category = categorize_device("Studio Monitor Microphone", true, false, false);
+        assert_eq!(category, DeviceCategory::Microphone);
+    }
+
+    #[test]
+    fn detect_call_app_matches_configured_processes() {
+        let running = vec![
+            "/Applications/Microsoft Teams.app/Contents/MacOS/Microsoft Teams".to_string(),
+            "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder".to_string(),
+        ];
+        let config = crate::config::CallDetectionConfig::default();
+
+        let detected = detect_call_app_from_processes(&running, &config);
+
+        assert_eq!(detected.as_deref(), Some("Teams"));
+    }
+
+    #[test]
+    fn evaluate_capture_preflight_blocks_plain_mic_for_call_intent() {
+        let config = Config::default();
+        let preflight = evaluate_capture_preflight(
+            CaptureMode::Meeting,
+            Some(RecordingIntent::Call),
+            Some("Teams".into()),
+            "Built-in Microphone".into(),
+            false,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(preflight.intent, RecordingIntent::Call);
+        assert!(!preflight.system_audio_ready);
+        assert!(preflight.blocking_reason.is_some());
+        assert_eq!(
+            preflight.blocking_kind,
+            Some(CapturePreflightBlockKind::CallRoute)
+        );
+    }
+
+    #[test]
+    fn evaluate_capture_preflight_allows_known_system_audio_route() {
+        let config = Config::default();
+        let preflight = evaluate_capture_preflight(
+            CaptureMode::Meeting,
+            Some(RecordingIntent::Call),
+            Some("Zoom".into()),
+            "BlackHole 2ch".into(),
+            false,
+            &config,
+        )
+        .unwrap();
+
+        assert!(preflight.system_audio_ready);
+        assert!(preflight.blocking_reason.is_none());
+        assert_eq!(preflight.blocking_kind, None);
+        assert!(!preflight.warnings.is_empty());
+    }
+
+    #[test]
+    fn evaluate_capture_preflight_honors_degraded_override() {
+        let config = Config::default();
+        let preflight = evaluate_capture_preflight(
+            CaptureMode::Meeting,
+            Some(RecordingIntent::Call),
+            Some("Meet".into()),
+            "Built-in Microphone".into(),
+            true,
+            &config,
+        )
+        .unwrap();
+
+        assert!(preflight.blocking_reason.is_none());
+        assert_eq!(preflight.blocking_kind, None);
+        assert!(preflight.allow_degraded);
+        assert!(!preflight.warnings.is_empty());
+    }
+
+    #[test]
+    fn permission_preflight_granted_meeting_has_no_warning_or_block() {
+        let preflight = evaluate_permission_preflight(
+            RecordingIntent::Room,
+            MacPermissionStatus::Granted,
+            MacPermissionStatus::Granted,
+            false,
+        );
+
+        assert!(preflight.blocking_reason.is_none());
+        assert_eq!(preflight.blocking_kind, None);
+        assert!(preflight.warnings.is_empty());
+    }
+
+    #[test]
+    fn permission_preflight_denied_meeting_blocks_with_mic_fix() {
+        let preflight = evaluate_permission_preflight(
+            RecordingIntent::Room,
+            MacPermissionStatus::Denied,
+            MacPermissionStatus::Granted,
+            false,
+        );
+
+        assert_eq!(
+            preflight.blocking_kind,
+            Some(CapturePreflightBlockKind::Permission)
+        );
+        let blocking_reason = preflight
+            .blocking_reason
+            .expect("denied mic should block meeting capture");
+        assert!(blocking_reason.contains("microphone permission"));
+        assert!(blocking_reason.contains("System Settings > Privacy & Security > Microphone"));
+        assert!(preflight.warnings.is_empty());
+    }
+
+    #[test]
+    fn permission_preflight_denied_system_only_call_warns_without_blocking() {
+        let preflight = evaluate_permission_preflight(
+            RecordingIntent::Call,
+            MacPermissionStatus::Denied,
+            MacPermissionStatus::Granted,
+            true,
+        );
+
+        assert!(preflight.blocking_reason.is_none());
+        assert_eq!(preflight.blocking_kind, None);
+        assert_eq!(preflight.warnings.len(), 1);
+        assert_eq!(preflight.warnings[0], MIC_PERMISSION_DEGRADED_CALL_WARNING);
+        assert!(!preflight.warnings[0].contains("would capture silence"));
+    }
+
+    #[test]
+    fn permission_preflight_denied_call_without_system_audio_blocks() {
+        let preflight = evaluate_permission_preflight(
+            RecordingIntent::Call,
+            MacPermissionStatus::Denied,
+            MacPermissionStatus::Granted,
+            false,
+        );
+
+        assert!(preflight.blocking_reason.is_some());
+        assert_eq!(
+            preflight.blocking_kind,
+            Some(CapturePreflightBlockKind::Permission)
+        );
+        assert!(preflight.warnings.is_empty());
+    }
+
+    #[test]
+    fn permission_preflight_not_determined_meeting_warns_without_blocking() {
+        let preflight = evaluate_permission_preflight(
+            RecordingIntent::Room,
+            MacPermissionStatus::NotDetermined,
+            MacPermissionStatus::Granted,
+            false,
+        );
+
+        assert!(preflight.blocking_reason.is_none());
+        assert_eq!(preflight.blocking_kind, None);
+        assert_eq!(preflight.warnings.len(), 1);
+        assert!(preflight.warnings[0].contains("not yet confirmed microphone access"));
+    }
+
+    #[test]
+    fn permission_preflight_stale_meeting_warns_without_blocking() {
+        let preflight = evaluate_permission_preflight(
+            RecordingIntent::Room,
+            MacPermissionStatus::StaleOrRestartNeeded,
+            MacPermissionStatus::Granted,
+            false,
+        );
+
+        assert!(preflight.blocking_reason.is_none());
+        assert_eq!(preflight.blocking_kind, None);
+        assert_eq!(preflight.warnings.len(), 1);
+        assert!(preflight.warnings[0].contains("not yet confirmed microphone access"));
+    }
+
+    #[test]
+    fn permission_preflight_screen_recording_denied_call_warns_only() {
+        let preflight = evaluate_permission_preflight(
+            RecordingIntent::Call,
+            MacPermissionStatus::Granted,
+            MacPermissionStatus::Denied,
+            true,
+        );
+
+        assert!(preflight.blocking_reason.is_none());
+        assert_eq!(preflight.blocking_kind, None);
+        assert_eq!(preflight.warnings.len(), 1);
+        assert!(preflight.warnings[0].contains("Screen Recording permission"));
+    }
+
+    #[test]
+    fn permission_preflight_preserves_call_mode_block_when_mic_is_granted() {
+        let config = Config::default();
+        let mut preflight = evaluate_capture_preflight(
+            CaptureMode::Meeting,
+            Some(RecordingIntent::Call),
+            Some("Teams".into()),
+            "Built-in Microphone".into(),
+            false,
+            &config,
+        )
+        .unwrap();
+        let original_blocking_reason = preflight.blocking_reason.clone();
+        let permission_preflight = evaluate_permission_preflight(
+            preflight.intent,
+            MacPermissionStatus::Granted,
+            MacPermissionStatus::Granted,
+            preflight.system_audio_ready,
+        );
+
+        if permission_preflight.blocking_reason.is_some() {
+            preflight.blocking_reason = permission_preflight.blocking_reason;
+        }
+        preflight.warnings.extend(permission_preflight.warnings);
+
+        assert_eq!(preflight.blocking_reason, original_blocking_reason);
+        assert!(preflight.blocking_reason.is_some());
+        assert_eq!(
+            preflight.blocking_kind,
+            Some(CapturePreflightBlockKind::CallRoute)
+        );
+    }
+
+    #[test]
+    fn native_call_capture_bypass_only_skips_call_route_blocks() {
+        let config = Config::default();
+        let mut preflight = evaluate_capture_preflight(
+            CaptureMode::Meeting,
+            Some(RecordingIntent::Call),
+            Some("Teams".into()),
+            "Built-in Microphone".into(),
+            false,
+            &config,
+        )
+        .unwrap();
+
+        assert!(should_bypass_preflight_block_for_native_call_capture(
+            &preflight, true
+        ));
+
+        preflight.blocking_kind = Some(CapturePreflightBlockKind::Permission);
+        preflight.blocking_reason = Some(MIC_PERMISSION_BLOCKING_MESSAGE.into());
+        assert!(!should_bypass_preflight_block_for_native_call_capture(
+            &preflight, true
+        ));
+
+        preflight.blocking_kind = None;
+        assert!(!should_bypass_preflight_block_for_native_call_capture(
+            &preflight, true
+        ));
+    }
+
+    #[test]
+    fn microphone_only_preflight_granted_has_no_warning_or_block() {
+        let preflight = evaluate_microphone_only_permission_preflight(MacPermissionStatus::Granted);
+
+        assert!(preflight.blocking_reason.is_none());
+        assert_eq!(preflight.blocking_kind, None);
+        assert!(preflight.warnings.is_empty());
+    }
+
+    #[test]
+    fn microphone_only_preflight_denied_blocks_with_permission_kind() {
+        let preflight = evaluate_microphone_only_permission_preflight(MacPermissionStatus::Denied);
+
+        assert_eq!(
+            preflight.blocking_kind,
+            Some(CapturePreflightBlockKind::Permission)
+        );
+        assert_eq!(
+            preflight.blocking_reason.as_deref(),
+            Some(MIC_PERMISSION_BLOCKING_MESSAGE)
+        );
+        assert!(preflight.warnings.is_empty());
+    }
+
+    #[test]
+    fn microphone_only_preflight_not_determined_warns_without_blocking() {
+        let preflight =
+            evaluate_microphone_only_permission_preflight(MacPermissionStatus::NotDetermined);
+
+        assert!(preflight.blocking_reason.is_none());
+        assert_eq!(preflight.blocking_kind, None);
+        assert_eq!(preflight.warnings.len(), 1);
+        assert!(preflight.warnings[0].contains("not yet confirmed microphone access"));
+    }
+
+    #[test]
+    fn native_call_capture_bypass_only_applies_to_call_auto_loopback_failure() {
+        let mut config = Config::default();
+        config.recording.sources = Some(crate::config::SourcesConfig {
+            voice: Some("default".into()),
+            call: Some("auto".into()),
+        });
+
+        let loopback_error =
+            CaptureError::Io(std::io::Error::other(MISSING_DUAL_SOURCE_LOOPBACK_MESSAGE));
+        assert!(should_bypass_loopback_preflight_for_native_call_capture(
+            RecordingIntent::Call,
+            true,
+            &config,
+            &loopback_error,
+        ));
+
+        assert!(!should_bypass_loopback_preflight_for_native_call_capture(
+            RecordingIntent::Room,
+            true,
+            &config,
+            &loopback_error,
+        ));
+
+        assert!(!should_bypass_loopback_preflight_for_native_call_capture(
+            RecordingIntent::Call,
+            false,
+            &config,
+            &loopback_error,
+        ));
+
+        config.recording.sources = Some(crate::config::SourcesConfig {
+            voice: Some("default".into()),
+            call: Some("BlackHole 2ch".into()),
+        });
+        assert!(!should_bypass_loopback_preflight_for_native_call_capture(
+            RecordingIntent::Call,
+            true,
+            &config,
+            &loopback_error,
+        ));
+
+        let different_error = CaptureError::Io(std::io::Error::other("different error"));
+        config.recording.sources = Some(crate::config::SourcesConfig {
+            voice: Some("default".into()),
+            call: Some("auto".into()),
+        });
+        assert!(!should_bypass_loopback_preflight_for_native_call_capture(
+            RecordingIntent::Call,
+            true,
+            &config,
+            &different_error,
+        ));
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn dual_source_slot_for_chunk_ignores_wall_clock_jitter() {
+        use crate::streaming::{AudioChunk, SourceRole};
+
+        let base = 40;
+        let first = AudioChunk {
+            samples: vec![0.0; 1600],
+            rms: 0.0,
+            timestamp: Instant::now(),
+            index: 7,
+            source: SourceRole::Voice,
+        };
+        let delayed = AudioChunk {
+            samples: vec![0.0; 1600],
+            rms: 0.0,
+            timestamp: Instant::now() + std::time::Duration::from_millis(175),
+            index: 7,
+            source: SourceRole::Call,
+        };
+
+        assert_eq!(dual_source_slot_for_chunk(base, &first), 47);
+        assert_eq!(dual_source_slot_for_chunk(base, &delayed), 47);
+    }
+
+    fn test_config() -> crate::config::RecordingConfig {
+        crate::config::RecordingConfig {
+            silence_reminder_secs: 10,
+            silence_threshold: 3,
+            silence_auto_stop_secs: 30,
+            max_duration_secs: 60,
+            min_disk_space_mb: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn safety_guard_no_action_when_audio_present() {
+        let config = test_config();
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        assert!(matches!(guard.check(50, false), SafetyAction::None));
+    }
+
+    #[test]
+    fn safety_guard_escalating_nudge_schedule() {
+        assert_eq!(nudge_threshold_secs(300, 0), 300);
+        assert_eq!(nudge_threshold_secs(300, 1), 900);
+        assert_eq!(nudge_threshold_secs(300, 2), 1800);
+        assert_eq!(nudge_threshold_secs(300, 3), 1800);
+    }
+
+    #[test]
+    fn safety_guard_suppresses_for_active_call() {
+        let config = test_config();
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"))
+            .with_intent(RecordingIntent::Call);
+        assert!(matches!(guard.check(0, true), SafetyAction::None));
+    }
+
+    #[test]
+    fn safety_guard_extend_resets_silence() {
+        let config = test_config();
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        guard.check(0, false);
+        assert!(guard.silence_start.is_some());
+        guard.extend();
+        assert!(guard.silence_start.is_none());
+        assert_eq!(guard.nudge_count, 0);
+    }
+
+    #[test]
+    fn safety_guard_audio_resume_resets_silence() {
+        let config = test_config();
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        guard.check(0, false);
+        assert!(guard.silence_start.is_some());
+        guard.check(50, false);
+        assert!(guard.silence_start.is_none());
+    }
+
+    #[test]
+    fn safety_guard_time_cap_warning_at_90_percent() {
+        let config = crate::config::RecordingConfig {
+            max_duration_secs: 10,
+            silence_reminder_secs: 0,
+            silence_auto_stop_secs: 0,
+            min_disk_space_mb: 0,
+            ..Default::default()
+        };
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        guard.recording_start = Instant::now() - std::time::Duration::from_secs(9);
+        let action = guard.check(50, false);
+        assert!(matches!(action, SafetyAction::Warning(_)));
+        assert!(guard.time_cap_warned);
+    }
+
+    #[test]
+    fn safety_guard_time_cap_stops_at_limit() {
+        let config = crate::config::RecordingConfig {
+            max_duration_secs: 10,
+            silence_reminder_secs: 0,
+            silence_auto_stop_secs: 0,
+            min_disk_space_mb: 0,
+            ..Default::default()
+        };
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        guard.recording_start = Instant::now() - std::time::Duration::from_secs(11);
+        guard.time_cap_warned = true;
+        let action = guard.check(50, false);
+        assert!(matches!(
+            action,
+            SafetyAction::Stop(StopReason::TimeCapReached, _)
+        ));
+    }
+
+    #[test]
+    fn native_time_and_disk_guard_warns_then_stops_without_silence_inference() {
+        let config = crate::config::RecordingConfig {
+            max_duration_secs: 10,
+            min_disk_space_mb: 0,
+            silence_reminder_secs: 1,
+            silence_auto_stop_secs: 1,
+            ..Default::default()
+        };
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        let warning_at = guard.recording_start + std::time::Duration::from_secs(9);
+        assert!(matches!(
+            guard.check_time_and_disk_at(warning_at),
+            SafetyAction::Warning(_)
+        ));
+        assert!(matches!(
+            guard.check_time_and_disk_at(warning_at),
+            SafetyAction::None
+        ));
+        assert!(guard.silence_start.is_none());
+        let expired_at = guard.recording_start + std::time::Duration::from_secs(10);
+        assert!(matches!(
+            guard.check_time_and_disk_at(expired_at),
+            SafetyAction::Stop(StopReason::TimeCapReached, _)
+        ));
+        let unlimited = crate::config::RecordingConfig {
+            max_duration_secs: 0,
+            min_disk_space_mb: 0,
+            ..config
+        };
+        let mut guard = RecordingSafetyGuard::new(&unlimited, Path::new("/tmp/test.wav"));
+        let much_later = guard.recording_start + std::time::Duration::from_secs(7201);
+        assert!(matches!(
+            guard.check_time_and_disk_at(much_later),
+            SafetyAction::None
+        ));
+    }
+
+    #[test]
+    fn native_time_and_disk_guard_stops_for_low_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::RecordingConfig {
+            max_duration_secs: 0,
+            min_disk_space_mb: u64::MAX,
+            ..Default::default()
+        };
+        let mut guard = RecordingSafetyGuard::new(&config, dir.path());
+        let disk_check_at = guard.last_disk_check + std::time::Duration::from_secs(61);
+        assert!(matches!(
+            guard.check_time_and_disk_at(disk_check_at),
+            SafetyAction::Stop(StopReason::DiskSpaceLow, _)
+        ));
+    }
+
+    #[test]
+    fn stem_size_guard_warns_once_then_stops_below_the_wav_limit() {
+        let mut guard = StemSizeGuard::new();
+        assert!(matches!(guard.check(1024), SafetyAction::None));
+        let stop_at = WAV_STEM_BYTE_LIMIT - STEM_STOP_HEADROOM_BYTES;
+        assert!(matches!(
+            guard.check(stop_at / 10 * 9),
+            SafetyAction::Warning(_)
+        ));
+        // The warning fires once.
+        assert!(matches!(
+            guard.check(stop_at / 10 * 9 + 1),
+            SafetyAction::None
+        ));
+        assert!(matches!(
+            guard.check(stop_at),
+            SafetyAction::Stop(StopReason::StemSizeLimit, _)
+        ));
+        // Two minutes of 96 kHz mono f32 still fit between the stop point and
+        // the header limit: far more than the 5 s check interval plus stop.
+        assert!(stop_at + 2 * 60 * 96_000 * 4 < WAV_STEM_BYTE_LIMIT);
+    }
+
+    #[test]
+    fn time_cap_warning_handles_large_configured_values() {
+        let config = crate::config::RecordingConfig {
+            max_duration_secs: u64::MAX,
+            min_disk_space_mb: 0,
+            ..Default::default()
+        };
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        assert!(matches!(guard.check_time_and_disk(), SafetyAction::None));
+    }
+
+    #[test]
+    fn safety_guard_disabled_when_zeros() {
+        let config = crate::config::RecordingConfig {
+            silence_reminder_secs: 0,
+            silence_auto_stop_secs: 0,
+            max_duration_secs: 0,
+            min_disk_space_mb: 0,
+            ..Default::default()
+        };
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"));
+        assert!(matches!(guard.check(0, false), SafetyAction::None));
+    }
+
+    #[test]
+    fn safety_guard_call_intent_doubles_auto_stop_threshold() {
+        let config = test_config();
+        let mut guard = RecordingSafetyGuard::new(&config, Path::new("/tmp/test.wav"))
+            .with_intent(RecordingIntent::Call);
+        guard.silence_start = Some(Instant::now() - std::time::Duration::from_secs(31));
+        let action = guard.check(0, false);
+        assert!(!matches!(
+            action,
+            SafetyAction::Stop(StopReason::Silence, _)
+        ));
+    }
+
+    #[test]
+    fn available_disk_space_returns_some_for_valid_path() {
+        let result = available_disk_space_mb(&std::env::temp_dir());
+        assert!(result.is_some());
+        assert!(result.unwrap() > 0);
+    }
+
+    // Skipped on Windows CI: calling cpal twice in the same process (here + health test)
+    // triggers STATUS_ACCESS_VIOLATION on runners without audio hardware.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn list_input_devices_returns_vec_of_strings() {
+        let devices = list_input_devices();
+        // Should return a Vec<String> (may be empty in CI, but must not panic)
+        assert!(devices.iter().all(|d| !d.is_empty()));
+    }
+
+    /// Round-trip: `set_preferred_host_id` is observable via `preferred_host_id`.
+    /// Uses a serial guard because `PREFERRED_HOST` is process-wide static and
+    /// other parallel tests could otherwise race the read/write.
+    #[test]
+    fn preferred_host_cache_round_trips() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+
+        let prior = preferred_host_id();
+        let id = cached_default_host().id();
+        set_preferred_host_id(id);
+        assert_eq!(preferred_host_id(), Some(id));
+
+        // Restore prior state so other tests see what they expect.
+        if let Some(p) = prior {
+            set_preferred_host_id(p);
+        } else {
+            // No public clear; overwrite with current default is fine for tests.
+            set_preferred_host_id(id);
+        }
+    }
+
+    #[test]
+    fn check_input_device_availability_treats_empty_as_available() {
+        assert_eq!(
+            check_input_device_availability(""),
+            DeviceAvailability::Available
+        );
+        assert_eq!(
+            check_input_device_availability("   "),
+            DeviceAvailability::Available
+        );
+    }
+
+    /// Older configs persisted the decorated picker label
+    /// (`"Name (NHz, N ch)"`) rather than the canonical CPAL name.
+    /// The availability check must canonicalize the input first or it
+    /// would falsely flag legitimate pins as Missing and clear them.
+    ///
+    /// Ignored on Windows: cpal's WASAPI host enumeration on GitHub
+    /// runners triggers `STATUS_ACCESS_VIOLATION` (0xc0000005) once
+    /// the per-process cpal call count crosses a small threshold.
+    /// Same convention as `list_input_devices_returns_vec_of_strings`.
+    /// macOS + Linux coverage is sufficient for this platform-agnostic
+    /// Rust behavior.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn check_input_device_availability_handles_decorated_pin() {
+        // Find an actually-available device on this host, then build a
+        // decorated form of its canonical name and verify the check
+        // accepts it. If enumeration returns nothing (CI sans audio),
+        // the test trivially passes — `Unknown` is also valid.
+        let devices = list_input_devices_detailed();
+        let Some(any) = devices.first() else {
+            return;
+        };
+        let decorated = format!(" {} (96000Hz, 1 ch) ", any.name);
+        assert_eq!(
+            check_input_device_availability(&decorated),
+            DeviceAvailability::Available,
+            "decorated form of an existing device should canonicalize and resolve"
+        );
+    }
+
+    #[test]
+    fn auto_heal_missing_recording_device_noop_when_unset() {
+        let mut config = crate::config::Config::default();
+        config.recording.device = None;
+        assert!(!auto_heal_missing_recording_device(&mut config));
+        assert!(config.recording.device.is_none());
+    }
+
+    #[test]
+    fn auto_heal_missing_recording_device_noop_when_empty_string() {
+        let mut config = crate::config::Config::default();
+        config.recording.device = Some(String::new());
+        assert!(!auto_heal_missing_recording_device(&mut config));
+        // Empty string is left as-is — caller can normalize separately.
+        // The healer only acts when there's a real pin that fails.
+        assert_eq!(config.recording.device, Some(String::new()));
+    }
+
+    /// Ignored on Windows: this test makes two back-to-back cpal
+    /// enumeration calls (one through `auto_heal`, one through
+    /// `check_input_device_availability`), and combined with other
+    /// cpal-driven tests in the same binary it pushes WASAPI on
+    /// GitHub runners over the threshold that triggers
+    /// `STATUS_ACCESS_VIOLATION`. Same convention as
+    /// `list_input_devices_returns_vec_of_strings`.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn auto_heal_missing_recording_device_clears_when_definitely_missing() {
+        // Use a device name that no real system would expose so the
+        // verdict is deterministic regardless of the test host's audio
+        // setup, but only act if enumeration actually returned devices
+        // (CI runners with no audio hardware get DeviceAvailability::Unknown
+        // and the healer correctly leaves the pin alone).
+        let mut config = crate::config::Config::default();
+        let bogus = "__minutes_test_device_that_should_never_exist_12345__";
+        config.recording.device = Some(bogus.to_string());
+
+        let changed = auto_heal_missing_recording_device(&mut config);
+        match check_input_device_availability(bogus) {
+            DeviceAvailability::Missing => {
+                assert!(changed, "should clear pin when device is missing");
+                assert!(
+                    config.recording.device.is_none(),
+                    "missing pin should be cleared"
+                );
+            }
+            DeviceAvailability::Unknown => {
+                assert!(!changed, "Unknown verdict must not modify config");
+                assert_eq!(config.recording.device.as_deref(), Some(bogus));
+            }
+            DeviceAvailability::Available => {
+                panic!("bogus device name unexpectedly available — test invariant violated");
+            }
+        }
+    }
+
+    /// Issue #189 regression guard. The desktop's recording entry
+    /// points (`start_recording`, `run_live_session`,
+    /// `start_dictation_session`) call `auto_heal_missing_recording_device`
+    /// against an in-memory `Config` clone; they must NOT persist the
+    /// healed config. Persistence is the startup-only concern handled
+    /// in `main.rs` so users keep their pin for when the device
+    /// reconnects on a future launch.
+    ///
+    /// This test confirms the function leaves persistence to the
+    /// caller by writing a config to disk, healing an in-memory copy
+    /// with a missing device, and verifying the on-disk config is
+    /// unchanged.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn auto_heal_in_memory_does_not_persist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+
+        // Write a config with a real-looking but missing device pin.
+        let bogus = "__minutes_test_device_that_should_never_exist_runtime__";
+        let original = format!(
+            "[recording]\ndevice = \"{}\"\nallow_degraded_call_capture = false\n",
+            bogus
+        );
+        std::fs::write(&path, &original).expect("write");
+
+        // Heal an in-memory copy.
+        let mut runtime = crate::config::Config::load_from(&path);
+        let result = check_input_device_availability(bogus);
+        let changed = auto_heal_missing_recording_device(&mut runtime);
+
+        // On hosts where enumeration returns Unknown, the test trivially
+        // passes — there's nothing to heal.
+        if matches!(result, DeviceAvailability::Unknown) {
+            assert!(!changed);
+            return;
+        }
+
+        // Otherwise: in-memory copy was modified, on-disk file was not.
+        assert!(changed, "should heal an in-memory missing pin");
+        assert!(runtime.recording.device.is_none());
+        let disk_after = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            disk_after.contains(bogus),
+            "on-disk config must still reference the original pin so users can reconnect later; runtime heal must NOT touch the file. Got:\n{}",
+            disk_after
+        );
+    }
+}
+
+#[cfg(all(test, feature = "streaming"))]
+mod source_gap_tests {
+    use super::{DualSlotStats, SOURCE_GAP_FAULT_SLOTS};
+
+    #[test]
+    fn a_source_that_dies_partway_is_caught_even_though_the_totals_look_healthy() {
+        // Issue #792 bug 6: the microphone delivered normally, then a default
+        // input device change killed it and it never recovered. The stem came
+        // out the right length and at exact digital zero, and nothing
+        // complained. Cumulative counts cannot see this, because most of the
+        // recording really was fine.
+        let mut stats = DualSlotStats::default();
+        for _ in 0..600 {
+            stats.record(true, true);
+        }
+        for _ in 0..600 {
+            stats.record(false, true);
+        }
+
+        assert_eq!(stats.both, 600, "the healthy half still counts as healthy");
+        assert_eq!(stats.system_only, 600);
+        assert_eq!(
+            stats.faults(),
+            vec![("voice", 60.0)],
+            "the 60s of silence after the device change must be reported"
+        );
+    }
+
+    #[test]
+    fn brief_absences_are_not_faults_and_do_not_accumulate_across_recoveries() {
+        // Jitter, a dropped buffer, a moment of rescheduling. A source that
+        // comes back is working, and repeated short gaps must not add up into
+        // a fault, or every long recording would report one.
+        let mut stats = DualSlotStats::default();
+        for _ in 0..20 {
+            for _ in 0..(SOURCE_GAP_FAULT_SLOTS - 1) {
+                stats.record(false, true);
+            }
+            stats.record(true, true);
+        }
+
+        assert!(
+            stats.faults().is_empty(),
+            "gaps that recover are not faults, however many of them there are"
+        );
+        assert_eq!(stats.voice_gap_longest, SOURCE_GAP_FAULT_SLOTS - 1);
+    }
+
+    #[test]
+    fn the_threshold_is_the_boundary_it_claims_to_be() {
+        let mut just_under = DualSlotStats::default();
+        for _ in 0..(SOURCE_GAP_FAULT_SLOTS - 1) {
+            just_under.record(false, true);
+        }
+        assert!(just_under.faults().is_empty());
+
+        let mut exactly_at = DualSlotStats::default();
+        for _ in 0..SOURCE_GAP_FAULT_SLOTS {
+            exactly_at.record(false, true);
+        }
+        assert_eq!(exactly_at.faults(), vec![("voice", 30.0)]);
+    }
+
+    #[test]
+    fn both_sources_can_fault_and_each_is_named() {
+        let mut stats = DualSlotStats::default();
+        for _ in 0..SOURCE_GAP_FAULT_SLOTS {
+            stats.record(false, true);
+        }
+        for _ in 0..SOURCE_GAP_FAULT_SLOTS {
+            stats.record(true, false);
+        }
+        assert_eq!(stats.faults(), vec![("voice", 30.0), ("system", 30.0)]);
+    }
+}
+
+#[cfg(all(test, feature = "streaming"))]
+mod stem_content_tests {
+    use super::{StemContent, STEM_CORRUPTION_NONZERO_RATIO};
+
+    fn stem(pattern: &[i16], repeats: usize) -> StemContent {
+        let mut content = StemContent::default();
+        for _ in 0..repeats {
+            content.record(pattern);
+        }
+        content
+    }
+
+    #[test]
+    fn the_reported_zero_stuffing_is_flagged() {
+        // #792 measured 7.9% to 10.7% nonzero on the corrupted system stems.
+        // One real sample followed by nine zeros is 10%, the middle of that.
+        let mut pattern = [0i16; 10];
+        pattern[0] = 4_000;
+        let content = stem(&pattern, 160);
+
+        assert_eq!(content.nonzero_ratio(), Some(0.1));
+        assert!(
+            content.looks_zero_stuffed(),
+            "a stem that is 10% audio is the failure this exists to catch"
+        );
+    }
+
+    #[test]
+    fn a_quiet_but_healthy_microphone_is_not_flagged() {
+        // The microphone stems in the same recordings measured 97% to 99.7%
+        // nonzero even where nobody was speaking, because a live input carries
+        // dither rather than exact zeros. Flagging those would make this
+        // warning worthless within a week.
+        let mut pattern = [1i16; 1000];
+        pattern[0] = 0;
+        pattern[1] = 0;
+        pattern[2] = 0;
+        let content = stem(&pattern, 4);
+
+        assert_eq!(content.nonzero_ratio(), Some(0.997));
+        assert!(!content.looks_zero_stuffed());
+    }
+
+    #[test]
+    fn a_completely_silent_stem_is_left_to_the_gap_counters() {
+        // All zeros is a source that never delivered, which is a different
+        // fault with a different message. Reporting it here as well would give
+        // the user two explanations for one problem, one of them wrong.
+        let content = stem(&[0i16; 100], 10);
+
+        assert_eq!(content.nonzero_ratio(), Some(0.0));
+        assert!(!content.looks_zero_stuffed());
+    }
+
+    #[test]
+    fn an_empty_stem_has_no_opinion() {
+        let content = StemContent::default();
+        assert_eq!(content.nonzero_ratio(), None);
+        assert!(!content.looks_zero_stuffed());
+    }
+
+    #[test]
+    fn the_threshold_is_the_boundary_it_claims_to_be() {
+        // Just under the threshold is corruption, at it is not, so the
+        // constant means what the doc comment says rather than being
+        // approximately right.
+        let under = StemContent {
+            written: 1000,
+            nonzero: (STEM_CORRUPTION_NONZERO_RATIO * 1000.0) as u64 - 1,
+        };
+        assert!(under.looks_zero_stuffed());
+
+        let at = StemContent {
+            written: 1000,
+            nonzero: (STEM_CORRUPTION_NONZERO_RATIO * 1000.0) as u64,
+        };
+        assert!(!at.looks_zero_stuffed());
+    }
+}

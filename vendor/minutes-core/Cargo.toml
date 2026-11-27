@@ -1,0 +1,113 @@
+# Vendored minutes-core: crates/core and crates/whisper-guard from
+# silverstein/minutes at 209265fac94763d45171acb284c258eff6718690, plus Margin's
+# patches (margin/UPSTREAM-PATCHES.md, DECISIONS.md D80). Everything below
+# [workspace.package] is upstream's root manifest at that commit, unchanged, so
+# the member crates' `*.workspace = true` keys resolve as they do upstream.
+[workspace]
+members = ["crates/core", "crates/whisper-guard"]
+resolver = "2"
+
+[workspace.package]
+version = "0.32.1"
+edition = "2021"
+license = "MIT"
+authors = ["Mat Silverstein"]
+description = "Conversation memory for AI assistants"
+repository = "https://github.com/silverstein/minutes"
+homepage = "https://useminutes.app"
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "1.0"
+toml_edit = "0.25"
+
+# Audio
+cpal = { version = "0.18.1", default-features = false, features = ["pipewire", "realtime"] }
+hound = "3.5"
+
+# Transcription
+# `tracing_backend` routes whisper.cpp + ggml C-level logs through the Rust
+# tracing subscriber so we can filter them like any other event. Without this,
+# the C `whisper_vad_detect_speech` line floods the user's terminal during a
+# recording (issue #163). Pair with `whisper_rs::install_logging_hooks()` at
+# process startup.
+whisper-rs = { version = "0.16", features = ["tracing_backend"] }
+
+# File watching
+notify = "8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Filesystem
+dirs = "7"
+walkdir = "2"
+which = "8"
+cap-std = "4.0.2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Signal handling
+ctrlc = "3"
+
+# HTTP client (for LLM API calls — no secrets in process args)
+ureq = { version = "3", features = ["json", "platform-verifier"] }
+
+# File locking (atomic PID file operations)
+fs2 = "0.4"
+
+# JSON Schema generation
+schemars = { version = "1", features = ["derive", "chrono04"] }
+
+# Compressed-audio decoding fallback used only when ffmpeg is unavailable.
+# Never linked into a decode that runs in this process: container probing can
+# allocate attacker-declared tables, so it is confined to the bounded
+# audio-decode worker child, which installs RLIMIT_AS before exec.
+symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "wav", "isomp4"] }
+
+# Noise reduction (pure Rust RNNoise port)
+nnnoiseless = { version = "0.5", default-features = false }
+
+# Channels (for streaming audio)
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+getrandom = "0.4"
+interprocess = "2.4.2"
+
+# Speaker diarization (native, no Python). Use the crates.io release so the
+# manifest stays `cargo publish`-able. The only known upstream bug (i16→f32
+# normalization + trailing-speech flush in get_segments) lives in a function we
+# deliberately bypass: diarize.rs runs its own ONNX segmentation via `ort` and
+# only consumes pyannote-rs's EmbeddingExtractor, which is byte-identical between
+# 0.3.4 and the old patched fork. See diarize.rs `segment_speech` / `get_segments`
+# comments. (Previously pinned to gregoire22enpc/pyannote-rs@ae9fbc1.)
+pyannote-rs = "0.3.4"
+
+# ONNX Runtime + ndarray (used directly for segmentation model — pyannote-rs
+# has a normalisation bug so we bypass get_segments for the segmentation step)
+ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
+# Runtime loader for the isolated sherpa plugin (#685).
+libloading = "0.9"
+ndarray = "0.16"
+
+# SQLite (relationship graph index)
+rusqlite = { version = "0.41", features = ["bundled", "hooks", "limits"] }
+
+# System locale detection (UI language "auto" resolution — see crate::i18n)
+sys-locale = "0.3"

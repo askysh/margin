@@ -1379,6 +1379,105 @@ The full comparison is in `docs/parity/app.md`.
 
 ## Silence, titles, search and summaries (26 Nov 2026, Grug round)
 
+### D80. A vendored minutes-core with patches, again
+- New fact (benchmark plan, docs/benchmark/2026-11-27-improvement-plan.md §1.3): the
+  next transcription and speaker gains need changes inside core: VAD and decoding
+  settings, the vocabulary prompt, the speaker count, short speaker tracks, RTTM output
+  and the speaker pipeline. Core has no settings for any of them.
+- Options: (a) wait for upstream; (b) a fork repository, as in D46; (c) the pristine
+  crates at the pinned commit, vendored into this repository, with a Cargo `[patch]`
+  pointing at them, and one commit per patch.
+- Pick: **(c)**. It needs no second repository, every patch is reviewable in this
+  repository's history, and the pin stays the same.
+  - `margin/vendor/minutes-core/` holds `crates/core` and `crates/whisper-guard` from
+    silverstein/minutes at `209265f`, unchanged in its first commit. It also holds the
+    files that core's build script and tests read from outside those crates: the calendar
+    helper sources, two test fixtures, `assets/demo.wav` and `mcp/src/index.ts`.
+  - Its root `Cargo.toml` is upstream's `[workspace.package]` and
+    `[workspace.dependencies]`, with only the two crates as members. Its `Cargo.lock` is
+    upstream's lock, pruned to those crates, so core's own tests build with upstream's
+    versions.
+  - `src-tauri/Cargo.toml` keeps both `minutes-core` lines on the upstream `rev` and adds
+    `[patch."https://github.com/silverstein/minutes"] minutes-core = { path = ... }`.
+    `Cargo.lock` then lists minutes-core and whisper-guard without a source.
+  - Every patch defaults to upstream's behaviour. Margin turns patches on in
+    `corecfg.rs`. Each patch has an entry in UPSTREAM-PATCHES.md (#25 onward), written
+    to be sent upstream as a pull request.
+- How to rebase onto a new upstream ref (docs/development.md, "Updating minutes-core"):
+  1. List Margin's patch commits: `git log --oneline -- margin/vendor/minutes-core`.
+  2. Run `scripts/bump-upstream.sh --no-build <ref>`. It moves the pin and re-seeds
+     `Cargo.lock`.
+  3. Replace `crates/core`, `crates/whisper-guard` and the extra files with the new
+     ref's copies, and commit that alone ("vendor pristine minutes-core <ref>").
+  4. Cherry-pick each patch commit in order, and fix any conflicts.
+  5. Run `cargo build` and `cargo test`. Cargo drops the source lines for the two
+     patched crates from the lock again.
+  6. A patch that upstream has merged is dropped. When none are left, delete
+     `margin/vendor/` and the `[patch]` table, and Margin is back on plain upstream.
+
+### D81. A Hindi + English model, from a file the user adds
+- New fact (Hinglish trial, 26 Nov 2026): Trelis/whisper-hinglish-preview (Apache-2.0),
+  converted to ggml, loads as a normal large-v3 model in stock whisper.cpp. On FLEURS
+  Hindi (25 clips) its WER was 12.1, against 20.8 for large-v3-turbo with language `hi`.
+  It writes Devanagari only, English words included.
+- Pick: a fourth transcription model, `hinglish`, "Hindi + English (Devanagari)". It is
+  for Hindi-heavy calls and is never the default.
+  - No public URL hosts the converted file. Margin offers no download: the model is ready
+    when `ggml-hinglish.bin` (q5_0, 1.08 GB) is in the models folder. A download attempt
+    says where to put the file (`models::fetch`, `local_only`).
+  - Margin refuses to select it until `ggml-hinglish.bin` is in the models folder and at
+    least 500 MB, so a half-copied file does not count. If the file goes missing, or
+    breaks, later, core transcribes with large-v3-turbo if installed, else small
+    (UPSTREAM-PATCHES #33). The fallback uses the user's language from before Hinglish
+    (auto-detect by default), not Hindi. A started recording says so once, and the
+    finished meeting says which model ran (D83). A missing file never blocks the other
+    downloads.
+  - While it is selected, the transcription language is `hi`. Auto-detect would let it
+    decide per window, and its output is Devanagari anyway. `save` remembers the
+    language from before (`language-before-hinglish` next to config.toml), and gives it
+    back when another model is chosen.
+  - Rolling transcription is off with it (`corecfg::rolling_supported`). Rolling pieces
+    must come from the final pass's model, and this one cannot keep up live.
+  - The live transcript uses Balanced (`small`), as with Best: the model is large-v3
+    sized, much slower than turbo. It runs with the user's language, not `hi` (D83).
+- Core needs no patch: it loads `models_dir/ggml-<model>.bin` for any name
+  (UPSTREAM-PATCHES #32 asks for a model file path and download spec).
+
+### D83. Hinglish: which language each model runs with, and what the notices say
+- New fact (review of D81, 27 Nov 2026): core read `transcription.language` (`hi`) where
+  the Hinglish model never runs: the live transcript, which uses `small`, and the process
+  trace of a meeting that fell back. The notice at Start named the fallback by Margin's
+  rule (the first non-empty file), but core skips a fallback that fails to load. And a
+  broken Hinglish file of 500 MB or more passes Margin's size check, so core fell back
+  with no word to the user.
+- Live transcript with Hinglish selected. Options: (a) `hi`, as the batch pass; (b) the
+  user's language from before Hinglish (auto-detect by default); (c) always auto-detect.
+  Pick **(b)**. `small` forced to `hi` writes poor Devanagari, and Margin's live view is
+  a draft that the batch pass replaces. (c) would detect Hindi windows and do the same.
+  The cost: Hindi speech shows as rough text in the live view until the final
+  transcript is in.
+- Rule in core (UPSTREAM-PATCHES #33): while `missing_model_fallbacks` is set, which
+  Margin does only with Hinglish, `language` belongs to `transcription.model` alone. Every
+  other whisper model, a fallback or the live model, runs with
+  `missing_model_fallback_language`. So the batch pass keeps `hi` with Hinglish, and a
+  fallback, the live transcript, dictation and the process trace get the user's language. With
+  every other model the fallback list is empty and core behaves as upstream.
+- Notices:
+  - At Start, with the file missing or under 500 MB: "Hindi + English model file is
+    missing or unreadable", "This meeting uses another installed model, language
+    <name>." It names no model, since only core knows which one loads.
+  - After processing: core writes `{step: transcribe, reason: model_fallback, message:
+    "used <model> because hinglish missing|empty|failed to load"}` into the meeting file.
+    With "Meeting ready", Margin shows "Hindi + English model failed to load" (or "file
+    was missing", "file was empty") and "This meeting used <model>." That covers a large
+    broken file. Like "Meeting ready", it comes only when the job enters a finished state,
+    not again when a finished job's view changes (a retitle).
+- Summary and title: with summary language "auto" they follow the transcription
+  language, so a Hinglish meeting is summarized in Hindi. After a fallback they follow
+  the language the fallback ran with, read from the meeting's `model_fallback` record
+  (core's pipeline summary and title, core's resummarize, which Margin's summaries use,
+  and Margin's title step in `summaries.rs`).
+
 ### D90. Lines Whisper makes up on silence are removed with the prompt echoes
 - New fact (Grug round H2): a 3-second near-silent recording came back as `[SPEAKER_1 0:00]
   [SYSTEM] Продолжение следует...` ("To be continued") and `...of royal descent in zoos across
@@ -1443,3 +1542,6 @@ The full comparison is in `docs/parity/app.md`.
   assistant's lead-in ("Based on the transcript...", "Here is...", "Sure..." and names a summary
   or overview), and a last line that offers more ("Let me know if..."). Nothing else in the
   summary changes.
+
+
+## minutes-core with Margin's patches (27 Nov 2026)

@@ -241,11 +241,24 @@ pub mod ops {
 
     pub fn start_recording(kind: Kind, title: Option<String>) -> Res<RecorderView> {
         let cfg = corecfg::load();
+        let mut fallback_notice = None;
+        if let Some(file) = models::missing_local_model(&cfg) {
+            if models::local_model_fallback(&cfg).is_none() {
+                return Err(format!("{} has no download. Copy its file to {}, or choose another model in Settings → Transcription.", file.label, file.dest.display()));
+            }
+            // Core transcribes with a fallback and its own language (corecfg pins
+            // missing_model_fallbacks and missing_model_fallback_language).
+            fallback_notice = Some(models::local_model_fallback_notice(&cfg, &file));
+        }
         if !models::ready_to_record(&cfg) {
             let missing: Vec<String> = models::required(&cfg).into_iter().filter(|f| !f.installed && !f.live).map(|f| f.label.to_lowercase()).collect();
             return Err(format!("Margin is still getting the {} model. Open Settings → Transcription to see the download.", missing.join(" and ")));
         }
         let view = recorder().start(kind, title)?;
+        // Once per recording: a refused or failed start says nothing yet.
+        if let Some(notice) = fallback_notice {
+            crate::events::notify(notice);
+        }
         // However the recording started, the window makes room for the call (D53).
         if prefs::load().recording_chip() {
             crate::events::emit(crate::events::SHRINK_TO_CHIP, ());

@@ -1,7 +1,9 @@
 # Upstream patches (candidates for PRs to silverstein/minutes)
 
 Each entry: what, why, where. Upstream merged #11 (transcript checkpoints). Nothing else
-here has been applied to upstream, and we work around each of the others locally.
+here has been applied to upstream. We work around #1–#24 locally. #25 onward are commits
+in Margin's vendored core, `margin/vendor/minutes-core` (DECISIONS.md D80). Each one is
+written to be sent upstream as a pull request, and each defaults to today's behaviour.
 
 ## 1. `voice::db_path()` should honour `MINUTES_DATA_DIR`
 - **Where:** `crates/core/src/voice.rs` `db_path()` (v0.32.1 ~line 135). It hardcodes
@@ -338,4 +340,193 @@ here has been applied to upstream, and we work around each of the others locally
 - **Patch:** after decoding, drop a segment whose normalized text is contained in the
   normalized prompt, or that contains the prompt's fixed sentence.
 - **Workaround:** `library::scrub_prompt_echo` removes the lines when a meeting is ready.
+
+## 25. VAD and decoding settings for the batch whisper pass
+- **Where:** `crates/core/src/config.rs` `TranscriptionConfig`; `transcribe.rs`
+  `transcribe_with_whisper` (new `apply_whisper_tuning`, `configured_vad_params`).
+- **Why:** `whisper_guard::default_whisper_params` always uses whisper.cpp's Silero
+  defaults (threshold 0.5, 250 ms shortest speech, 30 ms padding) and whisper.cpp's text
+  conditioning. On AMI, 77% of Margin's word errors are deletions, mostly short
+  backchannels that the VAD drops (docs/benchmark/2026-11-27-improvement-plan.md §1.3).
+  Hosts cannot tune any of it.
+- **Patch:** optional `transcription.vad_threshold`, `vad_min_speech_ms`,
+  `vad_min_silence_ms`, `vad_speech_pad_ms` and `n_max_text_ctx`, plus
+  `suppress_nst` (default false). A missing key keeps whisper.cpp's value, so existing
+  configs decode exactly as before. The fields are part of `TranscriptionConfig`'s
+  `Debug` output, so transcript checkpoints made with other values are not reused.
+- **Caveat for the PR:** whisper.cpp passes the initial prompt through the same buffer as
+  the earlier text. `n_max_text_ctx = 0` therefore also drops the vocabulary prompt. The
+  doc comment says so.
+- **Tests:** `transcribe::tests::vad_tuning_is_absent_by_default_and_follows_the_config`.
+
+## 26. An opt-in bare-term vocabulary prompt (measured worse; off by default)
+- **Where:** `crates/core/src/transcribe.rs` `DecodeHints::whisper_terms_prompt` and
+  `transcribe_with_whisper`; `config.rs` `transcription.prompt_terms_only`.
+- **Why:** Whisper's prompt is earlier transcript text that conditions spelling and
+  style. It does not follow the instruction in "Names and terms that may appear in this
+  audio: … Preserve spelling exactly when heard.", and reads that sentence back on noise
+  (Margin D71, #24).
+- **Measured (AMI, large-v3-turbo; Margin D82):** the bare list `"AMI ES2004a final,
+  <user name>"` raised WER from 26.6% to 30.3% on ES2004a (insertions 33 → 89) and from
+  26.2% to 26.7% on TS3003a. An unpunctuated list conditions unpunctuated, fragmented
+  output and repeated phrases. So the sentence stays the default, and
+  `prompt_terms_only = true` is only for experiments.
+- **Tests:** `transcribe::tests::decode_hints_build_whisper_prompt` checks both prompts.
+
+## 27. A speaker-count range for diarization, and a cap from the calendar
+- **Where:** `crates/core/src/config.rs` `DiarizationConfig`; `diarize_tracks.rs`
+  `cluster_embeddings` (`SpeakerBounds`); `diarize_legacy.rs` (`cap_template_clusters`);
+  `pipeline.rs` (`config_with_attendee_speaker_cap`, at both diarization call sites).
+- **Why:** clustering stops at a fixed cosine threshold and knows nothing about how many
+  people were there. On AMI ES2004a, community-1 found 5 speakers for 4 people. The
+  matched calendar event already tells core who was invited.
+- **Patch:** `diarization.max_speakers` and `min_speakers` (both optional) and
+  `max_speakers_from_attendees` (default false).
+  - community-1: the agglomeration stops above the threshold once at the minimum. Above
+    the maximum after the threshold pass, it queues the remaining clusters' compatible
+    pairs (k²/2 for k clusters, never one per observation pair) and keeps merging. When
+    only same-window pairs are left, the closest clusters merge anyway, because the count
+    was asked for.
+  - legacy: the closest template clusters merge down to the maximum.
+  - With `max_speakers_from_attendees`, the cap is the attendees plus one, or
+    `max_speakers` if that is smaller. The count comes from the job's calendar event when
+    it has one, else from the attendee list saved with the transcript, with combined
+    entries ("Gert and Liam", "Bo & Cy") split.
+- **Tests:** `diarize_tracks::tests::a_maximum_*`, `a_minimum_stops_merging_above_the_threshold`;
+  `diarize_legacy::tests::template_clusters_merge_closest_first_down_to_the_cap`;
+  `pipeline::tests::the_attendee_cap_is_attendees_plus_one_and_never_raises_max_speakers`.
+
+## 28. Give short community-1 tracks a speaker instead of `UNKNOWN`
+- **Where:** `crates/core/src/diarize.rs` `diarize_with_pyannote_rs`; `diarize_tracks.rs`
+  `attach_short_tracks`; `config.rs` `diarization.attach_unknown`.
+- **Why:** a local track with under 1.5 s of clean audio is not clustered and is labelled
+  `UNKNOWN`. That covers most backchannels: 64 `UNKNOWN` lines in Margin's ES2004a
+  transcript.
+- **Patch:** with `attach_unknown` (default false), such a track takes:
+  1. the speaker of the nearest clustered speech on both sides, when it is the same
+     speaker and each side is within 1 s;
+  2. else the nearest cluster to an embedding of its own clean audio (when it has at least
+     0.5 s), if the similarity is above the clustering threshold;
+  3. else stays `UNKNOWN`.
+
+  It never takes a speaker that another clustered track of the same window has, since
+  the segmentation model separated them. An attached track is recorded as speech of its
+  label with no embedded audio. When a label's attached speech is more than 10% of its
+  speech, it is reported as uncovered, so voice matching's coverage guard
+  (`diarize::segment_covers_its_speech`) does not auto-name that label. Up to 10%, naming
+  stays possible. The default path keeps upstream's strict guard. A short track whose
+  embedding comes back invalid is skipped, not an error.
+- **Tests:** `diarize_tracks::tests::a_short_track_*` (3 tests).
+
+## 29. Write the raw diarization as RTTM
+- **Where:** `crates/core/src/diarize.rs` (`segments_to_rttm`, `write_meeting_rttm`);
+  `pipeline.rs`, next to the meeting embeddings sidecar, after any title rename;
+  `config.rs` `diarization.write_rttm`.
+- **Why:** transcript lines are a poor stand-in for speaker turns: no overlap, and a line
+  runs until the next one. Scoring tools (pyannote.metrics, dscore, md-eval) read RTTM.
+- **Patch:** with `write_rttm` (default false), `<meeting>.diarization.rttm` sits beside
+  the meeting `.md`, one `SPEAKER <file> 1 <start> <dur> <NA> <NA> <spk> <NA> <NA>` line
+  per segment. The first line is the comment `;; written by Margin`. Core replaces only a
+  regular file (not a symlink) that starts with that line. It writes a 0600 temp file
+  and renames it into place. The temp name is unique per write
+  (`<target>.<pid>-<n>.tmp`), and only files of exactly that shape left more than a minute
+  ago are cleaned up. The marker check reads 64 bytes. A foreign file is
+  logged and left alone. The name is core's own, so a user's `<meeting>.rttm` is never
+  touched. RTTMs from Margin's first round of builds have no marker and count as foreign.
+  Those builds never shipped.
+- **Tests:** `diarize::tests::rttm_has_one_speaker_line_per_segment_and_skips_empty_ones`,
+  `the_rttm_has_its_own_private_name_beside_the_meeting`.
+
+## 30. A fuller community-1 pipeline: overlapping windows and frame aggregation
+- **Where:** `crates/core/src/diarize.rs` (`segmentation_classes`, `diarize_community_full`);
+  `diarize_tracks.rs` (`decode_window_slots`, `aggregate_windows`); `config.rs`
+  `diarization.speaker_pipeline`.
+- **Why:** core's community-1 path uses non-overlapping 10 s windows and labels each local
+  track on its own. pyannote's pipeline slides the window, clusters every window's local
+  speakers, and decides each frame from all the windows that cover it.
+- **Patch:** `speaker_pipeline = "full"` (default `"simplified"`):
+  - a 10 s window every 2.5 s, longer steps when needed to stay within clustering's
+    observation budget;
+  - an embedding per local speaker with at least 1 s of clean audio;
+  - the existing centroid agglomeration, with the configured threshold and bounds;
+  - per frame, the speaker count is the rounded mean count of active local speakers
+    over the covering windows, and the frame goes to that many speakers with the most
+    votes.
+
+  No VBx: it needs PLDA parameters that the ONNX model set does not include. The value
+  is read without regard to case. An unknown value is logged and means "simplified".
+  Each observation reports its whole track as speech. Aggregated speech that no observed
+  track covers, compared on the same frame grid, is reported as uncovered, so the
+  voice-matching coverage guard holds and a fully embedded speaker can still be named.
+- **Tests:** `diarize_tracks::tests::decoding_keeps_each_tracks_local_slot`,
+  `aggregation_votes_across_overlapping_windows_and_keeps_overlap`.
+
+## 31. The summary prompt forbids a lead-in and a closing offer
+- **Where:** `crates/core/src/summarize.rs` `build_base_system_prompt`.
+- **Why:** small local models (qwen3.5:4b) open with "Based on the transcript provided,
+  here is a structured summary…" and close with "Let me know if…". Those lines land in
+  the meeting note.
+- **Patch:** `summarization.no_lead_in` (default false: upstream's prompt). When it is
+  on, one paragraph goes before the format block: start with the TITLE line, end with the
+  last section, nothing before or after. Margin turns it on (`corecfg.rs`) and also
+  strips such lines afterwards.
+- **Tests:** `summarize::tests::the_system_prompt_forbids_a_lead_in_and_a_closing_offer`.
+
+## 32. A model that is not one of ggerganov's files
+- **Where:** `crates/core/src/health.rs` (~line 353) and `transcribe.rs` resolve
+  `model_path/ggml-{model}.bin`. The CLI's setup downloads only from
+  `huggingface.co/ggerganov/whisper.cpp`.
+- **Why:** fine-tuned whisper models, such as Trelis/whisper-hinglish-preview converted
+  to ggml, load in stock whisper.cpp. A host can offer one only by naming the file
+  `ggml-<id>.bin` and handling the download itself.
+- **Patch:** an optional `transcription.model_file` (a path), used instead of the derived
+  name when set, and a `ModelSpec` with a URL and checksum in the download API from #2.
+- **Workaround:** Margin's "hinglish" model id (DECISIONS.md D81) expects
+  `ggml-hinglish.bin` in the models folder and offers no download.
+
+## 33. Fallback models for a missing model file
+- **Where:** `crates/core/src/transcribe.rs` `load_whisper_context`, `ModelFallback`,
+  `FilterStats::model_fallback`; `config.rs` `transcription.missing_model_fallbacks`,
+  `missing_model_fallback_language`, `TranscriptionConfig::language_for`,
+  `Config::live_language`; `pipeline.rs` (both writers of `processing_warnings`);
+  `live_transcript.rs`, `apple_speech_shadow.rs`; `process_trace.rs` `update_language`;
+  `dictation.rs`; `source_transcript.rs` (merges the record of both tracks); `summarize.rs`
+  `config_for_transcript`; `resummarize.rs`.
+- **Why:** a host that offers a model it cannot download (#32) needs the meeting
+  transcribed anyway when the file goes missing, without rewriting the user's choice.
+- **Patch:** `missing_model_fallbacks: Vec<String>` (default empty, which keeps upstream's
+  error). When `model`'s file is missing, empty or fails to load, the next entry that
+  loads is used, with a warning.
+  - **Language.** With fallbacks set, `language` belongs to `model` alone. Every other
+    model runs with `missing_model_fallback_language` (default `None`: detect): a
+    fallback, the live transcript's model, whatever the live backend, and dictation
+    (`Config::dictation_language`). The process
+    trace records the fallback's language. With no fallbacks, every reader gets
+    `language`, as upstream.
+  - **Record.** The meeting file gets a processing warning
+    `{step: transcribe, reason: model_fallback, message: "used <model> because <model>
+    missing|empty|failed to load"}`, and `status: degraded`, as for `engine_fallback`.
+    It travels in `FilterStats::model_fallback` from the model load to both pipeline
+    paths. `ModelFallback::from_warning` / `recorded_in` read it back, so a host need not
+    parse the message.
+  - **Summary.** An `"auto"` summary language follows `transcription.language`
+    (`summarize::get_effective_summary_language`). After a fallback the transcript is in
+    the fallback's language, so `summarize::config_for_transcript` gives the summary
+    `language_for(<model that ran>)`: the summary and the LLM title in the pipeline
+    (both paths; `title_generation_decision` takes the fallback), and
+    `resummarize_meeting`, which reads the meeting's `model_fallback` record. Without a
+    fallback the config is passed through unchanged.
+- **Tests:** `transcribe::tests::missing_empty_or_broken_models_fall_back_with_the_fallback_language`,
+  `the_process_trace_records_the_fallback_language`, `a_model_fallback_warning_reads_back`,
+  `chunk_stats_keep_the_model_fallback`;
+  `pipeline::tests::the_meeting_file_records_which_fallback_model_transcribed`;
+  `summarize::tests::an_auto_summary_follows_the_language_of_the_model_that_transcribed`;
+  `resummarize::tests::after_a_model_fallback_the_summary_language_follows_the_fallback`;
+  `pipeline::tests::the_llm_title_follows_the_language_of_the_model_that_transcribed`;
+  `config::tests::dictation_gets_the_language_only_when_it_runs_the_configured_model`;
+  `config::tests::without_fallbacks_every_model_and_the_live_transcript_keep_the_language`,
+  `with_fallbacks_only_the_configured_model_gets_the_language`;
+  `live_transcript::tests::the_live_transcript_beside_a_hinglish_model_uses_the_fallback_language`.
+  The tests that load a model need `MINUTES_TEST_WHISPER_MODEL`, the path of a real ggml
+  model, and return early without it.
 

@@ -109,6 +109,12 @@ pub fn start(call: bool, wav: &Path, title: Option<String>) -> Option<Session> {
         tracing::info!("rolling transcription off: \"Transcribe during the meeting\" is off in Settings");
         return None;
     }
+    if !corecfg::rolling_supported(&cfg.transcription.model) {
+        // Pieces from a lighter model would not match the final pass, and core would
+        // transcribe their ranges again (D81).
+        tracing::info!(model = %cfg.transcription.model, "rolling transcription off: this model is too slow to keep up live");
+        return None;
+    }
     let model = crate::paths::models_dir().join(format!("ggml-{}.bin", cfg.transcription.model));
     if !model.exists() {
         tracing::info!(model = %cfg.transcription.model, "rolling transcription off: the model is not installed yet");
