@@ -389,6 +389,15 @@ pub struct TranscriptionConfig {
     pub vad_min_silence_ms: Option<u32>,
     /// Audio kept on each side of a speech run, in ms. `None`: whisper.cpp's 30.
     pub vad_speech_pad_ms: Option<u32>,
+    /// How far above the adaptive noise floor a 100 ms window must be to count
+    /// as speech when a meeting is split into chunks for whisper. Audio between
+    /// chunks is never transcribed, so a lower value keeps quieter speech.
+    /// Default 4.0, as upstream. Values that are not finite and positive mean 4.0.
+    pub meeting_chunk_noise_multiplier: f32,
+    /// Audio added on each side of every meeting chunk, in ms, so a word that
+    /// starts below the speech threshold is not cut. Chunks that then overlap
+    /// are merged, so no audio is transcribed twice. Default 0, as upstream.
+    pub meeting_chunk_pad_ms: u32,
     /// Tokens of earlier text that whisper conditions each 30 s window on.
     /// `None` keeps whisper.cpp's default (16384, capped at half the model's
     /// text context). `0` turns the conditioning off, so an error or a
@@ -1872,6 +1881,8 @@ impl Default for TranscriptionConfig {
             vad_min_speech_ms: None,
             vad_min_silence_ms: None,
             vad_speech_pad_ms: None,
+            meeting_chunk_noise_multiplier: 4.0,
+            meeting_chunk_pad_ms: 0,
             n_max_text_ctx: None,
             suppress_nst: false,
             prompt_terms_only: false,

@@ -1120,7 +1120,7 @@ pub(crate) fn transcribe_meeting_samples(
     const MIN_MEETING_CHUNKS: usize = 2;
 
     let audio_duration_secs = samples.len() as f64 / 16000.0;
-    let vad_chunks = detect_meeting_vad_chunks(samples);
+    let vad_chunks = detect_meeting_vad_chunks(samples, MeetingChunking::from_config(config));
 
     if vad_chunks.len() < MIN_MEETING_CHUNKS {
         return transcribe_dispatch(audio_path, config, hints);
@@ -2641,15 +2641,84 @@ fn decode_with_ffmpeg_binary(
 // resample() and normalize_audio() are provided by whisper_guard::audio
 // and re-exported at the top of this file.
 
-pub(crate) fn detect_meeting_vad_chunks(samples: &[f32]) -> Vec<(usize, usize)> {
+const MEETING_CHUNK_MAX_SAMPLES: usize = 16_000 * 45;
+
+/// How [`detect_meeting_vad_chunks`] splits a meeting: `transcription.
+/// meeting_chunk_noise_multiplier` and `meeting_chunk_pad_ms`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MeetingChunking {
+    noise_multiplier: f32,
+    pad_samples: usize,
+}
+
+impl Default for MeetingChunking {
+    fn default() -> Self {
+        Self {
+            noise_multiplier: 4.0,
+            pad_samples: 0,
+        }
+    }
+}
+
+impl MeetingChunking {
+    pub(crate) fn from_config(config: &Config) -> Self {
+        let multiplier = config.transcription.meeting_chunk_noise_multiplier;
+        Self {
+            noise_multiplier: if multiplier.is_finite() && multiplier > 0.0 {
+                multiplier
+            } else {
+                Self::default().noise_multiplier
+            },
+            pad_samples: config.transcription.meeting_chunk_pad_ms as usize * 16,
+        }
+    }
+}
+
+pub(crate) fn detect_meeting_vad_chunks(
+    samples: &[f32],
+    chunking: MeetingChunking,
+) -> Vec<(usize, usize)> {
+    let chunks = detect_energy_chunks(samples, chunking.noise_multiplier);
+    pad_meeting_chunks(chunks, chunking.pad_samples, samples.len())
+}
+
+/// Widens each chunk by `pad` on both sides, within `0..len`. Chunks that then
+/// overlap are merged, unless the merge would pass the 45 s chunk limit: then
+/// they meet halfway between the original chunks. No sample is in two chunks,
+/// and chunks stay in order.
+fn pad_meeting_chunks(chunks: Vec<(usize, usize)>, pad: usize, len: usize) -> Vec<(usize, usize)> {
+    if pad == 0 {
+        return chunks;
+    }
+    let mut padded: Vec<(usize, usize)> = Vec::with_capacity(chunks.len());
+    let mut previous_end = 0;
+    for (start, end) in chunks {
+        let (padded_start, padded_end) = (start.saturating_sub(pad), end.saturating_add(pad).min(len));
+        match padded.last_mut() {
+            Some(last) if padded_start < last.1 => {
+                if padded_end - last.0 <= MEETING_CHUNK_MAX_SAMPLES {
+                    last.1 = padded_end;
+                } else {
+                    let meet = previous_end + (start - previous_end) / 2;
+                    last.1 = meet;
+                    padded.push((meet, padded_end));
+                }
+            }
+            _ => padded.push((padded_start, padded_end)),
+        }
+        previous_end = end;
+    }
+    padded
+}
+
+fn detect_energy_chunks(samples: &[f32], noise_multiplier: f32) -> Vec<(usize, usize)> {
     const SAMPLE_RATE: usize = 16_000;
     const WINDOW_SAMPLES: usize = 1_600; // 100ms
     const ROTATE_SILENCE_MS: u64 = 800;
     const MIN_CHUNK_SAMPLES: usize = SAMPLE_RATE; // 1s
-    const MAX_CHUNK_SAMPLES: usize = SAMPLE_RATE * 45;
+    const MAX_CHUNK_SAMPLES: usize = MEETING_CHUNK_MAX_SAMPLES;
     const NOISE_FLOOR_MIN: f32 = 0.0001;
     const NOISE_FLOOR_MAX: f32 = 0.02;
-    const NOISE_MULTIPLIER: f32 = 4.0;
     const HANGOVER_CHUNKS: u32 = 5;
     const ADAPT_RATE: f32 = 0.02;
 
@@ -2675,7 +2744,7 @@ pub(crate) fn detect_meeting_vad_chunks(samples: &[f32]) -> Vec<(usize, usize)> 
             / window.len().max(1) as f64)
             .sqrt() as f32;
 
-        let threshold = noise_floor * NOISE_MULTIPLIER;
+        let threshold = noise_floor * noise_multiplier;
         if rms > threshold {
             speaking = true;
             hangover_remaining = HANGOVER_CHUNKS;
@@ -5764,12 +5833,89 @@ mod tests {
         samples.extend(constant_samples(2, 0.0));
         samples.extend(constant_samples(2, 0.05));
 
-        let chunks = detect_meeting_vad_chunks(&samples);
+        let chunks = detect_meeting_vad_chunks(&samples, MeetingChunking::default());
         assert_eq!(
             chunks.len(),
             2,
             "expected split around long silence: {chunks:?}"
         );
+    }
+
+    fn loud_silence_loud() -> Vec<f32> {
+        let mut samples = constant_samples(2, 0.05);
+        samples.extend(constant_samples(2, 0.0));
+        samples.extend(constant_samples(2, 0.05));
+        samples
+    }
+
+    #[test]
+    fn default_meeting_chunking_is_upstreams() {
+        assert_eq!(MeetingChunking::from_config(&Config::default()), MeetingChunking::default());
+        // Upstream's chunks for this signal: the hangover keeps 500 ms after the
+        // first burst, and the second runs to the end.
+        assert_eq!(
+            detect_meeting_vad_chunks(&loud_silence_loud(), MeetingChunking::default()),
+            vec![(0, 40_000), (64_000, 96_000)]
+        );
+        let mut config = Config::default();
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            config.transcription.meeting_chunk_noise_multiplier = bad;
+            assert_eq!(MeetingChunking::from_config(&config), MeetingChunking::default(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn padded_meeting_chunks_widen_clamp_and_merge() {
+        let chunking = |pad_ms| {
+            let mut config = Config::default();
+            config.transcription.meeting_chunk_pad_ms = pad_ms;
+            MeetingChunking::from_config(&config)
+        };
+        let samples = loud_silence_loud();
+        assert_eq!(
+            detect_meeting_vad_chunks(&samples, chunking(300)),
+            vec![(0, 44_800), (59_200, 96_000)],
+            "clamped to the audio at both ends"
+        );
+        assert_eq!(
+            detect_meeting_vad_chunks(&samples, chunking(1_200)),
+            vec![(0, 96_000)],
+            "overlapping chunks merge"
+        );
+    }
+
+    #[test]
+    fn padded_chunks_never_overlap_and_keep_the_45_second_limit() {
+        let second = 16_000;
+        let long = vec![(0, 40 * second), (41 * second, 80 * second)];
+        assert_eq!(
+            pad_meeting_chunks(long, second, 100 * second),
+            vec![(0, 40 * second + second / 2), (40 * second + second / 2, 81 * second)],
+            "a merge past 45 s meets halfway instead"
+        );
+        let chunks = vec![(5_000, 20_000), (21_000, 22_000), (30_000, 60_000), (61_000, 900_000), (905_000, 990_000)];
+        for pad in [0, 500, 4_800, 16_000, 200_000] {
+            let padded = pad_meeting_chunks(chunks.clone(), pad, 1_000_000);
+            for pair in padded.windows(2) {
+                assert!(pair[0].1 <= pair[1].0, "pad {pad}: {padded:?}");
+            }
+            for &(start, end) in &chunks {
+                assert!(padded.iter().any(|&(s, e)| s <= start && end <= e), "pad {pad} lost ({start}, {end}): {padded:?}");
+            }
+            assert!(padded.iter().all(|&(s, e)| s < e && e <= 1_000_000));
+        }
+    }
+
+    #[test]
+    fn a_lower_noise_multiplier_keeps_quieter_speech() {
+        let mut samples = constant_samples(2, 0.05);
+        samples.extend(constant_samples(3, 0.003));
+        samples.extend(constant_samples(2, 0.0));
+        let covered = |multiplier| {
+            let chunking = MeetingChunking { noise_multiplier: multiplier, pad_samples: 0 };
+            detect_meeting_vad_chunks(&samples, chunking).iter().map(|(s, e)| e - s).sum::<usize>()
+        };
+        assert!(covered(2.5) > covered(4.0), "{} vs {}", covered(2.5), covered(4.0));
     }
 
     #[test]
@@ -5779,7 +5925,7 @@ mod tests {
         samples.extend(vec![0.0; 4_800]); // 300ms silence
         samples.extend(constant_samples(2, 0.05));
 
-        let chunks = detect_meeting_vad_chunks(&samples);
+        let chunks = detect_meeting_vad_chunks(&samples, MeetingChunking::default());
         assert_eq!(
             chunks.len(),
             1,

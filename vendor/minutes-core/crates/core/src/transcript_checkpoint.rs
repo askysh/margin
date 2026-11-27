@@ -131,7 +131,10 @@ pub fn transcribe_span(
                 .into(),
         ));
     }
-    let chunks = transcribe::detect_meeting_vad_chunks(samples);
+    let chunks = transcribe::detect_meeting_vad_chunks(
+        samples,
+        transcribe::MeetingChunking::from_config(&config),
+    );
     let clock_offset = usize::try_from(start_sample).map_err(|_| {
         TranscribeError::UnsupportedFormat("span starts past the audio budget".into())
     })?;
@@ -218,7 +221,10 @@ pub(crate) fn transcribe_meeting_with_spans(
         let gap_end = span.map_or(samples.len(), |s| s.start_sample as usize);
         if gap_end > cursor {
             let chunks: Vec<(usize, usize)> =
-                transcribe::detect_meeting_vad_chunks(&samples[cursor..gap_end])
+                transcribe::detect_meeting_vad_chunks(
+                    &samples[cursor..gap_end],
+                    transcribe::MeetingChunking::from_config(config),
+                )
                     .into_iter()
                     .map(|(start, end)| (start + cursor, end + cursor))
                     .collect();

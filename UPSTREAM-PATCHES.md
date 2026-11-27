@@ -530,3 +530,25 @@ written to be sent upstream as a pull request, and each defaults to today's beha
   The tests that load a model need `MINUTES_TEST_WHISPER_MODEL`, the path of a real ggml
   model, and return early without it.
 
+
+## 34. Meeting chunks: a speech threshold and padding
+- **Where:** `crates/core/src/transcribe.rs` `detect_meeting_vad_chunks` (`MeetingChunking`,
+  `pad_meeting_chunks`); `transcript_checkpoint.rs` (both chunk calls); `config.rs`
+  `transcription.meeting_chunk_noise_multiplier`, `meeting_chunk_pad_ms`.
+- **Why:** before whisper runs, the energy chunker decides which audio of a meeting is
+  transcribed at all. A 100 ms window counts as speech only above 4× the adaptive noise
+  floor; the gaps between chunks are dropped, and a chunk starts exactly at its first
+  loud window. On AMI, 5.9% (ES2004a) and 15.8% (TS3003a) of the reference speech lies
+  outside the chunks, so no decoder or Silero setting can recover it: those act inside
+  the chunks.
+- **Patch:** `meeting_chunk_noise_multiplier` (default 4.0; a value that is not finite and
+  positive means 4.0) and `meeting_chunk_pad_ms` (default 0). With a pad, each chunk
+  grows by that much on both sides, within the audio. Chunks that then overlap are
+  merged, so no sample is transcribed twice. A merge that would pass the 45 s chunk limit
+  meets halfway between the two chunks instead. The defaults give upstream's chunks
+  exactly. Both fields are in `TranscriptionConfig`'s `Debug` output, so transcript
+  checkpoints made with other values are not reused.
+- **Tests:** `transcribe::tests::default_meeting_chunking_is_upstreams`,
+  `padded_meeting_chunks_widen_clamp_and_merge`,
+  `padded_chunks_never_overlap_and_keep_the_45_second_limit`,
+  `a_lower_noise_multiplier_keeps_quieter_speech`.
