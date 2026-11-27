@@ -21,6 +21,7 @@
 // Ask (chat) runs against a stand-in claude (scripts/e2e/fake-claude.py), never the real one.
 // Screenshots and report.json go to $E2E_OUT (default /tmp/margin-e2e/out).
 // E2E_BRIDGE_PORT, E2E_UI_PORT, E2E_OLLAMA_PORT and CARGO_TARGET_DIR move a run off the defaults.
+// E2E_TIMEOUT (ms) raises the default wait of every action, for a loaded machine.
 //
 // On Windows the pass runs as far as the Windows build goes (DECISIONS.md D61):
 // - The sandbox is in the temp folder, and it sets USERPROFILE, APPDATA and LOCALAPPDATA too.
@@ -130,6 +131,8 @@ const browser = await webkit.launch();
 const macUi = windows && process.env.E2E_UI !== "windows" ? { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15" } : {};
 const ctx = await browser.newContext({ viewport: { width: 1180, height: 760 }, deviceScaleFactor: 2, colorScheme: flag("--dark") ? "dark" : "light", ...macUi });
 const page = await ctx.newPage();
+// A machine under heavy load starves the page: E2E_TIMEOUT (ms) raises the default wait.
+if (process.env.E2E_TIMEOUT) page.setDefaultTimeout(Number(process.env.E2E_TIMEOUT));
 const consoleErrors = [];
 page.on("pageerror", (e) => consoleErrors.push(e.message));
 page.on("console", (m) => m.type() === "error" && consoleErrors.push(m.text()));
@@ -211,7 +214,8 @@ await check("setup step: Documents and Balanced preselected, saved, download sta
   assert((await page.evaluate(() => window.__E2E__.calls)).includes("download_models"), "download not started on setup");
 });
 await check("permissions step explains and never prompts", async () => {
-  await page.getByText("System audio", { exact: true }).waitFor();
+  // With the permission granted the title also holds an "Allowed" badge, so match its start.
+  await page.locator(".perm-title", { hasText: /^System audio/ }).waitFor();
   await page.getByText(/Margin never records your screen/).waitFor();
   await page.keyboard.press("Enter");
   await page.getByText("Want summaries too?").waitFor();
