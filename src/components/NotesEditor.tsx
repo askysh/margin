@@ -26,6 +26,16 @@ export function NotesEditor({ value, onChange, placeholder, autoFocus, readOnly 
     fit(el);
   }, [value]);
 
+  // The browser's own autofocus puts the caret at the start of notes that are already there,
+  // so the next words typed would land before them, and a later "caret to the end" would
+  // split a word typed in between.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!autoFocus || !el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, [autoFocus]);
+
   // A narrower column wraps more lines, so the box must grow then too, or the end of the
   // notes is cut off. Only a change of width fits it again: fit() changes the height.
   useLayoutEffect(() => {
@@ -78,7 +88,6 @@ export function NotesEditor({ value, onChange, placeholder, autoFocus, readOnly 
       onChange={(e) => onChange(e.target.value)}
       onKeyDown={onKeyDown}
       placeholder={placeholder}
-      autoFocus={autoFocus}
       readOnly={readOnly}
       spellCheck
       aria-label="Your notes"

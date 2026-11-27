@@ -717,7 +717,7 @@ await check("search shows a corrected spelling when the backend sent one (L3)", 
     if (!body.includes('"search_meetings"')) return route.fallback();
     const real = await route.fetch();
     const answer = await real.json();
-    await route.fulfill({ response: real, json: { ok: true, value: { hits: answer.value, corrected: "legal review" } } });
+    await route.fulfill({ response: real, json: { ok: true, value: { hits: answer.value.hits, corrected: "legal review" } } });
   });
   try {
     await page.getByLabel("Search meetings").fill("legal reveiw");
@@ -729,12 +729,16 @@ await check("search shows a corrected spelling when the backend sent one (L3)", 
   await page.route("**/invoke", async (route) => {
     if (!(route.request().postData() ?? "").includes('"search_meetings"')) return route.fallback();
     const real = await route.fetch();
-    await route.fulfill({ response: real, json: { ok: true, value: { hits: (await real.json()).value, corrected: null } } });
+    await route.fulfill({ response: real, json: { ok: true, value: { hits: (await real.json()).value.hits, corrected: null } } });
   });
   try {
     await page.getByLabel("Search meetings").fill("legal review");
+    // The earlier correction's line and rows stay until this answer lands; the backend now
+    // corrects "legal reveiw" itself, so rows are there at once and cannot signal the answer.
+    await page.locator(".search-corrected").waitFor({ state: "detached", timeout: 5000 }).catch(() => {
+      throw new Error("a null correction shows a line");
+    });
     await page.locator(".row-hit").first().waitFor({ timeout: 5000 });
-    assert((await page.locator(".search-corrected").count()) === 0, "a null correction shows a line");
   } finally {
     await page.unroute("**/invoke");
   }

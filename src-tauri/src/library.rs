@@ -1000,6 +1000,10 @@ fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+/// What core writes in place of the trailing noise it trimmed. On a silent recording all of
+/// the transcript is noise, so this line is all that is left, and it is not speech.
+const CORE_TRAILING_NOISE_MARKER: &str = "[Recording ended - ";
+
 /// Whisper writes lines nobody said when the microphone hears silence or noise. This removes
 /// them from `## Transcript` (D90). A transcript line goes when:
 /// - it is only markers (`[BLANK_AUDIO]`, `(music)`, a bare `[SYSTEM]`);
@@ -1009,6 +1013,7 @@ fn word_count(text: &str) -> usize {
 /// - it is a dangling fragment that starts with "..." in a transcript of at most 12 words
 ///   in which something else was just removed (a silent recording yields a subtitle credit
 ///   and a half sentence together);
+/// - it is core's trailing-noise marker and no speech is left;
 /// - it is a "thank you" or one-word line, and nothing real is left (silence often becomes
 ///   a lone "Thank you").
 /// Every other byte stays. Returns the cleaned content and the number of lines removed.
@@ -1041,12 +1046,17 @@ fn drop_silence_hallucinations(content: &str) -> (String, usize) {
             dropped[*i] = true;
         }
     }
+    let nothing_spoken = live(&dropped).is_empty();
     let mut removed = 0;
     let mut last_dropped = false;
     let kept: Vec<&str> = lines
         .iter()
         .enumerate()
         .filter(|(i, l)| {
+            if nothing_spoken && l.trim_start().starts_with(CORE_TRAILING_NOISE_MARKER) {
+                removed += 1;
+                return false;
+            }
             let marker = l.trim_start().starts_with("[...] [repeated audio removed");
             let drop = if marker { last_dropped } else { dropped[*i] };
             if marker || spoken[*i].is_some() {
@@ -1382,6 +1392,18 @@ mod tests {
         assert!(fm.entities.is_empty());
         assert!(content.contains("## Notes\n\nmy note"));
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn core_trailing_noise_marker_alone_is_a_silent_recording() {
+        let silent = "---\ntitle: QA silent\ntype: meeting\ndate: 2026-11-27\nduration: 6s\nstatus: transcript-only\n---\n\n## Transcript\n\n[Recording ended - 1 lines of trailing noise removed]\n";
+        let file = temp_meeting("noise-marker", silent);
+        let removed = scrub_prompt_echo(&file).unwrap();
+        assert_eq!(removed, 1);
+        assert!(write_no_speech(&file, false, removed).unwrap());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+        let real = "---\ntitle: T\n---\n\n## Transcript\n\n[A 0:00] We ship on Friday.\n[Recording ended - 2 lines of trailing noise removed]\n";
+        assert_eq!(scrub_prompt_echo_text(real, "T"), (real.to_string(), 0));
     }
 
     #[test]
