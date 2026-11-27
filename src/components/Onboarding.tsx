@@ -276,7 +276,7 @@ function StepReady({ s, saving, onChange, onFinish }: { s: Settings; saving: boo
       {canRecordCalls && (
         <label className="ob-toggle">
           <span>
-            <strong>Start notes from my calendar.</strong> When a meeting on your calendar starts, Margin offers to record it under its name.
+            <strong>Start notes from my calendar.</strong> When a meeting on your calendar starts, Margin offers to record it under its name.{" "}
             {OS_NAME} asks to read your calendar when you switch this on.
           </span>
           <input type="checkbox" role="switch" className="switch" aria-label="Start notes from my calendar" checked={s.calendar_toast ?? false} onChange={(e) => onChange({ calendar_toast: e.target.checked })} />
