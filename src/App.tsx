@@ -72,6 +72,7 @@ export default function App() {
     setToast({ text, tone });
     window.setTimeout(() => setToast((t) => (t?.text === text ? null : t)), tone === "error" ? 6000 : 4000);
   }, []);
+  const dismissToast = useCallback((text: string) => setToast((t) => (t?.text === text ? null : t)), []);
   // An error belongs to the screen it came from: moving to another view or Settings section
   // closes it, so it never shows up next to something unrelated.
   useEffect(() => {
@@ -166,7 +167,7 @@ export default function App() {
       }),
       // The menu bar's "Settings…": the same as ⌘,.
       // Setup has no Settings yet, so the item waits until it is done.
-      on<null>("open-settings", () => onboardedRef.current && setSettings((now) => now ?? lastSection.current)),
+      on<null>("open-settings", () => onboardedRef.current && setSettings((now) => now ?? sectionToOpen())),
       on<AppPrefs>("app-prefs", (prefs) => setBoot((b) => b && { ...b, prefs })),
       // A click on the recording chip: back to the live notes, with the caret in them.
       on<null>("open-live", () => {
@@ -218,9 +219,12 @@ export default function App() {
   const closeAsk = useCallback(() => setAskOpen(false), []);
   // ⌘, opens the section you were on last, as System Settings does; a deep link (a
   // permission error, say) picks one.
+  // While you record, Settings opens on Recording: the microphone and the call are what you
+  // came to look at, not the section you left last time.
+  const sectionToOpen = (): SectionId => (recorderRef.current?.recording ? "recording" : lastSection.current);
   const openSettings = useCallback((section?: SectionId) => {
     setDrawer(false);
-    setSettings((now) => section ?? now ?? lastSection.current);
+    setSettings((now) => section ?? now ?? sectionToOpen());
   }, []);
   const closeSettings = useCallback(() => {
     if (resettingRef.current) return;
@@ -374,6 +378,7 @@ export default function App() {
           {recording ? (
             <div className="rec-control">
               <span className="rec-dot" aria-hidden />
+              {settings && <span className="rec-label">Recording</span>}
               <span className="rec-time mono">{clock(tick.elapsed_secs)}</span>
               {hasRecordingChip && boot.prefs.recording_chip && !recorder?.stopping && (
                 <button
@@ -408,6 +413,7 @@ export default function App() {
                 onResetBusy={setResetting}
                 onReset={() => { setResetting(false); lastSection.current = "general"; setSettings(null); setAskOpen(false); setSelection({ type: "home" }); lastList.current = ""; setMeetings([]); reboot(); }}
                 notify={notify}
+                dismissToast={dismissToast}
               />
             </Suspense>
           )}

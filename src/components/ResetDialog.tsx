@@ -59,7 +59,7 @@ export function ResetDialog({ onCancel, onDone, onBusy, notify }: { onCancel: ()
           <li>
             <label className="check">
               <input type="checkbox" checked={!forgetVoices} onChange={(e) => setForgetVoices(!e.target.checked)} />
-              <span>Keep recognised voices <span className="quiet">({preview?.voice_count ?? "…"}{preview?.upstream_app_installed ? ", shared with the Minutes app" : ""})</span></span>
+              <span>Keep recognized voices <span className="quiet">({preview?.voice_count ?? "…"}{preview?.upstream_app_installed ? ", shared with the Minutes app" : ""})</span></span>
             </label>
           </li>
         </ul>

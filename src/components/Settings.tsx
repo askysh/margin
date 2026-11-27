@@ -22,11 +22,12 @@ interface Props {
   onReset: () => void;
   onResetBusy: (busy: boolean) => void;
   notify: Notify;
+  dismissToast: (text: string) => void;
 }
 
 /** The Settings page: one section at a time, all sharing one settings state and save queue. */
-export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetBusy, notify }: Props) {
-  const ctx = useSettingsState(boot, onSaved, notify);
+export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetBusy, notify, dismissToast }: Props) {
+  const ctx = useSettingsState(boot, onSaved, notify, dismissToast);
   const [resetOpen, setResetOpen] = useState(false);
   // WebKit doesn't focus a clicked button, so the opener comes from the click itself.
   const resetOpener = useRef<HTMLElement | null>(null);
@@ -73,7 +74,7 @@ export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetB
 export type SettingsView = ReturnType<typeof useSettingsState> & { boot: Boot; notify: Notify; openReset: (from: HTMLElement) => void };
 
 /** Everything the sections read and change, loaded once when Settings opens. */
-function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: Notify) {
+function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: Notify, dismissToast: (text: string) => void) {
   const [s, setS] = useState<Settings>(boot.settings);
   const [backends, setBackends] = useState<Backends | null>(null);
   const [perms, setPerms] = useState<Permissions | null>(null);
@@ -101,6 +102,8 @@ function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: No
   const confirmed = useRef<Settings>(boot.settings);
   const queue = useRef<Promise<void>>(Promise.resolve());
   const pendingSaves = useRef(0);
+  // The error toast each setting last raised, so saving that setting again clears it.
+  const refusals = useRef(new Map<string, string>());
   /** Resolves to the refusal's text, or null once the change is saved. */
   const save = (patch: Partial<Settings>): Promise<string | null> => {
     latest.current = { ...latest.current, ...patch };
@@ -120,10 +123,17 @@ function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: No
           latest.current = withoutPatch(latest.current, patch, confirmed.current);
           setS(latest.current);
           notify(errorText(e), "error");
+          for (const key of Object.keys(patch)) refusals.current.set(key, errorText(e));
           resolve(errorText(e));
           return;
         }
         pendingSaves.current--;
+        for (const key of Object.keys(patch)) {
+          const refusal = refusals.current.get(key);
+          if (refusal === undefined) continue;
+          dismissToast(refusal);
+          refusals.current.delete(key);
+        }
         confirmed.current = saved;
         if (pendingSaves.current === 0) {
           latest.current = saved;

@@ -22,13 +22,14 @@ export function SummaryChoice({ backends, value, onChange }: Props) {
         aria-checked={engine === "claude"}
         disabled={!claude}
         className={`option ${engine === "claude" ? "on" : ""}`}
+        title={claude ?? undefined}
         onClick={() => onChange({ ...value, summary_engine: "claude", claude_path: claude ?? null })}
       >
         <span className="option-title">Claude, through your Claude Code CLI</span>
         <span className="option-body">
           {claude ? "Uses your own Claude account. The transcript is sent to Anthropic to summarize." : "Not found. Install Claude Code to use this."}
         </span>
-        {claude && <span className="option-path path">{claude}</span>}
+        {claude && <span className="option-body">Claude Code (found)</span>}
       </button>
       <button type="button"
         role="radio"

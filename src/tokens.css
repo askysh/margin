@@ -8,9 +8,11 @@
   --ink: #1c2430;
   --ink-2: #445060;
   --pencil: #67717c;
+  --placeholder: #5e6873;
   --hair: #d5ddd2;
   --hair-strong: #c3cdc0;
   --rule: #5e9480;
+  --rule-ink: #3b7660;
   --rule-soft: rgba(94, 148, 128, 0.42);
   --rule-wash: rgba(94, 148, 128, 0.12);
   --tally: #d63f2a;
@@ -33,9 +35,11 @@
     --ink: #e3e8e1;
     --ink-2: #b7bfb5;
     --pencil: #8b959c;
+    --placeholder: #98a2a8;
     --hair: #2a3238;
     --hair-strong: #364047;
     --rule: #6fa893;
+    --rule-ink: #8cc2ac;
     --rule-soft: rgba(111, 168, 147, 0.4);
     --rule-wash: rgba(111, 168, 147, 0.12);
     --tally: #f05a43;

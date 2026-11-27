@@ -268,6 +268,13 @@ pub const NOT_SIGNED_IN: &str = "Claude isn't signed in. Open Windows Terminal, 
 #[cfg(windows)]
 pub const TOO_OLD: &str = "Your Claude Code is too old for Ask. Run `claude update` in Windows Terminal, then try again.";
 
+/// What the Ask callout says, beside its Check again button. `NOT_SIGNED_IN` is for an
+/// answer that failed to sign in, where there is no such button.
+#[cfg(not(windows))]
+const SIGN_IN_TO_USE_ASK: &str = "Ask uses Claude Code. To use it, open Terminal, run `claude` and sign in, then press Check again.";
+#[cfg(windows)]
+const SIGN_IN_TO_USE_ASK: &str = "Ask uses Claude Code. To use it, open Windows Terminal, run `claude` and sign in, then press Check again.";
+
 pub fn readiness() -> Readiness {
     let problem = |p, m: &str| Readiness { ready: false, problem: Some(p), message: Some(m.into()) };
     let Some(bin) = claude_bin() else { return problem("not-installed", NOT_INSTALLED) };
@@ -275,7 +282,7 @@ pub fn readiness() -> Readiness {
         return problem("too-old", TOO_OLD);
     }
     match signed_in(&bin) {
-        Some(false) => problem("not-signed-in", NOT_SIGNED_IN),
+        Some(false) => problem("not-signed-in", SIGN_IN_TO_USE_ASK),
         _ => Readiness { ready: true, problem: None, message: None },
     }
 }

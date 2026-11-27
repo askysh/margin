@@ -427,7 +427,7 @@ pub mod ops {
     pub fn desk_command() -> Res<Option<String>> {
         let desk = paths::home().join("margin-desk").join("bin").join("desk.mjs");
         if !desk.is_file() {
-            return Err(format!("Margin Desk is not in {}. Put it there (see its README), then click this again.", desk.parent().and_then(|p| p.parent()).unwrap_or(&desk).display()));
+            return Err("Margin Desk is not in ~/margin-desk. Put it there (see its README), then click this again.".into());
         }
         let node = crate::summaries::find_node(&paths::home()).ok_or("Margin can't find Node.js, which Margin Desk needs. Install it (brew install node), then click this again.")?;
         Ok(Some(format!("{} {} run", node.display(), desk.display())))

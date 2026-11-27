@@ -185,8 +185,12 @@ const closeSettings = async () => {
 };
 
 // ---------------------------------------------------------------- onboarding
+// Where the setup header sits on each step: it must not move as the content changes height.
+const setupHeaderTops = [];
+const noteSetupHeader = async () => setupHeaderTops.push(Math.round((await page.locator(".ob-head").boundingBox()).y));
 await check("onboarding shows on first run", async () => {
   await page.getByText("Notes in your words.").waitFor({ timeout: 8000 });
+  await noteSetupHeader();
 });
 await check("name step saves your name (Return continues)", async () => {
   await page.getByLabel("Your name, so transcripts can label you").fill("Akash QA");
@@ -200,6 +204,7 @@ await check("name step saves your name (Return continues)", async () => {
 });
 await check("setup step: Documents and Balanced preselected, saved, download starts", async () => {
   await page.getByRole("radio", { name: /Documents/ }).waitFor();
+  await noteSetupHeader();
   assert((await page.getByRole("radio", { name: /Documents/ }).getAttribute("aria-checked")) === "true", "Documents not preselected");
   assert((await page.getByRole("radio", { name: /Balanced/ }).getAttribute("aria-checked")) === "true", "Balanced not preselected");
   assert(!fs.existsSync(meetingsDir), "default folder created before Continue");
@@ -217,11 +222,15 @@ await check("permissions step explains and never prompts", async () => {
   // With the permission granted the title also holds an "Allowed" badge, so match its start.
   await page.locator(".perm-title", { hasText: /^System audio/ }).waitFor();
   await page.getByText(/Margin never records your screen/).waitFor();
+  await noteSetupHeader();
   await page.keyboard.press("Enter");
   await page.getByText("Want summaries too?").waitFor();
 });
 await check("summaries step: none preselected and saved", async () => {
   assert((await page.getByRole("radio", { name: /No summaries/ }).getAttribute("aria-checked")) === "true", "No summaries not preselected");
+  await noteSetupHeader();
+  const claudeChoice = await page.getByRole("radio", { name: /Claude, through/ }).innerText();
+  assert(!/[\\/]claude/.test(claudeChoice), `the Claude choice shows a path: ${claudeChoice}`);
   await button("Continue").click();
   await page.getByText("You're ready.").waitFor();
   const cfg = fs.readFileSync(path.join(marginHome, "config.toml"), "utf8");
@@ -230,6 +239,8 @@ await check("summaries step: none preselected and saved", async () => {
 await check("ready step offers the calendar switch, off and with its permission note, and points to Margin Desk (M7)", async () => {
   const calendar = page.getByRole("switch", { name: "Start notes from my calendar" });
   await calendar.waitFor();
+  await noteSetupHeader();
+  assert(setupHeaderTops.length === 5 && new Set(setupHeaderTops).size === 1, `the setup header moved between steps: ${setupHeaderTops}`);
   assert(!(await calendar.isChecked()), "the calendar switch is on by default");
   await page.getByText(/asks to read your calendar when you switch this on/).waitFor();
   await page.getByText(/Margin Desk is in Settings → Knowledge/).waitFor();
@@ -519,6 +530,8 @@ await check("copy the transcript and the whole meeting as Markdown", async () =>
 // ---------------------------------------------------------------- rename
 await check("rename a speaker everywhere and remember the voice", async () => {
   await page.locator(".chip.unnamed").first().click();
+  assert((await page.locator(".popover input:not([type])").getAttribute("placeholder")) === "Type the person's name", "the rename field has no hint");
+  assert(await button("Rename everywhere").isDisabled(), "Rename everywhere is enabled with no name");
   await page.locator(".popover input:not([type])").fill("Priya");
   await button("Rename everywhere").click();
   await page.locator(".toast").filter({ hasText: /Renamed to Priya/ }).waitFor({ timeout: 8000 });
@@ -531,7 +544,7 @@ await check("rename a speaker everywhere and remember the voice", async () => {
 });
 await check("the saved voice shows in Settings", async () => {
   await openSettings("Voices");
-  await page.getByRole("list", { name: "Voices Margin recognises" }).getByText("Priya", { exact: true }).waitFor();
+  await page.getByRole("list", { name: "Voices Margin recognizes" }).getByText("Priya", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Forget Priya" }).waitFor();
   await closeSettings();
 });
@@ -541,7 +554,7 @@ await check("a second meeting with the same voice is labelled automatically", as
   await page.locator(".row-job").waitFor({ state: "detached", timeout: 120000 });
   const f = meetingFiles().find((x) => x.includes("qa-follow-up"));
   const md = fs.readFileSync(path.join(meetingsDir, f), "utf8");
-  assert(/\[Priya \d+:\d\d\]/.test(md), "Priya not recognised in the second meeting");
+  assert(/\[Priya \d+:\d\d\]/.test(md), "Priya not recognized in the second meeting");
   await page.locator(".row").filter({ hasText: "QA follow-up" }).first().click();
   await page.locator(".chip", { hasText: "Priya" }).waitFor();
 });
@@ -665,12 +678,27 @@ if (simulate) {
     // The Settings button, then Esc.
     await page.getByRole("button", { name: "Settings", exact: true }).click();
     await settingsPage().waitFor();
+    const openedOn = (await settingsNav().locator('[aria-current="page"]').textContent()).trim();
+    assert(openedOn === "Recording", `Settings opened on ${openedOn} during a recording`);
+    assert(await page.locator(".rec-control .rec-label").isVisible(), "Settings does not say it is recording");
     await page.keyboard.press("Escape");
     await settingsPage().waitFor({ state: "detached" });
     assert((await focusedLabel()) === "Your notes", `focus after Esc: ${await focusedLabel()}`);
     await page.keyboard.type(" [after-settings]");
     // The microphone banner's Change microphone, then Back.
     await page.evaluate(() => window.__E2E__.emit("mic-silent", "QA: the microphone is silent"));
+    await page.getByRole("button", { name: "Change microphone" }).waitFor();
+    await page.setViewportSize({ width: 700, height: 760 });
+    try {
+      const [banner, rec] = await Promise.all([page.locator(".mic-banner").boundingBox(), page.locator(".rec-control").boundingBox()]);
+      const cut = await page.locator(".mic-banner > span").evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+      assert(!cut, "the narrow microphone banner cuts its text off");
+      assert(banner.x + banner.width <= rec.x, "the microphone banner runs under the recording controls");
+      assert((await page.getByRole("button", { name: "Change microphone" }).boundingBox()).height < 24, "Change microphone breaks across lines");
+      await page.screenshot({ path: path.join(out, "narrow-mic-banner.png") });
+    } finally {
+      await page.setViewportSize({ width: 1180, height: 760 });
+    }
     await page.getByRole("button", { name: "Change microphone" }).click();
     await settingsPage().waitFor();
     await closeSettings();
@@ -1150,6 +1178,30 @@ await check("settings: a refused command stays in the box, marked invalid, and i
   await settled();
   await closeSettings();
 });
+await check("settings: a toast shows ~ for the home folder, clears the control that raised it, and a good save removes it", async () => {
+  await openSettings("Knowledge");
+  const desk = button("Use Margin Desk");
+  await desk.click();
+  const toast = page.locator(".toast-error");
+  await toast.waitFor({ timeout: 5000 });
+  const text = await toast.innerText();
+  assert(text.includes("~/margin-desk") && !text.includes(home), `desk toast: ${text}`);
+  const [t, d] = await Promise.all([toast.boundingBox(), desk.boundingBox()]);
+  assert(t.y + t.height <= d.y || d.y + d.height <= t.y, `the toast covers Use Margin Desk: ${JSON.stringify([t, d])}`);
+  await page.screenshot({ path: path.join(out, "desk-toast.png") });
+  const box = page.getByLabel("Run this command");
+  await box.fill("/no/such/program --run");
+  await box.blur();
+  await page.locator(".toast-error", { hasText: /no\/such|can't find/ }).waitFor({ timeout: 5000 });
+  await box.fill("/bin/echo desk-hook");
+  await box.blur();
+  // An error toast otherwise stays six seconds.
+  await page.locator(".toast").waitFor({ state: "detached", timeout: 3500 });
+  await box.fill("");
+  await box.blur();
+  await settled();
+  await closeSettings();
+});
 await check("settings: the shortcut text tells in Margin from any app (L5)", async () => {
   await openSettings("Recording");
   const text = await settingsPage().getByText(/from any app/).innerText();
@@ -1233,9 +1285,12 @@ await check("ask: not signed in says how to fix it", async () => {
   await page.keyboard.press("Meta+j");
   await page.locator(".ask").waitFor({ timeout: 5000 });
   try {
-    await page.locator(".ask-setup", { hasText: /isn't signed in.*run claude/ }).waitFor({ timeout: 8000 });
-    await page.locator(".ask-setup", { hasText: /Ask always uses Claude Code/ }).waitFor({ timeout: 1000 });
+    await page.locator(".ask-setup", { hasText: /Ask uses Claude Code.*run claude and sign in.*press Check again/ }).waitFor({ timeout: 8000 });
+    assert((await page.locator(".ask-setup").innerText()).indexOf("Ollama") < 0, "the callout still talks about Ollama");
     assert(await page.locator(".ask-compose").getByRole("button", { name: "Ask" }).isDisabled(), "Ask enabled while not signed in");
+    const field = page.getByLabel("Ask a question");
+    assert(await field.isDisabled(), "the question field takes text while not signed in");
+    assert((await field.getAttribute("placeholder")) === "Sign in to Claude to ask", "no reason on the disabled field");
     await page.screenshot({ path: path.join(out, "ask-not-signed-in.png") });
   } finally {
     fs.rmSync(path.join(claudeDir, "logged-out"), { force: true });
@@ -1343,6 +1398,21 @@ await check("a narrow window shows one column and the sidebar as a drawer", asyn
   await page.locator(".sidebar").first().waitFor();
 });
 
+await check("settings in a narrow window: labelled navigation while it fits, named icons below that", async () => {
+  await page.setViewportSize({ width: 700, height: 760 });
+  try {
+    await openSettings("General");
+    assert(await settingsNav().getByText("Recording", { exact: true }).isVisible(), "no section labels at 700 px");
+    await page.setViewportSize({ width: 520, height: 760 });
+    assert(!(await settingsNav().getByText("Recording", { exact: true }).isVisible()), "labels crowd a 520 px window");
+    const icon = settingsNav().getByRole("button", { name: "Recording", exact: true });
+    assert((await icon.getAttribute("title")) === "Recording", "the icon has no tooltip");
+    assert(await settingsPage().getByRole("heading", { level: 1, name: "General" }).isVisible(), "the section's name is not shown");
+  } finally {
+    await page.setViewportSize({ width: 1180, height: 760 });
+  }
+  await closeSettings();
+});
 await check("the notepad button narrows the window and brings it back (D57)", async () => {
   const toggle = page.getByRole("button", { name: "Notepad view" });
   assert((await toggle.getAttribute("aria-pressed")) === "false", "pressed in a wide window");

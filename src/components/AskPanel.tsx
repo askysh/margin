@@ -20,6 +20,8 @@ interface Props {
   bar: boolean;
 }
 
+const SIGN_IN_PLACEHOLDER = "Sign in to Claude to ask";
+
 const SUGGESTIONS: Record<AskScope, string[]> = {
   meeting: ["What did I commit to?", "Draft a follow-up email", "What decisions were made?", "What questions are still open?"],
   all: ["What did I commit to this week?", "What decisions did we make recently?", "What's still open across my meetings?"],
@@ -131,7 +133,7 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen,
   }, [messages.length, partial, running, open]);
 
   const send = async (text: string) => {
-    if (!text.trim() || running) return;
+    if (!text.trim() || running || notReady) return;
     setSendError(null);
     setDraft("");
     const seq = doneSeq.current;
@@ -159,6 +161,7 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen,
 
   const notReady = ready && !ready.ready ? ready : null;
   const placeholder = about ? "Ask about this meeting" : "Ask about your meetings";
+  const inputPlaceholder = notReady ? SIGN_IN_PLACEHOLDER : placeholder;
 
   const close = () => {
     onClose();
@@ -204,7 +207,6 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen,
         {notReady && (
           <div className="callout ask-setup" role="status">
             <Markdown source={notReady.message ?? ""} />
-            <p className="quiet-note">Ask always uses Claude Code. It does not use the summary engine from Settings, so Ollama, or summaries turned off, does not change this.</p>
             <button className="btn btn-quiet" onClick={checkReady}>Check again</button>
           </div>
         )}
@@ -228,7 +230,8 @@ export function AskPanel({ meeting, scope, onScope, onOpenMeeting, open, onOpen,
           rows={1}
           value={draft}
           aria-label="Ask a question"
-          placeholder={placeholder}
+          placeholder={inputPlaceholder}
+          disabled={!!notReady}
           onChange={(e) => {
             setDraft(e.target.value);
             e.target.style.height = "auto";

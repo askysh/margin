@@ -88,7 +88,7 @@ Margin, never during a recording. Settings → Updates turns the automatic check
   - **Play** the recording, or click a time in the transcript to play from there.
 - **Speaker names.** Click a speaker, type a name and choose *Rename everywhere*. Margin
   updates the transcript, the summary, action items, `attendees` and `speaker_map`.
-  With "Recognise this voice" on, the next meeting labels that person by voice.
+  With "Recognize this voice" on, the next meeting labels that person by voice.
 - **Library and search.** Meetings are grouped by Today, Yesterday, This week and month.
   Search covers titles, notes and transcripts. Click an attendee to list only the meetings
   with that person.
@@ -110,9 +110,9 @@ Margin, never during a recording. Settings → Updates turns the automatic check
     Claude can read your meetings), **Updates** and **About**.
 - **Reset.** *Reset Margin…* under *Start over* clears settings, the processing queue,
   logs and state, then runs setup again.
-  - "Keep my meetings", "Keep downloaded speech models" and "Keep recognised voices" are
+  - "Keep my meetings", "Keep downloaded speech models" and "Keep recognized voices" are
     on by default.
-  - To delete meetings you must type `delete`. Margin moves only the files it recognises
+  - To delete meetings you must type `delete`. Margin moves only the files it recognizes
     as meetings to the Trash, so a vault keeps its other notes.
   - Audio that was not processed goes to `failed-captures/` and is never deleted.
 - **Crash safety.** Notes typed during a recording are saved as you type. If Margin stops
