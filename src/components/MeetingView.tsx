@@ -116,7 +116,7 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
   // One display name per label, used by chips and transcript rows alike: a name from
   // speaker_map wins, then "You" / "Them" / "Speaker n".
   const names = useMemo(() => {
-    const base = speakerNames((m?.transcript ?? []).map((t) => t.speaker ?? "").filter(Boolean));
+    const base = speakerNames([...(m?.transcript ?? []).map((t) => t.speaker ?? ""), ...(m?.speakers ?? []).map((s) => s.label)].filter(Boolean));
     for (const s of m?.speakers ?? []) if (s.name) base.set(s.label, s.name);
     return base;
   }, [m]);

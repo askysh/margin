@@ -6,7 +6,7 @@ import { Logo } from "./Logo";
 import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { MicIcon, PermissionRow, SpeakerIcon } from "./PermissionRow";
 import { SummaryChoice } from "./SummaryChoice";
-import { APP_NAME, canRecordCalls, DEVICE, ENTER_KEY, hasSystemAudioPermission, isWindows, joinPath, keys, TRAY } from "../platform";
+import { APP_NAME, canRecordCalls, DEVICE, ENTER_KEY, hasSystemAudioPermission, isWindows, joinPath, keys, OS_NAME, TRAY } from "../platform";
 import { OneDriveNote } from "./OneDriveNote";
 
 const STEPS = ["You", "Setup", "Permissions", "Summaries", "Ready"] as const;
@@ -41,6 +41,15 @@ export function Onboarding({ initial, onDone }: { initial: Settings; onDone: () 
     }
   };
 
+  const change = async (patch: Partial<Settings>) => {
+    setError(null);
+    try {
+      setS(await api.saveSettings({ ...s, ...patch }));
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+
   const finish = async () => {
     setSaving(true);
     try {
@@ -69,7 +78,7 @@ export function Onboarding({ initial, onDone }: { initial: Settings; onDone: () 
           {step === 1 && <StepSetup s={s} saving={saving} onNext={next} />}
           {step === 2 && <StepPermissions onNext={() => setStep(3)} />}
           {step === 3 && <StepSummaries s={s} saving={saving} onNext={next} />}
-          {step === READY && <StepReady s={s} saving={saving} onFinish={finish} />}
+          {step === READY && <StepReady s={s} saving={saving} onChange={change} onFinish={finish} />}
         </div>
         {error && <p className="ob-error" role="alert">{error}</p>}
         {step > SETUP && step < READY && <div className="ob-foot"><DownloadProgress compact /></div>}
@@ -238,7 +247,7 @@ function StepSummaries({ s, onNext, saving }: { s: Settings; onNext: (patch: Par
   );
 }
 
-function StepReady({ s, saving, onFinish }: { s: Settings; saving: boolean; onFinish: () => void }) {
+function StepReady({ s, saving, onChange, onFinish }: { s: Settings; saving: boolean; onChange: (patch: Partial<Settings>) => void; onFinish: () => void }) {
   return (
     <>
       <h1 className="ob-title">You're ready.</h1>
@@ -258,12 +267,22 @@ function StepReady({ s, saving, onFinish }: { s: Settings; saving: boolean; onFi
         <li>
           <span className="way-demo"><kbd>{keys("⌘", "Ctrl")}</kbd><kbd>{keys("⇧", "Shift")}</kbd><kbd>R</kbd></span>
           {canRecordCalls ? (
-            <span className="way-text"><strong>From the keyboard.</strong> <span className="mono">⌘⇧R</span> records a call, <span className="mono">⌘⇧I</span> a meeting in the room.</span>
+            <span className="way-text"><strong>In Margin.</strong> <span className="mono">⌘⇧R</span> records a call, <span className="mono">⌘⇧I</span> a meeting in the room. To start from any app, turn on a shortcut in Settings.</span>
           ) : (
-            <span className="way-text"><strong>From the keyboard.</strong> <span className="mono">Ctrl+Shift+R</span> records a meeting in the room.</span>
+            <span className="way-text"><strong>In Margin.</strong> <span className="mono">Ctrl+Shift+R</span> records a meeting in the room. To start from any app, turn on a shortcut in Settings.</span>
           )}
         </li>
       </ul>
+      {canRecordCalls && (
+        <label className="ob-toggle">
+          <span>
+            <strong>Start notes from my calendar.</strong> When a meeting on your calendar starts, Margin offers to record it under its name.{" "}
+            {OS_NAME} asks to read your calendar when you switch this on.
+          </span>
+          <input type="checkbox" role="switch" className="switch" aria-label="Start notes from my calendar" checked={s.calendar_toast ?? false} onChange={(e) => onChange({ calendar_toast: e.target.checked })} />
+        </label>
+      )}
+      <p className="ob-hint ob-desk">Want meetings turned into tasks and notes pages? Margin Desk is in Settings → Knowledge.</p>
       <DownloadProgress pendingNote="Recording works once this finishes. You can look around meanwhile." />
       <Continue label={`Start using ${APP_NAME}`} disabled={saving} onClick={onFinish} />
     </>

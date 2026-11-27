@@ -21,6 +21,7 @@
 // Ask (chat) runs against a stand-in claude (scripts/e2e/fake-claude.py), never the real one.
 // Screenshots and report.json go to $E2E_OUT (default /tmp/margin-e2e/out).
 // E2E_BRIDGE_PORT, E2E_UI_PORT, E2E_OLLAMA_PORT and CARGO_TARGET_DIR move a run off the defaults.
+// E2E_TIMEOUT (ms) raises the default wait of every action, for a loaded machine.
 //
 // On Windows the pass runs as far as the Windows build goes (DECISIONS.md D61):
 // - The sandbox is in the temp folder, and it sets USERPROFILE, APPDATA and LOCALAPPDATA too.
@@ -130,6 +131,8 @@ const browser = await webkit.launch();
 const macUi = windows && process.env.E2E_UI !== "windows" ? { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15" } : {};
 const ctx = await browser.newContext({ viewport: { width: 1180, height: 760 }, deviceScaleFactor: 2, colorScheme: flag("--dark") ? "dark" : "light", ...macUi });
 const page = await ctx.newPage();
+// A machine under heavy load starves the page: E2E_TIMEOUT (ms) raises the default wait.
+if (process.env.E2E_TIMEOUT) page.setDefaultTimeout(Number(process.env.E2E_TIMEOUT));
 const consoleErrors = [];
 page.on("pageerror", (e) => consoleErrors.push(e.message));
 page.on("console", (m) => m.type() === "error" && consoleErrors.push(m.text()));
@@ -211,7 +214,8 @@ await check("setup step: Documents and Balanced preselected, saved, download sta
   assert((await page.evaluate(() => window.__E2E__.calls)).includes("download_models"), "download not started on setup");
 });
 await check("permissions step explains and never prompts", async () => {
-  await page.getByText("System audio", { exact: true }).waitFor();
+  // With the permission granted the title also holds an "Allowed" badge, so match its start.
+  await page.locator(".perm-title", { hasText: /^System audio/ }).waitFor();
   await page.getByText(/Margin never records your screen/).waitFor();
   await page.keyboard.press("Enter");
   await page.getByText("Want summaries too?").waitFor();
@@ -223,13 +227,33 @@ await check("summaries step: none preselected and saved", async () => {
   const cfg = fs.readFileSync(path.join(marginHome, "config.toml"), "utf8");
   assert(/\[summarization\][^[]*engine = "none"/s.test(cfg), "summaries choice not saved");
 });
+await check("ready step offers the calendar switch, off and with its permission note, and points to Margin Desk (M7)", async () => {
+  const calendar = page.getByRole("switch", { name: "Start notes from my calendar" });
+  await calendar.waitFor();
+  assert(!(await calendar.isChecked()), "the calendar switch is on by default");
+  await page.getByText(/asks to read your calendar when you switch this on/).waitFor();
+  await page.getByText(/Margin Desk is in Settings → Knowledge/).waitFor();
+  // The QA bridge never asks macOS for calendar access, so the switch is refused and stays off.
+  await calendar.click();
+  await page.locator(".ob-error", { hasText: /asked only in the app/ }).waitFor({ timeout: 15000 });
+  assert(!(await calendar.isChecked()), "the calendar switch stayed on after a refused save");
+  assert(/\[calendar\][^[]*enabled = false/s.test(fs.readFileSync(path.join(marginHome, "config.toml"), "utf8")), "calendar was turned on without access");
+});
 await check("ready step shows how to record, then setup finishes", async () => {
   await page.getByText("From the menu bar.").waitFor();
   await page.getByText(/⌘⇧R/).first().waitFor();
+  const keysRow = await page.locator(".ways li").nth(2).innerText();
+  assert(/In Margin\./.test(keysRow) && /any app/.test(keysRow), `shortcut row does not say where ⌘⇧R works: ${keysRow}`);
+  if (!windows) assert((await page.locator(".ob-card .path").innerText()) === "~/Documents/Meetings", "ready step shows the absolute save path");
   await page.getByText("Models ready").waitFor({ timeout: seed ? 15000 : 600000 });
   await button("Start using Margin").click();
   await page.getByText(/Your first meeting starts here/).waitFor({ timeout: 8000 });
   assert(JSON.parse(fs.readFileSync(path.join(marginHome, "prefs.json"), "utf8")).onboarding_complete, "prefs not saved");
+});
+
+await check("home shows the save folder with ~ for the home folder (L10)", async () => {
+  if (windows) return;
+  assert((await page.locator(".page-home .path").innerText()) === "~/Documents/Meetings", `home path: ${await page.locator(".page-home .path").innerText()}`);
 });
 
 // ---------------------------------------------------------------- record a call (simulated mic)
@@ -574,6 +598,30 @@ await check("rename the meeting from its title", async () => {
   await page.locator(".row-title", { hasText: "QA launch sync, renamed" }).waitFor({ timeout: 5000 });
   assert(/^title: QA launch sync, renamed$/m.test(fs.readFileSync(mdPath, "utf8")), "frontmatter title not updated");
 });
+await check("an UNKNOWN speaker shows as Unknown speaker, styled like an unnamed chip (L6)", async () => {
+  const fixture = path.join(meetingsDir, "2026-11-02-qa-unknown-speaker.md");
+  fs.writeFileSync(fixture, [
+    "---", "title: QA unknown speaker", "type: meeting", "date: 2026-11-02T10:00:00+05:30", "duration: 1m", "---", "",
+    "## Transcript", "", "[SPEAKER_0 0:01] First voice.", "", "[UNKNOWN 0:05] A voice nobody matched.", "", "[SPEAKER_2 0:09] Third voice.", "",
+  ].join("\n"), { mode: 0o600 });
+  try {
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.locator(".row").filter({ hasText: "QA unknown speaker" }).first().click();
+    const chip = page.locator(".chip", { hasText: "Unknown speaker" });
+    await chip.waitFor({ timeout: 5000 });
+    assert((await page.locator(".chip", { hasText: /^UNKNOWN$/ }).count()) === 0, "a chip still reads UNKNOWN");
+    assert((await chip.getAttribute("class")).includes("unnamed"), "the chip is not styled as unnamed");
+    assert((await chip.evaluate((el) => getComputedStyle(el).borderStyle)) === "dashed", "the chip border is not dashed");
+    assert((await page.locator(".turn-speaker", { hasText: "Unknown speaker" }).count()) === 1, "the transcript row does not say Unknown speaker");
+    assert(!(await page.locator(".page-meeting").innerText()).includes("UNKNOWN"), "UNKNOWN shows on the page");
+    const chips = await page.locator(".chip").allInnerTexts();
+    assert(chips.join("|") === "Speaker 1|Unknown speaker|Speaker 3", `chips: ${chips.join("|")}`);
+    assert(/\[UNKNOWN 0:05\]/.test(fs.readFileSync(fixture, "utf8")), "the file changed");
+  } finally {
+    fs.rmSync(fixture, { force: true });
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  }
+});
 await check("a silent recording explains itself", async () => {
   const silent = path.join(base, "silence.wav");
   const wav = Buffer.alloc(44 + 16000 * 2 * 6);
@@ -610,12 +658,50 @@ if (simulate) {
     await page.locator(".row-live").click();
     assert((await page.getByLabel("Your notes").inputValue()).includes("kept across navigation"), "live notes wiped on return");
     assert((await page.locator(".live-speaker").count()) === 0, "in-person recording shows You/Them");
-    await page.getByLabel("Meeting title").fill("QA in person");
+  });
+  await check("notes typed after Settings, or after Change microphone, are kept (H1)", async () => {
+    const notes = page.getByLabel("Your notes");
+    const focusedLabel = () => page.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.tagName);
+    // The Settings button, then Esc.
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await settingsPage().waitFor();
+    await page.keyboard.press("Escape");
+    await settingsPage().waitFor({ state: "detached" });
+    assert((await focusedLabel()) === "Your notes", `focus after Esc: ${await focusedLabel()}`);
+    await page.keyboard.type(" [after-settings]");
+    // The microphone banner's Change microphone, then Back.
+    await page.evaluate(() => window.__E2E__.emit("mic-silent", "QA: the microphone is silent"));
+    await page.getByRole("button", { name: "Change microphone" }).click();
+    await settingsPage().waitFor();
+    await closeSettings();
+    assert((await focusedLabel()) === "Your notes", `focus after Back: ${await focusedLabel()}`);
+    await page.keyboard.type(" [after-banner]");
+    // Dismissing the banner leaves the caret in the notes.
+    await page.evaluate(() => window.__E2E__.emit("mic-silent", "QA: the microphone is silent"));
+    await page.getByRole("alert").getByRole("button", { name: "Dismiss" }).click();
+    await page.keyboard.type(" [after-dismiss]");
+    // Nothing focused: a printable key goes to the notes and is typed there.
+    await page.evaluate(() => document.activeElement?.blur());
+    assert((await focusedLabel()) === "BODY", `could not blur: ${await focusedLabel()}`);
+    await page.keyboard.type(" [bare-page]");
+    // A key typed in the title stays in the title.
+    const title = page.getByLabel("Meeting title");
+    await title.click();
+    await page.keyboard.type("Z");
+    assert((await title.inputValue()).endsWith("Z"), "the title lost its key");
+    const text = await notes.inputValue();
+    for (const mark of ["[after-settings]", "[after-banner]", "[after-dismiss]", "[bare-page]"]) assert(text.includes(mark), `notes lost ${mark}: ${text}`);
+    assert(!text.includes("Z"), "a key typed in the title went to the notes");
+    await title.fill("QA in person");
+  });
+  await check("a recording saves what was typed after Settings", async () => {
     await page.waitForTimeout(8000); // a first sentence of speech
     await page.getByRole("button", { name: "Stop" }).click();
     await page.locator(".turn").first().waitFor({ timeout: 180000 });
     const f = meetingFiles().find((x) => x.includes("qa-in-person"));
-    assert(f && fs.readFileSync(path.join(meetingsDir, f), "utf8").includes("- kept across navigation"), "notes missing in saved file");
+    const saved = f && fs.readFileSync(path.join(meetingsDir, f), "utf8");
+    assert(saved && saved.includes("- kept across navigation"), "notes missing in saved file");
+    for (const mark of ["[after-settings]", "[after-banner]", "[after-dismiss]", "[bare-page]"]) assert(saved.includes(mark), `saved file lost ${mark}`);
   });
 }
 
@@ -624,6 +710,38 @@ await check("search finds a meeting by transcript text", async () => {
   await page.getByLabel("Search meetings").fill("legal review");
   await page.locator(".row-hit").first().waitFor({ timeout: 5000 });
   assert((await page.locator(".row-hit").first().innerText()).toLowerCase().includes("legal review"), "hit excerpt wrong");
+});
+await check("search shows a corrected spelling when the backend sent one (L3)", async () => {
+  await page.route("**/invoke", async (route) => {
+    const body = route.request().postData() ?? "";
+    if (!body.includes('"search_meetings"')) return route.fallback();
+    const real = await route.fetch();
+    const answer = await real.json();
+    await route.fulfill({ response: real, json: { ok: true, value: { hits: answer.value, corrected: "legal review" } } });
+  });
+  try {
+    await page.getByLabel("Search meetings").fill("legal reveiw");
+    await page.getByText("Showing results for “legal review”").waitFor({ timeout: 5000 });
+  } finally {
+    await page.unroute("**/invoke");
+  }
+  // A null correction, and a bare list from an older backend, show no line.
+  await page.route("**/invoke", async (route) => {
+    if (!(route.request().postData() ?? "").includes('"search_meetings"')) return route.fallback();
+    const real = await route.fetch();
+    await route.fulfill({ response: real, json: { ok: true, value: { hits: (await real.json()).value, corrected: null } } });
+  });
+  try {
+    await page.getByLabel("Search meetings").fill("legal review");
+    await page.locator(".row-hit").first().waitFor({ timeout: 5000 });
+    assert((await page.locator(".search-corrected").count()) === 0, "a null correction shows a line");
+  } finally {
+    await page.unroute("**/invoke");
+  }
+  await page.getByLabel("Search meetings").fill("legal reviews");
+  await page.getByLabel("Search meetings").fill("legal review");
+  await page.locator(".row-hit").first().waitFor({ timeout: 5000 });
+  assert((await page.locator(".search-corrected").count()) === 0, "the correction line stays for a bare list");
 });
 await check("search with no match says so", async () => {
   await page.getByLabel("Search meetings").fill("zebra unicorn");
@@ -1007,6 +1125,33 @@ await check("settings: Knowledge saves the command to run after each meeting (D7
   assert(!/^post_record\s*=/m.test(cfgText()), "an empty command did not turn the hook off");
   await closeSettings();
 });
+await check("settings: a refused command stays in the box, marked invalid, and is not saved (L4)", async () => {
+  await openSettings("Knowledge");
+  const box = page.getByLabel("Run this command");
+  await box.fill("/no/such/program --run");
+  await box.blur();
+  await page.locator("#set-post-record-error").waitFor({ timeout: 5000 });
+  await settled();
+  assert((await box.inputValue()) === "/no/such/program --run", `the box was cleared: "${await box.inputValue()}"`);
+  assert((await box.getAttribute("aria-invalid")) === "true", "the box is not marked invalid");
+  assert(!/^post_record\s*=/m.test(cfgText()), "a refused command was written");
+  await box.fill("/bin/echo desk-hook");
+  assert((await box.getAttribute("aria-invalid")) === null, "the mark stays while the text changes");
+  await box.blur();
+  await settled();
+  assert(inSection("hooks", 'post_record = "/bin/echo desk-hook"'), "the corrected command was not saved");
+  assert((await page.locator("#set-post-record-error").count()) === 0, "the error stays after a good save");
+  await box.fill("");
+  await box.blur();
+  await settled();
+  await closeSettings();
+});
+await check("settings: the shortcut text tells in Margin from any app (L5)", async () => {
+  await openSettings("Recording");
+  const text = await settingsPage().getByText(/from any app/).innerText();
+  assert(/⌃⌥⌘R/.test(text) && /Inside Margin/.test(text) && /⌘⇧R/.test(text), `shortcut help: ${text}`);
+  await closeSettings();
+});
 await check("settings: the calendar switch never prompts in the QA bridge and stays off (D67)", async () => {
   await openSettings("Recording");
   await toggle(/Start notes from my calendar/).check();
@@ -1085,6 +1230,7 @@ await check("ask: not signed in says how to fix it", async () => {
   await page.locator(".ask").waitFor({ timeout: 5000 });
   try {
     await page.locator(".ask-setup", { hasText: /isn't signed in.*run claude/ }).waitFor({ timeout: 8000 });
+    await page.locator(".ask-setup", { hasText: /Ask always uses Claude Code/ }).waitFor({ timeout: 1000 });
     assert(await page.locator(".ask-compose").getByRole("button", { name: "Ask" }).isDisabled(), "Ask enabled while not signed in");
     await page.screenshot({ path: path.join(out, "ask-not-signed-in.png") });
   } finally {

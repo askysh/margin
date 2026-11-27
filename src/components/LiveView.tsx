@@ -8,6 +8,8 @@ interface Props {
   recorder: RecorderView;
   lines: LiveLine[];
   level: number;
+  /** False while Settings covers the notes. App keeps this view mounted underneath it. */
+  active: boolean;
 }
 
 /** The latest notes and title typed, newer than the last debounced save. Stop sends them,
@@ -17,7 +19,7 @@ export const liveDraft: { session: string | null; notes: string | null; title: s
 /** The notepad during a meeting: your notes on the left and the live transcript on the
  * right. The rule between them is the recording light and level meter. A narrow window
  * shows one of the two, picked with a switch. */
-export function LiveView({ recorder, lines, level }: Props) {
+export function LiveView({ recorder, lines, level, active }: Props) {
   // Coming back to the live view mid-recording: what you typed lives in liveDraft, which is
   // newer than the recorder snapshot App holds.
   const same = liveDraft.session === recorder.started_at;
@@ -48,6 +50,9 @@ export function LiveView({ recorder, lines, level }: Props) {
     };
   }, [recorder.started_at]);
 
+  const column = useRef<HTMLDivElement>(null);
+  useNotesFocus(column, active);
+
   const startedLabel = useMemo(
     () => (recorder.started_at ? new Date(recorder.started_at) : new Date()).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }),
     [recorder.started_at],
@@ -61,7 +66,7 @@ export function LiveView({ recorder, lines, level }: Props) {
     <div className={`page page-live${oneColumn ? " page-compact" : ""}`}>
       {oneColumn && <SideSwitch side={side} onSide={setSide} transcriptLabel="Live transcript" />}
       {/* Hidden, not removed, so the caret and the scroll stay where you left them. */}
-      <div className={`notes-col${notesHidden ? " is-hidden" : ""}`}>
+      <div ref={column} className={`notes-col${notesHidden ? " is-hidden" : ""}`}>
         <input
           className="title-input"
           placeholder="Untitled meeting"
@@ -85,6 +90,33 @@ export function LiveView({ recorder, lines, level }: Props) {
       {(!oneColumn || side === "transcript") && <LiveTranscript lines={lines} call={recorder.kind === "call"} />}
     </div>
   );
+}
+
+function isEditable(el: EventTarget | null): boolean {
+  return el instanceof HTMLElement && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+}
+
+/** Keeps the caret in the notes during a recording. Settings hides this view, and a hidden
+ * field loses focus, so notes typed after Back went nowhere: focus returns when the view
+ * does. A printable key pressed with nothing to type in (focus on the page after a banner
+ * closed, say) goes to the notes too. Shortcuts carry ⌘, Ctrl or Alt, so they pass. */
+function useNotesFocus(column: React.RefObject<HTMLDivElement | null>, active: boolean) {
+  const wasActive = useRef(active);
+  useEffect(() => {
+    const notes = () => column.current?.querySelector("textarea");
+    if (active && !wasActive.current && !isEditable(document.activeElement)) notes()?.focus();
+    wasActive.current = active;
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (Array.from(e.key).length !== 1 || isEditable(e.target)) return;
+      // Space presses a focused button: only a bare page hands it to the notes.
+      if (e.key === " " && e.target !== document.body) return;
+      notes()?.focus();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active, column]);
 }
 
 export function Rule({ level, live }: { level: number; live: boolean }) {

@@ -7,7 +7,7 @@ import { SummaryChoice } from "./SummaryChoice";
 import { Card, Row, SectionHead, SelectRow, TextRow, ToggleRow, type Choice } from "./SettingsRows";
 import type { SettingsView } from "./Settings";
 import { OneDriveNote } from "./OneDriveNote";
-import { canRecordCalls, DEVICE, GLOBAL_SHORTCUT, hasAppleSpeech, hasGpuSwitch, hasOpenAtLogin, hasRecordingChip, SHOW_IN_FILES, TRAY } from "../platform";
+import { canRecordCalls, DEVICE, GLOBAL_SHORTCUT, hasAppleSpeech, hasGpuSwitch, hasOpenAtLogin, hasRecordingChip, keys, SHOW_IN_FILES, TRAY } from "../platform";
 
 type Save = (patch: Partial<Settings>) => void;
 
@@ -133,7 +133,7 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
         )}
         <ToggleRow
           title="Keyboard shortcut in every app"
-          help={<>Start and stop recording from any app with <kbd className="kbd">{GLOBAL_SHORTCUT}</kbd></>}
+          help={<>Start and stop recording from any app with <kbd className="kbd">{GLOBAL_SHORTCUT}</kbd>. Inside Margin, {keys("⌘⇧R and ⌘⇧I work", "Ctrl+Shift+R works")} without this.</>}
           checked={prefs.record_shortcut}
           onChange={(on) => changePrefs({ ...prefs, record_shortcut: on })}
         />

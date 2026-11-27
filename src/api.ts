@@ -222,6 +222,24 @@ export interface Voice {
   samples: number;
 }
 
+export interface SearchHit {
+  path: string;
+  excerpt: string;
+}
+
+/** What `search_meetings` answers. `corrected` is the spelling it searched for instead of the
+ * query, such as "warranty" for "warrnty"; null or absent when the query was used as typed. */
+export interface SearchResponse {
+  hits: SearchHit[];
+  corrected?: string | null;
+}
+
+/** An older backend answers with the bare list. */
+function searchResponse(r: SearchHit[] | SearchResponse): { hits: SearchHit[]; corrected?: string } {
+  if (Array.isArray(r)) return { hits: r };
+  return { hits: r.hits, corrected: r.corrected ?? undefined };
+}
+
 export interface ChatSource {
   path: string;
   title: string;
@@ -294,7 +312,7 @@ export const api = {
   readMeeting: (path: string) => invoke<MeetingDetail>("read_meeting", { path }),
   saveNotes: (path: string, notes: string) => invoke<void>("save_notes", { path, notes }),
   setMeetingTitle: (path: string, title: string) => invoke<void>("set_meeting_title", { path, title }),
-  search: (query: string) => invoke<{ path: string; excerpt: string }[]>("search_meetings", { query }),
+  search: (query: string) => invoke<SearchHit[] | SearchResponse>("search_meetings", { query }).then(searchResponse),
   trashMeeting: (path: string) => invoke<void>("trash_meeting", { path }),
   reveal: (path: string) => invoke<void>("reveal_in_finder", { path }),
   openInObsidian: (path: string) => invoke<void>("open_in_obsidian", { path }),

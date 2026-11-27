@@ -16,13 +16,28 @@ export function bytes(n: number): string {
   return `${n} B`;
 }
 
+/** `path` with the home folder as `~`. The home comes from `home`, else the folder the app
+ * learned with `learnHome`, else a guess from the path's shape. */
 export function tildify(path: string, home?: string): string {
-  const h = home ?? guessHome(path);
-  return h && path.startsWith(h) ? "~" + path.slice(h.length) : path;
+  const h = home ?? knownHome ?? guessHome(path);
+  if (!h || !path.startsWith(h)) return path;
+  const rest = path.slice(h.length);
+  return rest === "" || /^[\\/]/.test(rest) ? "~" + rest : path;
+}
+
+let knownHome: string | null = null;
+
+/** The backend gives no home folder, but the default meetings folder is `<home>/Documents/Meetings`
+ * (paths.rs `default_output_dir`). That is the only way to know a home whose path has no
+ * recognisable shape, such as a sandbox HOME. Where the shape is recognisable the guess
+ * stands: Windows moves Documents into OneDrive, and then this would name the wrong folder. */
+export function learnHome(defaultMeetingsDir: string): void {
+  const m = guessHome(defaultMeetingsDir) ? null : defaultMeetingsDir.match(/^(.+?)[\\/]Documents[\\/]Meetings$/);
+  knownHome = m ? m[1] : null;
 }
 
 function guessHome(path: string): string | null {
-  const m = path.match(/^\/Users\/[^/]+/);
+  const m = path.match(/^(\/Users\/[^/]+|\/home\/[^/]+|[A-Za-z]:\\Users\\[^\\]+)/);
   return m ? m[0] : null;
 }
 
@@ -65,15 +80,18 @@ export function speakerNames(order: string[]): Map<string, string> {
   for (const label of order) {
     if (out.has(label)) continue;
     n++;
-    out.set(label, label === "MICROPHONE" ? "You" : label === "SYSTEM" ? "Them" : isRawSpeaker(label) ? `Speaker ${n}` : label);
+    out.set(label, label === "MICROPHONE" ? "You" : label === "SYSTEM" ? "Them" : label === UNKNOWN_SPEAKER ? "Unknown speaker" : isRawSpeaker(label) ? `Speaker ${n}` : label);
   }
   return out;
 }
 
-/** Labels core writes before anyone is named: diarized `SPEAKER_n`, or the capture source
- * (`MICROPHONE` = your mic, `SYSTEM` = the call) on call recordings. */
+/** The label core writes for a stretch that matched no speaker. */
+const UNKNOWN_SPEAKER = "UNKNOWN";
+
+/** Labels core writes before anyone is named: diarized `SPEAKER_n`, `UNKNOWN`, or the capture
+ * source (`MICROPHONE` = your mic, `SYSTEM` = the call) on call recordings. */
 export function isRawSpeaker(label: string | null): boolean {
-  return !!label && /^(SPEAKER_\d+|MICROPHONE|SYSTEM)$/.test(label);
+  return !!label && /^(SPEAKER_\d+|UNKNOWN|MICROPHONE|SYSTEM)$/.test(label);
 }
 
 /** Run `fn(value)` once `value` has been stable for `ms`. A change still pending when the
