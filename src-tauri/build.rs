@@ -9,35 +9,19 @@ fn main() {
     tauri_build::build()
 }
 
-/// Compiles minutes-core's EventKit helper, `calendar-events`, from the pinned core checkout
-/// to `binaries/calendar-events-<target>`, so Tauri bundles and signs it next to `margin`.
-/// Core looks for the helper beside the running binary first. Without it, a copy of
-/// Margin on any other Mac reads no calendar (D67). The source stays in core: this compiles
-/// it from cargo's checkout and copies nothing into this repository.
+/// Compiles minutes-core's EventKit helper, `calendar-events`, from the vendored core
+/// (`../vendor/minutes-core/scripts`, D80) to `binaries/calendar-events-<target>`, so Tauri
+/// bundles and signs it next to `margin`. Core looks for the helper beside the running binary
+/// first. Without it, a copy of Margin on any other Mac reads no calendar (D67). Core itself
+/// comes from vendor/ through Cargo's `[patch]`, so cargo's git checkout of the pinned rev
+/// need not exist; the vendored scripts are that rev's files, unchanged.
 fn build_calendar_helper() {
-    let manifest = std::fs::read_to_string("Cargo.toml").expect("read Cargo.toml");
-    let rev = manifest
-        .lines()
-        .find(|l| l.starts_with("minutes-core") && l.contains("rev = \""))
-        .and_then(|l| l.split("rev = \"").nth(1))
-        .and_then(|r| r.split('"').next())
-        .expect("minutes-core rev in Cargo.toml");
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cargo"));
-    let checkouts = cargo_home.join("git").join("checkouts");
-    let short = &rev[..7.min(rev.len())];
-    let root = std::fs::read_dir(&checkouts)
-        .expect("cargo git checkouts")
-        .flatten()
-        .filter(|d| d.file_name().to_string_lossy().starts_with("minutes-"))
-        .map(|d| d.path().join(short))
-        .find(|p| p.join("scripts/calendar-events.swift").is_file())
-        .unwrap_or_else(|| panic!("minutes-core checkout {short} with scripts/calendar-events.swift not found under {}", checkouts.display()));
+    let root = std::path::Path::new("../vendor/minutes-core");
     let source = root.join("scripts/calendar-events.swift");
     let plist = root.join("scripts/calendar-helper-Info.plist");
+    assert!(source.is_file() && plist.is_file(), "calendar helper sources not found under {}", root.join("scripts").display());
     println!("cargo:rerun-if-changed={}", source.display());
-    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed={}", plist.display());
     let target = std::env::var("TARGET").expect("TARGET");
     let arch = target.split('-').next().unwrap_or("arm64").replace("aarch64", "arm64");
     std::fs::create_dir_all("binaries").expect("create binaries/");
