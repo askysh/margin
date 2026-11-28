@@ -247,7 +247,7 @@ fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
         Vec::new()
     };
     cfg.diarization.model_path = paths::diarization_models_dir();
-    pin_measured_transcription_defaults(&mut cfg.transcription);
+    pin_measured_transcription_defaults(&mut cfg.transcription, !crate::extras::vocabulary_terms().is_empty());
     cfg.vault.enabled = false;
     cfg.live_transcript.recording_sidecar = true;
     cfg.live_transcript.model = live_model(&cfg.transcription.model);
@@ -269,7 +269,12 @@ fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
 const MEETING_CHUNK_NOISE_MULTIPLIER: f32 = 2.5;
 const MEETING_CHUNK_PAD_MS: u32 = 300;
 
-fn pin_measured_transcription_defaults(t: &mut minutes_core::config::TranscriptionConfig) {
+/// `has_vocabulary`: the user's Settings word list is not empty. whisper.cpp passes the
+/// initial prompt through the conditioning buffer, so `n_max_text_ctx = 0` would drop the
+/// words and the name and title hints (UPSTREAM-PATCHES #25). Then the context stays
+/// upstream's. Earlier builds saved Margin's 0 into config.toml, where it cannot be told from
+/// a choice, so a 0 counts as Margin's own value; any other number is the user's and stays.
+fn pin_measured_transcription_defaults(t: &mut minutes_core::config::TranscriptionConfig, has_vocabulary: bool) {
     let core = minutes_core::config::TranscriptionConfig::default();
     if t.meeting_chunk_noise_multiplier == core.meeting_chunk_noise_multiplier {
         t.meeting_chunk_noise_multiplier = MEETING_CHUNK_NOISE_MULTIPLIER;
@@ -277,8 +282,8 @@ fn pin_measured_transcription_defaults(t: &mut minutes_core::config::Transcripti
     if t.meeting_chunk_pad_ms == core.meeting_chunk_pad_ms {
         t.meeting_chunk_pad_ms = MEETING_CHUNK_PAD_MS;
     }
-    if t.n_max_text_ctx.is_none() {
-        t.n_max_text_ctx = Some(0);
+    if matches!(t.n_max_text_ctx, None | Some(0)) {
+        t.n_max_text_ctx = (!has_vocabulary).then_some(0);
     }
 }
 
@@ -793,16 +798,32 @@ mod tests {
     #[test]
     fn measured_transcription_defaults_replace_only_cores_defaults() {
         let mut t = minutes_core::config::TranscriptionConfig::default();
-        pin_measured_transcription_defaults(&mut t);
+        pin_measured_transcription_defaults(&mut t, false);
         assert_eq!(t.meeting_chunk_noise_multiplier, MEETING_CHUNK_NOISE_MULTIPLIER);
         assert_eq!(t.meeting_chunk_pad_ms, MEETING_CHUNK_PAD_MS);
         assert_eq!(t.n_max_text_ctx, Some(0));
 
-        let mut chosen = minutes_core::config::TranscriptionConfig::default();
-        chosen.meeting_chunk_noise_multiplier = 3.0;
-        chosen.meeting_chunk_pad_ms = 150;
-        chosen.n_max_text_ctx = Some(64);
-        pin_measured_transcription_defaults(&mut chosen);
-        assert_eq!((chosen.meeting_chunk_noise_multiplier, chosen.meeting_chunk_pad_ms, chosen.n_max_text_ctx), (3.0, 150, Some(64)));
+        for has_vocabulary in [false, true] {
+            let mut chosen = minutes_core::config::TranscriptionConfig::default();
+            chosen.meeting_chunk_noise_multiplier = 3.0;
+            chosen.meeting_chunk_pad_ms = 150;
+            chosen.n_max_text_ctx = Some(64);
+            pin_measured_transcription_defaults(&mut chosen, has_vocabulary);
+            assert_eq!((chosen.meeting_chunk_noise_multiplier, chosen.meeting_chunk_pad_ms, chosen.n_max_text_ctx), (3.0, 150, Some(64)));
+        }
+    }
+
+    #[test]
+    fn vocabulary_words_keep_whispers_text_context() {
+        let mut t = minutes_core::config::TranscriptionConfig::default();
+        pin_measured_transcription_defaults(&mut t, true);
+        assert_eq!(t.n_max_text_ctx, None, "a 0 would drop the words from Whisper's prompt");
+        assert_eq!(t.meeting_chunk_pad_ms, MEETING_CHUNK_PAD_MS, "the chunk settings do not depend on it");
+        // A config.toml that an earlier build saved with Margin's 0.
+        let mut saved = minutes_core::config::TranscriptionConfig { n_max_text_ctx: Some(0), ..Default::default() };
+        pin_measured_transcription_defaults(&mut saved, true);
+        assert_eq!(saved.n_max_text_ctx, None);
+        pin_measured_transcription_defaults(&mut saved, false);
+        assert_eq!(saved.n_max_text_ctx, Some(0), "an emptied word list brings the measured setting back");
     }
 }

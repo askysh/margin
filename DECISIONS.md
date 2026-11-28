@@ -1468,6 +1468,15 @@ The full comparison is in `docs/parity/app.md`.
   repeating into the next ones.
   - `corecfg::pin_measured_transcription_defaults` replaces only core's own defaults, so
     a value set in config.toml stays.
+  - Revised after the final review (28 Nov 2026): whisper.cpp feeds the initial prompt
+    through the same buffer as the earlier text, so `n_max_text_ctx = 0` also drops the
+    prompt (UPSTREAM-PATCHES #25): the Settings vocabulary and the name and title hints
+    never reached the batch or rolling passes. The AMI gain was measured without user
+    vocabulary. So ctx 0 applies only while the user's own Vocabulary list is empty; with
+    words in it, `n_max_text_ctx` stays unset (upstream) and the words reach Whisper. The
+    check runs on every config load, so adding or clearing words takes effect at the next
+    meeting. Earlier builds saved the 0 into config.toml, so a 0 counts as Margin's value;
+    any other number is the user's and stays. Settings says so under the word list.
 - Rolling pieces (D49) must keep the whole-file chunks. Core pads each piece's chunks
   inside the piece, so padding never pulls audio from the next piece, and at Stop core
   reuses a piece whose audio digest and settings match, without comparing chunks. A cut

@@ -66,16 +66,23 @@ pub fn use_state_cwd() {
 
 // ---------------------------------------------------------------- vocabulary
 
+/// Core's `vocabulary::default_path()` once `paths::install_env` points `MINUTES_HOME` at the
+/// state directory. Named here so a process that never set it (a unit test, every
+/// `corecfg::load`) reads Margin's list, not the shared `~/.minutes` one.
+fn vocabulary_path() -> PathBuf {
+    paths::state_dir().join("vocabulary.toml")
+}
+
 /// The terms you typed in Settings. Entries that core or the upstream app added for other
 /// reasons (a speaker confirmation, an import) are not shown and are never removed.
 pub fn vocabulary_terms() -> Vec<String> {
-    vocabulary::load()
+    vocabulary::load_at(&vocabulary_path())
         .map(|store| store.entries.into_iter().filter(is_ours).map(|e| e.canonical).collect())
         .unwrap_or_default()
 }
 
 pub fn set_vocabulary(terms: &[String]) -> Result<(), String> {
-    let mut store = vocabulary::load().unwrap_or_else(|error| {
+    let mut store = vocabulary::load_at(&vocabulary_path()).unwrap_or_else(|error| {
         tracing::warn!(%error, "vocabulary unreadable; starting a new one");
         VocabularyStore::empty()
     });
@@ -86,7 +93,7 @@ pub fn set_vocabulary(terms: &[String]) -> Result<(), String> {
         entry.source = VocabularySource::Manual;
         entry
     }));
-    vocabulary::save_at(&vocabulary::default_path(), &store).map_err(|e| format!("Couldn't save the word list: {e}"))
+    vocabulary::save_at(&vocabulary_path(), &store).map_err(|e| format!("Couldn't save the word list: {e}"))
 }
 
 fn is_ours(entry: &VocabularyEntry) -> bool {

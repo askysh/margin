@@ -220,7 +220,7 @@ export function TranscriptionSection({ s, save, options, prefs, changePrefs }: S
         <TextRow
           id="set-vocabulary"
           label="Names and words to spell right"
-          help="One per line: people, products, acronyms. The transcriber gets up to 8 of them as hints."
+          help="One per line: people, products, acronyms. The transcriber gets up to 8 of them as hints. With words here, Margin turns off a setting that otherwise makes transcripts a little more accurate, so add only words it gets wrong."
           placeholder={"Priya Raman\nKubernetes"}
           value={(s.vocabulary ?? []).join("\n")}
           onSave={(text) => save({ vocabulary: text.split("\n") })}

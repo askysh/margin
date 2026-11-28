@@ -27,6 +27,9 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Fixed
 
+- Words in Settings → *Names and words to spell right* never reached Whisper: the measured
+  "no text conditioning" setting also drops Whisper's prompt. It now applies only while
+  the word list is empty (D82).
 - Margin rewrote finished meetings at every launch: the silence scrub ran again on each
   meeting it had already processed. It now runs only on a meeting that just finished (D90).
 - The silence scrub deleted real speech: a line that merely contained "Thank you for
