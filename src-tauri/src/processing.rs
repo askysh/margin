@@ -429,8 +429,10 @@ fn finish(job: &JobView, announce: bool) {
     restore_notes(job, Path::new(output));
     let _ = std::fs::remove_file(live_draft_path(&job.id));
     let untitled = std::fs::remove_file(untitled_marker(&job.id)).is_ok();
-    let no_speech = clean_transcript(Path::new(output), untitled);
+    // Only a job that just finished: the first poll at launch passes every archived job
+    // here, and the scrub must never rewrite a meeting that was already done.
     if announce {
+        let no_speech = clean_transcript(Path::new(output), untitled);
         // Before the summary rewrites the file.
         let fallback_notice = std::fs::read_to_string(output).ok().and_then(|content| model_fallback_notice(output, &content));
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
@@ -633,6 +635,30 @@ mod tests {
         assert!(at(&JobTimes::of(&failed).recording_finished_at, "2026-11-10T12:24:03+05:30"));
         let active = job(serde_json::json!({ "state": "transcribing", "started_at": "2026-11-10T12:24:10+05:30" }));
         assert_eq!(JobTimes::of(&active), JobTimes::default());
+    }
+
+    #[test]
+    fn a_launch_poll_leaves_an_old_meeting_file_alone() {
+        let dir = std::env::temp_dir().join(format!("margin-launch-poll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("old.md");
+        // What the scrub would change in a new meeting: a cut title, a silence phrase.
+        let old = "---\ntitle: I Have Kept People in Love, I Am Giving You a Split in Ca...\ntype: meeting\ndate: 2026-11-20T10:00:00+05:30\nduration: 5m\nstatus: complete\n---\n\n## Transcript\n\n[SPEAKER_1 0:00] [SYSTEM] Продолжение следует...\n";
+        std::fs::write(&file, old).unwrap();
+        let view = JobView {
+            id: "launch-poll-old".into(),
+            title: None,
+            state: JobState::Complete,
+            stage: None,
+            output_path: Some(file.display().to_string()),
+            created_at: "2026-11-20T10:05:00+05:30".into(),
+            error: None,
+            draft: None,
+            times: JobTimes::default(),
+        };
+        finish(&view, false);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), old);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
