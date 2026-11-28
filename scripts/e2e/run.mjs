@@ -703,6 +703,11 @@ if (simulate) {
     await settingsPage().waitFor();
     await closeSettings();
     assert((await focusedLabel()) === "Your notes", `focus after Back: ${await focusedLabel()}`);
+    // A Bluetooth headset that was gated until the wearer spoke: the warning goes away.
+    await page.evaluate(() => window.__E2E__.emit("mic-silent", "QA: the microphone is silent"));
+    await page.locator(".mic-banner").waitFor();
+    await page.evaluate(() => window.__E2E__.emit("mic-heard", null));
+    await page.locator(".mic-banner").waitFor({ state: "detached", timeout: 3000 });
     await page.keyboard.type(" [after-banner]");
     // Dismissing the banner leaves the caret in the notes.
     await page.evaluate(() => window.__E2E__.emit("mic-silent", "QA: the microphone is silent"));

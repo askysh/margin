@@ -158,6 +158,7 @@ export default function App() {
       on<string | null>("call-detected", (a) => setCallApp(a)),
       on<CalendarOffer>("calendar-upcoming", (o) => setCalendarOffer(o)),
       on<string>("mic-silent", (m) => setMicSilent(m)),
+      on<null>("mic-heard", () => setMicSilent(null)),
       // The menu bar's recent meetings and a click on a "meeting ready" notification.
       on<string>("open-meeting", (path) => {
         if (resettingRef.current) return;
@@ -362,7 +363,7 @@ export default function App() {
           )}
           {micSilent && recording && (
             <div className="call-banner mic-banner" role="alert" title={micSilent}>
-              <span><b>Your microphone is silent.</b> Your own voice is not recorded.</span>
+              <span><b>Margin hasn't heard your microphone yet.</b> If you have been talking, your voice is not being recorded.</span>
               <button className="link-btn danger" onClick={() => openSettings("recording")}>Change microphone</button>
               <button className="icon-btn small" aria-label="Dismiss" onClick={() => { setMicSilent(null); requestAnimationFrame(focusNotesEnd); }}>×</button>
             </div>

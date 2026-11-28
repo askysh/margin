@@ -26,6 +26,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
   and it takes about 7 minutes per hour of meeting instead of 2 (D72).
 
 ### Fixed
+- The "microphone is silent" warning now says Margin hasn't heard the microphone *yet*, keeps checking, and disappears as soon as the microphone is heard, so a Bluetooth headset that stays silent until you speak no longer leaves a false alarm.
+- The calendar helper is built from the vendored core, so a build no longer needs cargo's cached git checkout.
 
 - *Use Margin Desk* wrote a command that broke when Node or Margin Desk sat in a folder with
   a space in its name, such as `C:\Program Files\nodejs`. Both paths are quoted now (D70).

@@ -583,7 +583,7 @@ fn spawn_ticker(session: u64) {
         .spawn(move || {
             let r = recorder();
             let mut since = 0usize;
-            let mut mic_checked = false;
+            let mut mic = MicWatch::Unchecked;
             loop {
                 std::thread::sleep(Duration::from_millis(500));
                 let (kind, wav, ended) = {
@@ -618,13 +618,14 @@ fn spawn_ticker(session: u64) {
                     let guard = r.active.lock().unwrap();
                     guard.as_ref().map(|a| (Local::now() - a.started_at).num_seconds().max(0)).unwrap_or(0)
                 };
-                if !mic_checked && elapsed >= MIC_CHECK_AFTER_SECS {
+                if mic != MicWatch::Done && elapsed >= MIC_CHECK_AFTER_SECS {
                     // A track that is not readable yet is tried again on the next tick.
-                    if let Some(silent) = mic_silence(&mic_track(kind, &wav)) {
-                        mic_checked = true;
-                        if silent {
-                            warn_silent_mic();
-                        }
+                    let (next, say) = mic.next(mic_silence(&mic_track(kind, &wav)));
+                    mic = next;
+                    match say {
+                        Some(MicNews::Silent) => warn_silent_mic(),
+                        Some(MicNews::Heard) => events::emit("mic-heard", ()),
+                        None => {}
                     }
                 }
                 events::emit("recorder-tick", serde_json::json!({ "elapsed_secs": elapsed, "level": view_level }));
@@ -681,7 +682,36 @@ fn guess_speaker(wav: &Path, ts: DateTime<Local>, duration_ms: u64) -> Option<&'
     }
 }
 
-/// The microphone check runs once, this many seconds into a recording, over the last
+/// The microphone check. Some Bluetooth headsets send pure silence until the wearer speaks,
+/// so a silent first check is a warning, not a verdict: the check repeats on every tick and
+/// the warning is taken back as soon as the microphone is heard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MicWatch {
+    Unchecked,
+    Warned,
+    Done,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MicNews {
+    Silent,
+    Heard,
+}
+
+impl MicWatch {
+    fn next(self, silent: Option<bool>) -> (MicWatch, Option<MicNews>) {
+        match (self, silent) {
+            (_, None) => (self, None),
+            (MicWatch::Unchecked, Some(true)) => (MicWatch::Warned, Some(MicNews::Silent)),
+            (MicWatch::Unchecked, Some(false)) => (MicWatch::Done, None),
+            (MicWatch::Warned, Some(true)) => (MicWatch::Warned, None),
+            (MicWatch::Warned, Some(false)) => (MicWatch::Done, Some(MicNews::Heard)),
+            (MicWatch::Done, _) => (MicWatch::Done, None),
+        }
+    }
+}
+
+/// The first microphone check runs this many seconds into a recording, over the last
 /// `MIC_CHECK_WINDOW_MS` of the microphone track.
 const MIC_CHECK_AFTER_SECS: i64 = 30;
 const MIC_CHECK_WINDOW_MS: u64 = 20_000;
@@ -731,11 +761,11 @@ fn window_peak_from_end(path: &Path, duration_ms: u64) -> Option<f32> {
 /// goes on: the other side of a call is still worth keeping.
 fn warn_silent_mic() {
     let device = crate::corecfg::load().recording.device.filter(|d| !d.trim().is_empty()).unwrap_or_else(|| "the microphone".into());
-    let message = format!("Margin hears nothing from {device}. Your own voice is not being recorded. Check the microphone in Settings → Recording, or choose another input.");
+    let message = format!("Margin hasn't heard anything from {device} yet. If you have been talking, check the microphone in Settings → Recording. Some Bluetooth headsets stay silent until you speak.");
     tracing::warn!(%device, "microphone track is silent");
     events::emit("mic-silent", &message);
     events::notify(events::Notice {
-        title: "Margin can't hear your microphone".into(),
+        title: "Margin hasn't heard your microphone yet".into(),
         body: message,
         meeting: None,
         call_app: None,
@@ -887,6 +917,17 @@ mod tests {
         assert_eq!(mic_silence(&short), None, "too little audio to judge yet");
         assert_eq!(mic_silence(&dir.join("missing.wav")), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_silent_microphone_is_a_warning_that_is_taken_back_when_it_is_heard() {
+        let (warned, news) = MicWatch::Unchecked.next(Some(true));
+        assert_eq!((warned, news), (MicWatch::Warned, Some(MicNews::Silent)));
+        assert_eq!(warned.next(Some(true)), (MicWatch::Warned, None), "no repeat warning");
+        assert_eq!(warned.next(None), (MicWatch::Warned, None), "unreadable track: try again");
+        assert_eq!(warned.next(Some(false)), (MicWatch::Done, Some(MicNews::Heard)));
+        assert_eq!(MicWatch::Unchecked.next(Some(false)), (MicWatch::Done, None), "a working mic is never mentioned");
+        assert_eq!(MicWatch::Done.next(Some(true)), (MicWatch::Done, None));
     }
 
     #[test]
