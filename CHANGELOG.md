@@ -27,6 +27,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Fixed
 
+- *Summarize again* could replace a title you typed when it matched the first words
+  spoken. Only the automatic first summary of a new meeting names it now (D92).
 - Words in Settings → *Names and words to spell right* never reached Whisper: the measured
   "no text conditioning" setting also drops Whisper's prompt. It now applies only while
   the word list is empty (D82).

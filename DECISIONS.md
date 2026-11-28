@@ -1571,13 +1571,16 @@ The full comparison is in `docs/parity/app.md`.
   spoken and cuts it at 57 characters plus "..." (`finalize_title`).
 - Renames are not tracked anywhere: `set_title` writes the frontmatter. D59's guard was "the
   title still equals what Stop left", and it covered only the first summary after processing.
-- Pick: a title is replaced from the summary, after the first summary or after *Summarize
-  again*, when it is the Stop fallback, core's 60-character cut, or two or more words that are
+- Pick: a title is replaced from the summary after the first summary (and, until the
+  revision below, after *Summarize again*), when it is the Stop fallback, core's 60-character cut, or two or more words that are
   the opening words of the transcript. A calendar meeting is never replaced, and the title is
   checked again after the model runs. Margin cuts a title that core ended with "..." at a word
   boundary (also when the summary engine is off), and also when the library shows it.
-- Cost: a user title that was typed as the opening words of the speech is taken for the
-  machine's. Prompt change not made: the summary prompt is core's (`build_base_system_prompt`)
+- Revised after the final review (28 Nov 2026): only the automatic first summary of a newly
+  finished meeting replaces a title. *Summarize* and *Summarize again* never do, since the
+  user may have typed a title that matches the opening words since.
+- Cost: a user title that was typed as the opening words of the speech before the first
+  summary is taken for the machine's. Prompt change not made: the summary prompt is core's (`build_base_system_prompt`)
   and core already asks for a TITLE line, which `resummarize` keeps out of the file; the title
   call (D59) stays the way to get one.
 

@@ -237,6 +237,12 @@ fn title_words(text: &str) -> Vec<String> {
     text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect()
 }
 
+/// Only the automatic first summary of a newly finished meeting renames it, and only when
+/// its title is the machine's (D92).
+fn wants_new_title(after_processing: bool, fm: &minutes_core::markdown::Frontmatter, body: &str, fallback: Option<&str>) -> bool {
+    after_processing && is_auto_title(fm, body, fallback)
+}
+
 /// The title came from the machine and the user has not touched it (D92). Margin does not
 /// record renames, so this reads the file:
 /// - the title is the fallback that Stop left (`fallback`, set for a meeting started with no
@@ -268,12 +274,12 @@ fn is_auto_title(fm: &minutes_core::markdown::Frontmatter, body: &str, fallback:
 /// no summary and kept its fallback, the first words of the transcript. Only the frontmatter
 /// title changes. The file keeps its name, so links and the job record still find it, as with
 /// a title typed in the meeting view. A title changed while the model ran is kept.
-fn title_from_summary(path: &std::path::Path, fallback: Option<&str>) {
+fn title_from_summary(path: &std::path::Path, after_processing: bool, fallback: Option<&str>) {
     let refined = (|| -> Result<Option<(String, String)>, String> {
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let (fm_text, body) = minutes_core::markdown::split_frontmatter(&content);
         let fm: minutes_core::markdown::Frontmatter = serde_yaml::from_str(fm_text).map_err(|e| e.to_string())?;
-        if !is_auto_title(&fm, body, fallback) {
+        if !wants_new_title(after_processing, &fm, body, fallback) {
             return Ok(None);
         }
         let Some(text) = crate::library::sections(body).into_iter().find(|s| s.heading == "Summary").map(|s| s.body) else {
@@ -313,16 +319,17 @@ fn title_from_summary(path: &std::path::Path, fallback: Option<&str>) {
     }
 }
 
-/// Retitle and clean a summary core just wrote: the model's preamble goes (D94), then an
-/// auto title is replaced (D92). Called with the summary still marked as running, so the
-/// view reads the file once, when the run ends. Failures are logged; the summary stays.
-pub fn finish_summary(path: &std::path::Path, fallback: Option<&str>) {
+/// Retitle and clean a summary core just wrote: the model's preamble goes (D94), then, after
+/// the first summary of a newly finished meeting, an auto title is replaced (D92). Called
+/// with the summary still marked as running, so the view reads the file once, when the run
+/// ends. Failures are logged; the summary stays.
+pub fn finish_summary(path: &std::path::Path, after_processing: bool, fallback: Option<&str>) {
     match clean_summary_in_file(path) {
         Ok(true) => tracing::info!("removed a preamble from the summary"),
         Ok(false) => {}
         Err(error) => tracing::warn!(%error, "could not clean the summary"),
     }
-    title_from_summary(path, fallback);
+    title_from_summary(path, after_processing, fallback);
 }
 
 const PREAMBLE_OPENERS: &[&str] = &[
@@ -496,6 +503,14 @@ mod tests {
         assert!(!super::is_auto_title(&fm("I", false), BODY, None));
         assert!(!super::is_auto_title(&fm("I Have Kept People in Love", true), BODY, None));
         assert!(!super::is_auto_title(&fm("Wait for it...", false), BODY, None));
+    }
+
+    #[test]
+    fn a_summarize_click_never_renames_the_meeting() {
+        let typed = fm("I Have Kept People in Love", false);
+        assert!(!super::wants_new_title(false, &typed, BODY, None), "a title typed as the opening words stays");
+        assert!(!super::wants_new_title(false, &fm("Stop Here", false), BODY, Some("Stop Here")));
+        assert!(super::wants_new_title(true, &typed, BODY, None), "the first summary after processing names it");
     }
 
     #[test]

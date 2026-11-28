@@ -437,11 +437,12 @@ pub mod ops {
         summarize_meeting_with(path, false, None)
     }
 
-    /// `ingest_knowledge`: also update the knowledge wiki from the new summary. Only the
-    /// first summary after processing does this; core appends a log entry on every ingest,
-    /// so Summarize again would add a duplicate line. `fallback_title`: the title Stop left on
-    /// a meeting that had none (D59).
-    pub fn summarize_meeting_with(path: String, ingest_knowledge: bool, fallback_title: Option<String>) -> Res<()> {
+    /// `after_processing`: the automatic first summary of a newly finished meeting. Only it
+    /// updates the knowledge wiki (core appends a log entry on every ingest, so Summarize
+    /// again would add a duplicate line), and only it may replace a machine title (D92): a
+    /// title the user typed can match the opening words, and a Summarize they click must not
+    /// rename it. `fallback_title`: the title Stop left on a meeting that had none (D59).
+    pub fn summarize_meeting_with(path: String, after_processing: bool, fallback_title: Option<String>) -> Res<()> {
         let p = PathBuf::from(path);
         library::ensure_inside_output(&p)?;
         processing::ensure_not_processing(&p)?;
@@ -472,7 +473,7 @@ pub mod ops {
             &minutes_core::resummarize::ResummarizeOptions {
                 apply: true,
                 template_override: extras::summary_template_slug(),
-                refresh: minutes_core::derived::RefreshOptions { ingest_knowledge: ingest_knowledge && cfg.knowledge.enabled },
+                refresh: minutes_core::derived::RefreshOptions { ingest_knowledge: after_processing && cfg.knowledge.enabled },
             },
         ))
         .map_err(|e| {
@@ -487,7 +488,7 @@ pub mod ops {
         if !report.applied {
             return Err("The summary engine returned nothing. Check that it's running, then try again.".into());
         }
-        summaries::finish_summary(&p, fallback_title.as_deref());
+        summaries::finish_summary(&p, after_processing, fallback_title.as_deref());
         Ok(())
     }
 
