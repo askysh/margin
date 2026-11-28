@@ -32,6 +32,9 @@ pub struct Prefs {
     /// transcript or stops the app (win.rs `whisper_on_cpu`). Stored inverted so a missing
     /// key means the graphics card is used.
     pub no_gpu: bool,
+    /// Ollama summaries: let the model think before it answers. Off unless you turn it on,
+    /// so a missing key sends `"think": false` through ollama_proxy.rs.
+    pub ollama_thinking: bool,
 }
 
 /// The preferences the UI can change.

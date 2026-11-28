@@ -1,0 +1,1416 @@
+#[cfg(any(test, target_os = "macos"))]
+use std::process::Command;
+#[cfg(any(test, target_os = "macos"))]
+use std::time::Duration;
+
+use chrono::{DateTime, Local};
+#[cfg(target_os = "macos")]
+use chrono::{Datelike, Timelike};
+
+// ──────────────────────────────────────────────────────────────
+// Calendar integration — upcoming meetings from macOS Calendar.
+//
+// Uses AppleScript to query Calendar.app. Avoids the `whose`
+// filter on CalDAV calendars (causes timeouts). Instead fetches
+// all events for today and filters by time in the script.
+//
+// Also tries a compiled EventKit helper if available.
+// ──────────────────────────────────────────────────────────────
+
+/// Maximum time to wait for a calendar subprocess before giving up.
+/// Calendar queries should complete in <1s when Calendar.app is healthy.
+/// 3s is generous enough for slow CalDAV syncs but doesn't freeze the app.
+#[cfg(any(test, target_os = "macos"))]
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(any(test, target_os = "macos"))]
+const EVENTKIT_OVERLAP_LOOKAHEAD_MINUTES: u32 = 120;
+#[cfg(any(test, target_os = "macos"))]
+const EVENTKIT_OVERLAP_LOOKBACK_MINUTES: u32 = 120;
+
+/// Run a Command with a timeout. Returns None if the process hangs or fails to start.
+///
+/// On Unix, the child is placed in its own process group so that the entire
+/// group (including any grandchild processes) can be killed on timeout.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    // Put the child in its own process group so we can kill the whole group.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setpgid is async-signal-safe and called between fork/exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+    }
+
+    let child = cmd.spawn().ok()?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let child_id = child.id();
+    let handle = std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let _ = handle.join();
+            result.ok()
+        }
+        Err(_) => {
+            // Timed out — kill the entire process group
+            eprintln!(
+                "[calendar] subprocess {} timed out after {:?}, killing",
+                child_id, timeout
+            );
+            #[cfg(unix)]
+            {
+                unsafe {
+                    libc::kill(-(child_id as i32), libc::SIGKILL);
+                    // Also kill the PID directly in case setpgid raced
+                    libc::kill(child_id as i32, libc::SIGKILL);
+                }
+            }
+            // Wait briefly for the waiter thread to notice the kill and exit,
+            // so we don't leak threads + zombie processes across retries.
+            let _ = handle.join().ok();
+            None
+        }
+    }
+}
+
+/// A calendar event with title, start time, attendees, and optional meeting URL.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CalendarEvent {
+    pub title: String,
+    pub start: String,
+    pub minutes_until: i64,
+    #[serde(default)]
+    pub attendees: Vec<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Name of the calendar the event belongs to, when the source reports it
+    /// (the EventKit helper does; the AppleScript fallback does not).
+    #[serde(default)]
+    pub calendar: Option<String>,
+    /// End time in the same local `YYYY-MM-DD HH:MM` form as `start`, when the
+    /// source reports it (EventKit only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// The event's location as written, for display. `url` holds only a
+    /// meeting link extracted from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// iCalendar UID. Shared by every copy of one invite, including copies
+    /// that reach the Mac through two accounts, and by every occurrence of a
+    /// recurring event (pair it with `start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+}
+
+/// Apply the `[calendar]` ignore filters to a list of events.
+pub fn filter_events(
+    events: Vec<CalendarEvent>,
+    config: &crate::config::CalendarConfig,
+) -> Vec<CalendarEvent> {
+    let ignored: Vec<String> = config
+        .ignore_title_contains
+        .iter()
+        .filter(|pattern| !pattern.is_empty())
+        .map(|pattern| pattern.to_lowercase())
+        .collect();
+    events
+        .into_iter()
+        .filter(|event| {
+            let title = event.title.to_lowercase();
+            if ignored.iter().any(|pattern| title.contains(pattern)) {
+                return false;
+            }
+            if event.calendar.as_deref().is_some_and(|calendar| {
+                config
+                    .ignore_calendars
+                    .iter()
+                    .any(|ignored| ignored.trim().eq_ignore_ascii_case(calendar.trim()))
+            }) {
+                return false;
+            }
+            !config.require_attendees_or_url || !event.attendees.is_empty() || event.url.is_some()
+        })
+        .collect()
+}
+
+/// Filter with the user's on-disk `[calendar]` settings.
+#[cfg(target_os = "macos")]
+fn apply_configured_filters(events: Vec<CalendarEvent>) -> Vec<CalendarEvent> {
+    filter_events(events, &crate::config::Config::load().calendar)
+}
+
+/// Extract a meeting URL (Zoom, Google Meet, Teams, Webex) from text.
+/// Searches for common video conferencing URL patterns and returns the first match.
+pub fn extract_meeting_url(text: &str) -> Option<String> {
+    let mut remaining = text;
+    while let Some(start) = remaining.find("https://") {
+        let url_text = &remaining[start..];
+        let end = url_text
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | ')' | ']'))
+            .unwrap_or(url_text.len());
+        let url = url_text[..end].trim_end_matches(['.', ',', ';', '\'']);
+
+        if let Some(redirect_url) = extract_google_redirect_url(url) {
+            if is_meeting_url(&redirect_url) {
+                return Some(redirect_url);
+            }
+        }
+
+        if is_meeting_url(url) {
+            return Some(url.to_string());
+        }
+
+        remaining = &url_text[end..];
+    }
+
+    None
+}
+
+fn is_meeting_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let rest_lower = rest.to_ascii_lowercase();
+    let (host, path) = match rest_lower.find('/') {
+        Some(slash) => (&rest_lower[..slash], &rest_lower[slash..]),
+        None => (rest_lower.as_str(), ""),
+    };
+
+    if matches_domain(host, "zoom.us") || matches_domain(host, "zoom.com") {
+        return path.starts_with("/j/")
+            || path.starts_with("/my/")
+            || path.starts_with("/s/")
+            || path.starts_with("/wc/join/")
+            || path.starts_with("/join")
+            || path.starts_with("/meeting/register/")
+            || path.starts_with("/webinar/register/");
+    }
+
+    (host == "meet.google.com" && path.len() > 1)
+        || (host == "teams.microsoft.com" && path.starts_with("/l/meetup-join/"))
+        || (host == "teams.live.com" && path.starts_with("/meet/"))
+        || (matches_domain(host, "webex.com") && path.starts_with("/meet/"))
+        || (host == "facetime.apple.com" && path.len() > 1)
+}
+
+fn matches_domain(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn extract_google_redirect_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let rest_lower = rest.to_ascii_lowercase();
+    let slash = rest_lower.find('/')?;
+    let host = &rest_lower[..slash];
+    if host != "google.com" && host != "www.google.com" {
+        return None;
+    }
+    let path_and_query = &rest[slash..];
+    if !path_and_query.starts_with("/url?") {
+        return None;
+    }
+    let query = path_and_query.split_once('?')?.1;
+    query.split('&').find_map(|param| {
+        let (key, value) = param.split_once('=')?;
+        if key == "q" || key == "url" {
+            Some(percent_decode(value))
+        } else {
+            None
+        }
+    })
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((high << 4) | low);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Calendar authorization state as reported by the EventKit helper's
+/// non-prompting `--status` probe (#300).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarAccess {
+    /// Full read access: meeting reminders and suggestions work.
+    FullAccess,
+    /// Write-only / add-only: reads return nothing, reminders are dead.
+    WriteOnly,
+    /// Explicitly denied.
+    Denied,
+    /// Restricted by policy (MDM, parental controls).
+    Restricted,
+    /// Never asked yet: the next feature use will prompt.
+    NotDetermined,
+    /// Helper missing, non-macOS, or unparseable output.
+    Unknown,
+}
+
+impl CalendarAccess {
+    /// True when reads work and reminders can function.
+    pub fn can_read(self) -> bool {
+        matches!(self, CalendarAccess::FullAccess)
+    }
+}
+
+/// Probe calendar authorization WITHOUT prompting (safe from Settings and
+/// readiness surfaces). Uses the helper's `--status` mode; never triggers a
+/// permission dialog (#300).
+pub fn calendar_access_status() -> CalendarAccess {
+    #[cfg(not(target_os = "macos"))]
+    {
+        CalendarAccess::Unknown
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(helper) = find_calendar_helper() else {
+            return CalendarAccess::Unknown;
+        };
+        let mut cmd = crate::engine_process::command(&helper);
+        cmd.arg("--status");
+        let Some(output) = output_with_timeout(cmd, SUBPROCESS_TIMEOUT) else {
+            return CalendarAccess::Unknown;
+        };
+        if !output.status.success() {
+            return CalendarAccess::Unknown;
+        }
+        parse_calendar_access(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+/// Parse the helper's `--status` JSON line into a [`CalendarAccess`].
+/// Only reachable from the macOS helper path in non-test builds.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_calendar_access(raw: &str) -> CalendarAccess {
+    let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+        Ok(value) => value,
+        Err(_) => return CalendarAccess::Unknown,
+    };
+    match value.get("calendar_access").and_then(|v| v.as_str()) {
+        Some("full-access") => CalendarAccess::FullAccess,
+        Some("write-only") => CalendarAccess::WriteOnly,
+        Some("denied") => CalendarAccess::Denied,
+        Some("restricted") => CalendarAccess::Restricted,
+        Some("not-determined") => CalendarAccess::NotDetermined,
+        _ => CalendarAccess::Unknown,
+    }
+}
+
+/// Query upcoming calendar events within the next `lookahead_minutes`.
+/// Returns events sorted by start time (all-day events excluded).
+/// On non-macOS platforms, returns an empty list (calendar integration uses AppleScript/EventKit).
+pub fn upcoming_events(lookahead_minutes: u32) -> Vec<CalendarEvent> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = lookahead_minutes;
+        Vec::new()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !calendar_integration_enabled() {
+            return Vec::new();
+        }
+        // Try compiled EventKit helper first (fastest path, no Apple Events)
+        if let Some(events) = query_via_eventkit(lookahead_minutes) {
+            // EventKit helper responded — use its result even if empty
+            // (empty means no events, not a failure). Don't fall through
+            // to AppleScript, which would double the timeout if Calendar
+            // is hung since both paths talk to the same backend.
+            return dedup_occurrences(apply_configured_filters(events));
+        }
+        // AppleScript fallback: only reached when EventKit helper is missing
+        dedup_occurrences(apply_configured_filters(query_via_applescript(
+            lookahead_minutes,
+        )))
+    }
+}
+
+/// Events for a schedule view: everything starting within the next
+/// `lookahead_minutes`, plus events that started up to `lookback_minutes` ago
+/// so a caller can show the ones still in progress (check `end`). Sorted by
+/// start, filtered with the `[calendar]` settings, one entry per occurrence.
+/// The AppleScript fallback reports neither end times nor past events.
+pub fn schedule_events(lookback_minutes: u32, lookahead_minutes: u32) -> Vec<CalendarEvent> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (lookback_minutes, lookahead_minutes);
+        Vec::new()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !calendar_integration_enabled() {
+            return Vec::new();
+        }
+        let events = query_via_eventkit_window(lookback_minutes, lookahead_minutes)
+            .unwrap_or_else(|| query_via_applescript(lookahead_minutes));
+        dedup_occurrences(apply_configured_filters(events))
+    }
+}
+
+/// Find calendar events that overlap a given time window.
+/// Used to match a recording to its calendar event after the fact.
+/// On non-macOS platforms, returns an empty list.
+pub fn events_overlapping(at: DateTime<Local>) -> Vec<CalendarEvent> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = at;
+        Vec::new()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !calendar_integration_enabled() {
+            return Vec::new();
+        }
+
+        // Preserve the fast helper path for "right now" lookups, but allow
+        // historical reprocessing to center the query on the recording time.
+        if (Local::now() - at).num_seconds().abs() <= 60 {
+            return events_overlapping_now();
+        }
+
+        if let Some(events) = query_overlap_via_eventkit(Some(at.timestamp())) {
+            return apply_configured_filters(events);
+        }
+
+        apply_configured_filters(query_events_with_attendees_at(at))
+    }
+}
+
+pub fn events_overlapping_now() -> Vec<CalendarEvent> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !calendar_integration_enabled() {
+            return Vec::new();
+        }
+        // Try EventKit helper first (sub-second, no CalDAV round-trips).
+        // Pass lookahead=120, lookback=120 for a 4-hour window centered on now.
+        if let Some(events) = query_overlap_via_eventkit(None) {
+            return apply_configured_filters(events);
+        }
+        // AppleScript fallback: only reached when EventKit helper is missing
+        apply_configured_filters(query_events_with_attendees())
+    }
+}
+
+/// Returns `false` when the user has set `[calendar] enabled = false`.
+/// Every caller in this module consults this before touching Calendar so
+/// an opted-out user never sees AppleScript launch Calendar.app.
+#[cfg(target_os = "macos")]
+fn calendar_integration_enabled() -> bool {
+    crate::config::Config::load().calendar.enabled
+}
+
+/// `true` when Calendar.app is currently running.
+///
+/// Used as a last-line guard before any `tell application "Calendar"`
+/// AppleScript. `tell application` auto-launches the target app, which
+/// meant every 60s poll launched Calendar.app for users who never use it.
+/// `pgrep -x Calendar` is ~1ms and does not trigger any TCC prompts.
+#[cfg(target_os = "macos")]
+fn is_calendar_app_running() -> bool {
+    crate::engine_process::command("pgrep")
+        .args(["-x", "Calendar"])
+        .output()
+        .map(|out| out.status.success() && !out.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// AppleScript query that fetches current/recent events WITH attendee names.
+#[cfg(target_os = "macos")]
+fn query_events_with_attendees() -> Vec<CalendarEvent> {
+    query_events_with_attendees_at(Local::now())
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_month(month: u32) -> &'static str {
+    match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "January",
+    }
+}
+
+/// AppleScript query centered on an explicit timestamp.
+#[cfg(target_os = "macos")]
+fn query_events_with_attendees_at(center: DateTime<Local>) -> Vec<CalendarEvent> {
+    // Never auto-launch Calendar.app from a background query. `tell
+    // application "Calendar"` launches the app as a side effect, which
+    // surprised users who don't use Apple Calendar.
+    if !is_calendar_app_running() {
+        return Vec::new();
+    }
+    let script = r#"set now to current date
+set year of now to __YEAR__
+set month of now to __MONTH__
+set day of now to __DAY__
+set hours of now to __HOUR__
+set minutes of now to __MINUTE__
+set seconds of now to __SECOND__
+set windowStart to now - (2 * 60 * 60)
+set windowEnd to now + (2 * 60 * 60)
+set todayStart to current date
+set year of todayStart to __YEAR__
+set month of todayStart to __MONTH__
+set day of todayStart to __DAY__
+set hours of todayStart to 0
+set minutes of todayStart to 0
+set seconds of todayStart to 0
+set tomorrowEnd to todayStart + (2 * 24 * 60 * 60)
+set output to ""
+set unitSep to (ASCII character 31)
+set fieldSep to (ASCII character 30)
+tell application "Calendar"
+    repeat with cal in calendars
+        try
+            set evts to (every event of cal whose start date >= todayStart and start date <= tomorrowEnd)
+            repeat with evt in evts
+                set s to start date of evt
+                set e to end date of evt
+                if (s <= windowEnd and e >= windowStart) then
+                    set t to summary of evt
+                    set mins to ((s - now) / 60) as integer
+                    set attendeeNames to ""
+                    try
+                        set theAttendees to attendees of evt
+                        repeat with anAttendee in theAttendees
+                            if attendeeNames is not "" then
+                                set attendeeNames to attendeeNames & fieldSep
+                            end if
+                            set attendeeNames to attendeeNames & (name of anAttendee)
+                        end repeat
+                    end try
+                    set loc to ""
+                    try
+                        set loc to location of evt
+                        if loc is missing value then set loc to ""
+                    end try
+                    set output to output & t & unitSep & (s as string) & unitSep & mins & unitSep & attendeeNames & unitSep & loc & linefeed
+                end if
+            end repeat
+        end try
+    end repeat
+end tell
+return output"#
+        .replace("__YEAR__", &center.year().to_string())
+        .replace("__MONTH__", applescript_month(center.month()))
+        .replace("__DAY__", &center.day().to_string())
+        .replace("__HOUR__", &center.hour().to_string())
+        .replace("__MINUTE__", &center.minute().to_string())
+        .replace("__SECOND__", &center.second().to_string());
+
+    let mut cmd = crate::engine_process::command("osascript");
+    cmd.arg("-e").arg(script);
+    let output = match output_with_timeout(cmd, SUBPROCESS_TIMEOUT) {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+
+    let mut events = parse_applescript_output(&output);
+
+    dedup_events(&mut events);
+    events
+}
+
+/// Parse the shared AppleScript fields: title, start, minutes, attendees, location.
+/// Both upcoming and overlapping queries must retain attendee data before filtering.
+#[cfg(any(test, target_os = "macos"))]
+fn parse_applescript_output(stdout: &str) -> Vec<CalendarEvent> {
+    let unit_sep = '\x1F';
+    let field_sep = '\x1E';
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(5, unit_sep).collect();
+            if parts.len() >= 3 {
+                let attendees = if parts.len() >= 4 && !parts[3].trim().is_empty() {
+                    parts[3]
+                        .split(field_sep)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let location = parts
+                    .get(4)
+                    .map(|loc| loc.trim())
+                    .filter(|loc| !loc.is_empty() && *loc != "missing value");
+                Some(CalendarEvent {
+                    title: parts[0].trim().to_string(),
+                    start: parts[1].trim().to_string(),
+                    minutes_until: parts[2].trim().parse().unwrap_or(0),
+                    attendees,
+                    url: location.and_then(extract_meeting_url),
+                    calendar: None,
+                    end: None,
+                    location: location.map(str::to_string),
+                    uid: None,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Parse EventKit helper JSON output, extracting meeting URLs from raw location strings.
+#[cfg(any(test, target_os = "macos"))]
+fn parse_eventkit_output(stdout: &str) -> Vec<CalendarEvent> {
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut event: CalendarEvent = serde_json::from_str(line).ok()?;
+            // The helper outputs the raw location string as url —
+            // extract an actual meeting URL (Zoom, Meet, Teams, etc.) or set to None.
+            event.location = event
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|loc| !loc.is_empty())
+                .map(str::to_string);
+            event.url = event.url.as_deref().and_then(extract_meeting_url);
+            event.uid = event.uid.filter(|uid| !uid.is_empty());
+            Some(event)
+        })
+        .collect()
+}
+
+/// Deduplicate events by title, keeping the one closest to now.
+#[cfg(any(test, target_os = "macos"))]
+fn dedup_events(events: &mut Vec<CalendarEvent>) {
+    events.sort_by_key(|e| (e.title.clone(), e.minutes_until.abs()));
+    events.dedup_by(|a, b| a.title == b.title);
+    // Re-sort by proximity to now (most relevant first)
+    events.sort_by_key(|e| e.minutes_until.abs());
+}
+
+/// Collapse copies of the same occurrence, keeping start order.
+///
+/// One invite often reaches the Mac twice (the same Google account added
+/// twice, or once as Google and once as CalDAV), so every event shows up
+/// twice. Two entries are one occurrence when they start at the same time and
+/// either share an iCalendar UID or match on title, end and location (a field
+/// only one copy reports counts as a match). Run it after the `[calendar]`
+/// filters, so a copy in an ignored calendar cannot hide the kept one. Unlike
+/// `dedup_events`, distinct same-title events at different times all survive.
+/// The kept copy picks up a meeting link, location or attendees the first one
+/// lacked.
+pub fn dedup_occurrences(events: Vec<CalendarEvent>) -> Vec<CalendarEvent> {
+    fn same_occurrence(a: &CalendarEvent, b: &CalendarEvent) -> bool {
+        if a.start != b.start {
+            return false;
+        }
+        if let (Some(x), Some(y)) = (&a.uid, &b.uid) {
+            if x == y {
+                return true;
+            }
+        }
+        let norm = |s: &str| {
+            s.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        };
+        // A field only one copy reports (AppleScript has no end; one account
+        // may drop the location) does not tell the copies apart.
+        let agree = |x: Option<String>, y: Option<String>| x.is_none() || y.is_none() || x == y;
+        norm(&a.title) == norm(&b.title)
+            && agree(a.end.clone(), b.end.clone())
+            && agree(
+                a.location.as_deref().map(norm),
+                b.location.as_deref().map(norm),
+            )
+    }
+
+    let mut kept: Vec<CalendarEvent> = Vec::with_capacity(events.len());
+    for event in events {
+        match kept.iter_mut().find(|k| same_occurrence(k, &event)) {
+            Some(existing) => {
+                if existing.url.is_none() {
+                    existing.url = event.url;
+                }
+                if existing.location.is_none() {
+                    existing.location = event.location;
+                }
+                if existing.end.is_none() {
+                    existing.end = event.end;
+                }
+                if existing.attendees.len() < event.attendees.len() {
+                    existing.attendees = event.attendees;
+                }
+            }
+            None => kept.push(event),
+        }
+    }
+    kept
+}
+
+/// Query via compiled Swift EventKit helper (if available and permitted).
+#[cfg(target_os = "macos")]
+fn query_via_eventkit(lookahead_minutes: u32) -> Option<Vec<CalendarEvent>> {
+    query_via_eventkit_window(0, lookahead_minutes)
+}
+
+/// Like `query_via_eventkit`, but also returns events that started up to
+/// `lookback_minutes` ago (negative `minutes_until`).
+#[cfg(target_os = "macos")]
+fn query_via_eventkit_window(
+    lookback_minutes: u32,
+    lookahead_minutes: u32,
+) -> Option<Vec<CalendarEvent>> {
+    let helper = find_calendar_helper()?;
+
+    let mut cmd = crate::engine_process::command(&helper);
+    cmd.arg(lookahead_minutes.to_string());
+    if lookback_minutes > 0 {
+        cmd.arg(lookback_minutes.to_string());
+    }
+    let output = output_with_timeout(cmd, SUBPROCESS_TIMEOUT)?;
+
+    if !output.status.success() {
+        if output.status.code() == Some(2) {
+            // Helper signals access-not-granted distinctly so dead reminders
+            // are observable instead of reading as "no events" (#300).
+            tracing::warn!(
+                "calendar read access not granted (write-only or denied); meeting reminders are off"
+            );
+        }
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(parse_eventkit_output(&stdout))
+}
+
+/// Query overlapping events via EventKit helper with a backward+forward window.
+/// Returns None if the helper is missing or fails (triggers AppleScript fallback).
+#[cfg(target_os = "macos")]
+fn query_overlap_via_eventkit(reference_epoch_seconds: Option<i64>) -> Option<Vec<CalendarEvent>> {
+    let helper = find_calendar_helper()?;
+    query_overlap_via_eventkit_with_helper(&helper, reference_epoch_seconds)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn query_overlap_via_eventkit_with_helper(
+    helper: &std::path::Path,
+    reference_epoch_seconds: Option<i64>,
+) -> Option<Vec<CalendarEvent>> {
+    tracing::info!(
+        lookahead_minutes = EVENTKIT_OVERLAP_LOOKAHEAD_MINUTES,
+        lookback_minutes = EVENTKIT_OVERLAP_LOOKBACK_MINUTES,
+        reference_epoch_seconds,
+        "querying calendar overlap via EventKit helper"
+    );
+
+    let mut cmd = crate::engine_process::command(helper);
+    cmd.arg(EVENTKIT_OVERLAP_LOOKAHEAD_MINUTES.to_string())
+        .arg(EVENTKIT_OVERLAP_LOOKBACK_MINUTES.to_string());
+    if let Some(reference_epoch_seconds) = reference_epoch_seconds {
+        cmd.arg(reference_epoch_seconds.to_string());
+    }
+    let output = output_with_timeout(cmd, SUBPROCESS_TIMEOUT)?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut events = parse_eventkit_output(&stdout);
+    dedup_events(&mut events);
+    Some(events)
+}
+
+/// Find the compiled calendar-events helper binary.
+///
+/// Lookup order:
+/// 1. `<exe>/calendar-events` — inside a packaged .app bundle at
+///    `Contents/MacOS/calendar-events`. Tauri places it there because
+///    `tauri.macos.conf.json` declares it as an `externalBin`. This
+///    placement lets Tauri sign and notarize the helper in lockstep
+///    with the main binary. (Earlier releases declared it under
+///    `resources` which put it at `Contents/Resources/resources/` and
+///    failed notarization; see the v0.14.0 release fix.)
+/// 2. Workspace `tauri/src-tauri/bin/calendar-events` — dev fallback.
+///    `tauri/src-tauri/build.rs` compiles the Swift helper here on
+///    every `cargo tauri build` / `cargo tauri dev`, so the CLI finds
+///    it when running from source after at least one Tauri build has
+///    completed.
+/// 3. Workspace `tauri/src-tauri/resources/calendar-events` — legacy
+///    dev fallback for local workspaces that still have the old build
+///    output path cached.
+/// 4. Workspace `target/release/calendar-events` — legacy dev fallback
+///    for older local workflows that compiled the helper directly into
+///    `target/`.
+///
+/// The workspace root is derived from `CARGO_MANIFEST_DIR` at compile
+/// time so it works regardless of where the user cloned the repo.
+#[cfg(target_os = "macos")]
+fn find_calendar_helper() -> Option<std::path::PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join("calendar-events");
+            if beside.exists() {
+                return Some(beside);
+            }
+        }
+    }
+    // CARGO_MANIFEST_DIR points at crates/core; the workspace root is two up.
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent());
+    if let Some(root) = workspace_root {
+        let staged = root.join("tauri/src-tauri/bin/calendar-events");
+        if staged.exists() {
+            return Some(staged);
+        }
+        let legacy_staged = root.join("tauri/src-tauri/resources/calendar-events");
+        if legacy_staged.exists() {
+            return Some(legacy_staged);
+        }
+        let legacy = root.join("target/release/calendar-events");
+        if legacy.exists() {
+            return Some(legacy);
+        }
+    }
+    // CLI-only builds compile the helper in core's build script without staging
+    // a desktop bundle. Use that exact build artifact for local CLI runs.
+    let built = std::path::Path::new(env!("OUT_DIR")).join("calendar-events");
+    built.is_file().then_some(built)
+}
+
+/// AppleScript approach: fetch ALL events for today+tomorrow, filter by time.
+/// Avoids `whose start date >= ...` which times out on CalDAV calendars.
+#[cfg(target_os = "macos")]
+fn query_via_applescript(lookahead_minutes: u32) -> Vec<CalendarEvent> {
+    // See `query_events_with_attendees_at`: skip when Calendar.app isn't
+    // already running so periodic polling never auto-launches the app.
+    if !is_calendar_app_running() {
+        return Vec::new();
+    }
+    // Fetch events for a 2-day window, then filter in the script
+    let script = format!(
+        r#"set now to current date
+set todayStart to current date
+set hours of todayStart to 0
+set minutes of todayStart to 0
+set seconds of todayStart to 0
+set tomorrowEnd to todayStart + (2 * 24 * 60 * 60)
+set lookaheadSecs to {minutes} * 60
+set horizon to now + lookaheadSecs
+set output to ""
+set unitSep to (ASCII character 31)
+set fieldSep to (ASCII character 30)
+tell application "Calendar"
+    repeat with cal in calendars
+        try
+            set evts to (every event of cal whose start date >= todayStart and start date <= tomorrowEnd)
+            repeat with evt in evts
+                set s to start date of evt
+                if s >= now and s <= horizon then
+                    set t to summary of evt
+                    set mins to ((s - now) / 60) as integer
+                    set attendeeNames to ""
+                    try
+                        set theAttendees to attendees of evt
+                        repeat with anAttendee in theAttendees
+                            if attendeeNames is not "" then
+                                set attendeeNames to attendeeNames & fieldSep
+                            end if
+                            set attendeeNames to attendeeNames & (name of anAttendee)
+                        end repeat
+                    end try
+                    set loc to ""
+                    try
+                        set loc to location of evt
+                        if loc is missing value then set loc to ""
+                    end try
+                    set output to output & t & unitSep & (s as string) & unitSep & mins & unitSep & attendeeNames & unitSep & loc & linefeed
+                end if
+            end repeat
+        end try
+    end repeat
+end tell
+return output"#,
+        minutes = lookahead_minutes
+    );
+
+    let mut cmd = crate::engine_process::command("osascript");
+    cmd.arg("-e").arg(&script);
+    let output = match output_with_timeout(cmd, SUBPROCESS_TIMEOUT) {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Some(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            eprintln!("[calendar] applescript failed: {}", stderr.trim());
+            return Vec::new();
+        }
+        None => {
+            eprintln!("[calendar] osascript timed out or failed to start");
+            return Vec::new();
+        }
+    };
+
+    let mut events = parse_applescript_output(&output);
+
+    // The same event can appear in multiple calendars; callers merge the
+    // copies with `dedup_occurrences` after filtering.
+    events.sort_by_key(|e| e.minutes_until);
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::CalendarConfig;
+
+    fn event(title: &str, attendees: &[&str], url: Option<&str>) -> CalendarEvent {
+        CalendarEvent {
+            title: title.to_string(),
+            start: "2026-10-02 10:00".to_string(),
+            minutes_until: 5,
+            attendees: attendees.iter().map(|a| a.to_string()).collect(),
+            url: url.map(str::to_string),
+            calendar: None,
+            end: None,
+            location: None,
+            uid: None,
+        }
+    }
+
+    fn titles(events: &[CalendarEvent]) -> Vec<&str> {
+        events.iter().map(|e| e.title.as_str()).collect()
+    }
+
+    #[test]
+    fn applescript_attendee_filter_keeps_invited_meetings_and_video_calls() {
+        // The wire format emitted by both AppleScript calendar queries.
+        // In-person invitations have attendees but no recognized meeting URL.
+        let output = concat!(
+            "Planning\x1F2026-10-02 10:00\x1F5\x1F Alice \x1E Bob \x1FConference Room B\n",
+            "Call\x1F2026-10-02 11:00\x1F65\x1F\x1Fhttps://zoom.us/j/1\n",
+            "Focus time\x1F2026-10-02 12:00\x1F125\x1F\x1FDesk\n",
+        );
+        let events = parse_applescript_output(output);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].attendees, vec!["Alice", "Bob"]);
+        assert_eq!(events[0].url, None);
+        assert!(events[1].attendees.is_empty());
+        assert_eq!(events[1].url.as_deref(), Some("https://zoom.us/j/1"));
+        let config = CalendarConfig {
+            require_attendees_or_url: true,
+            ..CalendarConfig::default()
+        };
+        assert_eq!(
+            titles(&filter_events(events, &config)),
+            vec!["Planning", "Call"]
+        );
+    }
+
+    #[test]
+    fn applescript_empty_attendees_and_non_meeting_url_do_not_count_as_invitation() {
+        let output = "Personal block\x1F2026-10-02 10:00\x1F5\x1F \x1E \x1Fhttps://example.com\n";
+        let events = parse_applescript_output(output);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].attendees.is_empty());
+        assert_eq!(events[0].url, None);
+        let config = CalendarConfig {
+            require_attendees_or_url: true,
+            ..CalendarConfig::default()
+        };
+        assert!(filter_events(events, &config).is_empty());
+    }
+
+    #[test]
+    fn ignored_calendars_drop_their_events_and_unknown_calendars_pass() {
+        let mut family = event("Za Hebrew School", &["Mat", "Kid"], None);
+        family.calendar = Some("Family".into());
+        let mut work = event("Standup", &["a"], None);
+        work.calendar = Some("Work".into());
+        let unknown = event("From AppleScript", &[], None);
+        let config = CalendarConfig {
+            ignore_calendars: vec![" family ".into()],
+            ..CalendarConfig::default()
+        };
+        assert_eq!(
+            titles(&filter_events(vec![family, work, unknown], &config)),
+            vec!["Standup", "From AppleScript"]
+        );
+    }
+
+    #[test]
+    fn helper_json_with_and_without_calendar_parses() {
+        let with: CalendarEvent = serde_json::from_str(
+            r#"{"title":"T","start":"s","minutes_until":3,"attendees":[],"url":null,"calendar":"Work"}"#,
+        )
+        .unwrap();
+        assert_eq!(with.calendar.as_deref(), Some("Work"));
+        let older: CalendarEvent =
+            serde_json::from_str(r#"{"title":"T","start":"s","minutes_until":3}"#).unwrap();
+        assert_eq!(older.calendar, None);
+    }
+
+    #[test]
+    fn older_calendar_config_keeps_ignore_filters_disabled() {
+        let config: CalendarConfig =
+            toml::from_str("enabled = true\nuse_event_title_for_meeting_title = true\n").unwrap();
+        assert!(config.enabled);
+        assert!(config.use_event_title_for_meeting_title);
+        assert!(config.ignore_title_contains.is_empty());
+        assert!(config.ignore_calendars.is_empty());
+        assert!(!config.require_attendees_or_url);
+    }
+
+    #[test]
+    fn filter_is_noop_with_default_config() {
+        let events = vec![
+            event("Focus time", &[], None),
+            event("Standup", &["a"], None),
+        ];
+        let kept = filter_events(events, &CalendarConfig::default());
+        assert_eq!(titles(&kept), vec!["Focus time", "Standup"]);
+    }
+
+    #[test]
+    fn filter_drops_titles_containing_substring_case_insensitively() {
+        let config = CalendarConfig {
+            ignore_title_contains: vec!["focus".to_string(), "LUNCH".to_string()],
+            ..CalendarConfig::default()
+        };
+        let events = vec![
+            event("Deep FOCUS block", &["a"], None),
+            event("team lunch", &["a"], None),
+            event("Standup", &["a"], None),
+        ];
+        assert_eq!(titles(&filter_events(events, &config)), vec!["Standup"]);
+    }
+
+    #[test]
+    fn filter_ignores_empty_title_patterns() {
+        let config = CalendarConfig {
+            ignore_title_contains: vec![String::new()],
+            ..CalendarConfig::default()
+        };
+        let kept = filter_events(vec![event("Standup", &["a"], None)], &config);
+        assert_eq!(titles(&kept), vec!["Standup"]);
+    }
+
+    #[test]
+    fn filter_require_attendees_or_url_keeps_either() {
+        let config = CalendarConfig {
+            require_attendees_or_url: true,
+            ..CalendarConfig::default()
+        };
+        let events = vec![
+            event("Dentist", &[], None),
+            event("1:1", &["a@x.com"], None),
+            event("Call", &[], Some("https://zoom.us/j/1")),
+        ];
+        assert_eq!(titles(&filter_events(events, &config)), vec!["1:1", "Call"]);
+    }
+
+    #[test]
+    fn filter_applies_both_options_together() {
+        let config = CalendarConfig {
+            ignore_title_contains: vec!["optional".to_string()],
+            require_attendees_or_url: true,
+            ..CalendarConfig::default()
+        };
+        let events = vec![
+            event("Optional sync", &["a"], None),
+            event("Dentist", &[], None),
+            event("Planning", &["a"], None),
+        ];
+        assert_eq!(titles(&filter_events(events, &config)), vec!["Planning"]);
+    }
+
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn extract_zoom_url() {
+        let text = "https://zoom.us/j/1234567890?pwd=abc123";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://zoom.us/j/1234567890?pwd=abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_google_meet_url() {
+        let text = "Join: https://meet.google.com/abc-defg-hij";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://meet.google.com/abc-defg-hij".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_teams_url() {
+        let text = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_no_url() {
+        assert_eq!(extract_meeting_url("Conference Room B"), None);
+        assert_eq!(extract_meeting_url(""), None);
+        assert_eq!(extract_meeting_url("https://docs.google.com/doc/123"), None);
+    }
+
+    #[test]
+    fn extract_url_from_mixed_text() {
+        let text = "Location: Building 4, Room 201\nhttps://zoom.us/j/999 (backup link)";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://zoom.us/j/999".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_zoom_subdomain_url() {
+        let text = "https://us02web.zoom.us/j/8765432?pwd=xyz";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://us02web.zoom.us/j/8765432?pwd=xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_zoom_vanity_url() {
+        let text = "https://airwallex.zoom.com/j/93507198550";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://airwallex.zoom.com/j/93507198550".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_zoom_us_vanity_url_with_dash() {
+        let text = "Join from calendar: https://hooli-it.zoom.us/j/93507198550?pwd=abc";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://hooli-it.zoom.us/j/93507198550?pwd=abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_zoom_vanity_personal_link() {
+        let text = "Personal room: https://mycompany.zoom.us/my/grant";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://mycompany.zoom.us/my/grant".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_zoom_vanity_url_from_google_calendar_redirect() {
+        let text = "https://www.google.com/url?q=https://airwallex.zoom.com/j/93507198550?jst%3D2&sa=D&source=calendar";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://airwallex.zoom.com/j/93507198550?jst=2".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_visible_zoom_vanity_url_from_markdown_link() {
+        let text = "[https://airwallex.zoom.com/j/93507198550](https://www.google.com/url?q=https://airwallex.zoom.com/j/93507198550?jst%3D2&sa=D&source=calendar)";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://airwallex.zoom.com/j/93507198550".to_string())
+        );
+    }
+
+    // Tests that shell out to a POSIX helper script are unix-only. On
+    // Windows there is no chmod +x equivalent and the fake helper below
+    // wouldn't execute as a script. The behavior being tested
+    // (argument-passing contract between Minutes and the EventKit
+    // helper) is itself macOS-only anyway, so there's nothing to validate
+    // on Windows.
+    /// Exec a just-written script with retries. Writing an executable and
+    /// exec'ing it immediately races with concurrent test forks inheriting
+    /// the short-lived write fd (ETXTBSY); the helper returns None on spawn
+    /// failure, so retry a few times before declaring the run failed.
+    #[cfg(unix)]
+    fn run_helper_with_etxtbsy_retry(
+        helper_path: &std::path::Path,
+        reference: Option<i64>,
+    ) -> Option<Vec<CalendarEvent>> {
+        for _ in 0..10 {
+            if let Some(events) = query_overlap_via_eventkit_with_helper(helper_path, reference) {
+                return Some(events);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_overlap_via_eventkit_passes_reference_timestamp() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let helper_path = tempdir.path().join("calendar-events");
+        let args_path = tempdir.path().join("args.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            args_path.display()
+        );
+        std::fs::write(&helper_path, script).unwrap();
+        let mut permissions = std::fs::metadata(&helper_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper_path, permissions).unwrap();
+
+        let events = run_helper_with_etxtbsy_retry(&helper_path, Some(1_700_000_000))
+            .expect("helper should run");
+        assert!(events.is_empty());
+
+        let args = std::fs::read_to_string(&args_path).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["120", "120", "1700000000"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_overlap_via_eventkit_omits_reference_timestamp_when_not_provided() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let helper_path = tempdir.path().join("calendar-events");
+        let args_path = tempdir.path().join("args.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            args_path.display()
+        );
+        std::fs::write(&helper_path, script).unwrap();
+        let mut permissions = std::fs::metadata(&helper_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper_path, permissions).unwrap();
+
+        let events = run_helper_with_etxtbsy_retry(&helper_path, None).expect("helper should run");
+        assert!(events.is_empty());
+
+        let args = std::fs::read_to_string(&args_path).unwrap();
+        assert_eq!(args.lines().collect::<Vec<_>>(), ["120", "120"]);
+    }
+
+    fn occurrence(title: &str, start: &str, uid: Option<&str>) -> CalendarEvent {
+        CalendarEvent {
+            start: start.to_string(),
+            end: Some("2026-10-30 10:30".to_string()),
+            location: Some("Betaworks, 29 Little West 12th".to_string()),
+            uid: uid.map(str::to_string),
+            ..event(title, &["Samir"], None)
+        }
+    }
+
+    #[test]
+    fn dedup_occurrences_collapses_one_invite_seen_through_two_accounts() {
+        let mut second = occurrence(
+            "Coffee: Samir / Mat",
+            "2026-10-30 09:30",
+            Some("abc@google.com"),
+        );
+        second.url = Some("https://meet.google.com/abc-defg-hij".to_string());
+        second.attendees = vec!["Samir".to_string(), "Mat".to_string()];
+        let events = super::dedup_occurrences(vec![
+            occurrence(
+                "Coffee: Samir / Mat",
+                "2026-10-30 09:30",
+                Some("abc@google.com"),
+            ),
+            second,
+            occurrence("buffer", "2026-10-30 10:30", None),
+        ]);
+        assert_eq!(titles(&events), vec!["Coffee: Samir / Mat", "buffer"]);
+        // The kept copy picks up what only the duplicate had.
+        assert_eq!(
+            events[0].url.as_deref(),
+            Some("https://meet.google.com/abc-defg-hij")
+        );
+        assert_eq!(events[0].attendees.len(), 2);
+    }
+
+    #[test]
+    fn dedup_occurrences_matches_on_title_end_and_location_without_a_uid() {
+        let mut spaced = occurrence("  Coffee:  samir / Mat ", "2026-10-30 09:30", None);
+        spaced.location = Some("betaworks,  29 Little West 12th".to_string());
+        let events = super::dedup_occurrences(vec![
+            occurrence("Coffee: Samir / Mat", "2026-10-30 09:30", None),
+            spaced,
+        ]);
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn dedup_occurrences_keeps_distinct_occurrences() {
+        let mut other_end = occurrence("block", "2026-10-30 09:30", None);
+        other_end.end = Some("2026-10-30 11:00".to_string());
+        let events = super::dedup_occurrences(vec![
+            // Same title at different times: two real blocks.
+            occurrence("block", "2026-10-30 09:30", None),
+            occurrence("block", "2026-10-30 17:30", None),
+            // Same start, different title.
+            occurrence("Claude", "2026-10-30 09:30", None),
+            // Same title and start but a different length, no shared UID.
+            other_end,
+            // A recurring series shares one UID across occurrences.
+            occurrence("Standup", "2026-10-30 09:30", Some("series@x")),
+            occurrence("Standup", "2026-10-31 09:30", Some("series@x")),
+        ]);
+        assert_eq!(events.len(), 6);
+    }
+
+    #[test]
+    fn dedup_occurrences_treats_a_field_only_one_copy_reports_as_a_match() {
+        // AppleScript copies carry no end; one account dropped the location.
+        let mut bare = occurrence("Sync", "2026-10-30 09:30", None);
+        bare.end = None;
+        bare.location = None;
+        let events =
+            super::dedup_occurrences(vec![occurrence("Sync", "2026-10-30 09:30", None), bare]);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].location.is_some());
+    }
+
+    #[test]
+    fn filtering_before_merging_keeps_the_copy_in_a_visible_calendar() {
+        let mut hidden = occurrence("Sync", "2026-10-30 09:30", Some("u@x"));
+        hidden.calendar = Some("Jax".to_string());
+        let mut work = occurrence("Sync", "2026-10-30 09:30", Some("u@x"));
+        work.calendar = Some("Work".to_string());
+        let config = CalendarConfig {
+            ignore_calendars: vec!["Jax".to_string()],
+            ..CalendarConfig::default()
+        };
+        let events = super::dedup_occurrences(super::filter_events(vec![hidden, work], &config));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].calendar.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn parse_eventkit_output_keeps_location_end_and_uid() {
+        let line = r#"{"title":"Sync","start":"2026-10-30 09:30","minutes_until":6,"attendees":["Samir"],"url":"Zoom https://us02web.zoom.us/j/123 ","calendar":"Work","end":"2026-10-30 10:00","uid":"abc@google.com"}"#;
+        let events = super::parse_eventkit_output(&format!("{line}\n"));
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            event.location.as_deref(),
+            Some("Zoom https://us02web.zoom.us/j/123")
+        );
+        assert_eq!(event.url.as_deref(), Some("https://us02web.zoom.us/j/123"));
+        assert_eq!(event.end.as_deref(), Some("2026-10-30 10:00"));
+        assert_eq!(event.uid.as_deref(), Some("abc@google.com"));
+
+        // Output from an older helper without the new fields still parses.
+        let old = r#"{"title":"Sync","start":"2026-10-30 09:30","minutes_until":6,"attendees":[],"url":null,"calendar":null}"#;
+        let events = super::parse_eventkit_output(old);
+        assert_eq!(events[0].end, None);
+        assert_eq!(events[0].location, None);
+    }
+}
+
+#[cfg(test)]
+mod calendar_access_tests {
+    use super::*;
+
+    #[test]
+    fn parses_all_status_labels() {
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"full-access\"}"),
+            CalendarAccess::FullAccess
+        );
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"write-only\"}"),
+            CalendarAccess::WriteOnly
+        );
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"denied\"}"),
+            CalendarAccess::Denied
+        );
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"restricted\"}"),
+            CalendarAccess::Restricted
+        );
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"not-determined\"}"),
+            CalendarAccess::NotDetermined
+        );
+    }
+
+    #[test]
+    fn garbage_and_unexpected_labels_are_unknown() {
+        assert_eq!(parse_calendar_access("not json"), CalendarAccess::Unknown);
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"sideways\"}"),
+            CalendarAccess::Unknown
+        );
+        assert_eq!(parse_calendar_access("{}"), CalendarAccess::Unknown);
+    }
+
+    #[test]
+    fn only_full_access_can_read() {
+        assert!(CalendarAccess::FullAccess.can_read());
+        for state in [
+            CalendarAccess::WriteOnly,
+            CalendarAccess::Denied,
+            CalendarAccess::Restricted,
+            CalendarAccess::NotDetermined,
+            CalendarAccess::Unknown,
+        ] {
+            assert!(!state.can_read());
+        }
+    }
+}

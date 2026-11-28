@@ -83,6 +83,15 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             })
             .map_err(|e| e.to_string())?;
             let done = minutes_core::jobs::load_job(&job.id);
+            // The app scrubs prompt echoes when a meeting is ready (D71); do the same here so
+            // the harness measures what the app shows.
+            if let Some(out) = done.as_ref().and_then(|j| j.output_path.clone()) {
+                match crate::library::scrub_prompt_echo(std::path::Path::new(&out)) {
+                    Ok(n) if n > 0 => eprintln!("removed {n} prompt echo line(s)"),
+                    Ok(_) => {}
+                    Err(error) => eprintln!("prompt echo check failed: {error}"),
+                }
+            }
             eprintln!("finished in {:.1}s", t.elapsed().as_secs_f32());
             println!("{}", serde_json::to_string_pretty(&done.map(|j| (j.state, j.output_path, j.error))).unwrap());
             Ok(())

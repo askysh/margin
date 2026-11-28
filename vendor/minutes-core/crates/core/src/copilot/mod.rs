@@ -1,0 +1,62 @@
+//! Portable real-time meeting copilot.
+//!
+//! This module consumes revisioned transcript evidence and emits short-lived,
+//! versioned nudges. It never owns capture, mutates transcript history, or
+//! exposes arbitrary tools to the fast model lane.
+
+mod battle_card;
+mod clock;
+mod control;
+pub mod eval;
+mod latency;
+mod mode;
+mod ollama_provider;
+mod policy;
+mod provider;
+mod relay;
+mod routing;
+mod runner;
+mod strategy;
+mod topic;
+mod types;
+mod window_contract;
+
+pub use crate::ollama::CancelToken;
+pub use battle_card::{BattleCard, BattleCardError, GroundingSource, RepositoryGrounding};
+pub use clock::{CopilotClock, SystemCopilotClock};
+pub use control::{
+    clear_session_controls, copilot_feedback_path, copilot_pause_path, copilot_pid_path,
+    copilot_status_path, copilot_stop_path, create_session_guard, read_session_status,
+    request_feedback, request_pause, request_resume, request_stop, take_feedback_request,
+    write_session_status, CopilotEvidenceMode, CopilotFeedbackRequest, CopilotSessionStatus,
+    RECORDING_WITHOUT_LIVE_TEXT,
+};
+pub use latency::{LatencyRecord, PartialLatencySeed};
+pub use mode::{MeetingMode, MeetingModePolicy, OpportunityKind};
+pub use ollama_provider::OllamaCopilotModel;
+pub use policy::{CopilotFeedback, NudgePolicy, PolicySnapshot};
+pub use provider::{
+    AppleFoundationCopilotModel, CloudCopilotModel, CopilotModel, ModelError, ModelErrorKind,
+    ModelEventSink, ModelHealth, ModelHealthStatus, ModelPrivacyClass, ModelStreamEvent,
+};
+pub use relay::{
+    capture_relay_discovery_path, current_capture_owner_pid, plan_capture_attachment,
+    reduce_relay_draft, CaptureAttachPlan, CaptureRelayClient, CaptureRelayDiscovery,
+    CaptureRelayError, CaptureRelayServer, RelayCurrentDraft, RelayCursor, RelayDraftSnapshot,
+    RelayDraftState, RelayFrame, RelayTranscriptUpdate, RelayTransport, CURRENT_DRAFT_STALE_AFTER,
+};
+pub use routing::{route_fast_model, FastModelRoute, ProviderProbe, RoutingPolicy};
+pub use runner::{
+    CopilotRunner, DepthLaneConfig, DepthLaneSnapshot, FeedbackOutcome, RunnerEvent, SubmitOutcome,
+};
+pub use strategy::{StrategyRefreshReason, StrategyRequest, StrategyState, StrategyStateDraft};
+pub use topic::{is_decisive_final, keywords as topic_keywords, TopicShift, TopicShiftDetector};
+pub use types::{
+    CopilotHealth, CopilotInputMode, CopilotRequest, CopilotSetupAction, CopilotSetupActionKind,
+    CopilotSetupKind, CopilotSetupNeeded, CopilotState, CopilotUtterance, Nudge, NudgeDraft,
+    NudgeKind, TranscriptUpdateKind, COPILOT_CONTRACT_VERSION,
+};
+pub use window_contract::{
+    current_window_environment, evaluate_copilot_window_contract, ContractSupport,
+    CopilotHudContractDecision, CopilotWindowCapabilities, WindowEnvironment, WindowPlatform,
+};

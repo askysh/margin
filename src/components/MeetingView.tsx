@@ -116,7 +116,7 @@ export const MeetingView = memo(function MeetingView({ path, notify, onChanged, 
   // One display name per label, used by chips and transcript rows alike: a name from
   // speaker_map wins, then "You" / "Them" / "Speaker n".
   const names = useMemo(() => {
-    const base = speakerNames((m?.transcript ?? []).map((t) => t.speaker ?? "").filter(Boolean));
+    const base = speakerNames([...(m?.transcript ?? []).map((t) => t.speaker ?? ""), ...(m?.speakers ?? []).map((s) => s.label)].filter(Boolean));
     for (const s of m?.speakers ?? []) if (s.name) base.set(s.label, s.name);
     return base;
   }, [m]);
@@ -465,7 +465,7 @@ function SpeakerChip(props: {
     setBusy(true);
     try {
       const r = await api.renameSpeaker(props.path, props.label, name.trim(), remember);
-      props.onRenamed(r.note ?? (r.voice_saved ? `Renamed to ${name.trim()}. Margin will recognise this voice next time.` : `Renamed to ${name.trim()}.`));
+      props.onRenamed(r.note ?? (r.voice_saved ? `Renamed to ${name.trim()}. Margin will recognize this voice next time.` : `Renamed to ${name.trim()}.`));
     } catch (err) {
       props.notify(errorText(err), "error");
     } finally {
@@ -483,14 +483,14 @@ function SpeakerChip(props: {
           <label className="field-label" htmlFor={`rn-${props.label}`}>
             {props.label === "SYSTEM" ? "Who was on the other end of the call?" : props.label === "MICROPHONE" ? "Who was speaking on your mic?" : `Who is ${props.display}?`}
           </label>
-          <input id={`rn-${props.label}`} autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" />
+          <input id={`rn-${props.label}`} autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Type the person's name" />
           <label className="check">
             <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
-            Recognise this voice in future meetings
+            Recognize this voice in future meetings
           </label>
           <div className="popover-actions">
             <button type="button" className="btn btn-quiet" onClick={props.onClose}>Cancel</button>
-            <button type="submit" className="btn btn-primary" disabled={busy || !name.trim()}>Rename everywhere</button>
+            <button type="submit" className="btn btn-primary" disabled={busy || !name.trim()} title={name.trim() ? undefined : "Type the person's name first"}>Rename everywhere</button>
           </div>
         </form>
       )}

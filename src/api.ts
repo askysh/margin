@@ -25,6 +25,26 @@ export interface Settings {
   open_at_login?: boolean;
   /** Transcribe during the meeting. On by default, for every model. */
   rolling_transcription?: boolean;
+  /** Ollama summaries answer without thinking first. On by default (D69). */
+  ollama_fast?: boolean;
+  /** Offer to start notes when a calendar event begins (D67). */
+  calendar_toast?: boolean;
+  /** Core's knowledge wiki after each meeting, facts from frontmatter only (D70). */
+  knowledge_enabled?: boolean;
+  knowledge_adapter?: "obsidian" | "wiki" | "para";
+  knowledge_path?: string;
+  /** A command run after each processed meeting, with the meeting path appended. "" is off. */
+  post_record?: string;
+  /** Core's speaker model set (D72). */
+  speaker_model?: "legacy" | "community-1";
+}
+
+/** A calendar event that starts now (calendar_watch.rs). */
+export interface CalendarOffer {
+  title: string;
+  start: string;
+  url: string | null;
+  attendees: string[];
 }
 
 export interface SettingsOptions {
@@ -202,6 +222,24 @@ export interface Voice {
   samples: number;
 }
 
+export interface SearchHit {
+  path: string;
+  excerpt: string;
+}
+
+/** What `search_meetings` answers. `corrected` is the spelling it searched for instead of the
+ * query, such as "warranty" for "warrnty"; null or absent when the query was used as typed. */
+export interface SearchResponse {
+  hits: SearchHit[];
+  corrected?: string | null;
+}
+
+/** An older backend answers with the bare list. */
+function searchResponse(r: SearchHit[] | SearchResponse): { hits: SearchHit[]; corrected?: string } {
+  if (Array.isArray(r)) return { hits: r };
+  return { hits: r.hits, corrected: r.corrected ?? undefined };
+}
+
 export interface ChatSource {
   path: string;
   title: string;
@@ -246,6 +284,8 @@ export const api = {
     invoke<{ default_dir: string; obsidian_vaults: { name: string; path: string }[] }>("folder_choices"),
   /** Windows: the folder is inside OneDrive. Always false on macOS. */
   folderInOneDrive: (path: string) => invoke<boolean>("folder_in_onedrive", { path }),
+  startCalendarNotes: (offer: CalendarOffer) => invoke<void>("start_calendar_notes", { offer }),
+  deskCommand: () => invoke<string | null>("desk_command"),
   completeOnboarding: () => invoke<void>("complete_onboarding"),
   modelsStatus: () => invoke<ModelFile[]>("models_status"),
   downloadModels: () => invoke<void>("download_models"),
@@ -272,7 +312,7 @@ export const api = {
   readMeeting: (path: string) => invoke<MeetingDetail>("read_meeting", { path }),
   saveNotes: (path: string, notes: string) => invoke<void>("save_notes", { path, notes }),
   setMeetingTitle: (path: string, title: string) => invoke<void>("set_meeting_title", { path, title }),
-  search: (query: string) => invoke<{ path: string; excerpt: string }[]>("search_meetings", { query }),
+  search: (query: string) => invoke<SearchHit[] | SearchResponse>("search_meetings", { query }).then(searchResponse),
   trashMeeting: (path: string) => invoke<void>("trash_meeting", { path }),
   reveal: (path: string) => invoke<void>("reveal_in_finder", { path }),
   openInObsidian: (path: string) => invoke<void>("open_in_obsidian", { path }),

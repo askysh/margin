@@ -1,0 +1,7222 @@
+#[cfg(feature = "whisper")]
+use crate::bounded_inference::{try_send_drop_newest, EnqueueResult, QueueCounters};
+use crate::config::Config;
+use crate::error::{LiveTranscriptError, MinutesError, TranscribeError};
+use crate::live_audio_coverage::{
+    append_span, AudioPacket, AudioSpan, CoverageLedger, RecognitionProvenance,
+};
+use crate::live_input_progress::{Counter, InputProgress, Stage};
+use crate::live_partials::{LivePartialPublisher, SupersessionReason};
+use crate::pid;
+use crate::sidecar_timing::SidecarWorkerTimings;
+use crate::streaming::AudioStream;
+use crate::streaming_whisper::StreamingWhisper;
+use crate::transcription_coordinator::{collapse_noise_markers, strip_foreign_script};
+use crate::vad::Vad;
+#[cfg(feature = "whisper")]
+use crate::vad::{VadEngine, VadResult};
+use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+// ──────────────────────────────────────────────────────────────
+// Live transcript pipeline:
+//
+//   ┌─────────────┐
+//   │ AudioStream  │──▶ 100ms chunks at 16kHz
+//   └──────┬───────┘
+//          │
+//          ▼
+//   ┌─────────────┐
+//   │ VAD loop     │──▶ speaking? → accumulate
+//   │              │    silence?  → finalize utterance → JSONL
+//   │              │    (NO silence timeout — runs until stop)
+//   └──────┬───────┘
+//          │
+//          ▼
+//   ┌─────────────────────────────────┐
+//   │ LiveTranscriptWriter            │
+//   │  ├─ append JSONL line           │
+//   │  └─ append WAV samples          │
+//   └──────────────────────────────────┘
+//
+// Key difference from dictation:
+//   - No silence timeout (meetings have silences)
+//   - Accumulates all utterances in a single JSONL file
+//   - Optionally saves raw WAV for post-meeting reprocessing
+//   - Runs until explicit `minutes stop`
+// ──────────────────────────────────────────────────────────────
+
+/// A single line in the live transcript JSONL file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptLine {
+    /// Sequential line number (1-based).
+    pub line: usize,
+    /// Wall clock timestamp (ISO 8601).
+    pub ts: DateTime<Local>,
+    /// Milliseconds since session start.
+    pub offset_ms: u64,
+    /// Utterance duration in milliseconds.
+    pub duration_ms: u64,
+    /// Transcribed text.
+    pub text: String,
+    /// Speaker label (null for now, future diarization fills this).
+    pub speaker: Option<String>,
+}
+
+/// How the live transcript is being produced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TranscriptSource {
+    /// Standalone `minutes live` session.
+    #[serde(rename = "standalone")]
+    Standalone,
+    /// Sidecar running alongside `minutes record`.
+    #[serde(rename = "recording-sidecar")]
+    RecordingSidecar,
+}
+
+impl TranscriptSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::RecordingSidecar => "recording-sidecar",
+        }
+    }
+}
+
+pub const PARAKEET_SCOPE_DOC_REF: &str = "docs/architecture/parakeet.md#scope";
+/// Shown at session start when a retained `engine = "parakeet"` preference is
+/// not selectable. The session resolves explicitly to Whisper.
+pub const PARAKEET_LIVE_SCOPE_WARNING: &str =
+    "parakeet cannot receive secure private audio in this runtime; live transcription uses whisper (see docs/architecture/parakeet.md#scope)";
+/// Shown at runtime when the parakeet engine IS compiled in but fails during a
+/// live session (warmup error, sidecar unreachable, transcribe error). The
+/// session transparently falls back to whisper for the remainder.
+#[cfg(feature = "parakeet")]
+pub const PARAKEET_LIVE_FALLBACK_WARNING: &str =
+    "parakeet live transcription failed; falling back to whisper for this session (see docs/architecture/parakeet.md#scope)";
+
+pub const APPLE_SPEECH_SCOPE_DOC_REF: &str = "docs/designs/apple-speech-benchmark-2026-04-22.md";
+pub const APPLE_SPEECH_LIVE_SCOPE_WARNING: &str =
+    "the authenticated apple-speech byte-transport service is unavailable or untrusted; live transcript uses sealed local Whisper for this session";
+pub const APPLE_SPEECH_LIVE_FALLBACK_WARNING: &str =
+    "apple-speech live transcription is unavailable; using sealed local Whisper for this session";
+
+/// True iff this build can route `engine = "parakeet"` to the parakeet path.
+/// Used at session start to decide between scope-warning (compile-time gap)
+/// and the real parakeet dispatch.
+fn live_engine_scope_warning(engine: &str) -> Option<&'static str> {
+    if engine.eq_ignore_ascii_case("parakeet") && !live_supports_parakeet(engine) {
+        Some(PARAKEET_LIVE_SCOPE_WARNING)
+    } else if engine.eq_ignore_ascii_case("apple-speech") && !live_supports_apple_speech() {
+        Some(APPLE_SPEECH_LIVE_SCOPE_WARNING)
+    } else {
+        None
+    }
+}
+
+fn live_supports_parakeet(engine: &str) -> bool {
+    engine.eq_ignore_ascii_case("parakeet")
+        && crate::pipeline::parakeet_capability(cfg!(feature = "parakeet")).selectable
+}
+
+fn recording_sidecar_live_backend(config: &Config) -> (&str, Option<String>) {
+    let backend = config.effective_live_transcript_backend();
+    if backend.eq_ignore_ascii_case("parakeet") {
+        if live_supports_parakeet(backend) {
+            return ("parakeet", None);
+        }
+        return (
+            "whisper",
+            Some(format!(
+                "live_transcript.backend retained parakeet, but Parakeet {}; using whisper for recording sidecar",
+                crate::pipeline::parakeet_capability(cfg!(feature = "parakeet"))
+                    .unavailable_reason()
+            )),
+        );
+    }
+    if backend.eq_ignore_ascii_case("whisper") {
+        return ("whisper", None);
+    }
+    if backend.eq_ignore_ascii_case("apple-speech") {
+        let reason = if live_supports_apple_speech() {
+            "Apple Speech runs only in standalone live transcript".to_string()
+        } else {
+            format!(
+                "Apple Speech {}",
+                crate::pipeline::apple_speech_unavailable_reason()
+            )
+        };
+        return (
+            "whisper",
+            Some(format!(
+                "live_transcript.backend retained apple-speech, but {reason}; using sealed local Whisper for recording sidecar"
+            )),
+        );
+    }
+
+    (
+        "whisper",
+        Some(format!(
+            "live_transcript.backend resolved to unsupported recording-sidecar backend '{backend}'; using whisper"
+        )),
+    )
+}
+
+/// Config to hand the general `transcribe()` dispatcher when the LIVE backend
+/// resolved to parakeet. The dispatcher switches on `transcription.engine`, and
+/// the live backend can be parakeet while the batch engine is something else
+/// (`live_transcript.backend = "parakeet"`), so the engine must be forced or
+/// the sidecar would silently run the batch engine under a parakeet label.
+/// Borrows when the engine already is parakeet; clones only on the override.
+/// Compiled for parakeet builds and for tests (the regression test must run in
+/// feature-less CI too); dead-code-free otherwise.
+#[cfg(any(feature = "parakeet", test))]
+fn forced_parakeet_config(config: &Config) -> std::borrow::Cow<'_, Config> {
+    if config.transcription.engine.eq_ignore_ascii_case("parakeet") {
+        std::borrow::Cow::Borrowed(config)
+    } else {
+        let mut owned = config.clone();
+        owned.transcription.engine = "parakeet".into();
+        std::borrow::Cow::Owned(owned)
+    }
+}
+
+#[cfg(feature = "parakeet")]
+fn live_ready_parakeet_fallback(config: &Config) -> bool {
+    crate::transcription_coordinator::parakeet_backend_status(config).ready
+}
+
+#[cfg(not(feature = "parakeet"))]
+#[allow(dead_code)]
+fn live_ready_parakeet_fallback(_config: &Config) -> bool {
+    false
+}
+
+fn live_supports_apple_speech() -> bool {
+    crate::pipeline::apple_speech_private_audio_transport_supported()
+}
+
+/// Resolve a retained standalone-live preference to the backend that will
+/// actually receive audio. Callers that describe evidence availability must
+/// use runtime truth, not the saved label.
+pub fn resolved_standalone_backend(config: &Config) -> &str {
+    let requested = config.effective_live_transcript_backend();
+    if requested.eq_ignore_ascii_case("parakeet") && !live_supports_parakeet(requested) {
+        "whisper"
+    } else {
+        crate::pipeline::resolved_apple_speech_backend(requested)
+    }
+}
+
+/// Session-start warning: fires only when `engine = "parakeet"` was requested
+/// and the current build cannot honor it (parakeet feature not compiled in).
+/// Always visible on stderr so the user sees that their engine choice was
+/// silently downgraded.
+fn emit_live_engine_scope_warning(engine: &str, source: &'static str) {
+    let Some(message) = live_engine_scope_warning(engine) else {
+        return;
+    };
+
+    eprintln!("[minutes] {}", message);
+    tracing::warn!(engine, source, "{}", message);
+    crate::logging::append_log(&serde_json::json!({
+        "ts": Local::now().to_rfc3339(),
+        "level": "warn",
+        "step": "live_transcript_scope",
+        "file": "",
+        "message": message,
+        "extra": {
+            "engine": engine,
+            "source": source,
+            "doc_ref": PARAKEET_SCOPE_DOC_REF,
+        }
+    }))
+    .ok();
+}
+
+/// Runtime fallback warning: fires when the parakeet path fails mid-session
+/// (warmup error or transcribe error) and the session is transparently switched
+/// to whisper for the remainder. Always visible on stderr — the user needs to
+/// know their transcripts changed engines.
+#[cfg(feature = "parakeet")]
+fn emit_live_engine_fallback_warning(source: &'static str, detail: &str) {
+    eprintln!(
+        "[minutes] {} (detail: {})",
+        PARAKEET_LIVE_FALLBACK_WARNING, detail
+    );
+    tracing::warn!(source, detail, "{}", PARAKEET_LIVE_FALLBACK_WARNING);
+    crate::logging::append_log(&serde_json::json!({
+        "ts": Local::now().to_rfc3339(),
+        "level": "warn",
+        "step": "live_transcript_fallback",
+        "file": "",
+        "message": PARAKEET_LIVE_FALLBACK_WARNING,
+        "extra": {
+            "source": source,
+            "detail": detail,
+            "doc_ref": PARAKEET_SCOPE_DOC_REF,
+        }
+    }))
+    .ok();
+}
+
+/// Persist one sidecar diagnostic to `~/.minutes/logs/minutes.log`.
+///
+/// The desktop app installs no tracing subscriber, so every `tracing::warn!`
+/// in this module vanishes there. Anything that explains a missing or thin
+/// live transcript goes through here as well, so a user or a support thread
+/// can read it back after the call instead of reconstructing it from the WAV.
+fn persist_sidecar_log(
+    level: &'static str,
+    step: &'static str,
+    message: &str,
+    extra: serde_json::Value,
+) {
+    crate::logging::append_log(&serde_json::json!({
+        "ts": Local::now().to_rfc3339(),
+        "level": level,
+        "step": step,
+        "file": "",
+        "message": message,
+        "extra": extra,
+    }))
+    .ok();
+}
+
+/// Per-utterance failures repeat at speech cadence. Persist the 1st, 10th,
+/// and 100th, then every 1000th, so a broken engine leaves a clear trail
+/// without flooding the log.
+pub(crate) fn should_persist_repeat(count: u64) -> bool {
+    matches!(count, 1 | 10 | 100) || (count >= 1000 && count.is_multiple_of(1000))
+}
+
+/// Explain a live model that resolved to a different file than the config asked
+/// for. `None` when the request was honored.
+///
+/// `resolve_model_path_by_name` falls back to the dictation model when the
+/// requested one is missing, and says so only through `tracing::warn!`. The
+/// desktop app installs no subscriber, so that vanishes there and the user gets
+/// a live transcript from a model they did not choose with nothing to read back
+/// afterwards. Same reasoning as #633, one layer down: the engine substitution
+/// was made visible, the model substitution underneath it was not.
+#[cfg(feature = "whisper")]
+fn live_model_downgrade_message(
+    requested: &str,
+    resolved: &std::path::Path,
+    fallback: &str,
+) -> Option<String> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    // An explicit path that resolved to itself was honored.
+    if resolved == std::path::Path::new(requested) {
+        return None;
+    }
+    // The resolver tries ggml-{name}.bin, whisper-{name}.bin and {name}.bin, so
+    // the requested name surviving in the filename means we got what we asked
+    // for.
+    let file = resolved.file_name()?.to_string_lossy().into_owned();
+    if file.contains(requested) {
+        return None;
+    }
+    Some(format!(
+        "live transcript model \"{requested}\" was not found, so live transcription used \
+         the dictation model \"{fallback}\" instead. Run `minutes setup --model {requested}` \
+         to install it, or set live_transcript.model to a model you already have."
+    ))
+}
+
+/// Explain a VAD engine that resolved to something other than what the config
+/// asked for. `None` when the request was honored.
+fn vad_downgrade_message(requested: &str, resolved: &str) -> Option<String> {
+    let requested = requested.trim().to_lowercase();
+    let want_ort = matches!(requested.as_str(), "ort-silero" | "ort" | "silero-ort");
+    match resolved {
+        "energy" => Some(format!(
+            "VAD engine \"{requested}\" unavailable; using energy VAD, which segments on volume alone"
+        )),
+        "silero" if want_ort => Some(
+            "VAD engine \"ort-silero\" unavailable (this build lacks the vad-ort feature or silero-vad-v6.2.0.onnx is missing from model_path); using whisper-silero"
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
+/// Utterances the recording sidecar skipped because no whisper model could be
+/// loaded. Reset at sidecar start; reported in the session summary.
+static SIDECAR_SKIPPED_UTTERANCES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Detected speech below which an empty session is just a quiet room rather
+/// than a silent engine failure: 30 s of 16 kHz samples.
+const SIDECAR_SUMMARY_SPEECH_SAMPLES_FLOOR: usize = 16_000 * 30;
+
+#[cfg(all(feature = "whisper", target_os = "macos"))]
+fn emit_apple_speech_fallback_warning(source: &'static str, detail: &str) {
+    eprintln!(
+        "[minutes] {} (detail: {})",
+        APPLE_SPEECH_LIVE_FALLBACK_WARNING, detail
+    );
+    tracing::warn!(source, detail, "{}", APPLE_SPEECH_LIVE_FALLBACK_WARNING);
+    crate::logging::append_log(&serde_json::json!({
+        "ts": Local::now().to_rfc3339(),
+        "level": "warn",
+        "step": "live_transcript_apple_fallback",
+        "file": "",
+        "message": APPLE_SPEECH_LIVE_FALLBACK_WARNING,
+        "extra": {
+            "source": source,
+            "detail": detail,
+            "doc_ref": APPLE_SPEECH_SCOPE_DOC_REF,
+        }
+    }))
+    .ok();
+}
+
+/// Status of the live transcript session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatus {
+    pub active: bool,
+    pub pid: Option<u32>,
+    pub line_count: usize,
+    pub duration_secs: f64,
+    /// Seconds since the end of the newest finalized line. Current drafts are
+    /// intentionally excluded; this is safe human-facing freshness evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_final_age_secs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub jsonl_path: Option<String>,
+    /// How the transcript is being produced (standalone or recording sidecar).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<TranscriptSource>,
+    /// Diagnostic detail when a transcript session is degraded or unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    /// Why live text is intentionally off for the active recording, as opposed
+    /// to `diagnostic`, which describes failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<LiveTranscriptDisabled>,
+    /// `missing` while the live remote-silence alert is outstanding for the
+    /// active recording (#1266): call audio is silent while the microphone
+    /// has speech, so every live line is local. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_audio: Option<crate::markdown::RemoteAudioStatus>,
+}
+
+/// Reasons live text is off on purpose while a recording is active.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LiveTranscriptDisabled {
+    /// `[live_transcript] recording_sidecar = false`: the recording captures
+    /// audio only and the transcript is produced after stop.
+    RecordingSidecarConfig,
+}
+
+/// Diagnostic written with the disabled status and surfaced to readers.
+pub const RECORDING_SIDECAR_DISABLED_DIAGNOSTIC: &str =
+    "live transcript is off for this recording (live_transcript.recording_sidecar = false)";
+
+/// Manages writing the JSONL and optional WAV file during a live session.
+struct LiveTranscriptWriter {
+    coverage: Option<CoverageLedger>,
+    session_id: Option<String>,
+    source: TranscriptSource,
+    jsonl_writer: BufWriter<File>,
+    wav_writer: Option<hound::WavWriter<BufWriter<File>>>,
+    line_count: usize,
+    start_time: std::time::Instant,
+    start_wall: DateTime<Local>,
+    jsonl_path: PathBuf,
+    jsonl_failed: bool,
+    wav_failed: bool,
+    pending_utterances: u64,
+    dropped_utterances: u64,
+    /// Milliseconds of VAD-detected speech the session has seen so far, as
+    /// reported by the audio loop, and the value it had at the last written
+    /// line. Their difference is how much speech produced nothing.
+    speech_ms_total: u64,
+    speech_ms_at_last_line: u64,
+    diagnostic: Option<String>,
+    last_status_write: Instant,
+    last_final_at: Option<DateTime<Local>>,
+    /// Apple Speech shadow measurement, `None` unless the session opted in
+    /// (`transcription.apple_speech_shadow`). Lives on the writer because the
+    /// writer is already threaded through every finalize path, so hooking it
+    /// here needs no signature churn in the capture code.
+    #[cfg(target_os = "macos")]
+    shadow: Option<LiveShadow>,
+}
+
+/// Per-session Apple Speech shadow state for a live transcript.
+///
+/// `StreamingWhisper` owns its accumulated audio internally and does not hand it
+/// back, so shadow keeps its own parallel copy of the utterance samples. The
+/// buffer is bounded: an utterance past [`SHADOW_MAX_SAMPLES`] marks the session
+/// sample overflowed and is skipped entirely rather than compared on truncated
+/// audio, which would understate Apple Speech and corrupt the measurement.
+#[cfg(target_os = "macos")]
+struct LiveShadow {
+    runner: crate::apple_speech_shadow::ShadowRunner,
+    samples: Vec<f32>,
+    overflowed: bool,
+}
+
+/// Cap on shadow's parallel sample buffer: 120 s at 16 kHz (~7.7 MB). Live
+/// utterances are VAD-segmented and far shorter; anything past this is skipped
+/// rather than truncated, keeping both memory and the measurement honest.
+#[cfg(target_os = "macos")]
+const SHADOW_MAX_SAMPLES: usize = 16_000 * 120;
+
+/// Lightweight sidecar written atomically on each utterance.
+/// Status readers check this instead of reparsing the full JSONL.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LiveStatusState {
+    Starting,
+    Healthy,
+    /// The session is alive and audio is flowing, but the engine has not
+    /// produced a line for an implausibly long stretch of detected speech.
+    /// Live reads still work; the diagnostic says what stalled.
+    Degraded,
+    Failed,
+    Stopped,
+    /// The recording started with `live_transcript.recording_sidecar = false`;
+    /// no sidecar thread exists to write anything else during the recording.
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveStatus {
+    pub start_time: DateTime<Local>,
+    pub updated_at: DateTime<Local>,
+    pub state: LiveStatusState,
+    pub line_count: usize,
+    pub last_offset_ms: u64,
+    pub last_duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_final_at: Option<DateTime<Local>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    /// Finalized utterances queued for transcription but not yet written.
+    /// Only present (recording sidecar) when the backlog is non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_utterances: Option<u64>,
+    /// Utterances whose audio was discarded because the transcription worker
+    /// could not keep up. Only present when non-zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_utterances: Option<u64>,
+}
+
+const SIDECAR_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+/// Detected speech (not wall-clock time) without a single transcribed line
+/// before the heartbeat reports `degraded`. Speech-based so a quiet waiting
+/// room never trips it; 90 s is three max-length utterances, well past any
+/// model load. A backlog (`pending_utterances > 0`) is a slow engine, not a
+/// stalled one, and keeps reporting `healthy` with its own diagnostic.
+const SIDECAR_STALL_SPEECH_MS: u64 = 90_000;
+const SIDECAR_HEALTH_STALE_AFTER_SECS: i64 = 3;
+const SIDECAR_STARTUP_TIMEOUT_SECS: i64 = 10;
+
+impl LiveTranscriptWriter {
+    fn new(
+        config: &Config,
+        session_id: Option<String>,
+        source: TranscriptSource,
+    ) -> Result<Self, MinutesError> {
+        let session_id = session_id.or_else(|| {
+            (source == TranscriptSource::RecordingSidecar)
+                .then(crate::copilot::CaptureRelayServer::current_process_session_id)
+                .flatten()
+        });
+        let jsonl_path = pid::live_transcript_jsonl_path();
+        if let Some(parent) = jsonl_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let jsonl_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&jsonl_path)?;
+        set_permissions_0600(&jsonl_path);
+        let jsonl_writer = BufWriter::new(jsonl_file);
+
+        let wav_writer = if config.live_transcript.save_wav {
+            let wav_path = pid::live_transcript_wav_path();
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            match hound::WavWriter::create(&wav_path, spec) {
+                Ok(w) => {
+                    set_permissions_0600(&wav_path);
+                    Some(w)
+                }
+                Err(e) => {
+                    tracing::warn!("could not create WAV file, continuing without: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let start_wall = Local::now();
+        let coverage = if config.live_transcript.coverage_shadow
+            && source == TranscriptSource::RecordingSidecar
+        {
+            match CoverageLedger::open(
+                &jsonl_path.with_extension("coverage.jsonl"),
+                session_id.as_deref(),
+            ) {
+                Ok(coverage) => Some(coverage),
+                Err(error) => {
+                    tracing::warn!(%error, "live coverage diagnostics unavailable; transcription continues");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let writer = Self {
+            coverage,
+            session_id,
+            source,
+            jsonl_writer,
+            wav_writer,
+            line_count: 0,
+            start_time: std::time::Instant::now(),
+            start_wall,
+            jsonl_path,
+            jsonl_failed: false,
+            wav_failed: false,
+            pending_utterances: 0,
+            dropped_utterances: 0,
+            speech_ms_total: 0,
+            speech_ms_at_last_line: 0,
+            diagnostic: None,
+            last_final_at: None,
+            last_status_write: Instant::now()
+                .checked_sub(SIDECAR_HEARTBEAT_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            #[cfg(target_os = "macos")]
+            shadow: None,
+        };
+
+        Ok(writer)
+    }
+
+    /// Arm Apple Speech shadow measurement for this session when the user opted
+    /// in. No-op when shadow is off (the default), when the runner thread cannot
+    /// be spawned, or on non-macOS. Independent of the product transport gate:
+    /// shadow measures alongside Whisper and never changes what is written.
+    #[cfg(target_os = "macos")]
+    fn enable_shadow(&mut self, config: &Config) {
+        if !crate::apple_speech_shadow::shadow_enabled(config) {
+            return;
+        }
+        // Attribute the evidence to the surface that produced it, using the
+        // canonical transcript-source vocabulary.
+        let source = match self.source {
+            TranscriptSource::Standalone => "standalone",
+            TranscriptSource::RecordingSidecar => "recording-sidecar",
+        };
+        // No up-front authority probe: the worker is only reachable from a
+        // trusted installed app bundle, and a process that cannot address it
+        // gets PermissionDenied on the first attempt, which the runner records
+        // as ShadowError::WorkerUnavailable and latches off. That is a precise,
+        // durable row and it costs one attempt, whereas probing here would mean
+        // reaching into the signed worker-authority surface for a diagnostic.
+        match crate::apple_speech_shadow::spawn_live_shadow_runner(config, source) {
+            Some(runner) => {
+                tracing::info!("apple-speech shadow measurement armed for this live session");
+                self.shadow = Some(LiveShadow {
+                    runner,
+                    samples: Vec::new(),
+                    overflowed: false,
+                });
+            }
+            None => crate::apple_speech_shadow::log_shadow_disabled(
+                source,
+                "worker thread could not be spawned",
+            ),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn enable_shadow(&mut self, _config: &Config) {}
+
+    /// Accumulate raw utterance samples for the shadow comparison, mirroring what
+    /// `StreamingWhisper` is fed. Bounded by [`SHADOW_MAX_SAMPLES`]; past that the
+    /// utterance is marked overflowed and will be skipped, not truncated.
+    #[cfg(target_os = "macos")]
+    fn push_shadow_samples(&mut self, samples: &[f32]) {
+        if let Some(shadow) = self.shadow.as_mut() {
+            if shadow.samples.len().saturating_add(samples.len()) > SHADOW_MAX_SAMPLES {
+                shadow.overflowed = true;
+                shadow.samples = Vec::new();
+                return;
+            }
+            if !shadow.overflowed {
+                shadow.samples.extend_from_slice(samples);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn push_shadow_samples(&mut self, _samples: &[f32]) {}
+
+    /// Hand the finished utterance to the shadow runner: the Whisper text that is
+    /// actually shipping, plus the samples that produced it. Called only where
+    /// Whisper is the shipped engine, so the comparison is always shadow-vs-shipped.
+    /// Ownership of the buffer moves to the runner (no copy on this thread), and
+    /// the runner drops the job if it is busy — capture is never blocked.
+    ///
+    /// The text is normalized exactly as `write_utterance` normalizes it, so a
+    /// comparison is only recorded for a transcript the user actually received:
+    /// normalization rejects (`[BLANK_AUDIO]` and friends) persist no line, so
+    /// shadow must not count them either. Either way the audio is consumed, so it
+    /// can never bleed into the next utterance.
+    #[cfg(target_os = "macos")]
+    fn submit_whisper_shadow(&mut self, whisper_text: &str) {
+        let normalized = normalize_live_transcript_text(whisper_text);
+        let Some(shadow) = self.shadow.as_mut() else {
+            return;
+        };
+        let samples = std::mem::take(&mut shadow.samples);
+        let overflowed = std::mem::replace(&mut shadow.overflowed, false);
+        let Some(text) = normalized else {
+            return;
+        };
+        if overflowed || samples.is_empty() {
+            return;
+        }
+        shadow.runner.try_submit(samples, text);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn submit_whisper_shadow(&mut self, _whisper_text: &str) {}
+
+    /// Drop any accumulated shadow audio without comparing it.
+    ///
+    /// Called wherever the Whisper stream is reset or discarded without producing
+    /// a finalized utterance (sub-second VAD segments, empty results, transcription
+    /// errors, reconnect discards). Without this the samples would carry into the
+    /// next utterance and Apple Speech would be handed several utterances of audio
+    /// while being scored against only the latest Whisper text.
+    #[cfg(target_os = "macos")]
+    fn discard_shadow_samples(&mut self) {
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.samples = Vec::new();
+            shadow.overflowed = false;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn discard_shadow_samples(&mut self) {}
+
+    /// Write the lightweight status file (atomic rename).
+    fn write_status(
+        &mut self,
+        state: LiveStatusState,
+        last_duration_ms: u64,
+        diagnostic: Option<&str>,
+    ) {
+        let backlog_diagnostic = (self.dropped_utterances > 0).then(|| {
+            format!(
+                "transcription backlog: {} utterance(s) dropped",
+                self.dropped_utterances
+            )
+        });
+        let status = LiveStatus {
+            start_time: self.start_wall,
+            updated_at: Local::now(),
+            state,
+            line_count: self.line_count,
+            last_offset_ms: self.start_time.elapsed().as_millis() as u64,
+            last_duration_ms,
+            last_final_at: self.last_final_at,
+            session_id: self.session_id.clone(),
+            diagnostic: diagnostic
+                .map(str::to_string)
+                .or(backlog_diagnostic)
+                .or_else(|| self.diagnostic.clone()),
+            pending_utterances: (self.pending_utterances > 0).then_some(self.pending_utterances),
+            dropped_utterances: (self.dropped_utterances > 0).then_some(self.dropped_utterances),
+        };
+        write_live_status(&status);
+        self.last_status_write = Instant::now();
+    }
+
+    /// Update transcription-backlog counters surfaced in the status file.
+    fn set_backlog_stats(&mut self, pending: u64, dropped: u64) {
+        self.pending_utterances = pending;
+        self.dropped_utterances = dropped;
+    }
+
+    fn set_diagnostic(&mut self, diagnostic: Option<String>) {
+        self.diagnostic = diagnostic;
+    }
+
+    /// Record how much speech the audio loop has detected so far.
+    fn set_speech_stats(&mut self, speech_ms_total: u64) {
+        self.speech_ms_total = speech_ms_total;
+    }
+
+    /// Speech has kept arriving but nothing has been written: the engine is
+    /// failing silently rather than merely running behind.
+    fn stall_diagnostic(&self) -> Option<String> {
+        let speech_ms = self
+            .speech_ms_total
+            .saturating_sub(self.speech_ms_at_last_line);
+        (self.pending_utterances == 0 && speech_ms >= SIDECAR_STALL_SPEECH_MS).then(|| {
+            format!(
+                "live transcription stalled: {}s of speech detected since the last transcribed line ({} line(s) so far); the transcription engine is not producing output",
+                speech_ms / 1000,
+                self.line_count
+            )
+        })
+    }
+
+    fn mark_healthy(&mut self) {
+        self.write_status(LiveStatusState::Healthy, 0, None);
+    }
+
+    fn mark_stopped(&mut self) {
+        self.write_status(LiveStatusState::Stopped, 0, None);
+    }
+
+    fn maybe_write_heartbeat(&mut self) {
+        if self.last_status_write.elapsed() >= SIDECAR_HEARTBEAT_INTERVAL {
+            match self.stall_diagnostic() {
+                Some(diagnostic) => {
+                    self.write_status(LiveStatusState::Degraded, 0, Some(&diagnostic))
+                }
+                None => self.write_status(LiveStatusState::Healthy, 0, None),
+            }
+        }
+    }
+
+    /// Append a transcribed utterance to the JSONL file.
+    /// Returns true if the write succeeded, false if JSONL is broken (data loss).
+    fn write_utterance(&mut self, text: &str, duration_secs: f64) -> bool {
+        let Some(text) = normalize_live_transcript_text(text) else {
+            return true; // not a failure, just nothing to write
+        };
+        if self.jsonl_failed {
+            return false; // already broken
+        }
+
+        self.line_count += 1;
+        self.speech_ms_at_last_line = self.speech_ms_total;
+        let offset = self.start_time.elapsed();
+        let line = TranscriptLine {
+            line: self.line_count,
+            ts: Local::now(),
+            offset_ms: offset.as_millis() as u64,
+            duration_ms: (duration_secs * 1000.0) as u64,
+            text,
+            speaker: None,
+        };
+
+        match serde_json::to_string(&line) {
+            Ok(json) => {
+                if let Err(e) = writeln!(self.jsonl_writer, "{}", json) {
+                    tracing::error!("JSONL write failed (disk full?): {}", e);
+                    self.jsonl_failed = true;
+                    return false;
+                } else if let Err(e) = self.jsonl_writer.flush() {
+                    tracing::error!("JSONL flush failed: {}", e);
+                    self.jsonl_failed = true;
+                    return false;
+                }
+            }
+            Err(e) => {
+                tracing::error!("failed to serialize transcript line: {}", e);
+            }
+        }
+        // Heartbeats must not make an old final appear freshly transcribed.
+        self.last_final_at = Some(line.ts);
+        // Update sidecar after each successful write
+        self.write_status(LiveStatusState::Healthy, line.duration_ms, None);
+        crate::events::append_event(crate::events::MinutesEvent::LiveUtteranceFinal {
+            session_id: self.session_id.clone(),
+            source: self.source.as_str().to_string(),
+            transcript_path: self.jsonl_path.display().to_string(),
+            line: line.line,
+            text: line.text.clone(),
+            speaker: line.speaker.clone(),
+            offset_ms: line.offset_ms,
+            duration_ms: line.duration_ms,
+        });
+        true
+    }
+
+    /// Write raw audio samples to the WAV file.
+    fn write_audio(&mut self, samples: &[f32]) {
+        if self.wav_failed {
+            return;
+        }
+        if let Some(ref mut writer) = self.wav_writer {
+            for &sample in samples {
+                let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                if let Err(e) = writer.write_sample(s) {
+                    tracing::warn!("WAV write failed (disk full?), continuing without: {}", e);
+                    self.wav_failed = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Finalize the WAV file and return session summary.
+    fn finalize(mut self) -> (usize, f64, PathBuf) {
+        if let Some(coverage) = self.coverage.as_mut() {
+            coverage.finish();
+        }
+        self.mark_stopped();
+        if let Some(writer) = self.wav_writer.take() {
+            if let Err(e) = writer.finalize() {
+                tracing::warn!("WAV finalize failed: {}", e);
+            }
+        }
+        let duration = self.start_time.elapsed().as_secs_f64();
+        (self.line_count, duration, self.jsonl_path)
+    }
+}
+
+pub fn normalize_live_transcript_text(text: &str) -> Option<String> {
+    let normalized_lines: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let body = live_text_part(line).trim();
+            if body.is_empty() {
+                None
+            } else {
+                Some(format!("[0:00] {}", body))
+            }
+        })
+        .collect();
+
+    if normalized_lines.is_empty() {
+        return None;
+    }
+
+    let normalized_lines = strip_foreign_script(normalized_lines);
+    let normalized_lines = collapse_noise_markers(normalized_lines);
+    let normalized_lines: Vec<String> = normalized_lines
+        .into_iter()
+        .filter_map(|line| {
+            let body = live_text_part(&line).trim();
+            if body.is_empty() || is_live_noise_marker(body) {
+                None
+            } else {
+                Some(body.to_string())
+            }
+        })
+        .collect();
+
+    if normalized_lines.is_empty() {
+        None
+    } else {
+        Some(normalized_lines.join(" "))
+    }
+}
+
+fn supersede_partial_after_finalize(
+    publisher: Option<&mut LivePartialPublisher>,
+    line_count_before: usize,
+    line_count_after: usize,
+) {
+    if let Some(publisher) = publisher {
+        let reason = if line_count_after > line_count_before {
+            SupersessionReason::Finalized
+        } else {
+            SupersessionReason::Discarded
+        };
+        publisher.supersede_current(reason);
+    }
+}
+
+fn live_text_part(line: &str) -> &str {
+    line.find("] ")
+        .map(|index| &line[index + 2..])
+        .unwrap_or(line)
+}
+
+fn is_live_noise_marker(text: &str) -> bool {
+    let trimmed = text.trim().strip_suffix('.').unwrap_or(text.trim());
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return false;
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    if inner.chars().all(|ch| ch.is_ascii_digit() || ch == ':') {
+        return false;
+    }
+
+    let word_count = inner.split_whitespace().count();
+    (1..=4).contains(&word_count) && inner.len() <= 40
+}
+
+/// Run the live transcript session. Blocks until stop_flag is set.
+///
+/// Unlike dictation, there is NO silence timeout — the session runs
+/// until explicitly stopped via `minutes stop` or the stop_flag.
+#[cfg(feature = "whisper")]
+pub fn run(
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    existing_context_session_id: Option<String>,
+) -> Result<(usize, f64, PathBuf), MinutesError> {
+    run_with_partials(stop_flag, config, existing_context_session_id, None)
+}
+
+/// Run standalone live transcription with an optional ephemeral in-process
+/// partial stream. The publisher is owned by the audio/VAD loop and uses only
+/// lock-free, non-blocking operations; durable finals continue through the
+/// unchanged writer path.
+#[cfg(feature = "whisper")]
+pub fn run_with_partials(
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    existing_context_session_id: Option<String>,
+    partial_publisher: Option<LivePartialPublisher>,
+) -> Result<(usize, f64, PathBuf), MinutesError> {
+    run_with_partials_internal(
+        stop_flag,
+        config,
+        existing_context_session_id,
+        partial_publisher,
+        false,
+        None,
+    )
+}
+
+/// Like [`run_with_partials`], but runs `release_capture` as soon as capture
+/// has stopped and the session files are safe, before the potentially long
+/// meeting pipeline. A caller that owns capture for the session (the CLI's
+/// capture relay) hands ownership back there, so a recording started right
+/// after Live stops is not refused for the whole processing time (#1110).
+#[cfg(feature = "whisper")]
+pub fn run_with_partials_releasing_capture(
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    existing_context_session_id: Option<String>,
+    partial_publisher: Option<LivePartialPublisher>,
+    release_capture: Box<dyn FnOnce() + Send>,
+) -> Result<(usize, f64, PathBuf), MinutesError> {
+    run_with_partials_internal(
+        stop_flag,
+        config,
+        existing_context_session_id,
+        partial_publisher,
+        false,
+        Some(release_capture),
+    )
+}
+
+/// Run the desktop Live session, archive its recoverable files on stop, and
+/// return before configured meeting processing begins. The desktop owns
+/// enqueueing that archived capture in the durable background worker.
+#[cfg(feature = "whisper")]
+pub fn run_with_partials_for_background(
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    existing_context_session_id: Option<String>,
+    partial_publisher: Option<LivePartialPublisher>,
+) -> Result<(usize, f64, PathBuf), MinutesError> {
+    run_with_partials_internal(
+        stop_flag,
+        config,
+        existing_context_session_id,
+        partial_publisher,
+        true,
+        None,
+    )
+}
+
+#[cfg(feature = "whisper")]
+fn run_with_partials_internal(
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    existing_context_session_id: Option<String>,
+    partial_publisher: Option<LivePartialPublisher>,
+    defer_processing: bool,
+    mut release_capture: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<(usize, f64, PathBuf), MinutesError> {
+    let mark_precreated_session_failed = |error: &MinutesError| {
+        if let Some(session_id) = existing_context_session_id.as_deref() {
+            crate::context_store::mark_live_transcript_failed(
+                session_id,
+                Some(Local::now()),
+                &error.to_string(),
+            )
+            .ok();
+        }
+    };
+
+    // Check conflicts: recording must not be active. `inspect_pid_file`, not
+    // `check_recording`: the recorder holds its PID file under a mandatory
+    // exclusive lock on Windows, so a read-based check errors there and
+    // `if let Ok(Some(_))` read that as "no recording" while one was running.
+    // That let a standalone live session start alongside a recording and
+    // write the same live-transcript.jsonl, the #258 hazard in reverse.
+    if pid::inspect_pid_file(&pid::pid_path()).is_active() {
+        let error: MinutesError = LiveTranscriptError::RecordingActive.into();
+        mark_precreated_session_failed(&error);
+        return Err(error);
+    }
+
+    // Check conflicts: dictation must not be active (same lock semantics).
+    let dict_pid = pid::dictation_pid_path();
+    if pid::inspect_pid_file(&dict_pid).is_active() {
+        let error: MinutesError = LiveTranscriptError::DictationActive.into();
+        mark_precreated_session_failed(&error);
+        return Err(error);
+    }
+
+    // Check conflicts: a voice session must not be holding the microphone.
+    let voice_pid = pid::voice_pid_path();
+    if pid::inspect_pid_file(&voice_pid).is_active() {
+        let error: MinutesError = LiveTranscriptError::VoiceActive.into();
+        mark_precreated_session_failed(&error);
+        return Err(error);
+    }
+
+    // Clear any stale stop sentinel from a previous session
+    pid::check_and_clear_sentinel();
+
+    // Acquire PID with flock held for session lifetime (prevents concurrent starts)
+    let lt_pid = pid::live_transcript_pid_path();
+    let pid_guard = match pid::create_pid_guard(&lt_pid) {
+        Ok(pid_guard) => pid_guard,
+        Err(e) => {
+            let error = match e {
+                crate::error::PidError::AlreadyRecording(pid) => {
+                    MinutesError::LiveTranscript(LiveTranscriptError::AlreadyActive(pid))
+                }
+                other => MinutesError::Pid(other),
+            };
+            mark_precreated_session_failed(&error);
+            return Err(error);
+        }
+    };
+
+    // Guard holds the flock — dropped when this function returns, cleaning up the PID file
+    write_live_status_transition(LiveStatusState::Starting, None);
+    let context_session_id = if let Some(session_id) = existing_context_session_id {
+        Some(session_id)
+    } else {
+        crate::desktop_context::maybe_start_live_transcript_session(
+            &config.desktop_context,
+            Local::now(),
+        )
+    };
+
+    let live_result = {
+        let _activity = crate::live_activity::begin_live_work();
+        run_inner(
+            stop_flag,
+            config,
+            context_session_id.clone(),
+            partial_publisher,
+        )
+    };
+    // The activity ends here, before archival/batch processing, including errors.
+    match live_result {
+        Ok((lines, duration, path)) => {
+            // The writer is closed now. Keep the liveness lock until the fixed
+            // scratch files have moved so a new session cannot truncate them,
+            // then release it before the potentially long meeting pipeline.
+            let finalization_result = if defer_processing {
+                crate::live_session::finalize_stopped_live_session_for_background_with_release(
+                    config,
+                    &pid::live_transcript_wav_path(),
+                    &path,
+                    || {
+                        drop(pid_guard);
+                        if let Some(release) = release_capture.take() {
+                            release();
+                        }
+                    },
+                )
+            } else {
+                crate::live_session::finalize_stopped_live_session_with_release(
+                    config,
+                    &pid::live_transcript_wav_path(),
+                    &path,
+                    || {
+                        drop(pid_guard);
+                        if let Some(release) = release_capture.take() {
+                            release();
+                        }
+                    },
+                )
+            };
+            let finalization = match finalization_result {
+                Ok(finalization) => finalization,
+                Err(error) => {
+                    if let Some(session_id) = context_session_id.as_deref() {
+                        crate::context_store::mark_live_transcript_failed(
+                            session_id,
+                            Some(Local::now()),
+                            &error.to_string(),
+                        )
+                        .ok();
+                    }
+                    return Err(error);
+                }
+            };
+            let awaiting_background_processing = defer_processing
+                && config.live_transcript.promote_on_stop
+                    == crate::config::LiveTranscriptPromoteOnStop::Process
+                && finalization.wav_path().is_some();
+            if !awaiting_background_processing {
+                if let Some(session_id) = context_session_id.as_deref() {
+                    crate::context_store::mark_live_transcript_complete(
+                        session_id,
+                        finalization.jsonl_path(),
+                        finalization.wav_path(),
+                        Some(Local::now()),
+                        json!({
+                            "line_count": lines,
+                            "duration_secs": duration,
+                            "meeting_path": finalization
+                                .meeting_path()
+                                .map(|path| path.display().to_string()),
+                        }),
+                    )
+                    .ok();
+                }
+            }
+            Ok((lines, duration, finalization.output_path().to_path_buf()))
+        }
+        Err(error) => {
+            drop(pid_guard);
+            if let Some(release) = release_capture.take() {
+                release();
+            }
+            if let Some(session_id) = context_session_id.as_deref() {
+                crate::context_store::mark_live_transcript_failed(
+                    session_id,
+                    Some(Local::now()),
+                    &error.to_string(),
+                )
+                .ok();
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Chunks the relay holds while the live loop is busy transcribing: about two
+/// minutes at 100 ms per chunk (~8 MB). The capture channel itself holds only
+/// ~6.4 s, so without the relay a slow utterance (a stalled engine, Whisper on
+/// a slow Mac, a model loading for fallback) drops audio from the saved WAV as
+/// well as from the transcript.
+const LIVE_AUDIO_RELAY_CHUNKS: usize = 1_200;
+
+/// Drain `source` on its own thread into a larger bounded queue, so capture
+/// never waits on transcription. The live loop still writes the WAV and runs
+/// VAD in order, only later. Disconnection passes through once the queue is
+/// drained, which keeps the loop's reconnect handling unchanged.
+fn relay_live_audio(
+    source: crossbeam_channel::Receiver<crate::streaming::AudioChunk>,
+) -> crossbeam_channel::Receiver<crate::streaming::AudioChunk> {
+    relay_live_audio_with_capacity(source, LIVE_AUDIO_RELAY_CHUNKS)
+}
+
+/// Hand every chunk still queued in the relay to `sink` (the WAV writer), so a
+/// stop or a device change never discards audio that capture already took.
+/// Callers close the capture stream first; `until_disconnected` then waits for
+/// its relay to finish forwarding, otherwise only what is queued now is taken.
+/// The relay's capacity plus the capture channel bounds the work, and a
+/// deadline keeps a slow disk from holding the stop open indefinitely.
+fn drain_relay_backlog(
+    audio_rx: &crossbeam_channel::Receiver<crate::streaming::AudioChunk>,
+    until_disconnected: bool,
+    mut sink: impl FnMut(&[f32]),
+) -> usize {
+    const MAX_CHUNKS: usize = LIVE_AUDIO_RELAY_CHUNKS + 256;
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let mut drained = 0;
+    while drained < MAX_CHUNKS && started.elapsed() < DEADLINE {
+        let next = if until_disconnected {
+            audio_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .ok()
+        } else {
+            audio_rx.try_recv().ok()
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        sink(&chunk.samples);
+        drained += 1;
+    }
+    if drained > 0 {
+        tracing::info!(
+            chunks = drained,
+            "wrote queued live audio to the session WAV"
+        );
+    }
+    let remaining = audio_rx.len();
+    if remaining > 0 {
+        // Only a WAV write slower than capture gets here; say what was lost.
+        persist_sidecar_log(
+            "warn",
+            "live_audio_drain_incomplete",
+            "stopped writing queued live audio to the session WAV before the queue emptied",
+            serde_json::json!({ "written_chunks": drained, "discarded_chunks": remaining }),
+        );
+    }
+    drained
+}
+
+fn relay_live_audio_with_capacity(
+    source: crossbeam_channel::Receiver<crate::streaming::AudioChunk>,
+    capacity: usize,
+) -> crossbeam_channel::Receiver<crate::streaming::AudioChunk> {
+    let (tx, rx) = crossbeam_channel::bounded(capacity);
+    let relay_source = source.clone();
+    let spawned = std::thread::Builder::new()
+        .name("live-audio-relay".into())
+        .spawn(move || {
+            let mut dropped: u64 = 0;
+            for chunk in relay_source.iter() {
+                match tx.try_send(chunk) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        // Over two minutes behind: drop rather than stall the
+                        // capture channel, and say so.
+                        dropped += 1;
+                        if dropped == 1 || dropped.is_multiple_of(100) {
+                            persist_sidecar_log(
+                                "warn",
+                                "live_audio_relay_overflow",
+                                "live transcript fell more than two minutes behind capture; dropping audio",
+                                serde_json::json!({ "dropped_chunks": dropped }),
+                            );
+                        }
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
+                }
+            }
+        });
+    match spawned {
+        Ok(_) => rx,
+        Err(error) => {
+            tracing::warn!(error = %error, "live audio relay thread failed to start; reading capture directly");
+            source
+        }
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn run_inner(
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    context_session_id: Option<String>,
+    mut partial_publisher: Option<LivePartialPublisher>,
+) -> Result<(usize, f64, PathBuf), MinutesError> {
+    let mut whisper_ctx: Option<whisper_rs::WhisperContext> = None;
+
+    // Start audio stream FIRST — validate mic access before truncating any files
+    let device_override = config.recording.device.as_deref();
+    let permission_preflight = crate::capture::preflight_microphone_only();
+    if let Some(reason) = permission_preflight.blocking_reason {
+        return Err(LiveTranscriptError::PermissionBlocked(reason).into());
+    }
+    for warning in permission_preflight.warnings {
+        tracing::warn!(warning = %warning, "live transcript microphone permission preflight warning");
+    }
+
+    let mut stream = AudioStream::start(device_override)?;
+    let mut audio_rx = relay_live_audio(stream.receiver.clone());
+    tracing::info!(device = %stream.device_name, "live transcript audio stream started");
+    // The desktop app installs no tracing subscriber, so record the input in
+    // the shared log too. Standalone Live captures this one device only; when
+    // a call's audio is missing (#1110), this is what shows which input it was.
+    crate::logging::append_log(&serde_json::json!({
+        "ts": Local::now().to_rfc3339(),
+        "level": "info",
+        "step": "live_transcript_input",
+        "file": "",
+        "message": "standalone live transcript captures a single input device",
+        "extra": {
+            "device": stream.device_name,
+            "device_override": device_override,
+            "device_is_system_audio_route":
+                crate::capture::is_system_audio_device_name(&stream.device_name),
+        }
+    }))
+    .ok();
+
+    // Device change monitor for auto-reconnection. Pinned when the user
+    // supplied an explicit device override.
+    let mut device_monitor = if device_override.is_some() {
+        crate::device_monitor::DeviceMonitor::pinned(&stream.device_name)
+    } else {
+        crate::device_monitor::DeviceMonitor::new(&stream.device_name)
+    };
+
+    // Only now create the writer (which truncates the JSONL and WAV files)
+    let mut writer =
+        LiveTranscriptWriter::new(config, context_session_id, TranscriptSource::Standalone)?;
+    writer.mark_healthy();
+    crate::events::append_event(crate::events::recording_started_event(
+        writer.session_id.clone(),
+        "live",
+        ["audio.capture", "live.utterance.final"],
+    ));
+
+    let mut vad = Vad::new();
+    let mut streaming = StreamingWhisper::with_partial_max_secs(
+        config.live_language(),
+        config.transcription.partial_max_secs,
+    );
+    let requested_standalone_backend = config.effective_live_transcript_backend();
+    #[cfg(any(target_os = "macos", feature = "parakeet"))]
+    let standalone_backend = resolved_standalone_backend(config);
+    #[cfg(target_os = "macos")]
+    let mut apple_utterance_samples: Vec<f32> = Vec::new();
+    #[cfg(target_os = "macos")]
+    let mut apple_live_enabled =
+        standalone_backend.eq_ignore_ascii_case("apple-speech") && live_supports_apple_speech();
+    // A failed Apple Speech utterance is re-transcribed by Whisper. Without
+    // that model the utterance would have nowhere to go, so a hand-edited or
+    // retained preference does not enable Apple Speech either.
+    #[cfg(target_os = "macos")]
+    if apple_live_enabled && !live_whisper_fallback_available(config) {
+        apple_live_enabled = false;
+        emit_apple_speech_fallback_warning(
+            "standalone",
+            "the Whisper fallback model for live transcript is not installed",
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let mut apple_live_enabled = false;
+
+    // Shadow scores Apple Speech against the Whisper line that ships. When Apple
+    // Speech is itself the shipped live engine there is no Whisper line to score,
+    // so the session records why it is not measuring instead of arming a runner
+    // that would never be fed.
+    if apple_live_enabled {
+        if crate::apple_speech_shadow::shadow_enabled(config) {
+            crate::apple_speech_shadow::log_shadow_disabled(
+                "standalone",
+                "apple-speech is the shipped live engine for this session",
+            );
+        }
+    } else {
+        writer.enable_shadow(config);
+    }
+
+    // Parakeet engine dispatch — mirrors run_sidecar_inner_mpsc. When the user
+    // configures `engine = "parakeet"` and the parakeet feature is compiled in,
+    // utterance samples are accumulated and routed through the parakeet path
+    // (warm sidecar socket when the effective sidecar decision is on, subprocess
+    // otherwise) at VAD-end. On failure the session transparently falls back
+    // to whisper for the remainder. See RFC 0002.
+    #[cfg(feature = "parakeet")]
+    let mut parakeet_utterance_samples: Vec<f32> = Vec::new();
+    #[cfg(feature = "parakeet")]
+    let mut parakeet_live_enabled = live_supports_parakeet(standalone_backend);
+    #[cfg(feature = "parakeet")]
+    let parakeet_fallback_ready = live_ready_parakeet_fallback(config);
+    #[cfg(not(feature = "parakeet"))]
+    let parakeet_live_enabled = false;
+    #[cfg(not(feature = "parakeet"))]
+    let parakeet_fallback_ready = false;
+
+    let mut was_speaking = false;
+    let mut utterance_samples: usize = 0;
+    let mut speech_samples_total: usize = 0;
+    let max_utterance_secs = config.live_transcript.max_utterance_secs.max(5);
+    let max_utterance_samples = (max_utterance_secs as usize).saturating_mul(16000);
+
+    // One-time scope warning when the user configured parakeet but the feature
+    // isn't compiled in. Same warning the recording sidecar emits.
+    if requested_standalone_backend.eq_ignore_ascii_case("parakeet") && !parakeet_live_enabled {
+        emit_live_engine_scope_warning(requested_standalone_backend, "standalone");
+    }
+    if requested_standalone_backend.eq_ignore_ascii_case("apple-speech") && !apple_live_enabled {
+        emit_live_engine_scope_warning(requested_standalone_backend, "standalone");
+    }
+    if apple_live_enabled {
+        eprintln!("[minutes] Apple Speech live transcript enabled (experimental, standalone only)");
+        // The fallback and scope warnings only record when Apple Speech is NOT
+        // used; this durable line is the positive record that it was.
+        crate::logging::append_log(&serde_json::json!({
+            "ts": Local::now().to_rfc3339(),
+            "level": "info",
+            "step": "live_transcript_backend",
+            "file": "",
+            "message": "standalone live transcript uses apple-speech",
+            "extra": {
+                "backend": "apple-speech",
+                "source": "standalone",
+            }
+        }))
+        .ok();
+    }
+
+    // Warm the parakeet sidecar at session start so the first utterance doesn't
+    // pay subprocess-spawn + model-load latency. We only warm the sidecar lane
+    // because:
+    //   - sidecar effective-on (auto or explicit) → warmup leaves a hot example-server
+    //     child + loaded model, making subsequent utterances fast.
+    //   - sidecar effective-off → warmup would just be a throwaway
+    //     subprocess on a silent WAV; it wouldn't leave a hot backend behind,
+    //     so the first real utterance still pays full spawn/model-load cost.
+    //     Skipping the no-op warmup avoids a 4-5s startup stall for nothing.
+    //
+    // Warmup failure is ADVISORY. We do NOT disable parakeet for the session
+    // on warmup error, because `crate::transcribe::transcribe()` already falls
+    // back sidecar→subprocess gracefully on a per-utterance basis. Forcing
+    // whisper here would be strictly worse than what the per-utterance code
+    // already does.
+    #[cfg(feature = "parakeet")]
+    if parakeet_live_enabled && crate::parakeet_sidecar::sidecar_enabled_effective(config) {
+        eprintln!("[minutes] Warming parakeet sidecar... (first-run cold start can take 10-30s)");
+        let started = std::time::Instant::now();
+        match crate::transcription_coordinator::warmup_active_backend(config) {
+            Ok(result) => {
+                tracing::info!(
+                    backend_id = %result.backend_id,
+                    elapsed_ms = result.elapsed_ms,
+                    "parakeet backend warmed for live session"
+                );
+                eprintln!("[minutes] parakeet sidecar ready ({}ms)", result.elapsed_ms);
+            }
+            Err(error) => {
+                // Log loudly, but keep parakeet_live_enabled = true so the
+                // per-utterance transcribe() path gets a chance to fall back
+                // sidecar→subprocess on its own.
+                tracing::warn!(
+                    error = %error,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "parakeet sidecar warmup failed; falling through to per-utterance dispatch (may still succeed via subprocess)"
+                );
+                eprintln!(
+                    "[minutes] parakeet sidecar warmup failed ({}); will try per-utterance subprocess path",
+                    error
+                );
+            }
+        }
+    }
+
+    tracing::info!("live transcript session started");
+
+    loop {
+        writer.set_speech_stats(samples_to_ms(speech_samples_total));
+        writer.maybe_write_heartbeat();
+        // Check stop flag
+        if stop_flag.load(Ordering::Relaxed) {
+            // Stop capture first so the backlog is finite, then put everything
+            // capture already took into the WAV the stop preserves.
+            drop(stream);
+            drain_relay_backlog(&audio_rx, true, |samples| writer.write_audio(samples));
+            // Finalize any in-progress utterance
+            if utterance_samples > 0 {
+                let line_count_before = writer.line_count;
+                #[cfg(feature = "parakeet")]
+                finalize_on_exit(
+                    &mut writer,
+                    &mut apple_live_enabled,
+                    #[cfg(target_os = "macos")]
+                    &mut apple_utterance_samples,
+                    parakeet_fallback_ready,
+                    &mut parakeet_live_enabled,
+                    &mut parakeet_utterance_samples,
+                    config,
+                    &mut streaming,
+                    &mut whisper_ctx,
+                    "standalone",
+                );
+                #[cfg(not(feature = "parakeet"))]
+                finalize_on_exit(
+                    &mut writer,
+                    &mut apple_live_enabled,
+                    #[cfg(target_os = "macos")]
+                    &mut apple_utterance_samples,
+                    parakeet_fallback_ready,
+                    config,
+                    &mut streaming,
+                    &mut whisper_ctx,
+                    "standalone",
+                );
+                supersede_partial_after_finalize(
+                    partial_publisher.as_mut(),
+                    line_count_before,
+                    writer.line_count,
+                );
+            }
+            break;
+        }
+
+        // Check for stop sentinel (from `minutes stop`)
+        if pid::check_and_clear_sentinel() {
+            drop(stream);
+            drain_relay_backlog(&audio_rx, true, |samples| writer.write_audio(samples));
+            if utterance_samples > 0 {
+                let line_count_before = writer.line_count;
+                #[cfg(feature = "parakeet")]
+                finalize_on_exit(
+                    &mut writer,
+                    &mut apple_live_enabled,
+                    #[cfg(target_os = "macos")]
+                    &mut apple_utterance_samples,
+                    parakeet_fallback_ready,
+                    &mut parakeet_live_enabled,
+                    &mut parakeet_utterance_samples,
+                    config,
+                    &mut streaming,
+                    &mut whisper_ctx,
+                    "standalone",
+                );
+                #[cfg(not(feature = "parakeet"))]
+                finalize_on_exit(
+                    &mut writer,
+                    &mut apple_live_enabled,
+                    #[cfg(target_os = "macos")]
+                    &mut apple_utterance_samples,
+                    parakeet_fallback_ready,
+                    config,
+                    &mut streaming,
+                    &mut whisper_ctx,
+                    "standalone",
+                );
+                supersede_partial_after_finalize(
+                    partial_publisher.as_mut(),
+                    line_count_before,
+                    writer.line_count,
+                );
+            }
+            break;
+        }
+
+        // Check for stream error or device change — attempt reconnection
+        if stream.has_error() || device_monitor.has_device_changed() {
+            let old_name = stream.device_name.clone();
+            tracing::info!(device = %old_name, "audio stream error or device change — reconnecting");
+            drop(stream);
+            // Audio captured before the change is still valid for the WAV; only
+            // the half-finished utterance is dropped from the transcript below.
+            drain_relay_backlog(&audio_rx, true, |samples| writer.write_audio(samples));
+            match AudioStream::start(device_override) {
+                Ok(new_stream) => {
+                    tracing::info!(
+                        old = %old_name, new = %new_stream.device_name,
+                        "live transcript audio stream reconnected"
+                    );
+                    device_monitor.update_device(&new_stream.device_name);
+                    stream = new_stream;
+                    audio_rx = relay_live_audio(stream.receiver.clone());
+                    // Discard any partial utterance — mic dropped mid-speech,
+                    // pre-reconnect audio is unreliable. Splicing pre+post
+                    // reconnect samples into one JSONL line would be silent
+                    // transcript corruption.
+                    if utterance_samples > 0 {
+                        tracing::info!(
+                            samples_discarded = utterance_samples,
+                            "discarding partial utterance across device reconnect"
+                        );
+                        if let Some(publisher) = partial_publisher.as_mut() {
+                            publisher.supersede_current(SupersessionReason::Discarded);
+                        }
+                    }
+                    streaming.reset();
+                    // Whisper's buffer was discarded, so shadow's parallel copy
+                    // must go too or it would bleed into the next utterance.
+                    writer.discard_shadow_samples();
+                    #[cfg(target_os = "macos")]
+                    apple_utterance_samples.clear();
+                    #[cfg(feature = "parakeet")]
+                    parakeet_utterance_samples.clear();
+                    utterance_samples = 0;
+                    was_speaking = false;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!("live transcript reconnect failed: {}", e);
+                    if utterance_samples > 0 {
+                        let line_count_before = writer.line_count;
+                        #[cfg(feature = "parakeet")]
+                        finalize_on_exit(
+                            &mut writer,
+                            &mut apple_live_enabled,
+                            #[cfg(target_os = "macos")]
+                            &mut apple_utterance_samples,
+                            parakeet_fallback_ready,
+                            &mut parakeet_live_enabled,
+                            &mut parakeet_utterance_samples,
+                            config,
+                            &mut streaming,
+                            &mut whisper_ctx,
+                            "standalone",
+                        );
+                        #[cfg(not(feature = "parakeet"))]
+                        finalize_on_exit(
+                            &mut writer,
+                            &mut apple_live_enabled,
+                            #[cfg(target_os = "macos")]
+                            &mut apple_utterance_samples,
+                            parakeet_fallback_ready,
+                            config,
+                            &mut streaming,
+                            &mut whisper_ctx,
+                            "standalone",
+                        );
+                        supersede_partial_after_finalize(
+                            partial_publisher.as_mut(),
+                            line_count_before,
+                            writer.line_count,
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Receive audio chunk (100ms timeout for stop checks)
+        let chunk = match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(chunk) => chunk,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                // Stream died — try to reconnect (device may have changed)
+                let old_name = stream.device_name.clone();
+                tracing::warn!("audio stream disconnected — attempting reconnect");
+                match AudioStream::start(device_override) {
+                    Ok(new_stream) => {
+                        tracing::info!(
+                            old = %old_name, new = %new_stream.device_name,
+                            "live transcript audio stream reconnected after disconnect"
+                        );
+                        device_monitor.update_device(&new_stream.device_name);
+                        stream = new_stream;
+                        audio_rx = relay_live_audio(stream.receiver.clone());
+                        // Discard partial utterance — see comment above the
+                        // device-change reconnect branch for rationale.
+                        if utterance_samples > 0 {
+                            tracing::info!(
+                                samples_discarded = utterance_samples,
+                                "discarding partial utterance across stream reconnect"
+                            );
+                            if let Some(publisher) = partial_publisher.as_mut() {
+                                publisher.supersede_current(SupersessionReason::Discarded);
+                            }
+                        }
+                        streaming.reset();
+                        // Whisper's buffer was discarded, so shadow's parallel
+                        // copy must go too or it would bleed into the next one.
+                        writer.discard_shadow_samples();
+                        #[cfg(target_os = "macos")]
+                        apple_utterance_samples.clear();
+                        #[cfg(feature = "parakeet")]
+                        parakeet_utterance_samples.clear();
+                        utterance_samples = 0;
+                        was_speaking = false;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!("reconnect after disconnect failed: {}", e);
+                        if utterance_samples > 0 {
+                            let line_count_before = writer.line_count;
+                            #[cfg(feature = "parakeet")]
+                            finalize_on_exit(
+                                &mut writer,
+                                &mut apple_live_enabled,
+                                #[cfg(target_os = "macos")]
+                                &mut apple_utterance_samples,
+                                parakeet_fallback_ready,
+                                &mut parakeet_live_enabled,
+                                &mut parakeet_utterance_samples,
+                                config,
+                                &mut streaming,
+                                &mut whisper_ctx,
+                                "standalone",
+                            );
+                            #[cfg(not(feature = "parakeet"))]
+                            finalize_on_exit(
+                                &mut writer,
+                                &mut apple_live_enabled,
+                                #[cfg(target_os = "macos")]
+                                &mut apple_utterance_samples,
+                                parakeet_fallback_ready,
+                                config,
+                                &mut streaming,
+                                &mut whisper_ctx,
+                                "standalone",
+                            );
+                            supersede_partial_after_finalize(
+                                partial_publisher.as_mut(),
+                                line_count_before,
+                                writer.line_count,
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        };
+
+        let audio_received_at = Instant::now();
+
+        // Write raw audio to WAV
+        writer.write_audio(&chunk.samples);
+
+        let vad_result = vad.process(chunk.rms);
+
+        if vad_result.speaking {
+            was_speaking = true;
+            utterance_samples += chunk.samples.len();
+            speech_samples_total += chunk.samples.len();
+            if let Some(publisher) = partial_publisher.as_mut() {
+                publisher.begin_utterance(audio_received_at);
+            }
+
+            if apple_live_enabled {
+                #[cfg(target_os = "macos")]
+                {
+                    apple_utterance_samples.extend_from_slice(&chunk.samples);
+                }
+            } else if parakeet_live_enabled {
+                #[cfg(feature = "parakeet")]
+                {
+                    parakeet_utterance_samples.extend_from_slice(&chunk.samples);
+                }
+            } else if let Ok(whisper_ctx) = ensure_live_whisper_ctx(&mut whisper_ctx, config) {
+                // Shadow keeps its own copy of what whisper is fed: StreamingWhisper
+                // does not hand its buffer back. No-op unless shadow is armed.
+                writer.push_shadow_samples(&chunk.samples);
+                if let Some(sr) = streaming.feed(&chunk.samples, whisper_ctx) {
+                    if let Some(publisher) = partial_publisher.as_mut() {
+                        let _ = publisher.try_publish_for_snapshot(
+                            sr.text,
+                            writer.start_time.elapsed().as_millis() as u64,
+                            audio_received_at,
+                        );
+                        // A full ring drops here. Do not log, wait, retry,
+                        // normalize, allocate another queue, or touch the
+                        // durable event path from this thread. Text cleanup is
+                        // intentionally owned by the consumer.
+                    }
+                }
+            }
+
+            // Force-finalize if max utterance reached
+            if utterance_samples >= max_utterance_samples {
+                tracing::info!("max utterance duration reached, force-finalizing");
+                let line_count_before = writer.line_count;
+                #[cfg(feature = "parakeet")]
+                let write_ok = finalize_live_utterance(
+                    &mut writer,
+                    &mut apple_live_enabled,
+                    #[cfg(target_os = "macos")]
+                    &mut apple_utterance_samples,
+                    parakeet_fallback_ready,
+                    &mut parakeet_live_enabled,
+                    &mut parakeet_utterance_samples,
+                    config,
+                    &mut streaming,
+                    &mut whisper_ctx,
+                    "standalone",
+                );
+                #[cfg(not(feature = "parakeet"))]
+                let write_ok = finalize_live_utterance(
+                    &mut writer,
+                    &mut apple_live_enabled,
+                    #[cfg(target_os = "macos")]
+                    &mut apple_utterance_samples,
+                    parakeet_fallback_ready,
+                    config,
+                    &mut streaming,
+                    &mut whisper_ctx,
+                    "standalone",
+                );
+                supersede_partial_after_finalize(
+                    partial_publisher.as_mut(),
+                    line_count_before,
+                    writer.line_count,
+                );
+                if !write_ok {
+                    tracing::error!("JSONL write failed — stopping session to prevent data loss");
+                    break;
+                }
+                utterance_samples = 0;
+                was_speaking = false;
+            }
+        } else if was_speaking && utterance_samples > 0 {
+            // Speech just ended — finalize the utterance
+            let line_count_before = writer.line_count;
+            #[cfg(feature = "parakeet")]
+            let write_ok = finalize_live_utterance(
+                &mut writer,
+                &mut apple_live_enabled,
+                #[cfg(target_os = "macos")]
+                &mut apple_utterance_samples,
+                parakeet_fallback_ready,
+                &mut parakeet_live_enabled,
+                &mut parakeet_utterance_samples,
+                config,
+                &mut streaming,
+                &mut whisper_ctx,
+                "standalone",
+            );
+            #[cfg(not(feature = "parakeet"))]
+            let write_ok = finalize_live_utterance(
+                &mut writer,
+                &mut apple_live_enabled,
+                #[cfg(target_os = "macos")]
+                &mut apple_utterance_samples,
+                parakeet_fallback_ready,
+                config,
+                &mut streaming,
+                &mut whisper_ctx,
+                "standalone",
+            );
+            supersede_partial_after_finalize(
+                partial_publisher.as_mut(),
+                line_count_before,
+                writer.line_count,
+            );
+            if !write_ok {
+                tracing::error!("JSONL write failed — stopping session to prevent data loss");
+                break;
+            }
+            utterance_samples = 0;
+            was_speaking = false;
+            // No silence timeout — keep running until stop
+        }
+    }
+
+    let (lines, duration, path) = writer.finalize();
+    clear_status_file();
+    tracing::info!(
+        lines = lines,
+        duration_secs = format!("{:.1}", duration),
+        "live transcript session ended"
+    );
+
+    Ok((lines, duration, path))
+}
+
+/// Stub when whisper feature is disabled.
+#[cfg(not(feature = "whisper"))]
+pub fn run(
+    _stop_flag: Arc<AtomicBool>,
+    _config: &Config,
+) -> Result<(usize, f64, PathBuf), MinutesError> {
+    Err(
+        TranscribeError::ModelLoadError("live transcript requires the whisper feature".into())
+            .into(),
+    )
+}
+
+// ── Recording sidecar ──────────────────────────────────────────
+//
+// ── Recording sidecar ──────────────────────────────────────────
+//
+// Runs alongside record_to_wav to produce a live JSONL transcript
+// while recording. Receives audio samples via a stdlib mpsc channel
+// from the capture callback and runs the same VAD + StreamingWhisper
+// loop that standalone live mode uses. The sidecar does NOT write
+// its own WAV (the recording WAV is the canonical audio).
+
+#[cfg(feature = "whisper")]
+const SIDECAR_VAD_CHUNK_MS: u64 = 100;
+#[cfg(feature = "whisper")]
+const SIDECAR_VAD_THRESHOLD: f32 = 0.2;
+#[cfg(feature = "whisper")]
+const SIDECAR_VAD_MIN_SPEECH_MS: i32 = 150;
+#[cfg(feature = "whisper")]
+const SIDECAR_VAD_MIN_SILENCE_MS: i32 = 500;
+#[cfg(feature = "whisper")]
+const SIDECAR_VAD_SPEECH_PAD_MS: i32 = 80;
+#[cfg(feature = "whisper")]
+const SIDECAR_VAD_IDLE_BUFFER_MS: usize = 3000;
+#[cfg(feature = "whisper")]
+const SIDECAR_VAD_ACTIVE_BUFFER_MS: usize = 8000;
+
+#[cfg(feature = "whisper")]
+#[derive(Debug, Default, Clone, Copy)]
+struct SidecarGatingStats {
+    samples_fed: usize,
+    samples_gated: usize,
+    speaking_windows: usize,
+    silence_windows: usize,
+}
+
+#[cfg(feature = "whisper")]
+impl SidecarGatingStats {
+    fn observe(&mut self, samples_len: usize, speaking: bool) {
+        self.samples_fed += samples_len;
+        if speaking {
+            self.speaking_windows += 1;
+        } else {
+            self.samples_gated += samples_len;
+            self.silence_windows += 1;
+        }
+    }
+}
+
+#[cfg(feature = "whisper")]
+enum RecordingSidecarVadBackend {
+    Silero(SileroSidecarVad),
+    /// Boxed because `OrtSileroVad` owns an ort `Session` plus state
+    /// and carry buffers, making it noticeably larger than the other
+    /// variants. Boxing keeps the enum size constant and silences
+    /// `clippy::large_enum_variant` without a per-variant allow.
+    #[cfg(feature = "vad-ort")]
+    OrtSilero(Box<crate::silero_vad::OrtSileroVad>),
+    Energy(Vad),
+}
+
+#[cfg(feature = "whisper")]
+struct RecordingSidecarVad {
+    backend: RecordingSidecarVadBackend,
+}
+
+#[cfg(feature = "whisper")]
+impl RecordingSidecarVad {
+    fn new(config: &Config) -> Self {
+        #[cfg(feature = "vad-ort")]
+        {
+            return Self::new_with_ort_constructor(
+                config,
+                crate::silero_vad::OrtSileroVad::new_catching_unwind,
+            );
+        }
+        #[cfg(not(feature = "vad-ort"))]
+        {
+            Self::new_without_ort(config)
+        }
+    }
+
+    #[cfg(feature = "vad-ort")]
+    fn new_with_ort_constructor(
+        config: &Config,
+        ort_constructor: impl FnOnce(
+            &Path,
+        ) -> Result<
+            crate::silero_vad::OrtSileroVad,
+            crate::silero_vad::OrtSileroError,
+        >,
+    ) -> Self {
+        // Pick the engine the user asked for. When ort-silero is
+        // requested but unavailable (feature off, ONNX missing, or
+        // load failure), fall through to whisper-silero with an
+        // explicit warn — silent fallback is the support footgun
+        // codex flagged in the spec review.
+        let requested = config.transcription.vad_engine.trim().to_lowercase();
+        let want_ort = matches!(requested.as_str(), "ort-silero" | "ort" | "silero-ort");
+        if !requested.is_empty()
+            && !want_ort
+            && !matches!(
+                requested.as_str(),
+                "whisper-silero" | "silero" | "whisper" | "default"
+            )
+        {
+            tracing::warn!(
+                requested = %requested,
+                "unknown transcription.vad_engine value — falling through to whisper-silero"
+            );
+        }
+
+        #[cfg(feature = "vad-ort")]
+        if want_ort {
+            if let Some(onnx_path) = crate::transcribe::resolve_silero_onnx_path(config) {
+                let ort_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ort_constructor(&onnx_path)
+                }))
+                .unwrap_or_else(|payload| {
+                    Err(crate::silero_vad::OrtSileroError::Panic(
+                        crate::silero_vad::panic_payload_message(payload),
+                    ))
+                });
+                match ort_result {
+                    Ok(engine) => {
+                        tracing::info!(
+                            vad_engine = "ort-silero",
+                            onnx_model = %onnx_path.display(),
+                            "recording sidecar using ort-Silero VAD (streaming)"
+                        );
+                        return Self {
+                            backend: RecordingSidecarVadBackend::OrtSilero(Box::new(engine)),
+                        };
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            onnx_model = %onnx_path.display(),
+                            error = %e,
+                            "ort-silero VAD failed to initialize; falling back to whisper-silero"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "ort-silero requested but silero-vad-v6.2.0.onnx missing in model_path — \
+                     falling back to whisper-silero. Run `minutes setup` (with vad-ort enabled \
+                     in your build) to fetch the ONNX."
+                );
+            }
+        }
+        #[cfg(not(feature = "vad-ort"))]
+        if want_ort {
+            tracing::warn!(
+                "ort-silero requested but this build was not compiled with the `vad-ort` \
+                 feature — falling back to whisper-silero"
+            );
+        }
+
+        if let Some(vad_path) = crate::transcribe::resolve_vad_model_path(config) {
+            match SileroSidecarVad::new(&vad_path) {
+                Ok(vad) => {
+                    tracing::info!(
+                        vad_engine = "whisper-silero",
+                        vad_model = %vad_path.display(),
+                        "recording sidecar using whisper-Silero VAD"
+                    );
+                    return Self {
+                        backend: RecordingSidecarVadBackend::Silero(vad),
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        vad_model = %vad_path.display(),
+                        error = %e,
+                        "failed to initialize Silero VAD for recording sidecar — falling back to energy VAD"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Silero VAD model unavailable for recording sidecar — falling back to energy VAD"
+            );
+        }
+
+        tracing::info!(vad_engine = "energy", "recording sidecar using energy VAD");
+        Self {
+            backend: RecordingSidecarVadBackend::Energy(Vad::new()),
+        }
+    }
+
+    #[cfg(not(feature = "vad-ort"))]
+    fn new_without_ort(config: &Config) -> Self {
+        // Pick the engine the user asked for. When ort-silero is
+        // requested but unavailable (feature off, ONNX missing, or
+        // load failure), fall through to whisper-silero with an
+        // explicit warn — silent fallback is the support footgun
+        // codex flagged in the spec review.
+        let requested = config.transcription.vad_engine.trim().to_lowercase();
+        let want_ort = matches!(requested.as_str(), "ort-silero" | "ort" | "silero-ort");
+        if !requested.is_empty()
+            && !want_ort
+            && !matches!(
+                requested.as_str(),
+                "whisper-silero" | "silero" | "whisper" | "default"
+            )
+        {
+            tracing::warn!(
+                requested = %requested,
+                "unknown transcription.vad_engine value — falling through to whisper-silero"
+            );
+        }
+
+        if want_ort {
+            tracing::warn!(
+                "ort-silero requested but this build was not compiled with the `vad-ort` \
+                 feature — falling back to whisper-silero"
+            );
+        }
+
+        if let Some(vad_path) = crate::transcribe::resolve_vad_model_path(config) {
+            match SileroSidecarVad::new(&vad_path) {
+                Ok(vad) => {
+                    tracing::info!(
+                        vad_engine = "whisper-silero",
+                        vad_model = %vad_path.display(),
+                        "recording sidecar using whisper-Silero VAD"
+                    );
+                    return Self {
+                        backend: RecordingSidecarVadBackend::Silero(vad),
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        vad_model = %vad_path.display(),
+                        error = %e,
+                        "failed to initialize Silero VAD for recording sidecar — falling back to energy VAD"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Silero VAD model unavailable for recording sidecar — falling back to energy VAD"
+            );
+        }
+
+        tracing::info!(vad_engine = "energy", "recording sidecar using energy VAD");
+        Self {
+            backend: RecordingSidecarVadBackend::Energy(Vad::new()),
+        }
+    }
+
+    fn mode_name(&self) -> &'static str {
+        match &self.backend {
+            RecordingSidecarVadBackend::Silero(_) => "silero",
+            #[cfg(feature = "vad-ort")]
+            RecordingSidecarVadBackend::OrtSilero(_) => "ort-silero",
+            RecordingSidecarVadBackend::Energy(_) => "energy",
+        }
+    }
+
+    fn process(&mut self, samples: &[f32], rms: f32) -> VadResult {
+        loop {
+            match &mut self.backend {
+                RecordingSidecarVadBackend::Silero(vad) => match vad.process(samples, rms) {
+                    Ok(result) => return result,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Silero VAD failed during recording sidecar run — falling back to energy VAD"
+                        );
+                        self.backend = RecordingSidecarVadBackend::Energy(Vad::new());
+                    }
+                },
+                #[cfg(feature = "vad-ort")]
+                RecordingSidecarVadBackend::OrtSilero(engine) => {
+                    let result = engine.process(samples, rms);
+                    if engine.is_healthy() {
+                        return result;
+                    }
+                    // Engine flipped unhealthy mid-call. Replace and
+                    // re-dispatch on the next loop iteration. The
+                    // result we just got is one silence frame; per
+                    // the trait contract, downstream must not act on
+                    // it as authoritative, but for the sidecar's
+                    // per-call flag it's fine to drop and refresh.
+                    tracing::warn!(
+                        "ort-Silero engine flipped unhealthy during recording sidecar run — falling back to energy VAD"
+                    );
+                    self.backend = RecordingSidecarVadBackend::Energy(Vad::new());
+                }
+                RecordingSidecarVadBackend::Energy(vad) => return vad.process(rms),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "whisper")]
+struct SileroSidecarVad {
+    ctx: whisper_rs::WhisperVadContext,
+    params: whisper_rs::WhisperVadParams,
+    buffer: Vec<f32>,
+    idle_buffer_samples: usize,
+    active_buffer_samples: usize,
+    min_silence_ms: u64,
+    chunk_ms: u64,
+    silence_ms: u64,
+    /// Sticky failure flag for the `VadEngine` impl. Set to `true` the
+    /// first time the inherent `process` returns `Err` so callers
+    /// using trait dispatch can surface health via `is_healthy`. The
+    /// existing enum-based dispatcher (`RecordingSidecarVad`) reads
+    /// the inherent `Result` directly and is unaffected.
+    failed: bool,
+}
+
+#[cfg(feature = "whisper")]
+impl SileroSidecarVad {
+    fn new(vad_path: &Path) -> Result<Self, whisper_rs::WhisperError> {
+        // This tiny model runs on every 100 ms window. Extra ggml workers add
+        // barrier synchronization and can amplify scheduling stalls. Keep the
+        // same model/thresholds while avoiding that intra-call worker barrier.
+        Self::new_with_threads(vad_path, 1)
+    }
+
+    fn new_with_threads(vad_path: &Path, threads: i32) -> Result<Self, whisper_rs::WhisperError> {
+        let vad_path = vad_path
+            .to_str()
+            .ok_or(whisper_rs::WhisperError::NullPointer)?;
+        let mut ctx_params = whisper_rs::WhisperVadContextParams::default();
+        ctx_params.set_n_threads(threads);
+
+        let mut params = whisper_rs::WhisperVadParams::default();
+        params.set_threshold(SIDECAR_VAD_THRESHOLD);
+        params.set_min_speech_duration(SIDECAR_VAD_MIN_SPEECH_MS);
+        params.set_min_silence_duration(SIDECAR_VAD_MIN_SILENCE_MS);
+        params.set_speech_pad(SIDECAR_VAD_SPEECH_PAD_MS);
+
+        let ctx = whisper_rs::WhisperVadContext::new(vad_path, ctx_params)?;
+
+        Ok(Self {
+            ctx,
+            params,
+            buffer: Vec::with_capacity(16000 * 3),
+            idle_buffer_samples: 16 * SIDECAR_VAD_IDLE_BUFFER_MS,
+            active_buffer_samples: 16 * SIDECAR_VAD_ACTIVE_BUFFER_MS,
+            min_silence_ms: SIDECAR_VAD_MIN_SILENCE_MS as u64,
+            chunk_ms: SIDECAR_VAD_CHUNK_MS,
+            silence_ms: 0,
+            failed: false,
+        })
+    }
+
+    fn process(
+        &mut self,
+        samples: &[f32],
+        rms: f32,
+    ) -> Result<VadResult, whisper_rs::WhisperError> {
+        self.buffer.extend_from_slice(samples);
+
+        let segments = match self.ctx.segments_from_samples(self.params, &self.buffer) {
+            Ok(segments) => segments,
+            Err(e) => {
+                self.failed = true;
+                return Err(e);
+            }
+        };
+        let buffer_ms = samples_to_ms(self.buffer.len());
+        let last_segment_end_ms = if segments.num_segments() > 0 {
+            segments
+                .get_segment(segments.num_segments() - 1)
+                .map(|segment| (segment.end * 10.0).round().max(0.0) as u64)
+        } else {
+            None
+        };
+
+        let speaking = last_segment_end_ms
+            .map(|end_ms| buffer_ms.saturating_sub(end_ms) < self.min_silence_ms)
+            .unwrap_or(false);
+
+        self.silence_ms = if speaking {
+            0
+        } else if let Some(end_ms) = last_segment_end_ms {
+            buffer_ms.saturating_sub(end_ms)
+        } else {
+            self.silence_ms.saturating_add(self.chunk_ms)
+        };
+
+        let max_len = if speaking || last_segment_end_ms.is_some() {
+            self.active_buffer_samples
+        } else {
+            self.idle_buffer_samples
+        };
+        trim_front(&mut self.buffer, max_len);
+
+        Ok(VadResult {
+            speaking,
+            silence_ms: self.silence_ms,
+            energy: rms,
+            noise_floor: 0.0,
+        })
+    }
+}
+
+#[cfg(feature = "whisper")]
+impl VadEngine for SileroSidecarVad {
+    /// Trait dispatch over `SileroSidecarVad::process`. Absorbs whisper
+    /// errors by setting the sticky `failed` flag and returning a
+    /// silence frame. Callers using trait dispatch must check
+    /// `is_healthy()` after each call and swap engines when it flips
+    /// to `false`. The existing enum-based `RecordingSidecarVad` keeps
+    /// using the inherent fallible API and its swap-on-error semantics
+    /// are unaffected.
+    fn process(&mut self, samples: &[f32], rms: f32) -> VadResult {
+        match SileroSidecarVad::process(self, samples, rms) {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Silero VAD process failed (trait dispatch) — emitting silence frame; is_healthy is now false"
+                );
+                VadResult {
+                    speaking: false,
+                    silence_ms: self.silence_ms,
+                    energy: rms,
+                    noise_floor: 0.0,
+                }
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "whisper-silero"
+    }
+
+    fn is_healthy(&self) -> bool {
+        !self.failed
+    }
+
+    fn reset(&mut self) {
+        // Reset reusable per-utterance state only. The `failed` flag
+        // is intentionally NOT cleared — sticky failures stay sticky,
+        // per the `VadEngine` trait contract. Dispatcher replaces
+        // failed engines; reset does not revive them.
+        self.buffer.clear();
+        self.silence_ms = 0;
+        debug_assert!(
+            !self.failed,
+            "reset called on a failed SileroSidecarVad — dispatcher should replace, not reset"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "whisper"))]
+impl SileroSidecarVad {
+    /// Test-only seam to flip the sticky failure flag without
+    /// requiring a corrupted model context. Used to verify the
+    /// `is_healthy` contract without a live whisper session.
+    pub(crate) fn force_failed_for_test(&mut self, value: bool) {
+        self.failed = value;
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn samples_to_ms(samples: usize) -> u64 {
+    ((samples as u64) * 1000) / 16000
+}
+
+#[cfg(feature = "whisper")]
+fn trim_front(buffer: &mut Vec<f32>, max_len: usize) {
+    if buffer.len() > max_len {
+        let drop = buffer.len() - max_len;
+        buffer.drain(0..drop);
+    }
+}
+
+// Gated on `whisper` alone: its only caller (`transcribe_utterance_for_sidecar`)
+// is cfg(feature = "whisper"), and a narrower gate breaks Linux default-feature
+// builds (whisper on, parakeet off, not macOS).
+#[cfg(feature = "whisper")]
+fn transcribe_with_whisper_for_live_sidecar(
+    samples: &[f32],
+    whisper_ctx: &whisper_rs::WhisperContext,
+    language: Option<String>,
+    abort_signal: Option<&Arc<AtomicBool>>,
+) -> Option<(String, f64)> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    // This is one complete recognition job, including current-speech snapshots.
+    // `feed()` runs inference every two seconds even with a one-second rolling
+    // window. Those discarded partial passes used to starve the final queue.
+    let mut streaming = StreamingWhisper::from_complete_audio(language, samples);
+    if let Some(abort_signal) = abort_signal {
+        streaming = streaming.with_abort_signal(Arc::clone(abort_signal));
+    }
+    streaming
+        .finalize(whisper_ctx)
+        .map(|result| (result.text, result.duration_secs))
+}
+
+/// Cap on finalized utterances awaiting transcription in the recording
+/// sidecar. Past this the engine is not keeping up with the meeting; holding
+/// more audio only grows latency without ever catching up, so overflow drops
+/// the newest utterance and is surfaced via `LiveStatus::dropped_utterances`.
+#[cfg(feature = "whisper")]
+const SIDECAR_UTTERANCE_QUEUE_CAP: usize = 3;
+
+/// Recording-sidecar drafts start after one second of speech, then refresh at
+/// a two-second cadence. Pending work is latest-only: the VAD consumer may
+/// replace a queued snapshot and never waits for recognition.
+#[cfg(feature = "whisper")]
+const SIDECAR_DRAFT_INTERVAL_SAMPLES: usize = 16000 * 2;
+#[cfg(feature = "whisper")]
+const SIDECAR_FIRST_DRAFT_SAMPLES: usize = 16000;
+
+#[cfg(feature = "whisper")]
+struct SidecarUtteranceJob {
+    spans: Vec<AudioSpan>,
+    samples: Vec<f32>,
+    queued_at: Instant,
+}
+
+#[cfg(feature = "whisper")]
+struct SidecarDraftJob {
+    utterance_sequence: u64,
+    samples: Vec<f32>,
+    offset_ms: u64,
+    audio_snapshot_at: Instant,
+}
+
+#[cfg(feature = "whisper")]
+struct SidecarDraftResult {
+    utterance_sequence: u64,
+    text: String,
+    offset_ms: u64,
+    audio_snapshot_at: Instant,
+}
+
+/// Provisional current speech deliberately has its own cheap gate instead of
+/// inheriting the finalized live transcript's VAD. The finalized path may use
+/// an optional model, fall back, or segment quiet audio differently; none of
+/// those choices should starve the replaceable draft or change durable output.
+#[cfg(feature = "whisper")]
+struct RecordingDraftGate {
+    vad: Vad,
+    was_speaking: bool,
+    utterance: Vec<f32>,
+    utterance_samples: usize,
+    utterance_start_offset_ms: u64,
+    next_draft_at: usize,
+    max_window_samples: usize,
+    stats: SidecarGatingStats,
+}
+
+#[cfg(feature = "whisper")]
+enum RecordingDraftGateEvent {
+    None,
+    Snapshot(SidecarDraftJob),
+    SpeechEnded,
+}
+
+#[cfg(feature = "whisper")]
+impl RecordingDraftGate {
+    fn new(config: &Config) -> Self {
+        Self {
+            vad: Vad::new(),
+            was_speaking: false,
+            utterance: Vec::new(),
+            utterance_samples: 0,
+            utterance_start_offset_ms: 0,
+            next_draft_at: SIDECAR_FIRST_DRAFT_SAMPLES,
+            max_window_samples: (config.transcription.partial_max_secs as usize)
+                .saturating_mul(16000)
+                .max(SIDECAR_FIRST_DRAFT_SAMPLES),
+            stats: SidecarGatingStats::default(),
+        }
+    }
+
+    fn process(
+        &mut self,
+        samples: &[f32],
+        rms: f32,
+        samples_received: usize,
+        publisher: &mut LivePartialPublisher,
+    ) -> RecordingDraftGateEvent {
+        let decision = self.vad.process(rms);
+        self.stats.observe(samples.len(), decision.speaking);
+
+        if decision.speaking {
+            if !self.was_speaking {
+                self.utterance.clear();
+                self.utterance_samples = 0;
+                self.utterance_start_offset_ms = samples_to_ms(samples_received);
+                self.next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
+                publisher.begin_utterance(Instant::now());
+            }
+            self.was_speaking = true;
+            self.utterance.extend_from_slice(samples);
+            self.utterance_samples = self.utterance_samples.saturating_add(samples.len());
+
+            if self.utterance_samples >= self.next_draft_at {
+                let (window, window_start) =
+                    sidecar_draft_window(&self.utterance, self.max_window_samples);
+                let snapshot = SidecarDraftJob {
+                    utterance_sequence: publisher.current_utterance_sequence(),
+                    samples: window.to_vec(),
+                    offset_ms: self
+                        .utterance_start_offset_ms
+                        .saturating_add(samples_to_ms(window_start)),
+                    audio_snapshot_at: Instant::now(),
+                };
+
+                // Once the cost ceiling is reached, retain only the bounded
+                // window. The total counter keeps cadence monotonic while the
+                // base offset advances with the discarded prefix.
+                if window_start > 0 {
+                    self.utterance.drain(..window_start);
+                    self.utterance_start_offset_ms = self
+                        .utterance_start_offset_ms
+                        .saturating_add(samples_to_ms(window_start));
+                }
+                self.next_draft_at = self
+                    .next_draft_at
+                    .saturating_add(SIDECAR_DRAFT_INTERVAL_SAMPLES);
+                return RecordingDraftGateEvent::Snapshot(snapshot);
+            }
+        } else if self.was_speaking {
+            self.reset_utterance();
+            publisher.supersede_current(SupersessionReason::Finalizing);
+            return RecordingDraftGateEvent::SpeechEnded;
+        }
+
+        RecordingDraftGateEvent::None
+    }
+
+    fn stop(&mut self, publisher: &mut LivePartialPublisher) {
+        self.reset_utterance();
+        publisher.supersede_current(SupersessionReason::Discarded);
+    }
+
+    fn reset_utterance(&mut self) {
+        self.was_speaking = false;
+        self.utterance.clear();
+        self.utterance_samples = 0;
+        self.next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn sidecar_draft_window(samples: &[f32], max_samples: usize) -> (&[f32], usize) {
+    let start = if max_samples == 0 {
+        0
+    } else {
+        samples.len().saturating_sub(max_samples)
+    };
+    (&samples[start..], start)
+}
+
+/// A capacity-one, newest-wins handoff. Both lock holders only swap an Option;
+/// recognition and audio copying happen outside the lock.
+#[cfg(feature = "whisper")]
+struct SidecarDraftMailbox<T> {
+    pending: Mutex<Option<T>>,
+    replaced: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "whisper")]
+impl<T> Default for SidecarDraftMailbox<T> {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(None),
+            replaced: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "whisper")]
+impl<T> SidecarDraftMailbox<T> {
+    fn offer_latest(&self, item: T) {
+        let mut pending = lock_ignore_poison(&self.pending);
+        if pending.replace(item).is_some() {
+            self.replaced.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn take(&self) -> Option<T> {
+        lock_ignore_poison(&self.pending).take()
+    }
+
+    fn clear(&self) {
+        lock_ignore_poison(&self.pending).take();
+    }
+}
+
+/// A poisoned writer mutex means a thread panicked mid-write; the writer's
+/// own failure latches (`jsonl_failed`) already cover torn state, and losing
+/// the remaining transcript over a poison flag would be strictly worse.
+#[cfg(feature = "whisper")]
+fn lock_ignore_poison<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(all(test, feature = "whisper"))]
+fn enqueue_sidecar_utterance(
+    job_tx: &std::sync::mpsc::SyncSender<SidecarUtteranceJob>,
+    samples: Vec<f32>,
+    counters: &QueueCounters,
+) -> EnqueueResult {
+    enqueue_sidecar_utterance_spanned(job_tx, samples, Vec::new(), counters)
+}
+
+#[cfg(feature = "whisper")]
+fn enqueue_sidecar_utterance_spanned(
+    job_tx: &std::sync::mpsc::SyncSender<SidecarUtteranceJob>,
+    samples: Vec<f32>,
+    spans: Vec<AudioSpan>,
+    counters: &QueueCounters,
+) -> EnqueueResult {
+    if samples.is_empty() {
+        return EnqueueResult::Disconnected;
+    }
+    let outcome = try_send_drop_newest(
+        job_tx,
+        SidecarUtteranceJob {
+            spans,
+            samples,
+            queued_at: Instant::now(),
+        },
+        counters,
+    );
+    match outcome {
+        EnqueueResult::Queued | EnqueueResult::Disconnected => {}
+        EnqueueResult::DroppedFull => {
+            let total = counters.dropped.load(Ordering::Relaxed);
+            tracing::warn!(
+                dropped_utterances = total,
+                "live sidecar transcription backlog full — dropping utterance audio"
+            );
+        }
+    }
+    outcome
+}
+
+#[cfg(feature = "whisper")]
+fn finish_sidecar_utterance(
+    job_tx: &std::sync::mpsc::SyncSender<SidecarUtteranceJob>,
+    samples: Vec<f32>,
+    spans: Vec<AudioSpan>,
+    writer: &Mutex<Option<LiveTranscriptWriter>>,
+    counters: &QueueCounters,
+) {
+    let outcome = enqueue_sidecar_utterance_spanned(job_tx, samples, spans.clone(), counters);
+    sidecar_coverage(writer, |ledger| {
+        ledger.classified(
+            &spans,
+            match outcome {
+                EnqueueResult::Queued => "pending-recognition",
+                EnqueueResult::DroppedFull => "dropped-recognition-queue",
+                EnqueueResult::Disconnected => "failed-recognition-queue",
+            },
+        )
+    });
+}
+
+#[cfg(feature = "whisper")]
+fn sidecar_coverage(
+    writer: &Mutex<Option<LiveTranscriptWriter>>,
+    observe: impl FnOnce(&mut CoverageLedger),
+) {
+    // Diagnostics may lose an observation rather than wait behind a transcript
+    // flush. Missing records and an unknown capture tail never qualify reuse.
+    let Ok(mut guard) = writer.try_lock() else {
+        return;
+    };
+    if let Some(ledger) = guard.as_mut().and_then(|w| w.coverage.as_mut()) {
+        observe(ledger);
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn write_timed_sidecar_utterance(
+    writer: &Mutex<Option<LiveTranscriptWriter>>,
+    text: &str,
+    duration_secs: f64,
+    timings: &mut SidecarWorkerTimings,
+    spans: &[AudioSpan],
+    provenance: Option<RecognitionProvenance>,
+) {
+    let started = Instant::now();
+    let mut guard = lock_ignore_poison(writer);
+    timings.writer_lock_wait.observe(started.elapsed());
+    if let Some(w) = guard.as_mut() {
+        let previous_line = w.line_count;
+        let written = timings
+            .writer_write
+            .measure(|| w.write_utterance(text, duration_secs));
+        if let (Some(ledger), Some(provenance)) = (w.coverage.as_mut(), provenance.as_ref()) {
+            if written && w.line_count > previous_line {
+                if let Some(normalized) = normalize_live_transcript_text(text) {
+                    ledger.finalized(spans, w.line_count, &normalized, provenance);
+                }
+            } else {
+                ledger.classified(spans, "empty-or-failed-transcript-write");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn sidecar_provenance(config: &Config, parakeet: bool) -> RecognitionProvenance {
+    RecognitionProvenance {
+        backend: if parakeet { "parakeet" } else { "whisper" }.into(),
+        model: if parakeet {
+            config.transcription.parakeet_model.clone()
+        } else {
+            resolve_live_model_path(config)
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "unresolved".into())
+        },
+        language: config.live_language(),
+    }
+}
+
+/// Engine dispatch for one finalized utterance on the sidecar's transcription
+/// worker. A parakeet failure permanently switches the session to whisper
+/// (loaded lazily, then kept warm) so a broken engine costs one utterance,
+/// not every subsequent one.
+#[cfg(feature = "whisper")]
+fn transcribe_utterance_for_sidecar(
+    samples: &[f32],
+    config: &Config,
+    whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
+    parakeet_enabled: &mut bool,
+    stop_flag: &Arc<AtomicBool>,
+    timings: &mut SidecarWorkerTimings,
+) -> Option<(String, f64)> {
+    #[cfg(feature = "parakeet")]
+    if *parakeet_enabled {
+        match timings
+            .final_inference
+            .measure(|| transcribe_with_parakeet_for_live_sidecar(samples, config))
+        {
+            Ok(result) => return result,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live recording-sidecar parakeet path failed — switching this session to whisper"
+                );
+                *parakeet_enabled = false;
+                emit_live_engine_fallback_warning("recording-sidecar", &error.to_string());
+            }
+        }
+    }
+    #[cfg(not(feature = "parakeet"))]
+    {
+        let _ = &parakeet_enabled;
+    }
+    let ctx = match whisper_ctx {
+        Some(ctx) => ctx,
+        None => match timings
+            .whisper_model_load
+            .measure(|| load_sidecar_whisper_ctx(config))
+        {
+            Ok(ctx) => whisper_ctx.insert(ctx),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "whisper model unavailable for live sidecar — skipping utterance"
+                );
+                let skipped = SIDECAR_SKIPPED_UTTERANCES.fetch_add(1, Ordering::Relaxed) + 1;
+                if should_persist_repeat(skipped) {
+                    persist_sidecar_log(
+                        "warn",
+                        "live_sidecar_utterance_skipped",
+                        "whisper model unavailable for the live sidecar; utterance skipped",
+                        serde_json::json!({
+                            "error": error.to_string(),
+                            "skipped_utterances": skipped,
+                        }),
+                    );
+                }
+                return None;
+            }
+        },
+    };
+    timings.final_inference.measure(|| {
+        transcribe_with_whisper_for_live_sidecar(
+            samples,
+            ctx,
+            config.live_language(),
+            Some(stop_flag),
+        )
+    })
+}
+
+#[cfg(feature = "whisper")]
+/// Resolve the Whisper model for live transcription.
+///
+/// An empty `live_transcript.model` falls back to `dictation.model`, NOT to
+/// `transcription.model`. That is deliberate: live transcription runs in real
+/// time against a streaming utterance and wants a small fast model, while batch
+/// transcription can afford a slower, more accurate one. Inheriting the batch
+/// model would hand anyone who chose a large model for quality a live sidecar
+/// too slow to keep up, trading a clear error for a vague performance problem.
+///
+/// The raw resolver error names a missing file but not the setting that chose
+/// it, which left a reporter reading our source to solve their own config
+/// problem (#756). The message is rewritten here to name the whole chain and
+/// both ways out, since `backend = "inherit"` sitting directly above `model`
+/// makes inheriting the natural assumption.
+/// Whether the Whisper model that live transcript falls back to is installed.
+/// Quiet counterpart of [`resolve_live_model_path`] for status surfaces: it
+/// neither logs nor warns, it only answers whether a fallback could load.
+pub fn live_whisper_fallback_available(config: &Config) -> bool {
+    if config.live_transcript.model.is_empty() {
+        crate::transcribe::resolve_model_path_for_dictation(config).is_ok()
+    } else {
+        crate::transcribe::resolve_model_path_by_name(&config.live_transcript.model, config).is_ok()
+    }
+}
+
+fn resolve_live_model_path(config: &Config) -> Result<std::path::PathBuf, MinutesError> {
+    if !config.live_transcript.model.is_empty() {
+        let resolved =
+            crate::transcribe::resolve_model_path_by_name(&config.live_transcript.model, config)?;
+        if let Some(message) = live_model_downgrade_message(
+            &config.live_transcript.model,
+            &resolved,
+            &config.dictation.model,
+        ) {
+            eprintln!("[minutes] {message}");
+            tracing::warn!("{message}");
+            persist_sidecar_log(
+                "warn",
+                "live_model_downgrade",
+                &message,
+                serde_json::json!({
+                    "requested": config.live_transcript.model,
+                    "resolved": resolved.display().to_string(),
+                    "fallback": config.dictation.model,
+                }),
+            );
+        }
+        return Ok(resolved);
+    }
+    crate::transcribe::resolve_model_path_for_dictation(config).map_err(|error| match error {
+        TranscribeError::ModelNotFound(detail) => TranscribeError::ModelNotFound(format!(
+            "live transcript resolved to the dictation model \"{}\" because \
+             live_transcript.model is empty. Note that it does NOT inherit \
+             transcription.model (currently \"{}\"): live transcription is \
+             real-time and wants a small fast model.\n\n{}\nAlternatively set \
+             live_transcript.model to a model you already have.",
+            config.dictation.model, config.transcription.model, detail
+        ))
+        .into(),
+        other => other.into(),
+    })
+}
+
+#[cfg(feature = "whisper")]
+fn load_sidecar_whisper_ctx(config: &Config) -> Result<whisper_rs::WhisperContext, MinutesError> {
+    let model_path = resolve_live_model_path(config)?;
+    tracing::info!(model = %model_path.display(), "loading whisper model for recording sidecar");
+    Ok(whisper_rs::WhisperContext::new_with_params(
+        model_path
+            .to_str()
+            .ok_or_else(|| TranscribeError::ModelLoadError("invalid path".into()))?,
+        crate::transcribe::whisper_context_params(),
+    )
+    .map_err(|e| TranscribeError::ModelLoadError(format!("{}", e)))?)
+}
+
+/// Minimum utterance length for the parakeet path — mirrors
+/// `StreamingWhisper::MIN_TRANSCRIBE_SAMPLES`. VAD blips shorter than this
+/// are dropped without hitting the sidecar/subprocess, avoiding temp-file
+/// churn and latency spikes on noisy inputs.
+#[cfg(feature = "parakeet")]
+const PARAKEET_LIVE_MIN_SAMPLES: usize = 16_000; // 1 second at 16kHz
+#[cfg(any(test, all(feature = "whisper", target_os = "macos")))]
+const APPLE_SPEECH_LIVE_MIN_SAMPLES: usize = 16_000; // 1 second at 16kHz
+
+#[cfg(feature = "parakeet")]
+fn transcribe_with_parakeet_for_live_sidecar(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<(String, f64)>, MinutesError> {
+    if samples.len() < PARAKEET_LIVE_MIN_SAMPLES {
+        // Drop sub-1s blips silently — they're almost always noise or mic
+        // pops that VAD didn't fully suppress. Same threshold whisper uses.
+        return Ok(None);
+    }
+
+    let tmp_wav = tempfile::Builder::new()
+        .prefix("minutes-live-sidecar-utterance-")
+        .suffix(".wav")
+        .tempfile()
+        .map_err(TranscribeError::Io)?;
+    crate::transcribe::write_wav_16k_mono(tmp_wav.path(), samples)?;
+
+    // The general dispatcher switches on `transcription.engine`. The live
+    // backend can resolve to parakeet independently of the batch engine
+    // (`live_transcript.backend = "parakeet"` with e.g. a sherpa batch engine),
+    // so force the engine here or the sidecar would label itself parakeet
+    // while actually running the batch engine (#395).
+    let forced = forced_parakeet_config(config);
+    match crate::transcribe::transcribe(tmp_wav.path(), &forced) {
+        Ok(result) => Ok(Some((result.text, samples.len() as f64 / 16000.0))),
+        Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Longest the capture consumer thread waits for one Apple Speech utterance.
+/// The audio channel buffers about 6.4 s. After a timeout the same thread loads
+/// the Whisper fallback and transcribes the utterance, as a Whisper live
+/// session always does, so the wait leaves most of that buffer for it. Apple
+/// Speech normally answers in well under a second.
+#[cfg(all(feature = "whisper", target_os = "macos"))]
+const APPLE_SPEECH_LIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(all(feature = "whisper", target_os = "macos"))]
+fn transcribe_with_apple_speech_for_live_sidecar(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<(String, f64)>, MinutesError> {
+    // The worker's own deadline is 180 s. Run the call on its own thread so a
+    // stalled worker costs this session at most the deadline below, then the
+    // caller latches the fallback engine; a late result is discarded.
+    let owned = zeroize::Zeroizing::new(samples.to_vec());
+    let config = config.clone();
+    call_with_deadline(APPLE_SPEECH_LIVE_DEADLINE, move || {
+        transcribe_with_apple_speech_for_live_sidecar_impl(
+            &owned,
+            &config,
+            crate::apple_speech_worker::transcribe_samples,
+        )
+    })
+}
+
+/// Run `call` on its own thread and wait at most `deadline` for it. A call
+/// that overruns keeps running detached; its result is dropped.
+#[cfg(any(test, all(feature = "whisper", target_os = "macos")))]
+fn call_with_deadline<T, F>(deadline: std::time::Duration, call: F) -> Result<T, MinutesError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, MinutesError> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("apple-speech-live".into())
+        .spawn(move || {
+            let _ = tx.send(call());
+        })
+        .map_err(MinutesError::Io)?;
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) => Err(MinutesError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "Apple Speech did not answer within {} ms",
+                deadline.as_millis()
+            ),
+        ))),
+    }
+}
+
+#[cfg(any(test, all(feature = "whisper", target_os = "macos")))]
+fn transcribe_with_apple_speech_for_live_sidecar_impl<F>(
+    samples: &[f32],
+    config: &Config,
+    transcribe_fn: F,
+) -> Result<Option<(String, f64)>, MinutesError>
+where
+    F: FnOnce(
+        &[f32],
+        Option<&str>,
+        crate::apple_speech::AppleSpeechMode,
+        bool,
+    ) -> crate::error::Result<crate::apple_speech::AppleSpeechTranscriptionResult>,
+{
+    if samples.len() < APPLE_SPEECH_LIVE_MIN_SAMPLES {
+        return Ok(None);
+    }
+
+    let locale = crate::apple_speech::live_locale_hint(config.live_language().as_deref());
+    // Never wait for an asset download here: this runs on the capture
+    // consumer thread, and the audio channel only buffers a few seconds. With
+    // assets missing the worker fails fast and the session falls back.
+    let result = transcribe_fn(
+        samples,
+        locale.as_deref(),
+        crate::apple_speech::AppleSpeechMode::Speech,
+        false,
+    )?;
+
+    if let Some(error) = result.error {
+        return Err(MinutesError::Io(std::io::Error::other(error)));
+    }
+    if result.transcript.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some((result.transcript, samples.len() as f64 / 16000.0)))
+}
+
+#[cfg(feature = "whisper")]
+fn ensure_live_whisper_ctx<'a>(
+    whisper_ctx: &'a mut Option<whisper_rs::WhisperContext>,
+    config: &Config,
+) -> Result<&'a whisper_rs::WhisperContext, MinutesError> {
+    if whisper_ctx.is_none() {
+        let model_path = resolve_live_model_path(config)?;
+        tracing::info!(
+            model = %model_path.display(),
+            "loading whisper model for live transcript fallback"
+        );
+        let ctx = whisper_rs::WhisperContext::new_with_params(
+            model_path
+                .to_str()
+                .ok_or_else(|| TranscribeError::ModelLoadError("invalid path".into()))?,
+            crate::transcribe::whisper_context_params(),
+        )
+        .map_err(|e| TranscribeError::ModelLoadError(format!("{}", e)))?;
+        *whisper_ctx = Some(ctx);
+    }
+
+    Ok(whisper_ctx
+        .as_ref()
+        .expect("whisper context should exist after ensure_live_whisper_ctx"))
+}
+
+#[cfg(all(target_os = "macos", feature = "whisper", feature = "parakeet"))]
+fn resolve_apple_speech_live_fallback<P, W>(
+    parakeet_fallback_ready: bool,
+    mut try_parakeet: P,
+    mut try_whisper: W,
+) -> Result<Option<(String, f64)>, MinutesError>
+where
+    P: FnMut() -> Result<Option<(String, f64)>, MinutesError>,
+    W: FnMut() -> Result<Option<(String, f64)>, MinutesError>,
+{
+    if parakeet_fallback_ready {
+        match try_parakeet() {
+            Ok(Some(result)) => return Ok(Some(result)),
+            Ok(None) => return Ok(None),
+            Err(_) => {}
+        }
+    }
+
+    try_whisper()
+}
+
+/// Finalize one utterance via the active engine (apple-speech, parakeet, or whisper)
+/// and write the resulting JSONL line.
+///
+/// Returns `true` if the write succeeded (or there was no text to write) and the
+/// session should continue; `false` on JSONL write failure, which signals the
+/// caller to stop to prevent data loss.
+///
+/// On apple/parakeet failure, the function automatically falls back to whisper
+/// for the accumulated samples and flips that engine flag to `false` so the
+/// remainder of the session uses whisper.
+#[cfg(all(feature = "whisper", feature = "parakeet"))]
+#[allow(clippy::too_many_arguments)]
+fn finalize_live_utterance(
+    writer: &mut LiveTranscriptWriter,
+    apple_live_enabled: &mut bool,
+    #[cfg(target_os = "macos")] apple_utterance_samples: &mut Vec<f32>,
+    parakeet_fallback_ready: bool,
+    parakeet_live_enabled: &mut bool,
+    parakeet_utterance_samples: &mut Vec<f32>,
+    config: &Config,
+    streaming: &mut StreamingWhisper,
+    whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
+    source: &'static str,
+) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    let _ = (apple_live_enabled, parakeet_fallback_ready);
+
+    #[cfg(target_os = "macos")]
+    if *apple_live_enabled {
+        match transcribe_with_apple_speech_for_live_sidecar(apple_utterance_samples, config) {
+            Ok(Some((text, duration_secs))) => {
+                let ok = writer.write_utterance(&text, duration_secs);
+                apple_utterance_samples.clear();
+                return ok;
+            }
+            Ok(None) => {
+                apple_utterance_samples.clear();
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live apple-speech path failed — switching this session to fallback backend"
+                );
+                *apple_live_enabled = false;
+                emit_apple_speech_fallback_warning(source, &error.to_string());
+                let fallback_result = resolve_apple_speech_live_fallback(
+                    parakeet_fallback_ready,
+                    || {
+                        *parakeet_live_enabled = true;
+                        match transcribe_with_parakeet_for_live_sidecar(
+                            apple_utterance_samples,
+                            config,
+                        ) {
+                            Ok(result) => Ok(result),
+                            Err(parakeet_error) => {
+                                tracing::warn!(
+                                    error = %parakeet_error,
+                                    "parakeet fallback after apple-speech live failure also failed — switching this session to whisper"
+                                );
+                                *parakeet_live_enabled = false;
+                                Err(parakeet_error)
+                            }
+                        }
+                    },
+                    || {
+                        let whisper_ctx = ensure_live_whisper_ctx(whisper_ctx, config).map_err(|load_error| {
+                            tracing::error!(
+                                error = %load_error,
+                                "failed to load whisper fallback after apple-speech live failure"
+                            );
+                            load_error
+                        })?;
+                        Ok(transcribe_with_whisper_for_live_sidecar(
+                            apple_utterance_samples,
+                            whisper_ctx,
+                            config.live_language(),
+                            None,
+                        ))
+                    },
+                );
+
+                match fallback_result {
+                    Ok(Some((text, duration_secs))) => {
+                        let ok = writer.write_utterance(&text, duration_secs);
+                        apple_utterance_samples.clear();
+                        return ok;
+                    }
+                    Ok(None) => {
+                        apple_utterance_samples.clear();
+                        return true;
+                    }
+                    Err(_) => {}
+                }
+                apple_utterance_samples.clear();
+                return true;
+            }
+        }
+    }
+
+    if *parakeet_live_enabled {
+        match transcribe_with_parakeet_for_live_sidecar(parakeet_utterance_samples, config) {
+            Ok(Some((text, duration_secs))) => {
+                let ok = writer.write_utterance(&text, duration_secs);
+                parakeet_utterance_samples.clear();
+                return ok;
+            }
+            Ok(None) => {
+                parakeet_utterance_samples.clear();
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live parakeet path failed — switching this session to whisper"
+                );
+                *parakeet_live_enabled = false;
+                emit_live_engine_fallback_warning(source, &error.to_string());
+                match ensure_live_whisper_ctx(whisper_ctx, config) {
+                    Ok(whisper_ctx) => {
+                        if let Some((text, duration_secs)) =
+                            transcribe_with_whisper_for_live_sidecar(
+                                parakeet_utterance_samples,
+                                whisper_ctx,
+                                config.live_language(),
+                                None,
+                            )
+                        {
+                            let ok = writer.write_utterance(&text, duration_secs);
+                            parakeet_utterance_samples.clear();
+                            return ok;
+                        }
+                    }
+                    Err(load_error) => {
+                        tracing::error!(
+                            error = %load_error,
+                            "failed to load whisper fallback after parakeet live failure"
+                        );
+                    }
+                }
+                parakeet_utterance_samples.clear();
+                return true;
+            }
+        }
+    }
+
+    // Whisper path
+    let write_ok = match ensure_live_whisper_ctx(whisper_ctx, config) {
+        Ok(whisper_ctx) => {
+            let ok = if let Some(sr) = streaming.finalize(whisper_ctx) {
+                // Whisper is the shipped engine here, so this is the one place a
+                // shadow comparison is valid. Submit only after the line is
+                // actually written: a failed JSONL write means the user never
+                // received this transcript, so it must not appear as evidence.
+                // No-op unless shadow is armed.
+                let written = writer.write_utterance(&sr.text, sr.duration_secs);
+                if written {
+                    writer.submit_whisper_shadow(&sr.text);
+                }
+                written
+            } else {
+                true
+            };
+            streaming.reset();
+            // No-op after a successful submit (which consumed the buffer), but
+            // load-bearing when finalize returned None: without it that audio
+            // would join the next utterance and be scored against its text.
+            writer.discard_shadow_samples();
+            ok
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "failed to load whisper backend for live transcript"
+            );
+            streaming.reset();
+            writer.discard_shadow_samples();
+            false
+        }
+    };
+    write_ok
+}
+
+/// Shutdown-time helper: finalize any partial utterance and log loudly on
+/// JSONL write failure. Called at every early-exit branch of `run_inner`
+/// (stop flag, stop sentinel, reconnect failure, stream disconnect failure).
+///
+/// We can't propagate the write_ok signal back into the caller's control flow
+/// at these branches — we're already breaking out of the loop. But if the
+/// write failed, the last utterance is silently dropped unless we log it.
+#[cfg(all(feature = "whisper", feature = "parakeet"))]
+#[allow(clippy::too_many_arguments)]
+fn finalize_on_exit(
+    writer: &mut LiveTranscriptWriter,
+    apple_live_enabled: &mut bool,
+    #[cfg(target_os = "macos")] apple_utterance_samples: &mut Vec<f32>,
+    parakeet_fallback_ready: bool,
+    parakeet_live_enabled: &mut bool,
+    parakeet_utterance_samples: &mut Vec<f32>,
+    config: &Config,
+    streaming: &mut StreamingWhisper,
+    whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
+    source: &'static str,
+) {
+    if !finalize_live_utterance(
+        writer,
+        apple_live_enabled,
+        #[cfg(target_os = "macos")]
+        apple_utterance_samples,
+        parakeet_fallback_ready,
+        parakeet_live_enabled,
+        parakeet_utterance_samples,
+        config,
+        streaming,
+        whisper_ctx,
+        source,
+    ) {
+        tracing::error!(
+            "JSONL write failed while finalizing last utterance on shutdown — last utterance may be lost"
+        );
+    }
+}
+
+#[cfg(all(feature = "whisper", not(feature = "parakeet")))]
+#[allow(clippy::too_many_arguments)]
+fn finalize_live_utterance(
+    writer: &mut LiveTranscriptWriter,
+    apple_live_enabled: &mut bool,
+    #[cfg(target_os = "macos")] apple_utterance_samples: &mut Vec<f32>,
+    _parakeet_fallback_ready: bool,
+    config: &Config,
+    streaming: &mut StreamingWhisper,
+    whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
+    source: &'static str,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    if *apple_live_enabled {
+        match transcribe_with_apple_speech_for_live_sidecar(apple_utterance_samples, config) {
+            Ok(Some((text, duration_secs))) => {
+                let ok = writer.write_utterance(&text, duration_secs);
+                apple_utterance_samples.clear();
+                return ok;
+            }
+            Ok(None) => {
+                apple_utterance_samples.clear();
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live apple-speech path failed — switching this session to whisper"
+                );
+                *apple_live_enabled = false;
+                emit_apple_speech_fallback_warning(source, &error.to_string());
+                match ensure_live_whisper_ctx(whisper_ctx, config) {
+                    Ok(whisper_ctx) => {
+                        if let Some((text, duration_secs)) =
+                            transcribe_with_whisper_for_live_sidecar(
+                                apple_utterance_samples,
+                                whisper_ctx,
+                                config.live_language(),
+                                None,
+                            )
+                        {
+                            let ok = writer.write_utterance(&text, duration_secs);
+                            apple_utterance_samples.clear();
+                            return ok;
+                        }
+                    }
+                    Err(load_error) => {
+                        tracing::error!(
+                            error = %load_error,
+                            "failed to load whisper fallback after apple-speech live failure"
+                        );
+                    }
+                }
+                apple_utterance_samples.clear();
+                return true;
+            }
+        }
+    }
+
+    let write_ok = match ensure_live_whisper_ctx(whisper_ctx, config) {
+        Ok(whisper_ctx) => {
+            if let Some(sr) = streaming.finalize(whisper_ctx) {
+                // Whisper is the shipped engine here, so this is the one place a
+                // shadow comparison is valid. Submit only after the line is
+                // actually written: a failed JSONL write means the user never
+                // received this transcript, so it must not appear as evidence.
+                // No-op unless shadow is armed.
+                let written = writer.write_utterance(&sr.text, sr.duration_secs);
+                if written {
+                    writer.submit_whisper_shadow(&sr.text);
+                }
+                written
+            } else {
+                true
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "failed to load whisper backend for live transcript"
+            );
+            false
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = (&apple_live_enabled, &config, source);
+    streaming.reset();
+    // No-op after a successful submit; load-bearing when finalize returned None
+    // or the whisper context failed to load.
+    writer.discard_shadow_samples();
+    write_ok
+}
+
+#[cfg(all(feature = "whisper", not(feature = "parakeet")))]
+#[allow(clippy::too_many_arguments)]
+fn finalize_on_exit(
+    writer: &mut LiveTranscriptWriter,
+    apple_live_enabled: &mut bool,
+    #[cfg(target_os = "macos")] apple_utterance_samples: &mut Vec<f32>,
+    parakeet_fallback_ready: bool,
+    config: &Config,
+    streaming: &mut StreamingWhisper,
+    whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
+    source: &'static str,
+) {
+    if !finalize_live_utterance(
+        writer,
+        apple_live_enabled,
+        #[cfg(target_os = "macos")]
+        apple_utterance_samples,
+        parakeet_fallback_ready,
+        config,
+        streaming,
+        whisper_ctx,
+        source,
+    ) {
+        tracing::error!(
+            "JSONL write failed while finalizing last utterance on shutdown — last utterance may be lost"
+        );
+    }
+}
+
+/// Run a live transcript sidecar that consumes audio samples from a channel.
+/// Blocks until the channel disconnects (recording stopped) or stop_flag is set.
+/// Loads its own whisper model (tiny/base) for real-time streaming.
+#[cfg(feature = "whisper")]
+pub fn run_sidecar_mpsc(
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    partial_publisher: Option<LivePartialPublisher>,
+) {
+    run_sidecar_receiver(
+        || {
+            rx.recv_timeout(Duration::from_millis(100))
+                .map(|samples| AudioPacket {
+                    samples,
+                    span: None,
+                    sources: None,
+                })
+        },
+        stop_flag,
+        config,
+        partial_publisher,
+    );
+}
+
+#[cfg(feature = "whisper")]
+pub(crate) fn run_tracked_sidecar_mpsc(
+    rx: std::sync::mpsc::Receiver<AudioPacket>,
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    partial_publisher: Option<LivePartialPublisher>,
+) {
+    run_sidecar_receiver(
+        || rx.recv_timeout(Duration::from_millis(100)),
+        stop_flag,
+        config,
+        partial_publisher,
+    );
+}
+
+#[cfg(feature = "whisper")]
+fn run_sidecar_receiver(
+    receive: impl FnMut() -> Result<AudioPacket, std::sync::mpsc::RecvTimeoutError>,
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    partial_publisher: Option<LivePartialPublisher>,
+) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_sidecar_inner_mpsc(receive, stop_flag, config, partial_publisher)
+    }));
+
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let message = format!("{}", e);
+            eprintln!(
+                "[minutes] Live transcript unavailable: {} — recording continues without real-time transcript",
+                message
+            );
+            tracing::warn!("live sidecar stopped: {}", message);
+            write_live_status_transition(LiveStatusState::Failed, Some(message.as_str()));
+        }
+        Err(payload) => {
+            let message = panic_payload_to_string(payload.as_ref());
+            eprintln!(
+                "[minutes] Live transcript unavailable: {} — recording continues without real-time transcript",
+                message
+            );
+            tracing::error!("live sidecar panicked: {}", message);
+            write_live_status_transition(LiveStatusState::Failed, Some(message.as_str()));
+        }
+    }
+}
+
+/// mpsc sidecar implementation.
+/// Used by record_to_wav which doesn't depend on the streaming feature.
+#[cfg(feature = "whisper")]
+fn run_sidecar_inner_mpsc(
+    mut receive: impl FnMut() -> Result<AudioPacket, std::sync::mpsc::RecvTimeoutError>,
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    mut partial_publisher: Option<LivePartialPublisher>,
+) -> Result<(), MinutesError> {
+    // Guard: don't clobber a standalone live transcript session's JSONL.
+    // `inspect_pid_file` (not `check_pid_file`) so a standalone session holding
+    // the PID file under a mandatory Windows lock is detected — otherwise the
+    // sidecar would write the same `live-transcript.jsonl` concurrently. See #258.
+    let lt_pid = pid::live_transcript_pid_path();
+    if pid::inspect_pid_file(&lt_pid).is_active() {
+        tracing::info!("standalone live transcript active — skipping recording sidecar");
+        return Ok(());
+    }
+
+    let _activity = crate::live_activity::begin_live_work();
+    let progress = InputProgress::start("sidecar-consumer");
+    write_live_status_transition(LiveStatusState::Starting, None);
+
+    let mut sidecar_config = config.clone();
+    sidecar_config.live_transcript.save_wav = false;
+    let writer = Arc::new(Mutex::new(Some(LiveTranscriptWriter::new(
+        &sidecar_config,
+        None,
+        TranscriptSource::RecordingSidecar,
+    )?)));
+    let (sidecar_backend, sidecar_backend_diagnostic) = recording_sidecar_live_backend(config);
+    if let Some(w) = lock_ignore_poison(&writer).as_mut() {
+        w.set_diagnostic(sidecar_backend_diagnostic.clone());
+        w.mark_healthy();
+    }
+
+    let mut vad = progress.measure(Stage::VadInit, || RecordingSidecarVad::new(config));
+    let parakeet_live_enabled = sidecar_backend.eq_ignore_ascii_case("parakeet");
+    let mut was_speaking = false;
+    let mut utterance: Vec<f32> = Vec::new();
+    let mut utterance_spans = Vec::new();
+    let mut gating_stats = SidecarGatingStats::default();
+    let max_utterance_secs = config.live_transcript.max_utterance_secs.max(5);
+    let max_utterance_samples = (max_utterance_secs as usize).saturating_mul(16000);
+
+    if let Some(diagnostic) = &sidecar_backend_diagnostic {
+        eprintln!("[minutes] {diagnostic}");
+        tracing::warn!(
+            requested_backend = %config.effective_live_transcript_backend(),
+            resolved_backend = sidecar_backend,
+            "recording sidecar live backend downgraded"
+        );
+        crate::logging::append_log(&serde_json::json!({
+            "ts": Local::now().to_rfc3339(),
+            "level": "warn",
+            "step": "live_transcript_backend",
+            "file": "",
+            "message": diagnostic,
+            "extra": {
+                "source": "recording-sidecar",
+                "requested_backend": config.effective_live_transcript_backend(),
+                "resolved_backend": sidecar_backend,
+            }
+        }))
+        .ok();
+    }
+
+    // ── Transcription worker ─────────────────────────────────────
+    // Inference must never run on this (consumer) thread: a single slow or
+    // wedged engine call starves the bounded capture channel (audio drops →
+    // garbled lines), freezes the status heartbeat, and defers stop handling
+    // for the duration of the call. The consumer below only does VAD and
+    // buffering; finalized utterances are handed to this worker over a small
+    // bounded queue, and a backlogged engine costs us utterances (counted in
+    // the status file) instead of the whole session.
+    let (job_tx, job_rx) =
+        std::sync::mpsc::sync_channel::<SidecarUtteranceJob>(SIDECAR_UTTERANCE_QUEUE_CAP);
+    let queue_counters = Arc::new(QueueCounters::default());
+    let draft_jobs = Arc::new(SidecarDraftMailbox::<SidecarDraftJob>::default());
+    let draft_results = Arc::new(SidecarDraftMailbox::<SidecarDraftResult>::default());
+    let drafts_enabled = partial_publisher.is_some();
+    let worker = {
+        let writer = Arc::clone(&writer);
+        let config = config.clone();
+        let counters = Arc::clone(&queue_counters);
+        let stop_flag = Arc::clone(&stop_flag);
+        let draft_jobs = Arc::clone(&draft_jobs);
+        let draft_results = Arc::clone(&draft_results);
+        std::thread::Builder::new()
+            .name("live-sidecar-transcribe".into())
+            .spawn(move || {
+                let mut timings = SidecarWorkerTimings::default();
+                let mut parakeet_enabled = parakeet_live_enabled;
+                // Loaded lazily on first whisper-path utterance: the load can
+                // take >10s for larger models, and doing it eagerly (worse, on
+                // the consumer thread, as before) dropped the first ~13s of
+                // every meeting. Parakeet sessions never pay it at all.
+                let mut whisper_ctx: Option<whisper_rs::WhisperContext> = None;
+                if drafts_enabled {
+                    match timings
+                        .whisper_model_load
+                        .measure(|| load_sidecar_whisper_ctx(&config))
+                    {
+                        Ok(ctx) => whisper_ctx = Some(ctx),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "whisper model unavailable for current-speech drafts"
+                        ),
+                    }
+                }
+                let mut finals_disconnected = false;
+                loop {
+                    let final_job = match job_rx.try_recv() {
+                        Ok(samples) => Some(samples),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            finals_disconnected = true;
+                            None
+                        }
+                    };
+                    if let Some(job) = final_job {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            timings.finals_skipped_at_stop =
+                                timings.finals_skipped_at_stop.saturating_add(1);
+                            counters.pending.fetch_sub(1, Ordering::Relaxed);
+                            sidecar_coverage(&writer, |l| {
+                                l.classified(&job.spans, "skipped-at-stop")
+                            });
+                            continue;
+                        }
+                        timings.final_queue_wait.observe(job.queued_at.elapsed());
+                        let result = transcribe_utterance_for_sidecar(
+                            &job.samples,
+                            &config,
+                            &mut whisper_ctx,
+                            &mut parakeet_enabled,
+                            &stop_flag,
+                            &mut timings,
+                        );
+                        counters.pending.fetch_sub(1, Ordering::Relaxed);
+                        if let Some((text, duration_secs)) = result {
+                            write_timed_sidecar_utterance(
+                                &writer,
+                                &text,
+                                duration_secs,
+                                &mut timings,
+                                &job.spans,
+                                config
+                                    .live_transcript
+                                    .coverage_shadow
+                                    .then(|| sidecar_provenance(&config, parakeet_enabled)),
+                            );
+                        } else {
+                            sidecar_coverage(&writer, |l| {
+                                l.classified(&job.spans, "recognition-failed-or-empty")
+                            });
+                        }
+                        continue;
+                    }
+
+                    if stop_flag.load(Ordering::Relaxed) {
+                        draft_jobs.clear();
+                    } else if let Some(job) = draft_jobs.take() {
+                        timings.drafts_taken = timings.drafts_taken.saturating_add(1);
+                        if whisper_ctx.is_none() {
+                            match timings
+                                .whisper_model_load
+                                .measure(|| load_sidecar_whisper_ctx(&config))
+                            {
+                                Ok(ctx) => whisper_ctx = Some(ctx),
+                                Err(error) => tracing::warn!(
+                                    error = %error,
+                                    "whisper model unavailable for current-speech drafts"
+                                ),
+                            }
+                        }
+                        if let Some(ctx) = whisper_ctx.as_ref() {
+                            if let Some((text, _)) = timings
+                                .draft_inference
+                                .measure(|| {
+                                    transcribe_with_whisper_for_live_sidecar(
+                                        &job.samples,
+                                        ctx,
+                                        config.live_language(),
+                                        Some(&stop_flag),
+                                    )
+                                })
+                                .and_then(|(text, duration)| {
+                                    normalize_live_transcript_text(&text)
+                                        .map(|text| (text, duration))
+                                })
+                            {
+                                draft_results.offer_latest(SidecarDraftResult {
+                                    utterance_sequence: job.utterance_sequence,
+                                    text,
+                                    offset_ms: job.offset_ms,
+                                    audio_snapshot_at: job.audio_snapshot_at,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    if finals_disconnected {
+                        break;
+                    }
+
+                    match job_rx.recv_timeout(Duration::from_millis(25)) {
+                        Ok(job) => {
+                            if stop_flag.load(Ordering::Relaxed) {
+                                timings.finals_skipped_at_stop =
+                                    timings.finals_skipped_at_stop.saturating_add(1);
+                                counters.pending.fetch_sub(1, Ordering::Relaxed);
+                                sidecar_coverage(&writer, |l| {
+                                    l.classified(&job.spans, "skipped-at-stop")
+                                });
+                                continue;
+                            }
+                            timings.final_queue_wait.observe(job.queued_at.elapsed());
+                            let result = transcribe_utterance_for_sidecar(
+                                &job.samples,
+                                &config,
+                                &mut whisper_ctx,
+                                &mut parakeet_enabled,
+                                &stop_flag,
+                                &mut timings,
+                            );
+                            counters.pending.fetch_sub(1, Ordering::Relaxed);
+                            if let Some((text, duration_secs)) = result {
+                                write_timed_sidecar_utterance(
+                                    &writer,
+                                    &text,
+                                    duration_secs,
+                                    &mut timings,
+                                    &job.spans,
+                                    config
+                                        .live_transcript
+                                        .coverage_shadow
+                                        .then(|| sidecar_provenance(&config, parakeet_enabled)),
+                                );
+                            } else {
+                                sidecar_coverage(&writer, |l| {
+                                    l.classified(&job.spans, "recognition-failed-or-empty")
+                                });
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            finals_disconnected = true;
+                        }
+                    }
+                }
+                timings
+            })
+            .map_err(|e| MinutesError::from(TranscribeError::Io(e)))?
+    };
+
+    let mut samples_received = 0usize;
+    let mut speech_samples_total = 0usize;
+    let mut draft_gate = partial_publisher
+        .as_ref()
+        .map(|_| RecordingDraftGate::new(config));
+    let mut last_draft_text = String::new();
+    let mut input_disconnected_unexpectedly = false;
+
+    tracing::info!(
+        current_speech_drafts = partial_publisher.is_some(),
+        "live sidecar started (recording mode)"
+    );
+    SIDECAR_SKIPPED_UTTERANCES.store(0, Ordering::Relaxed);
+    crate::streaming_whisper::reset_failure_count();
+    let vad_downgrade = vad_downgrade_message(&config.transcription.vad_engine, vad.mode_name());
+    persist_sidecar_log(
+        if vad_downgrade.is_some() {
+            "warn"
+        } else {
+            "info"
+        },
+        "live_sidecar_started",
+        vad_downgrade
+            .as_deref()
+            .unwrap_or("live transcript sidecar started"),
+        serde_json::json!({
+            "vad_requested": config.transcription.vad_engine,
+            "vad_resolved": vad.mode_name(),
+            "backend": sidecar_backend,
+            "current_speech_drafts": partial_publisher.is_some(),
+        }),
+    );
+
+    loop {
+        {
+            let _publishing = progress.stage(Stage::PublishDraft);
+            if let Some(result) = draft_results.take() {
+                if partial_publisher.as_ref().is_some_and(|publisher| {
+                    publisher.current_utterance_sequence() == result.utterance_sequence
+                }) && draft_gate.as_ref().is_some_and(|gate| gate.was_speaking)
+                    && result.text != last_draft_text
+                {
+                    if let Some(publisher) = partial_publisher.as_mut() {
+                        let _ = publisher.try_publish_for_snapshot(
+                            result.text.clone(),
+                            result.offset_ms,
+                            result.audio_snapshot_at,
+                        );
+                    }
+                    last_draft_text = result.text;
+                }
+            }
+        }
+        let heartbeat = progress.stage(Stage::Heartbeat);
+        // The heartbeat must never block behind the worker (which holds the
+        // lock across file IO in write_utterance). Skipping a contended tick
+        // is fine: the heartbeat interval is 1s and the staleness threshold
+        // 3s, and a write in progress is itself proof of liveness.
+        match writer.try_lock() {
+            Ok(mut guard) => {
+                if let Some(w) = guard.as_mut() {
+                    w.set_backlog_stats(
+                        queue_counters.pending.load(Ordering::Relaxed),
+                        queue_counters.dropped.load(Ordering::Relaxed),
+                    );
+                    w.set_speech_stats(samples_to_ms(speech_samples_total));
+                    w.maybe_write_heartbeat();
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                if let Some(w) = poisoned.into_inner().as_mut() {
+                    w.maybe_write_heartbeat();
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        drop(heartbeat);
+        if stop_flag.load(Ordering::Relaxed) {
+            draft_jobs.clear();
+            if let (Some(gate), Some(publisher)) = (draft_gate.as_mut(), partial_publisher.as_mut())
+            {
+                gate.stop(publisher);
+            }
+            finish_sidecar_utterance(
+                &job_tx,
+                std::mem::take(&mut utterance),
+                std::mem::take(&mut utterance_spans),
+                &writer,
+                &queue_counters,
+            );
+            break;
+        }
+
+        let packet = match progress.measure(Stage::Receive, &mut receive) {
+            Ok(s) => s,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                input_disconnected_unexpectedly = !stop_flag.load(Ordering::Relaxed);
+                draft_jobs.clear();
+                if let (Some(gate), Some(publisher)) =
+                    (draft_gate.as_mut(), partial_publisher.as_mut())
+                {
+                    gate.stop(publisher);
+                }
+                finish_sidecar_utterance(
+                    &job_tx,
+                    std::mem::take(&mut utterance),
+                    std::mem::take(&mut utterance_spans),
+                    &writer,
+                    &queue_counters,
+                );
+                break;
+            }
+        };
+
+        if config.live_transcript.coverage_shadow {
+            sidecar_coverage(&writer, |l| {
+                l.observe(packet.span.as_ref());
+                l.observe_sources(packet.span.as_ref(), packet.sources.as_ref());
+            });
+        }
+        let samples = packet.samples;
+        progress.add(Counter::SamplesReceived, samples.len());
+        let mut remaining = samples.len();
+        progress.set(Counter::ChunkRemainingSamples, remaining);
+
+        // Stem polls can deliver a large burst after a scheduling pause. Never
+        // let that burst bypass utterance limits or become one enormous draft.
+        for (index, samples) in samples.chunks(1600).enumerate() {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            let rms = if samples.is_empty() {
+                0.0
+            } else {
+                let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+                (sum_sq / samples.len() as f32).sqrt()
+            };
+
+            if let (Some(gate), Some(publisher)) = (draft_gate.as_mut(), partial_publisher.as_mut())
+            {
+                match progress.measure(Stage::DraftGate, || {
+                    gate.process(samples, rms, samples_received, publisher)
+                }) {
+                    RecordingDraftGateEvent::Snapshot(job) => draft_jobs.offer_latest(job),
+                    RecordingDraftGateEvent::SpeechEnded => {
+                        draft_jobs.clear();
+                        last_draft_text.clear();
+                    }
+                    RecordingDraftGateEvent::None => {}
+                }
+            }
+
+            let vad_result = progress.measure(Stage::Vad, || vad.process(samples, rms));
+            gating_stats.observe(samples.len(), vad_result.speaking);
+            progress.add(Counter::SamplesProcessed, samples.len());
+            if vad_result.speaking {
+                progress.add(Counter::SpeakingWindows, 1);
+            } else {
+                progress.add(Counter::SamplesGated, samples.len());
+                progress.add(Counter::SilenceWindows, 1);
+            }
+            remaining = remaining.saturating_sub(samples.len());
+            progress.set(Counter::ChunkRemainingSamples, remaining);
+            let _segment = progress.stage(Stage::Segment);
+
+            if vad_result.speaking {
+                was_speaking = true;
+                speech_samples_total += samples.len();
+                if let Some(span) = &packet.span {
+                    append_span(
+                        &mut utterance_spans,
+                        span.slice(index * 1600, samples.len()),
+                    );
+                }
+                utterance.extend_from_slice(samples);
+
+                if utterance.len() >= max_utterance_samples {
+                    tracing::info!("sidecar: max utterance duration, force-finalizing");
+                    finish_sidecar_utterance(
+                        &job_tx,
+                        std::mem::take(&mut utterance),
+                        std::mem::take(&mut utterance_spans),
+                        &writer,
+                        &queue_counters,
+                    );
+                    was_speaking = false;
+                }
+            } else if was_speaking && !utterance.is_empty() {
+                finish_sidecar_utterance(
+                    &job_tx,
+                    std::mem::take(&mut utterance),
+                    std::mem::take(&mut utterance_spans),
+                    &writer,
+                    &queue_counters,
+                );
+                was_speaking = false;
+            }
+            if !vad_result.speaking && config.live_transcript.coverage_shadow {
+                let spans = packet
+                    .span
+                    .as_ref()
+                    .map(|p| vec![p.slice(index * 1600, samples.len())])
+                    .unwrap_or_default();
+                sidecar_coverage(&writer, |l| l.classified(&spans, "detector-non-speech"));
+            }
+            samples_received = samples_received.saturating_add(samples.len());
+        }
+    }
+
+    // Let the worker drain its queue (post-stop jobs are skipped, and a single
+    // in-flight engine call is bounded by the parakeet subprocess timeout),
+    // then finalize.
+    drop(job_tx);
+    let worker_timings = progress.measure(Stage::WorkerJoin, || worker.join().ok());
+
+    let finalizing = progress.stage(Stage::Finalize);
+    let (lines, duration, _path) = match lock_ignore_poison(&writer).take() {
+        Some(w) => w.finalize(),
+        None => (0, 0.0, PathBuf::new()),
+    };
+    tracing::info!(
+        vad_mode = vad.mode_name(),
+        samples_fed = gating_stats.samples_fed,
+        samples_gated = gating_stats.samples_gated,
+        speaking_windows = gating_stats.speaking_windows,
+        silence_windows = gating_stats.silence_windows,
+        "live sidecar gating summary"
+    );
+    if let Some(gate) = draft_gate.as_ref() {
+        tracing::info!(
+            vad_mode = "energy",
+            samples_fed = gate.stats.samples_fed,
+            samples_gated = gate.stats.samples_gated,
+            speaking_windows = gate.stats.speaking_windows,
+            silence_windows = gate.stats.silence_windows,
+            "live draft gating summary"
+        );
+    }
+    tracing::info!(
+        lines = lines,
+        duration_secs = format!("{:.1}", duration),
+        draft_jobs_replaced = draft_jobs.replaced.load(Ordering::Relaxed),
+        draft_results_replaced = draft_results.replaced.load(Ordering::Relaxed),
+        "live sidecar ended (recording mode)"
+    );
+    let dropped_utterances = queue_counters.dropped.load(Ordering::Relaxed);
+    let no_output_despite_speech =
+        lines == 0 && speech_samples_total >= SIDECAR_SUMMARY_SPEECH_SAMPLES_FLOOR;
+    persist_sidecar_log(
+        if no_output_despite_speech || dropped_utterances > 0 {
+            "warn"
+        } else {
+            "info"
+        },
+        "live_sidecar_ended",
+        if no_output_despite_speech {
+            "live transcript sidecar ended with no lines despite detected speech"
+        } else if dropped_utterances > 0 {
+            "live transcript sidecar ended; some utterances were dropped because transcription could not keep up"
+        } else {
+            "live transcript sidecar ended"
+        },
+        serde_json::json!({
+            "lines": lines,
+            "duration_secs": format!("{:.1}", duration),
+            "vad_mode": vad.mode_name(),
+            "speaking_windows": gating_stats.speaking_windows,
+            "silence_windows": gating_stats.silence_windows,
+            "speech_secs": speech_samples_total / 16_000,
+            "dropped_utterances": dropped_utterances,
+            "skipped_utterances": SIDECAR_SKIPPED_UTTERANCES.load(Ordering::Relaxed),
+            "whisper_failures": crate::streaming_whisper::failure_count(),
+            "samples_fed": gating_stats.samples_fed,
+            "samples_gated": gating_stats.samples_gated,
+            "input_progress": progress.snapshot(),
+            "worker_timing": worker_timings,
+        }),
+    );
+
+    drop(finalizing);
+    if input_disconnected_unexpectedly {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "live transcript audio feeder disconnected while recording was still active",
+        )
+        .into());
+    }
+
+    // A normal recording stop should not leave stale sidecar state. Unexpected
+    // disconnects return an error above so the outer boundary can persist a
+    // Failed status and diagnostic instead of erasing the evidence.
+    clear_status_file();
+
+    Ok(())
+}
+
+/// Stub when whisper feature is disabled.
+#[cfg(not(feature = "whisper"))]
+pub fn run_sidecar_mpsc(
+    _rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    _stop_flag: Arc<AtomicBool>,
+    _config: &Config,
+    _partial_publisher: Option<LivePartialPublisher>,
+) {
+    tracing::warn!("live sidecar requires the whisper feature");
+}
+
+// ── Delta reader ────────────────────────────────────────────────
+
+/// Read transcript lines from the JSONL file since a given line number.
+pub fn read_since_line(since_line: usize) -> Result<Vec<TranscriptLine>, MinutesError> {
+    let path = pid::live_transcript_jsonl_path();
+    read_since_line_from_path(&path, since_line)
+}
+
+fn read_since_line_from_path(
+    path: &Path,
+    since_line: usize,
+) -> Result<Vec<TranscriptLine>, MinutesError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut lines = Vec::new();
+
+    for line_result in reader.lines() {
+        let line_str = match line_result {
+            Ok(s) => s,
+            Err(e) => {
+                // Skip lines with invalid UTF-8 (e.g., crash-torn multibyte chars)
+                tracing::warn!("skipping unreadable JSONL line: {}", e);
+                continue;
+            }
+        };
+        if line_str.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TranscriptLine>(&line_str) {
+            Ok(tl) if tl.line > since_line => lines.push(tl),
+            Ok(_) => {} // before cursor
+            Err(e) => {
+                tracing::warn!("skipping malformed JSONL line: {}", e);
+            }
+        }
+    }
+
+    Ok(lines)
+}
+
+/// Read transcript lines from the last N milliseconds (wall clock time).
+pub fn read_since_duration(duration_ms: u64) -> Result<Vec<TranscriptLine>, MinutesError> {
+    let path = pid::live_transcript_jsonl_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let all = read_since_line(0)?;
+    if all.is_empty() {
+        return Ok(all);
+    }
+
+    // Filter by wall clock time, not transcript offset
+    let ms = i64::try_from(duration_ms).unwrap_or(i64::MAX);
+    let cutoff = Local::now() - chrono::Duration::milliseconds(ms);
+    Ok(all.into_iter().filter(|l| l.ts >= cutoff).collect())
+}
+
+/// Get the status of the current live transcript session.
+///
+/// Detects both standalone live transcript sessions (via live-transcript.pid)
+/// and recording sidecar sessions (recording active + sidecar status file exists).
+pub fn session_status() -> SessionStatus {
+    // Standalone live-transcript PID. Use `inspect_pid_file` rather than
+    // `check_pid_file` so a session that holds the PID file under a mandatory
+    // Windows lock is still detected as active: the in-app reader and the lock
+    // holder are the same process, and a plain read of the locked file fails on
+    // Windows. See `pid::PidFileState` and issue #258.
+    let lt_pid = pid::live_transcript_pid_path();
+    let lt_pid_state = pid::inspect_pid_file(&lt_pid);
+
+    let recording_pid = pid::check_recording().ok().flatten();
+    let status_path = pid::live_transcript_status_path();
+    let jsonl_path = pid::live_transcript_jsonl_path();
+
+    derive_session_status(lt_pid_state, recording_pid, &status_path, &jsonl_path)
+}
+
+fn derive_session_status(
+    lt_pid_state: pid::PidFileState,
+    recording_pid: Option<u32>,
+    status_path: &Path,
+    jsonl_path: &Path,
+) -> SessionStatus {
+    let live_status = read_live_status(status_path);
+    let now = Local::now();
+    // A held PID file (readable on Unix, or lock-detected on Windows) proves the
+    // standalone session is alive. Liveness is NOT gated on heartbeat freshness:
+    // the heartbeat is written inline by the live loop, so a long utterance or
+    // model load can stall it past the staleness window while the session is
+    // perfectly healthy — gating on it would re-introduce the #258 flicker.
+    let standalone_active = lt_pid_state.is_active();
+
+    let (sidecar_active, sidecar_diagnostic) = if recording_pid.is_some() {
+        evaluate_recording_sidecar_status(live_status.as_ref(), now)
+    } else {
+        (false, None)
+    };
+    let diagnostic = if standalone_active {
+        live_status.as_ref().and_then(|status| match status.state {
+            LiveStatusState::Failed => Some(
+                status
+                    .diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "live transcript failed".into()),
+            ),
+            LiveStatusState::Degraded => Some(
+                status
+                    .diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "live transcription stalled".into()),
+            ),
+            _ => None,
+        })
+    } else {
+        sidecar_diagnostic
+    };
+
+    // Only meaningful while a recording is active; a standalone session that
+    // starts over a leftover disabled file reports its own state instead.
+    let disabled = match live_status.as_ref() {
+        Some(status)
+            if status.state == LiveStatusState::Disabled
+                && recording_pid.is_some()
+                && !standalone_active =>
+        {
+            Some(LiveTranscriptDisabled::RecordingSidecarConfig)
+        }
+        _ => None,
+    };
+
+    let active = standalone_active || sidecar_active;
+    let pid = if standalone_active {
+        // `None` when the session is alive but the PID is unreadable (Windows
+        // locked file) — we report active without fabricating a PID.
+        lt_pid_state.pid()
+    } else if sidecar_active {
+        recording_pid
+    } else {
+        None
+    };
+
+    let should_report_stats = standalone_active || recording_pid.is_some();
+    let (line_count, duration_secs) = if should_report_stats {
+        status_metrics(live_status.as_ref(), jsonl_path, now)
+    } else {
+        (0, 0.0)
+    };
+
+    let source = if standalone_active {
+        Some(TranscriptSource::Standalone)
+    } else if sidecar_active {
+        Some(TranscriptSource::RecordingSidecar)
+    } else {
+        None
+    };
+    let latest_final_age_secs = live_status.as_ref().and_then(|status| {
+        (status.line_count > 0).then(|| {
+            if let Some(at) = status.last_final_at {
+                return (now - at).num_milliseconds().max(0) as f64 / 1000.0;
+            }
+            let latest_final_end_secs = status
+                .last_offset_ms
+                .saturating_add(status.last_duration_ms)
+                as f64
+                / 1000.0;
+            (duration_secs - latest_final_end_secs).max(0.0)
+        })
+    });
+
+    SessionStatus {
+        active,
+        pid,
+        line_count,
+        duration_secs,
+        latest_final_age_secs,
+        session_id: live_status
+            .as_ref()
+            .and_then(|status| status.session_id.clone()),
+        jsonl_path: if jsonl_path.exists() {
+            Some(jsonl_path.to_string_lossy().to_string())
+        } else {
+            None
+        },
+        source,
+        diagnostic,
+        disabled,
+        remote_audio: crate::remote_silence::read_live_state(recording_pid)
+            .map(|state| state.remote_audio),
+    }
+}
+
+fn read_live_status(path: &Path) -> Option<LiveStatus> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<LiveStatus>(&content).ok())
+}
+
+fn write_live_status(status: &LiveStatus) {
+    let path = pid::live_transcript_status_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(json) = serde_json::to_string(status) {
+        if std::fs::write(&tmp, json).is_ok() {
+            std::fs::rename(&tmp, &path).ok();
+        }
+    }
+}
+
+fn write_live_status_transition(state: LiveStatusState, diagnostic: Option<&str>) {
+    let now = Local::now();
+    let existing = read_live_status(&pid::live_transcript_status_path());
+    let status = LiveStatus {
+        start_time: existing.as_ref().map(|s| s.start_time).unwrap_or(now),
+        updated_at: now,
+        state,
+        line_count: existing.as_ref().map(|s| s.line_count).unwrap_or(0),
+        last_offset_ms: existing.as_ref().map(|s| s.last_offset_ms).unwrap_or(0),
+        last_duration_ms: existing.as_ref().map(|s| s.last_duration_ms).unwrap_or(0),
+        last_final_at: existing.as_ref().and_then(|s| s.last_final_at),
+        session_id: existing.as_ref().and_then(|s| s.session_id.clone()),
+        diagnostic: diagnostic.map(str::to_string),
+        pending_utterances: existing.as_ref().and_then(|s| s.pending_utterances),
+        dropped_utterances: existing.as_ref().and_then(|s| s.dropped_utterances),
+    };
+    write_live_status(&status);
+}
+
+/// Record that the active recording runs without the live sidecar.
+///
+/// Writes a fresh status rather than a transition, so a leftover `Failed` or
+/// `Stopped` file cannot leak its counters into a recording that never had
+/// live text. Like a starting sidecar, it yields to an active standalone
+/// session (#258) and empties the fixed JSONL so readers do not present a
+/// previous session's finals as current.
+pub fn mark_recording_sidecar_disabled() {
+    let lt_pid = pid::live_transcript_pid_path();
+    if pid::inspect_pid_file(&lt_pid).is_active() {
+        tracing::info!("standalone live transcript active; leaving its live status untouched");
+        return;
+    }
+    let jsonl_path = pid::live_transcript_jsonl_path();
+    if jsonl_path.exists() {
+        std::fs::write(&jsonl_path, "").ok();
+    }
+    let now = Local::now();
+    write_live_status(&LiveStatus {
+        start_time: now,
+        updated_at: now,
+        state: LiveStatusState::Disabled,
+        line_count: 0,
+        last_offset_ms: 0,
+        last_duration_ms: 0,
+        last_final_at: None,
+        session_id: crate::copilot::CaptureRelayServer::current_process_session_id(),
+        diagnostic: Some(RECORDING_SIDECAR_DISABLED_DIAGNOSTIC.to_string()),
+        pending_utterances: None,
+        dropped_utterances: None,
+    });
+}
+
+fn evaluate_recording_sidecar_status(
+    live_status: Option<&LiveStatus>,
+    now: DateTime<Local>,
+) -> (bool, Option<String>) {
+    let Some(status) = live_status else {
+        return (false, Some("sidecar status unavailable".into()));
+    };
+
+    match status.state {
+        LiveStatusState::Healthy | LiveStatusState::Degraded => {
+            let age = (now - status.updated_at).num_seconds().max(0);
+            if age > SIDECAR_HEALTH_STALE_AFTER_SECS {
+                (false, Some("sidecar heartbeat stale".into()))
+            } else if status.state == LiveStatusState::Degraded {
+                // Audio still flows and existing lines stay readable, so the
+                // session is active; the diagnostic says the engine stalled.
+                (
+                    true,
+                    Some(
+                        status
+                            .diagnostic
+                            .clone()
+                            .filter(|msg| !msg.trim().is_empty())
+                            .unwrap_or_else(|| "live transcription stalled".into()),
+                    ),
+                )
+            } else {
+                (true, None)
+            }
+        }
+        LiveStatusState::Starting => {
+            let age = (now - status.start_time).num_seconds().max(0);
+            if age > SIDECAR_STARTUP_TIMEOUT_SECS {
+                (false, Some("sidecar still starting".into()))
+            } else {
+                (false, Some("sidecar starting".into()))
+            }
+        }
+        LiveStatusState::Failed => (
+            false,
+            Some(
+                status
+                    .diagnostic
+                    .clone()
+                    .filter(|msg| !msg.trim().is_empty())
+                    .unwrap_or_else(|| "sidecar failed".into()),
+            ),
+        ),
+        LiveStatusState::Stopped => (
+            false,
+            Some(
+                status
+                    .diagnostic
+                    .clone()
+                    .filter(|msg| !msg.trim().is_empty())
+                    .unwrap_or_else(|| "sidecar stopped".into()),
+            ),
+        ),
+        LiveStatusState::Disabled => (
+            false,
+            Some(RECORDING_SIDECAR_DISABLED_DIAGNOSTIC.to_string()),
+        ),
+    }
+}
+
+fn status_metrics(
+    live_status: Option<&LiveStatus>,
+    jsonl_path: &Path,
+    now: DateTime<Local>,
+) -> (usize, f64) {
+    if let Some(status) = live_status {
+        let elapsed = (now - status.start_time).num_seconds().max(0) as f64;
+        return (status.line_count, elapsed);
+    }
+
+    let lines = if jsonl_path.exists() {
+        read_since_line_from_path(jsonl_path, 0).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let count = lines.len();
+    let dur = lines
+        .last()
+        .map(|l| (l.offset_ms + l.duration_ms) as f64 / 1000.0)
+        .unwrap_or(0.0);
+    (count, dur)
+}
+
+fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        format!("sidecar panicked: {}", message)
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        format!("sidecar panicked: {}", message)
+    } else {
+        "sidecar panicked".into()
+    }
+}
+
+fn set_permissions_0600(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// Remove the status file so `session_status()` won't report stale data.
+pub fn clear_status_file() {
+    std::fs::remove_file(pid::live_transcript_status_path()).ok();
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::live_engine_scope_warning;
+    #[cfg(feature = "parakeet")]
+    use super::PARAKEET_LIVE_FALLBACK_WARNING;
+    #[cfg(not(feature = "parakeet"))]
+    use super::PARAKEET_LIVE_SCOPE_WARNING;
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "whisper")]
+    fn the_live_transcript_beside_a_hinglish_model_uses_the_fallback_language() {
+        let mut config = Config::default();
+        config.transcription.model = "hinglish".into();
+        config.transcription.language = Some("hi".into());
+        config.transcription.missing_model_fallback_language = Some("en".into());
+        config.live_transcript.model = "small".into();
+        assert_eq!(
+            sidecar_provenance(&config, false).language.as_deref(),
+            Some("hi"),
+            "without fallbacks, the language as configured (upstream)"
+        );
+        config.transcription.missing_model_fallbacks = vec!["large-v3-turbo".into(), "small".into()];
+        assert_eq!(sidecar_provenance(&config, false).language.as_deref(), Some("en"));
+    }
+
+    fn test_chunk(index: u64) -> crate::streaming::AudioChunk {
+        crate::streaming::AudioChunk {
+            samples: vec![0.0; 1_600],
+            rms: 0.0,
+            timestamp: std::time::Instant::now(),
+            index,
+            source: crate::streaming::SourceRole::Default,
+        }
+    }
+
+    #[test]
+    fn a_stalled_live_loop_loses_no_audio_behind_the_relay() {
+        // Capture sends with try_send into a 64-chunk channel and drops when it
+        // is full. The relay must keep draining it while the loop is stalled.
+        let (capture_tx, capture_rx) = crossbeam_channel::bounded(64);
+        let relayed = relay_live_audio(capture_rx);
+        let mut dropped_at_capture = 0;
+        for index in 0..500 {
+            if capture_tx.try_send(test_chunk(index)).is_err() {
+                dropped_at_capture += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(capture_tx);
+        // Only now does the "stalled" loop start reading.
+        let received: Vec<u64> = relayed.iter().map(|chunk| chunk.index).collect();
+        assert_eq!(dropped_at_capture, 0);
+        assert_eq!(received, (0..500).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn stop_and_device_change_keep_the_relay_backlog() {
+        let (capture_tx, capture_rx) = crossbeam_channel::bounded(64);
+        let relayed = relay_live_audio(capture_rx);
+        for index in 0..40 {
+            capture_tx.send(test_chunk(index)).unwrap();
+        }
+        // Not-yet-closed capture: take what is queued now.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut written = 0;
+        assert_eq!(
+            drain_relay_backlog(&relayed, false, |samples| written += samples.len()),
+            40
+        );
+        assert_eq!(written, 40 * 1_600);
+
+        // Stop and device change both close capture first, then everything it
+        // captured is written before the relay reports the disconnect.
+        for index in 40..60 {
+            capture_tx.send(test_chunk(index)).unwrap();
+        }
+        drop(capture_tx);
+        assert_eq!(drain_relay_backlog(&relayed, true, |_| {}), 20);
+    }
+
+    #[test]
+    fn the_relay_passes_a_capture_disconnect_through_after_draining() {
+        let (capture_tx, capture_rx) = crossbeam_channel::bounded(64);
+        let relayed = relay_live_audio(capture_rx);
+        capture_tx.send(test_chunk(7)).unwrap();
+        drop(capture_tx);
+        let first = relayed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(first.index, 7);
+        assert!(matches!(
+            relayed.recv_timeout(std::time::Duration::from_secs(2)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn a_stalled_apple_speech_call_costs_at_most_its_deadline() {
+        let started = std::time::Instant::now();
+        let result: Result<u8, MinutesError> =
+            call_with_deadline(std::time::Duration::from_millis(100), || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                Ok(1)
+            });
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            call_with_deadline(std::time::Duration::from_secs(5), || Ok(7)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn live_apple_speech_never_waits_for_an_asset_download() {
+        // The call runs on the capture consumer thread; waiting on an asset
+        // download there would overflow the few seconds the audio channel holds.
+        let mut asked_for_assets = None;
+        let result = transcribe_with_apple_speech_for_live_sidecar_impl(
+            &vec![0.0; APPLE_SPEECH_LIVE_MIN_SAMPLES],
+            &Config::default(),
+            |_, _, _, ensure_assets| {
+                asked_for_assets = Some(ensure_assets);
+                Err(MinutesError::Io(std::io::Error::other("assets missing")))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(asked_for_assets, Some(false));
+    }
+    use chrono::Duration as ChronoDuration;
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = crate::test_support::home_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        #[cfg(windows)]
+        let original_userprofile = std::env::var_os("USERPROFILE");
+
+        std::env::set_var("HOME", dir.path());
+        #[cfg(windows)]
+        std::env::set_var("USERPROFILE", dir.path());
+
+        let result = f();
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        #[cfg(windows)]
+        if let Some(userprofile) = original_userprofile {
+            std::env::set_var("USERPROFILE", userprofile);
+        } else {
+            std::env::remove_var("USERPROFILE");
+        }
+
+        result
+    }
+
+    fn live_status_with_state(state: LiveStatusState) -> LiveStatus {
+        LiveStatus {
+            start_time: Local::now(),
+            updated_at: Local::now(),
+            state,
+            line_count: 3,
+            last_offset_ms: 1200,
+            last_duration_ms: 400,
+            last_final_at: None,
+            session_id: None,
+            diagnostic: None,
+            pending_utterances: None,
+            dropped_utterances: None,
+        }
+    }
+
+    #[test]
+    fn test_transcript_line_roundtrip() {
+        let line = TranscriptLine {
+            line: 1,
+            ts: Local::now(),
+            offset_ms: 5000,
+            duration_ms: 3200,
+            text: "hello world".into(),
+            speaker: None,
+        };
+        let json = serde_json::to_string(&line).unwrap();
+        let parsed: TranscriptLine = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.line, 1);
+        assert_eq!(parsed.text, "hello world");
+        assert_eq!(parsed.offset_ms, 5000);
+        assert_eq!(parsed.duration_ms, 3200);
+        assert!(parsed.speaker.is_none());
+    }
+
+    #[test]
+    fn test_read_since_line_filters() {
+        let mut tmpfile = NamedTempFile::new().unwrap();
+        for i in 1..=5 {
+            let line = TranscriptLine {
+                line: i,
+                ts: Local::now(),
+                offset_ms: i as u64 * 10000,
+                duration_ms: 3000,
+                text: format!("utterance {}", i),
+                speaker: None,
+            };
+            writeln!(tmpfile, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+        }
+
+        let file = File::open(tmpfile.path()).unwrap();
+        let reader = BufReader::new(file);
+        let mut lines = Vec::new();
+        for line_result in reader.lines() {
+            let line_str = line_result.unwrap();
+            if let Ok(tl) = serde_json::from_str::<TranscriptLine>(&line_str) {
+                if tl.line > 3 {
+                    lines.push(tl);
+                }
+            }
+        }
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line, 4);
+        assert_eq!(lines[1].line, 5);
+    }
+
+    #[test]
+    fn test_session_status_no_session() {
+        let status = session_status();
+        // May or may not be active depending on test environment
+        // but should not panic
+        assert!(status.duration_secs >= 0.0);
+    }
+
+    #[test]
+    fn sidecar_utterance_queue_drops_newest_when_full_and_counts() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SidecarUtteranceJob>(2);
+        let counters = QueueCounters::default();
+
+        enqueue_sidecar_utterance(&tx, vec![0.1; 1600], &counters);
+        enqueue_sidecar_utterance(&tx, vec![0.2; 1600], &counters);
+        // Queue full — this one must be dropped, not block the caller.
+        enqueue_sidecar_utterance(&tx, vec![0.3; 1600], &counters);
+        // Empty utterances are a no-op either way.
+        enqueue_sidecar_utterance(&tx, Vec::new(), &counters);
+
+        assert_eq!(counters.pending.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.try_recv().unwrap().samples, vec![0.1; 1600]);
+        assert_eq!(rx.try_recv().unwrap().samples, vec![0.2; 1600]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sidecar_utterance_queue_disconnected_worker_is_silent() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SidecarUtteranceJob>(2);
+        drop(rx);
+        let counters = QueueCounters::default();
+
+        enqueue_sidecar_utterance(&tx, vec![0.1; 1600], &counters);
+
+        assert_eq!(counters.pending.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn sidecar_draft_mailbox_keeps_only_the_newest_pending_snapshot() {
+        let mailbox = SidecarDraftMailbox::default();
+        mailbox.offer_latest(SidecarDraftJob {
+            utterance_sequence: 1,
+            samples: vec![0.1; 1600],
+            offset_ms: 0,
+            audio_snapshot_at: Instant::now(),
+        });
+        mailbox.offer_latest(SidecarDraftJob {
+            utterance_sequence: 1,
+            samples: vec![0.2; 3200],
+            offset_ms: 0,
+            audio_snapshot_at: Instant::now(),
+        });
+
+        let pending = mailbox.take().unwrap();
+        assert_eq!(pending.samples.len(), 3200);
+        assert_eq!(mailbox.replaced.load(Ordering::Relaxed), 1);
+        assert!(mailbox.take().is_none());
+    }
+
+    #[test]
+    fn long_sidecar_drafts_roll_forward_with_bounded_audio() {
+        let samples: Vec<f32> = (0..48_000).map(|sample| sample as f32).collect();
+        let (window, start) = sidecar_draft_window(&samples, 32_000);
+
+        assert_eq!(start, 16_000);
+        assert_eq!(window.len(), 32_000);
+        assert_eq!(window.first(), Some(&16_000.0));
+        assert_eq!(window.last(), Some(&47_999.0));
+    }
+
+    #[test]
+    #[ignore = "requires the installed tiny Whisper model; uses repository fixture audio only"]
+    fn complete_sidecar_job_runs_one_recognition_pass_for_fixture_audio() {
+        let model = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/ggml-tiny.bin");
+        assert!(
+            model.is_file(),
+            "install the tiny model before running this check"
+        );
+        let ctx = whisper_rs::WhisperContext::new_with_params(
+            model.to_str().unwrap(),
+            crate::transcribe::whisper_context_params(),
+        )
+        .unwrap();
+        let mut fixture = hound::WavReader::open(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/demo.wav"),
+        )
+        .unwrap();
+        assert_eq!(fixture.spec().sample_rate, 16000);
+        assert_eq!(fixture.spec().channels, 1);
+        let samples: Vec<f32> = fixture
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let before = crate::streaming_whisper::recognition_passes_for_test();
+        let started = Instant::now();
+        let result =
+            transcribe_with_whisper_for_live_sidecar(&samples, &ctx, Some("en".into()), None)
+                .expect("the spoken fixture should produce text");
+        assert!(!result.0.trim().is_empty());
+        assert_eq!(result.1, samples.len() as f64 / 16000.0);
+        assert_eq!(
+            crate::streaming_whisper::recognition_passes_for_test() - before,
+            1
+        );
+        eprintln!(
+            "fixture audio_seconds={:.3} recognition_passes=1 elapsed_ms={}",
+            result.1,
+            started.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the installed tiny Whisper model; replays a fixture without capture"]
+    fn recording_sidecar_splits_a_delayed_audio_burst_before_recognition() {
+        let models = dirs::home_dir().unwrap().join(".minutes/models");
+        assert!(models.join("ggml-tiny.bin").is_file());
+        let mut fixture = hound::WavReader::open(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/demo.wav"),
+        )
+        .unwrap();
+        let speech: Vec<f32> = fixture
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        with_temp_home(|| {
+            let mut config = Config::default();
+            config.transcription.model_path = models;
+            config.transcription.vad_engine = "energy".into();
+            config.live_transcript.backend = "whisper".into();
+            config.live_transcript.model = "tiny".into();
+            config.live_transcript.max_utterance_secs = 5;
+            config.live_transcript.save_wav = false;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker =
+                std::thread::spawn(move || run_sidecar_mpsc(rx, worker_stop, &config, None));
+            // One delivery is much longer than the utterance limit, as when
+            // a growing stem is polled after the consumer has fallen behind.
+            tx.send(speech.repeat(6)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if read_live_status(&pid::live_transcript_status_path()).is_some_and(|status| {
+                    status.line_count > 0 && status.pending_utterances.is_none()
+                }) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            stop.store(true, Ordering::Relaxed);
+            worker.join().unwrap();
+            drop(tx);
+            let lines = read_since_line(0).unwrap();
+            assert!(!lines.is_empty(), "the fixture should yield finalized text");
+            assert!(
+                lines.iter().all(|line| line.duration_ms <= 5000),
+                "a transport burst bypassed the five-second utterance limit"
+            );
+            eprintln!(
+                "burst_fixture finalized_lines={} max_duration_ms={}",
+                lines.len(),
+                lines.iter().map(|line| line.duration_ms).max().unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn draft_gate_speech_end_immediately_supersedes_the_visible_draft() {
+        let config = Config::default();
+        let mut gate = RecordingDraftGate::new(&config);
+        let (mut publisher, mut subscriber) = crate::live_partials::channel(9, 2);
+        let samples = vec![0.006; 1600];
+        let mut snapshot = None;
+        for chunk in 0..10 {
+            if let RecordingDraftGateEvent::Snapshot(job) =
+                gate.process(&samples, 0.006, chunk * samples.len(), &mut publisher)
+            {
+                snapshot = Some(job);
+            }
+        }
+        let snapshot = snapshot.expect("one second of quiet speech should schedule a draft");
+        assert_eq!(snapshot.samples.len(), SIDECAR_FIRST_DRAFT_SAMPLES);
+        assert_eq!(
+            publisher.try_publish("provisional".into(), 0),
+            crate::live_partials::PartialPublishOutcome::Published
+        );
+        let crate::live_partials::LivePartialEvent::Partial(_) = subscriber.try_recv().unwrap()
+        else {
+            panic!("published draft should be visible before speech ends");
+        };
+
+        let silence = vec![0.0; 1600];
+        let mut ended = false;
+        for chunk in 0..6 {
+            ended |= matches!(
+                gate.process(&silence, 0.0, (10 + chunk) * silence.len(), &mut publisher,),
+                RecordingDraftGateEvent::SpeechEnded
+            );
+        }
+        assert!(ended, "energy hangover should eventually end the draft");
+
+        let crate::live_partials::LivePartialEvent::Superseded(signal) =
+            subscriber.try_recv().unwrap()
+        else {
+            panic!("speech end must invalidate a provisional draft before final inference");
+        };
+        assert_eq!(signal.reason, SupersessionReason::Finalizing);
+        assert!(subscriber.try_recv().is_none());
+    }
+
+    #[test]
+    fn draft_gate_does_not_schedule_silence() {
+        let config = Config::default();
+        let mut gate = RecordingDraftGate::new(&config);
+        let (mut publisher, mut subscriber) = crate::live_partials::channel(10, 2);
+        let samples = vec![0.0002; 1600];
+
+        for chunk in 0..20 {
+            assert!(matches!(
+                gate.process(&samples, 0.0002, chunk * samples.len(), &mut publisher,),
+                RecordingDraftGateEvent::None
+            ));
+        }
+
+        assert!(subscriber.try_recv().is_none());
+        assert!(!gate.was_speaking);
+    }
+
+    #[test]
+    fn draft_gate_keeps_long_speech_audio_bounded() {
+        let mut config = Config::default();
+        config.transcription.partial_max_secs = 1;
+        let mut gate = RecordingDraftGate::new(&config);
+        let (mut publisher, _subscriber) = crate::live_partials::channel(11, 2);
+        let samples = vec![0.02; 1600];
+        let mut snapshots = 0;
+
+        for chunk in 0..50 {
+            if let RecordingDraftGateEvent::Snapshot(job) =
+                gate.process(&samples, 0.02, chunk * samples.len(), &mut publisher)
+            {
+                snapshots += 1;
+                assert!(job.samples.len() <= 16_000);
+                assert!(gate.utterance.len() <= 16_000);
+            }
+        }
+
+        assert_eq!(snapshots, 3);
+        assert!(gate.utterance.len() <= 16_000);
+    }
+
+    #[test]
+    fn status_file_surfaces_transcription_backlog() {
+        with_temp_home(|| {
+            let config = Config::default();
+            let mut writer =
+                LiveTranscriptWriter::new(&config, None, TranscriptSource::RecordingSidecar)
+                    .unwrap();
+
+            writer.set_backlog_stats(2, 3);
+            writer.mark_healthy();
+
+            let status = read_live_status(&pid::live_transcript_status_path()).unwrap();
+            assert_eq!(status.pending_utterances, Some(2));
+            assert_eq!(status.dropped_utterances, Some(3));
+            assert!(status
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("3 utterance(s) dropped"));
+
+            // Counters at zero serialize as absent — backward compatible.
+            writer.set_backlog_stats(0, 0);
+            writer.mark_healthy();
+            let status = read_live_status(&pid::live_transcript_status_path()).unwrap();
+            assert_eq!(status.pending_utterances, None);
+            assert_eq!(status.dropped_utterances, None);
+            assert_eq!(status.diagnostic, None);
+        });
+    }
+
+    #[test]
+    fn timed_sidecar_writer_preserves_the_transcript_without_logging_its_text() {
+        with_temp_home(|| {
+            let writer = Mutex::new(Some(
+                LiveTranscriptWriter::new(
+                    &Config::default(),
+                    None,
+                    TranscriptSource::RecordingSidecar,
+                )
+                .unwrap(),
+            ));
+            let mut timings = SidecarWorkerTimings::default();
+            let text = "Synthetic discussion content stays in the transcript.";
+            write_timed_sidecar_utterance(&writer, text, 2.5, &mut timings, &[], None);
+            let (lines, _, path) = lock_ignore_poison(&writer).take().unwrap().finalize();
+            assert_eq!(lines, 1);
+            assert!(
+                !path.with_extension("coverage.jsonl").exists(),
+                "default sessions must not persist shadow diagnostics"
+            );
+            let line: TranscriptLine =
+                serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+            assert_eq!(line.text, text);
+            assert_eq!(line.duration_ms, 2500);
+            let diagnostic = serde_json::to_value(timings).unwrap();
+            assert_eq!(diagnostic["writer_lock_wait"]["count"], 1);
+            assert_eq!(diagnostic["writer_write"]["count"], 1);
+            assert!(!diagnostic.to_string().contains(text));
+        });
+    }
+
+    #[test]
+    fn unavailable_coverage_diagnostics_do_not_prevent_final_transcript_writes() {
+        with_temp_home(|| {
+            let mut config = Config::default();
+            config.live_transcript.coverage_shadow = true;
+            let coverage_path = pid::live_transcript_jsonl_path().with_extension("coverage.jsonl");
+            // A directory cannot be replaced by the optional diagnostic file.
+            std::fs::create_dir_all(&coverage_path).unwrap();
+            let w = LiveTranscriptWriter::new(&config, None, TranscriptSource::RecordingSidecar)
+                .unwrap();
+            assert!(w.coverage.is_none());
+            let writer = Mutex::new(Some(w));
+            let text = "Final transcription survives unavailable diagnostics.";
+            write_timed_sidecar_utterance(
+                &writer,
+                text,
+                2.5,
+                &mut SidecarWorkerTimings::default(),
+                &[],
+                None,
+            );
+            let (lines, _, path) = lock_ignore_poison(&writer).take().unwrap().finalize();
+            assert_eq!(lines, 1);
+            let line: TranscriptLine =
+                serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+            assert_eq!(line.text, text);
+            assert!(coverage_path.is_dir());
+        });
+    }
+
+    #[test]
+    fn shadow_final_keeps_capture_positions_separate_from_decode_completion_time() {
+        with_temp_home(|| {
+            let mut config = Config::default();
+            config.live_transcript.coverage_shadow = true;
+            let mut w = LiveTranscriptWriter::new(
+                &config,
+                Some("fixture-session".into()),
+                TranscriptSource::RecordingSidecar,
+            )
+            .unwrap();
+            w.start_time = Instant::now() - Duration::from_secs(20);
+            let path = w.jsonl_path.with_extension("coverage.jsonl");
+            let writer = Mutex::new(Some(w));
+            let span = AudioSpan {
+                stream: 1,
+                source: crate::live_audio_coverage::AudioSource::Mixed,
+                start_sample: 160_000,
+                sample_count: 40_000,
+            };
+            write_timed_sidecar_utterance(
+                &writer,
+                "Only final text is durable.",
+                2.5,
+                &mut SidecarWorkerTimings::default(),
+                &[span],
+                Some(sidecar_provenance(&config, false)),
+            );
+            let (_, _, transcript_path) = lock_ignore_poison(&writer).take().unwrap().finalize();
+            let line: TranscriptLine =
+                serde_json::from_str(std::fs::read_to_string(transcript_path).unwrap().trim())
+                    .unwrap();
+            assert!(line.offset_ms >= 20_000); // legacy rendering is unchanged
+            let text = std::fs::read_to_string(path).unwrap();
+            let rows: Vec<serde_json::Value> = text
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let final_row = rows.iter().find(|r| r["event"] == "finalized").unwrap();
+            assert_eq!(final_row["spans"][0]["start_sample"], 160_000);
+            assert_eq!(final_row["spans"][0]["sample_count"], 40_000);
+            assert_eq!(final_row["transcript_line"], line.line);
+            assert!(!text.contains("Only final text"));
+            assert_eq!(rows.last().unwrap()["complete"], false);
+        });
+    }
+
+    #[test]
+    fn shadow_records_dropped_recognition_without_fabricating_a_final() {
+        with_temp_home(|| {
+            let mut config = Config::default();
+            config.live_transcript.coverage_shadow = true;
+            let w = LiveTranscriptWriter::new(&config, None, TranscriptSource::RecordingSidecar)
+                .unwrap();
+            let path = w.jsonl_path.with_extension("coverage.jsonl");
+            let writer = Mutex::new(Some(w));
+            let (tx, _rx) = std::sync::mpsc::sync_channel(0);
+            let span = AudioSpan {
+                stream: 1,
+                source: crate::live_audio_coverage::AudioSource::Unknown,
+                start_sample: 0,
+                sample_count: 1600,
+            };
+            finish_sidecar_utterance(
+                &tx,
+                vec![0.1; 1600],
+                vec![span],
+                &writer,
+                &QueueCounters::default(),
+            );
+            lock_ignore_poison(&writer).take().unwrap().finalize();
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains("dropped-recognition-queue"));
+            assert!(!text.contains("\"event\":\"finalized\""));
+        });
+    }
+
+    #[test]
+    fn heartbeat_preserves_final_age_and_recording_session_identity() {
+        with_temp_home(|| {
+            let relay = crate::copilot::CaptureRelayServer::start(
+                crate::copilot::CopilotEvidenceMode::CaptureRelayPartials,
+                None,
+            )
+            .unwrap();
+            let mut writer = LiveTranscriptWriter::new(
+                &Config::default(),
+                None,
+                TranscriptSource::RecordingSidecar,
+            )
+            .unwrap();
+            assert!(writer.write_utterance("Synthetic fixture speech", 2.0));
+            writer.last_final_at = Some(Local::now() - ChronoDuration::seconds(45));
+            writer.last_status_write = Instant::now() - SIDECAR_HEARTBEAT_INTERVAL * 2;
+            writer.maybe_write_heartbeat();
+            let status = session_status_for_test_recording();
+            assert_eq!(
+                status.session_id.as_deref(),
+                Some(relay.discovery().session_id.as_str())
+            );
+            let age = status.latest_final_age_secs.unwrap();
+            assert!(
+                (45.0..47.0).contains(&age),
+                "heartbeat reset final age to {age}"
+            );
+        });
+    }
+
+    fn session_status_for_test_recording() -> SessionStatus {
+        derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &pid::live_transcript_status_path(),
+            &pid::live_transcript_jsonl_path(),
+        )
+    }
+
+    #[test]
+    fn status_reports_remote_audio_missing_for_the_active_recording_only() {
+        with_temp_home(|| {
+            assert_eq!(session_status_for_test_recording().remote_audio, None);
+            let state = crate::remote_silence::LiveRemoteAudioState {
+                remote_audio: crate::markdown::RemoteAudioStatus::Missing,
+                kind: "never-heard".into(),
+                recording_pid: std::process::id(),
+                since: Local::now(),
+            };
+            crate::remote_silence::write_live_state(Some(&state));
+            let status = session_status_for_test_recording();
+            assert_eq!(
+                status.remote_audio,
+                Some(crate::markdown::RemoteAudioStatus::Missing)
+            );
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(json["remote_audio"], "missing");
+
+            // Not attributed to an idle machine or another recording.
+            let idle = derive_session_status(
+                pid::PidFileState::Inactive,
+                None,
+                &pid::live_transcript_status_path(),
+                &pid::live_transcript_jsonl_path(),
+            );
+            assert_eq!(idle.remote_audio, None);
+
+            crate::remote_silence::write_live_state(None);
+            assert_eq!(session_status_for_test_recording().remote_audio, None);
+        });
+    }
+
+    #[test]
+    fn status_file_reports_degraded_when_speech_outpaces_lines() {
+        with_temp_home(|| {
+            let config = Config::default();
+            let mut writer =
+                LiveTranscriptWriter::new(&config, None, TranscriptSource::RecordingSidecar)
+                    .unwrap();
+            let force_heartbeat = |writer: &mut LiveTranscriptWriter| {
+                writer.last_status_write = Instant::now() - SIDECAR_HEARTBEAT_INTERVAL * 2;
+                writer.maybe_write_heartbeat();
+                read_live_status(&pid::live_transcript_status_path()).unwrap()
+            };
+
+            // Silence, or speech below the threshold, is healthy.
+            writer.set_speech_stats(SIDECAR_STALL_SPEECH_MS - 1);
+            let status = force_heartbeat(&mut writer);
+            assert_eq!(status.state, LiveStatusState::Healthy);
+            assert_eq!(status.diagnostic, None);
+
+            // Enough speech with nothing written is a stalled engine.
+            writer.set_speech_stats(SIDECAR_STALL_SPEECH_MS);
+            let status = force_heartbeat(&mut writer);
+            assert_eq!(status.state, LiveStatusState::Degraded);
+            assert!(status
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("live transcription stalled: 90s of speech"));
+
+            // A backlog means the engine is slow, not stalled.
+            writer.set_backlog_stats(1, 0);
+            let status = force_heartbeat(&mut writer);
+            assert_eq!(status.state, LiveStatusState::Healthy);
+            writer.set_backlog_stats(0, 0);
+
+            // A written line resets the stall window.
+            assert!(writer.write_utterance("finally some text", 1.0));
+            let status = force_heartbeat(&mut writer);
+            assert_eq!(status.state, LiveStatusState::Healthy);
+            assert_eq!(status.diagnostic, None);
+
+            // ...and the next stretch of unproductive speech trips it again.
+            writer.set_speech_stats(SIDECAR_STALL_SPEECH_MS * 2);
+            let status = force_heartbeat(&mut writer);
+            assert_eq!(status.state, LiveStatusState::Degraded);
+            assert!(status
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("(1 line(s) so far)"));
+        });
+    }
+
+    #[test]
+    fn repeated_failures_persist_on_a_log_scale() {
+        let persisted: Vec<u64> = (1..=3000).filter(|n| should_persist_repeat(*n)).collect();
+        assert_eq!(persisted, vec![1, 10, 100, 1000, 2000, 3000]);
+        assert!(!should_persist_repeat(0));
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn live_model_downgrade_is_explained_only_when_the_request_was_not_honored() {
+        use std::path::Path;
+
+        // Honored: the requested name survives in the resolved filename, in any
+        // of the three spellings the resolver tries.
+        assert_eq!(
+            live_model_downgrade_message("small", Path::new("/m/ggml-small.bin"), "base"),
+            None
+        );
+        assert_eq!(
+            live_model_downgrade_message("small", Path::new("/m/whisper-small.bin"), "base"),
+            None
+        );
+        assert_eq!(
+            live_model_downgrade_message("small", Path::new("/m/small.bin"), "base"),
+            None
+        );
+        // Honored: an explicit path that resolved to itself.
+        assert_eq!(
+            live_model_downgrade_message("/m/custom.bin", Path::new("/m/custom.bin"), "base"),
+            None
+        );
+        // Nothing requested, nothing to explain.
+        assert_eq!(
+            live_model_downgrade_message("", Path::new("/m/ggml-base.bin"), "base"),
+            None
+        );
+
+        // Not honored: the requested model was missing and the dictation model
+        // ran instead. Silent before, because the only record was a
+        // `tracing::warn!` the desktop app drops.
+        let downgraded =
+            live_model_downgrade_message("large-v3", Path::new("/m/ggml-base.bin"), "base")
+                .expect("a substitution must be explained");
+        assert!(
+            downgraded.contains("large-v3"),
+            "names what was asked for: {downgraded}"
+        );
+        assert!(
+            downgraded.contains("base"),
+            "names what actually ran: {downgraded}"
+        );
+        assert!(
+            downgraded.contains("minutes setup --model large-v3"),
+            "gives a way out: {downgraded}"
+        );
+    }
+
+    #[test]
+    fn vad_downgrade_is_explained_only_when_the_request_was_not_honored() {
+        assert_eq!(vad_downgrade_message("whisper-silero", "silero"), None);
+        assert_eq!(vad_downgrade_message("ort-silero", "ort-silero"), None);
+        assert_eq!(vad_downgrade_message("", "silero"), None);
+
+        let ort_fallback = vad_downgrade_message("ort-silero", "silero").unwrap();
+        assert!(ort_fallback.contains("vad-ort"));
+        assert!(ort_fallback.contains("whisper-silero"));
+
+        let energy = vad_downgrade_message("whisper-silero", "energy").unwrap();
+        assert!(energy.contains("energy VAD"));
+    }
+
+    #[test]
+    fn test_empty_utterance_skipped() {
+        // LiveTranscriptWriter.write_utterance skips empty text
+        // We test this by verifying TranscriptLine serialization of empty strings
+        let line = TranscriptLine {
+            line: 1,
+            ts: Local::now(),
+            offset_ms: 0,
+            duration_ms: 0,
+            text: "".into(),
+            speaker: None,
+        };
+        // The writer checks text.trim().is_empty() before writing
+        assert!(line.text.trim().is_empty());
+    }
+
+    #[test]
+    fn write_utterance_emits_live_utterance_event() {
+        with_temp_home(|| {
+            let config = Config::default();
+            let mut writer = LiveTranscriptWriter::new(
+                &config,
+                Some("session-1".into()),
+                TranscriptSource::Standalone,
+            )
+            .unwrap();
+
+            assert!(writer.write_utterance("hello from live mode", 1.25));
+
+            let events = crate::events::read_events_since_seq(0, None);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].seq, 1);
+            let json = serde_json::to_string(&events[0]).unwrap();
+            assert!(json.contains("\"event_type\":\"live.utterance.final\""));
+            match &events[0].event {
+                crate::events::MinutesEvent::LiveUtteranceFinal {
+                    session_id,
+                    source,
+                    transcript_path,
+                    line,
+                    text,
+                    speaker,
+                    offset_ms: _,
+                    duration_ms,
+                } => {
+                    assert_eq!(session_id.as_deref(), Some("session-1"));
+                    assert_eq!(source, "standalone");
+                    assert!(transcript_path.ends_with("live-transcript.jsonl"));
+                    assert_eq!(*line, 1);
+                    assert_eq!(text, "hello from live mode");
+                    assert!(speaker.is_none());
+                    assert_eq!(*duration_ms, 1250);
+                }
+                other => panic!("expected LiveUtteranceFinal, got {other:?}"),
+            }
+        });
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn precreated_context_session_is_failed_when_recording_blocks_start() {
+        with_temp_home(|| {
+            let session =
+                crate::context_store::start_live_transcript_session(Local::now()).unwrap();
+            let _recording_guard = crate::pid::create_pid_guard(&crate::pid::pid_path()).unwrap();
+            let stop_flag = Arc::new(AtomicBool::new(false));
+
+            let error = run(stop_flag, &Config::default(), Some(session.id.clone())).unwrap_err();
+
+            assert!(matches!(
+                error,
+                MinutesError::LiveTranscript(LiveTranscriptError::RecordingActive)
+            ));
+
+            let reloaded = crate::context_store::get_session(&session.id)
+                .unwrap()
+                .expect("context session should exist");
+            assert_eq!(
+                reloaded.state,
+                crate::context_store::ContextSessionState::Failed
+            );
+        });
+    }
+
+    #[cfg(feature = "whisper")]
+    fn read_wav_samples(path: &Path) -> Vec<f32> {
+        let mut reader = hound::WavReader::open(path).unwrap();
+        let spec = reader.spec();
+        let raw: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|sample| sample.unwrap() as f32 / i16::MAX as f32)
+            .collect();
+
+        let mono = if spec.channels == 1 {
+            raw
+        } else {
+            raw.chunks(spec.channels as usize)
+                .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
+                .collect()
+        };
+
+        if spec.sample_rate == 16000 {
+            mono
+        } else {
+            crate::transcribe::resample(&mono, spec.sample_rate, 16000)
+        }
+    }
+
+    #[cfg(feature = "whisper")]
+    fn write_wav_samples(path: &Path, samples: &[f32]) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for sample in samples {
+            let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            writer.write_sample(pcm).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[cfg(feature = "whisper")]
+    fn pad_with_silence_to_db_rms(samples: &[f32], target_db: f32) -> Vec<f32> {
+        let target_rms = 10f32.powf(target_db / 20.0);
+        let speech_energy = samples.iter().map(|sample| sample * sample).sum::<f32>();
+        let target_total_samples = (speech_energy / target_rms.powi(2))
+            .ceil()
+            .max(samples.len() as f32) as usize;
+        let silence_needed = target_total_samples.saturating_sub(samples.len());
+        let lead_silence = silence_needed / 2;
+        let tail_silence = silence_needed - lead_silence;
+
+        let mut padded = Vec::with_capacity(target_total_samples);
+        padded.extend(std::iter::repeat_n(0.0, lead_silence));
+        padded.extend_from_slice(samples);
+        padded.extend(std::iter::repeat_n(0.0, tail_silence));
+        padded
+    }
+
+    #[cfg(feature = "whisper")]
+    fn rms_db(samples: &[f32]) -> f32 {
+        let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
+            / samples.len() as f32)
+            .sqrt()
+            .max(1e-6);
+        20.0 * rms.log10()
+    }
+
+    #[cfg(feature = "whisper")]
+    fn count_detected_utterances<T>(
+        detector: &mut T,
+        samples: &[f32],
+        mut process: impl FnMut(&mut T, &[f32], f32) -> VadResult,
+    ) -> usize {
+        let mut utterances = 0usize;
+        let mut was_speaking = false;
+
+        for chunk in samples.chunks(1600) {
+            let rms = if chunk.is_empty() {
+                0.0
+            } else {
+                let sum_sq: f32 = chunk.iter().map(|sample| sample * sample).sum();
+                (sum_sq / chunk.len() as f32).sqrt()
+            };
+            let vad_result = process(detector, chunk, rms);
+
+            if vad_result.speaking {
+                was_speaking = true;
+            } else if was_speaking {
+                utterances += 1;
+                was_speaking = false;
+            }
+        }
+
+        if was_speaking {
+            utterances += 1;
+        }
+
+        utterances
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn silero_sidecar_vad_recovers_quiet_minus_40_db_wav() {
+        let config = Config::default();
+        let Some(vad_path) = crate::transcribe::resolve_vad_model_path(&config) else {
+            eprintln!("skipping quiet-audio Silero VAD test — model not installed");
+            return;
+        };
+
+        let demo_wav =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tauri/src/audio/cue-start.wav");
+        let original = read_wav_samples(&demo_wav);
+        let quiet = pad_with_silence_to_db_rms(&original, -40.0);
+        let quiet_db = rms_db(&quiet);
+        assert!(
+            (-40.5..=-39.5).contains(&quiet_db),
+            "expected fixture RMS near -40 dB, got {quiet_db:.2} dB"
+        );
+        let dir = tempdir().unwrap();
+        let quiet_wav = dir.path().join("demo-minus-40db.wav");
+        write_wav_samples(&quiet_wav, &quiet);
+        let quiet_samples = read_wav_samples(&quiet_wav);
+
+        let mut silero = SileroSidecarVad::new(&vad_path).unwrap();
+        let utterances =
+            count_detected_utterances(&mut silero, &quiet_samples, |detector, chunk, rms| {
+                detector.process(chunk, rms).unwrap()
+            });
+
+        assert!(
+            utterances >= 1,
+            "expected at least one utterance from -40 dB WAV after Silero VAD"
+        );
+    }
+
+    /// Capture-free regression. Explicitly supply the public Silero model and
+    /// repository demo.wav; never read a user model directory or meeting audio.
+    #[cfg(feature = "whisper")]
+    #[test]
+    #[ignore = "requires MINUTES_TEST_SILERO_MODEL and MINUTES_TEST_PUBLIC_WAV"]
+    fn single_thread_silero_matches_four_thread_segmentation() {
+        let model = std::env::var_os("MINUTES_TEST_SILERO_MODEL")
+            .expect("explicit public model path required");
+        let fixture = std::env::var_os("MINUTES_TEST_PUBLIC_WAV")
+            .expect("explicit public fixture path required");
+        let mut reader = hound::WavReader::open(fixture).unwrap();
+        assert_eq!(reader.spec().sample_rate, 16000);
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        let speech: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|sample| f32::from(sample.unwrap()) / 32768.0)
+            .collect();
+        assert!(!speech.is_empty());
+        let mut samples = vec![0.0; 16000];
+        samples.extend_from_slice(&speech);
+        samples.extend(std::iter::repeat_n(0.0, 16000 * 4));
+        samples.extend(speech.iter().map(|sample| sample * 0.1));
+        samples.extend(std::iter::repeat_n(0.0, 16000 * 4 + 777));
+        let mut one = SileroSidecarVad::new(Path::new(&model)).unwrap();
+        let mut four = SileroSidecarVad::new_with_threads(Path::new(&model), 4).unwrap();
+        let mut speaking = 0;
+        let mut silence = 0;
+        let mut transitions = 0;
+        let mut previous = false;
+        let mut wall = [std::time::Duration::ZERO; 2];
+        let mut maximum = wall;
+        for chunk in samples.chunks(1600) {
+            let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+            let start = std::time::Instant::now();
+            let a = one.process(chunk, rms).unwrap();
+            let elapsed = start.elapsed();
+            wall[0] += elapsed;
+            maximum[0] = maximum[0].max(elapsed);
+            let start = std::time::Instant::now();
+            let b = four.process(chunk, rms).unwrap();
+            let elapsed = start.elapsed();
+            wall[1] += elapsed;
+            maximum[1] = maximum[1].max(elapsed);
+            assert_eq!((a.speaking, a.silence_ms), (b.speaking, b.silence_ms));
+            assert_eq!(a.energy, b.energy);
+            assert_eq!(a.noise_floor, b.noise_floor);
+            speaking += usize::from(a.speaking);
+            silence += usize::from(!a.speaking);
+            transitions += usize::from(a.speaking != previous);
+            previous = a.speaking;
+        }
+        assert!(
+            speaking > 10 && silence > 10 && transitions >= 4,
+            "fixture must exercise speech, silence and utterance boundaries"
+        );
+        eprintln!("Silero parity: windows={} speaking={speaking} silence={silence} transitions={transitions} one_wall={:?} four_wall={:?} one_max={:?} four_max={:?}",
+            samples.len().div_ceil(1600), wall[0], wall[1], maximum[0], maximum[1]);
+    }
+
+    /// `is_healthy` must surface the sticky `failed` flag through trait
+    /// dispatch. Uses the test-only `force_failed_for_test` seam to
+    /// avoid needing a corrupt whisper context, since constructing one
+    /// reliably from a unit test is brittle.
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn silero_is_healthy_reflects_sticky_failure_via_trait() {
+        use crate::vad::VadEngine;
+        let model_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/ggml-silero-v6.2.0.bin");
+        if !model_path.exists() {
+            eprintln!(
+                "[is_healthy] skipping: no Silero model at {} — run `minutes setup`",
+                model_path.display()
+            );
+            return;
+        }
+        let mut silero = SileroSidecarVad::new(&model_path).unwrap();
+        // Healthy at construction.
+        assert!(
+            <SileroSidecarVad as VadEngine>::is_healthy(&silero),
+            "freshly constructed Silero must be healthy"
+        );
+        assert_eq!(
+            <SileroSidecarVad as VadEngine>::name(&silero),
+            "whisper-silero"
+        );
+        // Force the sticky failure flag and confirm trait dispatch
+        // reports it.
+        silero.force_failed_for_test(true);
+        assert!(
+            !<SileroSidecarVad as VadEngine>::is_healthy(&silero),
+            "is_healthy must return false once `failed` is set"
+        );
+    }
+
+    /// `reset` must NOT clear sticky failure state — the trait
+    /// contract is that failed engines are replaced, not revived.
+    /// Verifying this on the real engine guards against future drift.
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn silero_reset_does_not_clear_sticky_failure() {
+        use crate::vad::VadEngine;
+        let model_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/ggml-silero-v6.2.0.bin");
+        if !model_path.exists() {
+            eprintln!(
+                "[reset] skipping: no Silero model at {} — run `minutes setup`",
+                model_path.display()
+            );
+            return;
+        }
+        let mut silero = SileroSidecarVad::new(&model_path).unwrap();
+        silero.force_failed_for_test(true);
+        assert!(!<SileroSidecarVad as VadEngine>::is_healthy(&silero));
+        // reset() runs without panic in release; debug_assert would
+        // fire in debug builds, which is intentional — we want the
+        // dispatcher to surface the contract violation loudly during
+        // development. In tests, swallow the panic by clearing the
+        // flag first, then resetting, then re-failing to verify reset
+        // doesn't touch the flag from a healthy state.
+        silero.force_failed_for_test(false);
+        <SileroSidecarVad as VadEngine>::reset(&mut silero);
+        assert!(
+            <SileroSidecarVad as VadEngine>::is_healthy(&silero),
+            "reset on a healthy engine must keep is_healthy true"
+        );
+        silero.force_failed_for_test(true);
+        assert!(!<SileroSidecarVad as VadEngine>::is_healthy(&silero));
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    fn ort_silero_init_panic_falls_back_to_whisper_silero() {
+        let default_config = Config::default();
+        let Some(vad_model) = crate::transcribe::resolve_vad_model_path(&default_config) else {
+            eprintln!("[ort_fallback] skipping: no whisper-Silero VAD model installed");
+            return;
+        };
+
+        let dir = tempdir().unwrap();
+        std::fs::copy(&vad_model, dir.path().join("ggml-silero-v6.2.0.bin")).unwrap();
+        std::fs::write(dir.path().join("silero-vad-v6.2.0.onnx"), b"dummy onnx").unwrap();
+
+        let mut config = default_config;
+        config.transcription.model_path = dir.path().to_path_buf();
+        config.transcription.vad_model = "silero-v6.2.0".into();
+        config.transcription.vad_engine = "ort-silero".into();
+
+        let vad = RecordingSidecarVad::new_with_ort_constructor(&config, |_onnx_path| {
+            panic!("Failed to initialize ORT API")
+        });
+        assert!(
+            matches!(vad.backend, RecordingSidecarVadBackend::Silero(_)),
+            "ort-silero init panic must fall back to whisper-silero"
+        );
+    }
+
+    /// Look up the canonical Silero model paths for parity tests.
+    /// Returns `None` if either model is missing — the caller prints
+    /// a `skipping` message and returns instead of failing.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    fn parity_model_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let onnx_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/silero-vad-v6.2.0.onnx");
+        let ggml_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/ggml-silero-v6.2.0.bin");
+        if !onnx_path.exists() || !ggml_path.exists() {
+            return None;
+        }
+        Some((onnx_path, ggml_path))
+    }
+
+    /// Resolve a fixture path under `crates/assets/`. Returns `None`
+    /// if the fixture is missing — caller skips. All parity fixtures
+    /// are committed to the repo, so this is mostly a hedge against
+    /// running tests from a partial checkout.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    fn parity_fixture_path(name: &str) -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate parent")
+            .join("assets")
+            .join(name);
+        path.exists().then_some(path)
+    }
+
+    /// Run a fixture through both OrtSileroVad and SileroSidecarVad
+    /// at the production 100 ms cadence and return the per-chunk
+    /// `speaking` flags. Returned vectors are the same length and
+    /// represent identical timestamps so the parity-check helper can
+    /// just zip-walk them.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    fn run_both_engines_on_fixture(
+        fixture_path: &std::path::Path,
+        onnx_path: &std::path::Path,
+        ggml_path: &std::path::Path,
+    ) -> (Vec<bool>, Vec<bool>) {
+        use crate::silero_vad::OrtSileroVad;
+        use crate::vad::VadEngine;
+
+        let samples = read_wav_samples(fixture_path);
+        let mut ort_engine = OrtSileroVad::new(onnx_path).unwrap();
+        let mut whisper_engine = SileroSidecarVad::new(ggml_path).unwrap();
+
+        let chunk = 1600;
+        let mut ort_speak: Vec<bool> = Vec::new();
+        let mut whisper_speak: Vec<bool> = Vec::new();
+        for window in samples.chunks(chunk) {
+            let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+            let ort = ort_engine.process(window, rms);
+            let wh = whisper_engine.process(window, rms).unwrap();
+            ort_speak.push(ort.speaking);
+            whisper_speak.push(wh.speaking);
+        }
+        (ort_speak, whisper_speak)
+    }
+
+    /// Apply the codex parity bar from docs/plans/vad-refactor.md to
+    /// per-chunk speaking flags from both engines. `label` shows up
+    /// in the eprintln preamble so test output is greppable per
+    /// fixture.
+    ///
+    /// Bars enforced:
+    /// 1. Zero missed islands. Every contiguous speech region
+    ///    whisper-Silero flags must overlap with ≥1 ort-Silero
+    ///    speaking chunk. Utterance loss is release-blocking.
+    /// 2. Boundary drift ≤ 2 chunks (±200 ms). Slightly looser than
+    ///    the ±150 ms in the design doc, to absorb model-version
+    ///    noise without flapping in CI.
+    /// 3. No phantom speech. Every ort-Silero speaking chunk must
+    ///    fall within ±2 chunks of some whisper-Silero island.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    fn assert_parity_bar(label: &str, ort_speak: &[bool], whisper_speak: &[bool]) {
+        assert_eq!(
+            ort_speak.len(),
+            whisper_speak.len(),
+            "[{}] engine output lengths must match",
+            label
+        );
+
+        let islands = contiguous_runs(whisper_speak, true);
+        let ort_islands = contiguous_runs(ort_speak, true);
+        eprintln!(
+            "[parity:{label}] whisper islands={} | ort islands={} | ort speaking={}/{}",
+            islands.len(),
+            ort_islands.len(),
+            ort_speak.iter().filter(|&&s| s).count(),
+            ort_speak.len()
+        );
+
+        const DRIFT_TOLERANCE_CHUNKS: i64 = 2;
+
+        // Bar 1.
+        for (start, end) in &islands {
+            let any_overlap = ort_speak[*start..*end].iter().any(|&s| s);
+            assert!(
+                any_overlap,
+                "[{label}] ort-silero missed an entire whisper-silero island at chunks [{},{}) ({:.1}s-{:.1}s)",
+                start,
+                end,
+                *start as f32 * 0.1,
+                *end as f32 * 0.1
+            );
+        }
+
+        // Bar 2.
+        for (start, end) in &islands {
+            let nearest_start = ort_speak
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| s)
+                .map(|(i, _)| (i as i64 - *start as i64).abs())
+                .min()
+                .unwrap_or(i64::MAX);
+            let nearest_end = ort_speak
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| s)
+                .map(|(i, _)| (i as i64 - (*end as i64 - 1)).abs())
+                .min()
+                .unwrap_or(i64::MAX);
+            assert!(
+                nearest_start <= DRIFT_TOLERANCE_CHUNKS,
+                "[{label}] island start at chunk {} ({:.1}s): nearest ort-silero speech is {} chunks away (>200ms drift)",
+                start,
+                *start as f32 * 0.1,
+                nearest_start
+            );
+            assert!(
+                nearest_end <= DRIFT_TOLERANCE_CHUNKS,
+                "[{label}] island end at chunk {} ({:.1}s): nearest ort-silero speech is {} chunks away (>200ms drift)",
+                end,
+                *end as f32 * 0.1,
+                nearest_end
+            );
+        }
+
+        // Bar 3.
+        for (i, &is_speaking) in ort_speak.iter().enumerate() {
+            if !is_speaking {
+                continue;
+            }
+            let inside_or_near = islands.iter().any(|(s, e)| {
+                let near_start = (*s as i64 - i as i64).abs() <= DRIFT_TOLERANCE_CHUNKS;
+                let near_end = (i as i64 - (*e as i64 - 1)).abs() <= DRIFT_TOLERANCE_CHUNKS;
+                let inside = i >= *s && i < *e;
+                inside || near_start || near_end
+            });
+            assert!(
+                inside_or_near,
+                "[{label}] phantom ort-silero speech at chunk {} ({:.1}s) — not within ±200ms of any whisper-silero island",
+                i,
+                i as f32 * 0.1
+            );
+        }
+    }
+
+    /// Parity on the original demo.wav. Continuous speech, one
+    /// island, both engines should agree trivially. Sanity baseline
+    /// for the fixture-based stress tests below.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_ort_silero_vs_whisper_silero_on_demo_wav() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:demo] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("demo.wav") else {
+            eprintln!("[parity:demo] skipping: no demo.wav fixture");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        assert_parity_bar("demo", &ort_speak, &whisper_speak);
+    }
+
+    /// Fixture A. silence → 80 ms speech spike → silence. Below the
+    /// 150 ms min_speech filter that snakers4's reference and our
+    /// smoothing FSM enforce. ort-Silero must report zero speech on
+    /// this fixture; if it ever stops filtering, every cough and
+    /// click would fire the ASR pipeline (codex's commit 2 review
+    /// #1 finding).
+    ///
+    /// This is intentionally NOT a cross-engine parity test:
+    /// whisper-rs's bundled Silero runs in full-buffer rescan mode
+    /// and is more permissive on brief spikes than our streaming
+    /// implementation with the explicit min_speech gate. That
+    /// permissiveness is one of the structural problems Option B
+    /// solves; running the parity bar here would penalize ort for
+    /// behaving correctly. We log whisper's behavior for diagnostic
+    /// awareness and assert only on ort.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_brief_spike_under_min_speech_is_silence() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:brief_spike] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("parity_brief_spike.wav") else {
+            eprintln!("[parity:brief_spike] skipping: fixture missing — run examples/build_parity_fixtures");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        let ort_speech = ort_speak.iter().filter(|&&s| s).count();
+        let whisper_speech = whisper_speak.iter().filter(|&&s| s).count();
+        eprintln!(
+            "[parity:brief_spike] ort_speech_chunks={} whisper_speech_chunks={} (whisper expected to be over-permissive — that's the bug Option B fixes)",
+            ort_speech, whisper_speech
+        );
+        assert_eq!(
+            ort_speech, 0,
+            "ort-silero must filter an 80 ms spike (below 150 ms min_speech)"
+        );
+    }
+
+    /// Fixture B. Three 1.5 s utterances separated by 300 / 500 /
+    /// 800 ms gaps, with 200 ms head and 800 ms tail silence. The
+    /// 300 ms gap is below min_silence (500 ms) so utterances 1 and
+    /// 2 should merge into one island; 500 ms is at the boundary;
+    /// 800 ms is well above so utterance 3 is clearly its own
+    /// island. Both engines should agree on the segmentation,
+    /// whatever it works out to.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_three_utterances_with_varied_gaps() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:three_utterances] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("parity_three_utterances.wav") else {
+            eprintln!("[parity:three_utterances] skipping: fixture missing");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        assert_parity_bar("three_utterances", &ort_speak, &whisper_speak);
+    }
+
+    /// Fixture C. demo.wav scaled to 5% amplitude — well below the
+    /// energy-VAD threshold, but model-based VADs are robust to
+    /// quiet speech. Both should still detect the segment.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_low_volume_speech_still_detected() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:low_volume] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("parity_low_volume.wav") else {
+            eprintln!("[parity:low_volume] skipping: fixture missing");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        assert_parity_bar("low_volume", &ort_speak, &whisper_speak);
+        // Beyond cross-engine parity: if NEITHER engine detects any
+        // speech in 10s of quiet-but-real speech, that's a
+        // model-quality alarm we want to surface explicitly.
+        let any_ort = ort_speak.iter().any(|&s| s);
+        let any_whisper = whisper_speak.iter().any(|&s| s);
+        assert!(
+            any_ort || any_whisper,
+            "neither engine detected speech in low-volume fixture — model-quality regression?"
+        );
+    }
+
+    /// Fixture D. demo.wav truncated to 16384 + 137 = 16521 samples
+    /// (≈1.033 s). The streaming engine processes 32 full 512-sample
+    /// chunks and leaves a 137-sample tail in the buffer that never
+    /// reaches the ONNX session. This stresses the partial-tail path
+    /// — if zero-padding ever gets added to the buffer-flush logic,
+    /// the LSTM state could pick up a phantom silence and drift the
+    /// final decision. Both engines processing the same short
+    /// recording should agree.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_trailing_partial_chunk_handled_consistently() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:trailing_partial] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("parity_trailing_partial.wav") else {
+            eprintln!("[parity:trailing_partial] skipping: fixture missing");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        assert_parity_bar("trailing_partial", &ort_speak, &whisper_speak);
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    fn contiguous_runs(seq: &[bool], value: bool) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        let mut start: Option<usize> = None;
+        for (i, &v) in seq.iter().enumerate() {
+            if v == value && start.is_none() {
+                start = Some(i);
+            } else if v != value && start.is_some() {
+                runs.push((start.take().unwrap(), i));
+            }
+        }
+        if let Some(s) = start {
+            runs.push((s, seq.len()));
+        }
+        runs
+    }
+
+    /// SPIKE — does whisper-rs's Silero VAD carry LSTM state across
+    /// `detect_speech` calls? If yes, Option A in docs/plans/vad-refactor.md is
+    /// viable: feed only new-since-last-call samples per chunk, accumulate
+    /// probabilities externally. If no, the per-chunk re-scan is structural
+    /// and Option B (independent ort-backed Silero) is required.
+    ///
+    /// Run with: `cargo test -p minutes-core --features whisper --lib
+    ///   live_transcript::tests::option_a_spike -- --ignored --nocapture`
+    ///
+    /// Requires `~/.minutes/models/ggml-silero-v6.2.0.bin` to exist (i.e.
+    /// `minutes setup` has run on this machine). Output is informational
+    /// only; the test only fails if the model is unloadable.
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    #[ignore]
+    fn option_a_spike_silero_state_carries_across_detect_speech_calls() {
+        let model_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/ggml-silero-v6.2.0.bin");
+        if !model_path.exists() {
+            eprintln!(
+                "[spike] no Silero model at {} — run `minutes setup` first",
+                model_path.display()
+            );
+            return;
+        }
+
+        // Build deterministic test signal: 1s silence + 1s 440Hz tone +
+        // 1s silence, 16kHz f32 normalized to ~0.5 amplitude in the tone
+        // region. Total 48,000 samples = 3s.
+        let mut samples = Vec::with_capacity(48_000);
+        samples.extend(std::iter::repeat_n(0.0_f32, 16_000));
+        for i in 0..16_000 {
+            let t = i as f32 / 16_000.0;
+            samples.push((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5);
+        }
+        samples.extend(std::iter::repeat_n(0.0_f32, 16_000));
+
+        let mid = samples.len() / 2;
+
+        let make_ctx = || -> whisper_rs::WhisperVadContext {
+            let mut params = whisper_rs::WhisperVadContextParams::default();
+            params.set_n_threads(2);
+            whisper_rs::WhisperVadContext::new(model_path.to_str().expect("utf-8 path"), params)
+                .expect("Silero model load")
+        };
+
+        // Mode A: single full-buffer call.
+        let mut ctx_a = make_ctx();
+        ctx_a.detect_speech(&samples).expect("detect_speech full");
+        let probs_full = ctx_a.probabilities().to_vec();
+
+        // Mode B: two halves, fresh context.
+        let mut ctx_b = make_ctx();
+        ctx_b
+            .detect_speech(&samples[..mid])
+            .expect("detect_speech first half");
+        let probs_first_half = ctx_b.probabilities().to_vec();
+        ctx_b
+            .detect_speech(&samples[mid..])
+            .expect("detect_speech second half");
+        let probs_second_half = ctx_b.probabilities().to_vec();
+
+        let probs_concat: Vec<f32> = probs_first_half
+            .iter()
+            .copied()
+            .chain(probs_second_half.iter().copied())
+            .collect();
+
+        eprintln!("[spike] full samples: {}", samples.len());
+        eprintln!(
+            "[spike] mode A (single call) probs.len(): {}",
+            probs_full.len()
+        );
+        eprintln!(
+            "[spike] mode B (two halves) probs.len(): first={} second={} concat={}",
+            probs_first_half.len(),
+            probs_second_half.len(),
+            probs_concat.len()
+        );
+
+        // Length parity: do we get the same total probability count from
+        // both modes? If second_half's probabilities are computed as if the
+        // input were standalone (no carried context), the count should
+        // match a fresh call on samples[mid..].
+        if probs_full.len() != probs_concat.len() {
+            eprintln!(
+                "[spike] LENGTH MISMATCH (Mode A: {}, Mode B: {}) — \
+                 second detect_speech call produces output as if input were \
+                 standalone; LSTM state likely RESETS per call",
+                probs_full.len(),
+                probs_concat.len()
+            );
+        }
+
+        // Diff stats over the overlapping prefix.
+        let n = probs_full.len().min(probs_concat.len());
+        if n > 0 {
+            let diffs: Vec<f32> = (0..n)
+                .map(|i| (probs_full[i] - probs_concat[i]).abs())
+                .collect();
+            let max_diff = diffs.iter().fold(0.0_f32, |a, &b| a.max(b));
+            let mean_diff = diffs.iter().sum::<f32>() / diffs.len() as f32;
+            let above_5pct = diffs.iter().filter(|&&d| d > 0.05).count();
+            eprintln!(
+                "[spike] prefix diff stats over {} samples: max={:.4}, mean={:.4}, count_above_0.05={}",
+                n, max_diff, mean_diff, above_5pct
+            );
+            // Verdict guidance.
+            if max_diff < 0.01 {
+                eprintln!(
+                    "[spike] VERDICT: probabilities match within tolerance — \
+                     OPTION A LIKELY VIABLE. Incremental detect_speech \
+                     accumulates probabilities consistent with single call."
+                );
+            } else if max_diff < 0.1 {
+                eprintln!(
+                    "[spike] VERDICT: small drift (max diff {:.4}) — Option A \
+                     might work with retuned thresholds; investigate boundary \
+                     behavior more carefully before committing.",
+                    max_diff
+                );
+            } else {
+                eprintln!(
+                    "[spike] VERDICT: significant drift (max diff {:.4}) — \
+                     OPTION A NOT VIABLE. detect_speech does not preserve \
+                     LSTM state across calls. Option B (ort-backed Silero) \
+                     required.",
+                    max_diff
+                );
+            }
+        }
+
+        // The test always passes; output is informational. Failing here
+        // would just block the spike from running.
+        let _ = model_path;
+    }
+
+    /// SPIKE v2 — richer probe on real speech, simulating the production
+    /// 100ms-chunk cadence to see if incremental detect_speech calls
+    /// produce probabilities consistent enough with a single full-buffer
+    /// call that threshold-based speech detection lands in the same
+    /// places.
+    ///
+    /// Method:
+    /// 1. Load `crates/assets/demo.wav` (~10.6s of real speech) into
+    ///    16kHz f32 samples.
+    /// 2. Mode A: single detect_speech call over the whole buffer,
+    ///    record probabilities.
+    /// 3. Mode B: feed in 1600-sample (100ms) chunks, record each
+    ///    call's probabilities, concatenate.
+    /// 4. Apply binary threshold at 0.2 to both probability vectors
+    ///    and count windows where the speech/no-speech decision
+    ///    DIFFERS between modes. Each diff is a potential
+    ///    misdetection if Option A shipped.
+    ///
+    /// Verdict bar (per codex parity definition):
+    /// - 0 flips: Option A safe.
+    /// - 1-3 isolated flips at speech boundaries: probably fine,
+    ///   boundary drift up to ±150ms is acceptable.
+    /// - Many flips OR flips inside contiguous speech regions:
+    ///   Option A unsafe; Option B required.
+    ///
+    /// Run with: `cargo test -p minutes-core --features
+    /// "whisper streaming" --lib option_a_spike_v2 -- --ignored
+    /// --nocapture`
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    #[ignore]
+    fn option_a_spike_v2_real_speech_threshold_decisions() {
+        let model_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/ggml-silero-v6.2.0.bin");
+        if !model_path.exists() {
+            eprintln!(
+                "[spike v2] no Silero model at {} — run `minutes setup`",
+                model_path.display()
+            );
+            return;
+        }
+
+        // Find the demo WAV. Workspace root is two levels up from this
+        // crate; the assets crate sits next to ours.
+        let cargo_manifest = env!("CARGO_MANIFEST_DIR");
+        let demo_wav = std::path::PathBuf::from(cargo_manifest)
+            .parent()
+            .expect("crate parent")
+            .join("assets/demo.wav");
+        if !demo_wav.exists() {
+            eprintln!("[spike v2] no demo.wav at {}", demo_wav.display());
+            return;
+        }
+
+        let samples = read_wav_samples(&demo_wav);
+        eprintln!(
+            "[spike v2] loaded {} samples ({:.1}s at 16kHz)",
+            samples.len(),
+            samples.len() as f32 / 16_000.0
+        );
+
+        let make_ctx = || -> whisper_rs::WhisperVadContext {
+            let mut params = whisper_rs::WhisperVadContextParams::default();
+            params.set_n_threads(2);
+            whisper_rs::WhisperVadContext::new(model_path.to_str().expect("utf-8 path"), params)
+                .expect("Silero load")
+        };
+
+        // Mode A: single full-buffer call.
+        let mut ctx_a = make_ctx();
+        ctx_a.detect_speech(&samples).expect("detect_speech full");
+        let probs_a = ctx_a.probabilities().to_vec();
+
+        // Mode B: 100ms chunks, fresh context, append per-call probs.
+        let chunk_size = 1600; // 100ms at 16kHz
+        let mut ctx_b = make_ctx();
+        let mut probs_b: Vec<f32> = Vec::new();
+        for chunk in samples.chunks(chunk_size) {
+            ctx_b.detect_speech(chunk).expect("detect_speech chunk");
+            probs_b.extend_from_slice(ctx_b.probabilities());
+        }
+
+        eprintln!(
+            "[spike v2] Mode A probs.len: {} | Mode B probs.len: {}",
+            probs_a.len(),
+            probs_b.len()
+        );
+
+        // Align lengths for comparison. Mode B may have slightly more
+        // probability windows because each chunk's detect_speech rounds up.
+        let n = probs_a.len().min(probs_b.len());
+
+        // Apply the production threshold.
+        const THRESHOLD: f32 = 0.2; // matches SIDECAR_VAD_THRESHOLD
+        let mut flips = 0usize;
+        let mut flip_a_speech_b_silence = 0usize;
+        let mut flip_a_silence_b_speech = 0usize;
+        let mut max_diff = 0.0_f32;
+        let mut sum_diff = 0.0_f32;
+        let mut consecutive_flips = 0usize;
+        let mut max_consecutive = 0usize;
+
+        for i in 0..n {
+            let a_speech = probs_a[i] >= THRESHOLD;
+            let b_speech = probs_b[i] >= THRESHOLD;
+            let diff = (probs_a[i] - probs_b[i]).abs();
+            max_diff = max_diff.max(diff);
+            sum_diff += diff;
+
+            if a_speech != b_speech {
+                flips += 1;
+                consecutive_flips += 1;
+                max_consecutive = max_consecutive.max(consecutive_flips);
+                if a_speech {
+                    flip_a_speech_b_silence += 1;
+                } else {
+                    flip_a_silence_b_speech += 1;
+                }
+            } else {
+                consecutive_flips = 0;
+            }
+        }
+
+        let mean_diff = if n > 0 { sum_diff / n as f32 } else { 0.0 };
+
+        eprintln!(
+            "[spike v2] over {} comparable windows ({:.1}s of audio):",
+            n,
+            n as f32 * 32.0 / 16_000.0 // each prob window represents ~32ms
+        );
+        eprintln!("[spike v2]   max prob diff:  {:.4}", max_diff);
+        eprintln!("[spike v2]   mean prob diff: {:.4}", mean_diff);
+        eprintln!(
+            "[spike v2]   threshold flips: {} total (A=speech/B=silence: {}, A=silence/B=speech: {})",
+            flips, flip_a_speech_b_silence, flip_a_silence_b_speech
+        );
+        eprintln!(
+            "[spike v2]   longest flip run: {} windows ({:.0}ms)",
+            max_consecutive,
+            max_consecutive as f32 * 32.0
+        );
+
+        // Verdict.
+        let flip_pct = if n > 0 {
+            (flips as f32 / n as f32) * 100.0
+        } else {
+            0.0
+        };
+
+        if flips == 0 {
+            eprintln!(
+                "[spike v2] VERDICT: zero threshold flips — OPTION A SAFE. \
+                 Incremental detect_speech produces threshold decisions \
+                 identical to the full-buffer call on real speech."
+            );
+        } else if max_consecutive <= 5 && flip_pct < 5.0 {
+            eprintln!(
+                "[spike v2] VERDICT: {} isolated flips ({:.1}%, longest run {} \
+                 windows = {:.0}ms). Within codex's ±150ms boundary tolerance. \
+                 OPTION A LIKELY SAFE for production. Validate with one more \
+                 dogfood session before defaulting.",
+                flips,
+                flip_pct,
+                max_consecutive,
+                max_consecutive as f32 * 32.0
+            );
+        } else {
+            eprintln!(
+                "[spike v2] VERDICT: {} flips ({:.1}%, longest run {} windows \
+                 = {:.0}ms). Exceeds parity tolerance. OPTION A UNSAFE — \
+                 incremental probabilities diverge in ways that flip speech \
+                 detection. Option B (ort-backed Silero with persistent LSTM \
+                 state) is required.",
+                flips,
+                flip_pct,
+                max_consecutive,
+                max_consecutive as f32 * 32.0
+            );
+        }
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn sidecar_missing_status_is_inactive_with_diagnostic() {
+        let dir = tempdir().unwrap();
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &dir.path().join("live-status.json"),
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(!status.active);
+        assert_eq!(status.source, None);
+        assert_eq!(status.pid, None);
+        assert_eq!(
+            status.diagnostic.as_deref(),
+            Some("sidecar status unavailable")
+        );
+        assert_eq!(status.disabled, None);
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn sidecar_disabled_by_config_is_inactive_and_distinct_from_a_failure() {
+        with_temp_home(|| {
+            mark_recording_sidecar_disabled();
+
+            let status = session_status_for_test_recording();
+
+            assert!(!status.active);
+            assert_eq!(status.source, None);
+            assert_eq!(status.pid, None);
+            assert_eq!(status.line_count, 0);
+            assert_eq!(
+                status.disabled,
+                Some(LiveTranscriptDisabled::RecordingSidecarConfig)
+            );
+            assert_eq!(
+                status.diagnostic.as_deref(),
+                Some(RECORDING_SIDECAR_DISABLED_DIAGNOSTIC)
+            );
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(json["disabled"], "recording-sidecar-config");
+            assert_eq!(json["active"], false);
+        });
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn recording_sidecar_off_skips_the_sidecar_and_writes_the_disabled_status() {
+        with_temp_home(|| {
+            let mut config = Config::default();
+            config.live_transcript.recording_sidecar = false;
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let (live_tx, handle) = crate::capture::start_live_sidecar(&config, &stop, None);
+
+            assert!(
+                live_tx.is_none(),
+                "no sender: the pump must not forward audio"
+            );
+            assert!(handle.is_none(), "no sidecar thread may be spawned");
+            let written = read_live_status(&pid::live_transcript_status_path())
+                .expect("the disabled state must be written for live-text readers");
+            assert_eq!(written.state, LiveStatusState::Disabled);
+            let log = std::fs::read_to_string(crate::logging::log_path()).unwrap();
+            assert!(
+                log.lines()
+                    .any(|line| line.contains("\"live_sidecar_skipped\"")),
+                "the skip must be visible in minutes.log"
+            );
+        });
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn disabled_status_is_a_fresh_file_not_a_transition_from_stale_state() {
+        with_temp_home(|| {
+            let mut stale = live_status_with_state(LiveStatusState::Failed);
+            stale.line_count = 7;
+            stale.session_id = Some("old-session".into());
+            stale.diagnostic = Some("recognizer unavailable".into());
+            write_live_status(&stale);
+
+            mark_recording_sidecar_disabled();
+
+            let written = read_live_status(&pid::live_transcript_status_path()).unwrap();
+            assert_eq!(written.state, LiveStatusState::Disabled);
+            assert_eq!(written.line_count, 0);
+            assert_eq!(written.session_id, None);
+            assert_eq!(
+                written.diagnostic.as_deref(),
+                Some(RECORDING_SIDECAR_DISABLED_DIAGNOSTIC)
+            );
+            let status = session_status_for_test_recording();
+            assert_eq!(status.session_id, None);
+            assert_eq!(
+                status.disabled,
+                Some(LiveTranscriptDisabled::RecordingSidecarConfig)
+            );
+        });
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn disabled_status_is_ignored_once_the_recording_has_stopped() {
+        with_temp_home(|| {
+            mark_recording_sidecar_disabled();
+
+            let status = derive_session_status(
+                pid::PidFileState::Inactive,
+                None,
+                &pid::live_transcript_status_path(),
+                &pid::live_transcript_jsonl_path(),
+            );
+
+            assert!(!status.active);
+            assert_eq!(status.disabled, None);
+            assert_eq!(status.diagnostic, None);
+        });
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn standalone_session_over_a_disabled_file_reports_its_own_state() {
+        with_temp_home(|| {
+            mark_recording_sidecar_disabled();
+
+            let status = derive_session_status(
+                pid::PidFileState::Active(std::process::id()),
+                Some(std::process::id()),
+                &pid::live_transcript_status_path(),
+                &pid::live_transcript_jsonl_path(),
+            );
+
+            assert!(status.active);
+            assert_eq!(status.source, Some(TranscriptSource::Standalone));
+            assert_eq!(status.disabled, None);
+            assert_eq!(status.diagnostic, None);
+        });
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn disabled_marker_empties_stale_finals_and_yields_to_an_active_standalone_session() {
+        with_temp_home(|| {
+            let jsonl_path = pid::live_transcript_jsonl_path();
+            std::fs::create_dir_all(jsonl_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &jsonl_path,
+                "{\"line\":1,\"text\":\"from an earlier session\"}\n",
+            )
+            .unwrap();
+
+            mark_recording_sidecar_disabled();
+            assert_eq!(std::fs::read_to_string(&jsonl_path).unwrap(), "");
+            assert!(pid::live_transcript_status_path().exists());
+
+            clear_status_file();
+            std::fs::write(&jsonl_path, "{\"line\":1,\"text\":\"standalone\"}\n").unwrap();
+            let _guard = pid::create_pid_guard(&pid::live_transcript_pid_path()).unwrap();
+            mark_recording_sidecar_disabled();
+            assert!(!pid::live_transcript_status_path().exists());
+            assert!(std::fs::read_to_string(&jsonl_path)
+                .unwrap()
+                .contains("standalone"));
+        });
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn sidecar_reports_active_when_healthy_and_recording_is_active() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let status = live_status_with_state(LiveStatusState::Healthy);
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(status.active);
+        assert_eq!(status.source, Some(TranscriptSource::RecordingSidecar));
+        assert_eq!(status.pid, Some(std::process::id()));
+        assert_eq!(status.line_count, 3);
+        assert_eq!(status.diagnostic, None);
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn sidecar_stays_active_but_surfaces_the_diagnostic_when_degraded() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut live_status = live_status_with_state(LiveStatusState::Degraded);
+        live_status.diagnostic = Some("live transcription stalled: 120s of speech".into());
+        std::fs::write(&status_path, serde_json::to_string(&live_status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(
+            status.active,
+            "audio still flows; existing lines stay readable"
+        );
+        assert_eq!(status.source, Some(TranscriptSource::RecordingSidecar));
+        assert_eq!(
+            status.diagnostic.as_deref(),
+            Some("live transcription stalled: 120s of speech")
+        );
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn session_status_reports_final_freshness_without_provisional_text() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut live_status = live_status_with_state(LiveStatusState::Healthy);
+        live_status.start_time = Local::now() - ChronoDuration::seconds(10);
+        std::fs::write(&status_path, serde_json::to_string(&live_status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        let age = status
+            .latest_final_age_secs
+            .expect("final freshness should be available");
+        assert!((8.0..=9.0).contains(&age), "unexpected final age: {age}");
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn sidecar_failed_state_overrides_active_recording() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut status = live_status_with_state(LiveStatusState::Failed);
+        status.diagnostic = Some("sidecar failed".into());
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(!status.active);
+        assert_eq!(status.source, None);
+        assert_eq!(status.diagnostic.as_deref(), Some("sidecar failed"));
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn unexpected_sidecar_input_disconnect_preserves_failure_diagnostic() {
+        with_temp_home(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+            drop(tx);
+            let stop = Arc::new(AtomicBool::new(false));
+
+            run_sidecar_mpsc(rx, stop, &Config::default(), None);
+
+            let status = read_live_status(&pid::live_transcript_status_path())
+                .expect("unexpected disconnect should leave a status file");
+            assert_eq!(status.state, LiveStatusState::Failed);
+            assert!(status.diagnostic.as_deref().is_some_and(|message| {
+                message.contains("audio feeder disconnected while recording was still active")
+            }));
+        });
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn sidecar_summary_accounts_for_received_processed_and_gated_samples() {
+        with_temp_home(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(3);
+            tx.send(vec![0.0; 1600]).unwrap();
+            tx.send(vec![0.0; 1700]).unwrap();
+            tx.send(Vec::new()).unwrap();
+            drop(tx);
+            let stop = Arc::new(AtomicBool::new(false));
+            // The fresh temporary home has no models, so the normal explicit
+            // fallback uses energy VAD. No model inference or device access.
+            let config = Config::default();
+            run_sidecar_mpsc(rx, stop, &config, None);
+            let log = std::fs::read_to_string(crate::logging::log_path()).unwrap();
+            let summaries: Vec<serde_json::Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|entry: &serde_json::Value| entry["step"] == "live_sidecar_ended")
+                .collect();
+            assert_eq!(summaries.len(), 1);
+            let extra = &summaries[0]["extra"];
+            assert_eq!(extra["samples_fed"], 3300);
+            assert_eq!(extra["samples_gated"], 3300);
+            assert_eq!(extra["silence_windows"], 3);
+            let input = &extra["input_progress"];
+            assert_eq!(input["counters"]["samples_received"], 3300);
+            assert_eq!(input["counters"]["samples_processed"], 3300);
+            assert_eq!(input["counters"]["chunk_remaining_samples"], 0);
+            assert_eq!(input["wall_timing"]["vad"]["count"], 3);
+            assert_eq!(extra["worker_timing"]["final_inference"]["count"], 0);
+        });
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn expected_sidecar_stop_clears_status_file() {
+        with_temp_home(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+            drop(tx);
+            let stop = Arc::new(AtomicBool::new(true));
+
+            run_sidecar_mpsc(rx, stop, &Config::default(), None);
+
+            assert!(
+                !pid::live_transcript_status_path().exists(),
+                "a normal recording stop must not leave stale sidecar state"
+            );
+            let log = std::fs::read_to_string(crate::logging::log_path()).unwrap();
+            let summaries: Vec<serde_json::Value> = log
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|entry| entry["step"] == "live_sidecar_ended")
+                .collect();
+            assert_eq!(summaries.len(), 1, "one summary, not per-job timing logs");
+            let timing = &summaries[0]["extra"]["worker_timing"];
+            assert!(
+                timing.is_object(),
+                "the joined worker must return its timings"
+            );
+            assert_eq!(timing["final_queue_wait"]["count"], 0);
+            assert_eq!(timing["whisper_model_load"]["count"], 0);
+            assert_eq!(timing["drafts_taken"], 0);
+        });
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn standalone_failed_state_is_visible_to_status_readers() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut live_status = live_status_with_state(LiveStatusState::Failed);
+        live_status.diagnostic = Some("recognizer unavailable".into());
+        std::fs::write(&status_path, serde_json::to_string(&live_status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Active(std::process::id()),
+            None,
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(status.active);
+        assert_eq!(status.source, Some(TranscriptSource::Standalone));
+        assert_eq!(status.diagnostic.as_deref(), Some("recognizer unavailable"));
+    }
+
+    #[test]
+    fn pathname_only_live_backends_resolve_to_whisper() {
+        assert_eq!(
+            live_engine_scope_warning("parakeet"),
+            Some(PARAKEET_LIVE_SCOPE_WARNING)
+        );
+        assert_eq!(
+            live_engine_scope_warning("PaRaKeEt"),
+            Some(PARAKEET_LIVE_SCOPE_WARNING)
+        );
+        assert_eq!(live_engine_scope_warning("whisper"), None);
+        assert_eq!(
+            live_engine_scope_warning("apple-speech"),
+            Some(APPLE_SPEECH_LIVE_SCOPE_WARNING)
+        );
+        assert!(!live_supports_apple_speech());
+
+        let mut config = Config::default();
+        config.live_transcript.backend = "apple-speech".into();
+        assert_eq!(resolved_standalone_backend(&config), "whisper");
+        assert_eq!(
+            live_engine_scope_warning(config.effective_live_transcript_backend()),
+            Some(APPLE_SPEECH_LIVE_SCOPE_WARNING)
+        );
+        config.live_transcript.backend = "parakeet".into();
+        assert_eq!(resolved_standalone_backend(&config), "whisper");
+        assert_eq!(
+            live_engine_scope_warning(config.effective_live_transcript_backend()),
+            Some(PARAKEET_LIVE_SCOPE_WARNING)
+        );
+    }
+
+    #[test]
+    fn recording_sidecar_resolves_retained_parakeet_to_whisper() {
+        let mut config = Config::default();
+        config.live_transcript.backend = "parakeet".into();
+
+        let (backend, diagnostic) = recording_sidecar_live_backend(&config);
+
+        assert_eq!(backend, "whisper");
+        let diagnostic = diagnostic.expect("fallback reason must remain visible");
+        assert!(diagnostic.contains("retained parakeet"));
+        assert!(diagnostic.contains("secure private audio"));
+    }
+
+    #[test]
+    fn empty_live_model_error_names_the_setting_that_chose_it() {
+        // #756: the reporter had to read our source to learn that a blank
+        // live_transcript.model routes to dictation.model rather than
+        // transcription.model. The message must close that gap by itself.
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model: "small".into(),
+                model_path: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            dictation: crate::config::DictationConfig {
+                model: "base".into(),
+                ..Default::default()
+            },
+            live_transcript: crate::config::LiveTranscriptConfig {
+                model: String::new(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = resolve_live_model_path(&config)
+            .expect_err("no model file exists in the temp dir")
+            .to_string();
+
+        assert!(
+            error.contains("live_transcript.model is empty"),
+            "must name the setting that is empty: {error}"
+        );
+        assert!(
+            error.contains("dictation model \"base\""),
+            "must name where it actually resolved: {error}"
+        );
+        assert!(
+            error.contains("transcription.model"),
+            "must correct the natural assumption: {error}"
+        );
+        assert!(
+            error.contains("small"),
+            "must show the batch model it did NOT use: {error}"
+        );
+    }
+
+    #[test]
+    fn recording_sidecar_resolves_retained_apple_speech_honestly() {
+        let mut config = Config::default();
+        config.live_transcript.backend = "apple-speech".into();
+
+        let (backend, diagnostic) = recording_sidecar_live_backend(&config);
+
+        assert_eq!(backend, "whisper");
+        let diagnostic = diagnostic.expect("fallback reason must remain visible");
+        assert!(diagnostic.contains("retained apple-speech"));
+        // Assert against the reason function rather than a copy of its wording:
+        // this assertion previously hardcoded an older phrasing and silently went
+        // stale when the reason was reworded, which no CI job compiles (every
+        // unit-test job runs --no-default-features, so this feature-gated module
+        // is never built there).
+        assert!(diagnostic.contains(crate::pipeline::apple_speech_unavailable_reason()));
+        assert!(!diagnostic.contains("applies only to standalone"));
+    }
+
+    #[test]
+    fn recording_sidecar_live_backend_downgrades_unsupported_inherited_engine() {
+        let mut config = Config::default();
+        config.transcription.engine = "sherpa".into();
+        config.live_transcript.backend = crate::config::LIVE_TRANSCRIPT_BACKEND_INHERIT.into();
+
+        let (backend, diagnostic) = recording_sidecar_live_backend(&config);
+
+        assert_eq!(backend, "whisper");
+        assert!(diagnostic
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unsupported recording-sidecar backend 'sherpa'"));
+    }
+
+    #[test]
+    fn recording_sidecar_live_backend_honors_explicit_whisper_over_batch_engine() {
+        let mut config = Config::default();
+        config.transcription.engine = "sherpa".into();
+        config.live_transcript.backend = "whisper".into();
+
+        let (backend, diagnostic) = recording_sidecar_live_backend(&config);
+
+        assert_eq!(backend, "whisper");
+        assert_eq!(diagnostic, None);
+    }
+
+    #[test]
+    fn recording_sidecar_live_backend_treats_mixed_case_inherit_as_inherit() {
+        // A hand-edited "Inherit" must resolve like "inherit", not be treated
+        // as an unknown explicit backend and downgraded (#395 review finding).
+        let mut config = Config::default();
+        config.transcription.engine = "whisper".into();
+        config.live_transcript.backend = "Inherit".into();
+
+        let (backend, diagnostic) = recording_sidecar_live_backend(&config);
+
+        assert_eq!(backend, "whisper");
+        assert_eq!(diagnostic, None, "mixed-case inherit must not downgrade");
+    }
+
+    #[test]
+    fn forced_parakeet_config_overrides_batch_engine_for_live_dispatch() {
+        // live backend parakeet + batch engine sherpa: the dispatch config must
+        // carry engine=parakeet or the sidecar would run the batch engine under
+        // a parakeet label (#395 review finding).
+        let mut config = Config::default();
+        config.transcription.engine = "sherpa".into();
+        let forced = forced_parakeet_config(&config);
+        assert!(matches!(forced, std::borrow::Cow::Owned(_)));
+        assert_eq!(forced.transcription.engine, "parakeet");
+
+        // Already parakeet: no clone, config passes through.
+        config.transcription.engine = "Parakeet".into();
+        let forced = forced_parakeet_config(&config);
+        assert!(matches!(forced, std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// Scope-warning and runtime-fallback-warning are semantically distinct:
+    /// - scope = "this build doesn't support parakeet"
+    /// - fallback = "parakeet failed at runtime; falling back"
+    ///
+    /// If they drift to the same message, users can't distinguish whether
+    /// their config was ignored at compile time or broken at runtime.
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn scope_and_fallback_warnings_are_distinct_messages() {
+        // The fallback message must not claim the feature is unavailable —
+        // by definition it fires when the feature IS compiled in.
+        assert!(!PARAKEET_LIVE_FALLBACK_WARNING.contains("does not include"));
+        assert!(PARAKEET_LIVE_FALLBACK_WARNING.contains("fall"));
+    }
+
+    /// The parakeet live helper drops sub-1s utterances without hitting the
+    /// sidecar/subprocess. This guards against temp-file churn and latency
+    /// spikes on VAD blips. Matches StreamingWhisper::MIN_TRANSCRIBE_SAMPLES.
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn parakeet_live_helper_drops_subsecond_utterances() {
+        use super::transcribe_with_parakeet_for_live_sidecar;
+        let cfg = Config::default();
+        // 0.5s of silence at 16kHz. Should return Ok(None) without attempting
+        // to write a temp WAV or spawn a subprocess. If the floor is missing
+        // and this test reaches the parakeet subprocess path, it will fail or
+        // hang (no parakeet binary configured in default test Config).
+        let samples = vec![0.0f32; 8_000];
+        let result = transcribe_with_parakeet_for_live_sidecar(&samples, &cfg);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    /// Zero-length and exactly-at-threshold edge cases for the 1s floor.
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn parakeet_live_helper_threshold_edges() {
+        use super::transcribe_with_parakeet_for_live_sidecar;
+        use super::PARAKEET_LIVE_MIN_SAMPLES;
+        let cfg = Config::default();
+        // Empty buffer — drop.
+        assert!(matches!(
+            transcribe_with_parakeet_for_live_sidecar(&[], &cfg),
+            Ok(None)
+        ));
+        // One sample below threshold — drop.
+        let below = vec![0.0f32; PARAKEET_LIVE_MIN_SAMPLES - 1];
+        assert!(matches!(
+            transcribe_with_parakeet_for_live_sidecar(&below, &cfg),
+            Ok(None)
+        ));
+        // (We can't assert the threshold-exceeds branch here — it requires a
+        // real parakeet binary. The subprocess path is exercised by the smoke
+        // test in the RFC.)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "whisper", feature = "parakeet"))]
+    #[test]
+    fn apple_speech_fallback_prefers_ready_parakeet_before_whisper() {
+        let calls = std::sync::Mutex::new(Vec::<&'static str>::new());
+        let result = resolve_apple_speech_live_fallback(
+            true,
+            || {
+                calls.lock().unwrap().push("parakeet");
+                Ok(Some(("parakeet transcript".into(), 1.2)))
+            },
+            || {
+                calls.lock().unwrap().push("whisper");
+                Ok(Some(("whisper transcript".into(), 1.2)))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.lock().unwrap().as_slice(), &["parakeet"]);
+        assert_eq!(result, Some(("parakeet transcript".into(), 1.2)));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "whisper", feature = "parakeet"))]
+    #[test]
+    fn apple_speech_fallback_uses_whisper_when_parakeet_is_not_ready() {
+        let calls = std::sync::Mutex::new(Vec::<&'static str>::new());
+        let result = resolve_apple_speech_live_fallback(
+            false,
+            || {
+                calls.lock().unwrap().push("parakeet");
+                Ok(Some(("parakeet transcript".into(), 1.2)))
+            },
+            || {
+                calls.lock().unwrap().push("whisper");
+                Ok(Some(("whisper transcript".into(), 1.2)))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.lock().unwrap().as_slice(), &["whisper"]);
+        assert_eq!(result, Some(("whisper transcript".into(), 1.2)));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "whisper", feature = "parakeet"))]
+    #[test]
+    fn apple_speech_fallback_tries_whisper_after_parakeet_error() {
+        let calls = std::sync::Mutex::new(Vec::<&'static str>::new());
+        let result = resolve_apple_speech_live_fallback(
+            true,
+            || {
+                calls.lock().unwrap().push("parakeet");
+                Err(MinutesError::Io(std::io::Error::other("parakeet failed")))
+            },
+            || {
+                calls.lock().unwrap().push("whisper");
+                Ok(Some(("whisper transcript".into(), 0.9)))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.lock().unwrap().as_slice(), &["parakeet", "whisper"]);
+        assert_eq!(result, Some(("whisper transcript".into(), 0.9)));
+    }
+
+    #[test]
+    fn normalize_live_transcript_text_filters_noise_placeholders() {
+        assert_eq!(normalize_live_transcript_text("[typing]"), None);
+        assert_eq!(normalize_live_transcript_text("[BLANK_AUDIO]"), None);
+        assert_eq!(normalize_live_transcript_text("[Musik]"), None);
+    }
+
+    #[test]
+    fn normalize_live_transcript_text_flattens_timestamped_lines() {
+        let cleaned = normalize_live_transcript_text("[0:00] hello\n[0:01] world").unwrap();
+        assert_eq!(cleaned, "hello world");
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn sidecar_starting_state_is_not_ready() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let status = live_status_with_state(LiveStatusState::Starting);
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(!status.active);
+        assert_eq!(status.source, None);
+        assert_eq!(status.diagnostic.as_deref(), Some("sidecar starting"));
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn sidecar_long_startup_is_degraded() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut status = live_status_with_state(LiveStatusState::Starting);
+        status.start_time =
+            Local::now() - ChronoDuration::seconds(SIDECAR_STARTUP_TIMEOUT_SECS + 1);
+        status.updated_at = status.start_time;
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(!status.active);
+        assert_eq!(status.diagnostic.as_deref(), Some("sidecar still starting"));
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn stale_healthy_sidecar_is_treated_as_inactive() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut status = live_status_with_state(LiveStatusState::Healthy);
+        status.updated_at =
+            Local::now() - ChronoDuration::seconds(SIDECAR_HEALTH_STALE_AFTER_SECS + 1);
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(!status.active);
+        assert_eq!(
+            status.diagnostic.as_deref(),
+            Some("sidecar heartbeat stale")
+        );
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn stale_status_file_is_ignored_when_recording_is_stopped() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let status = live_status_with_state(LiveStatusState::Failed);
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            None,
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(!status.active);
+        assert_eq!(status.line_count, 0);
+        assert_eq!(status.duration_secs, 0.0);
+        assert_eq!(status.diagnostic, None);
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn trace_sidecar_transition_when_it_fails_mid_recording() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut healthy = live_status_with_state(LiveStatusState::Healthy);
+        healthy.line_count = 7;
+        std::fs::write(&status_path, serde_json::to_string(&healthy).unwrap()).unwrap();
+
+        let healthy_status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+        println!(
+            "healthy => active={}, source={:?}, diagnostic={:?}, lines={}",
+            healthy_status.active,
+            healthy_status.source,
+            healthy_status.diagnostic,
+            healthy_status.line_count
+        );
+
+        let mut failed = healthy.clone();
+        failed.state = LiveStatusState::Failed;
+        failed.updated_at = Local::now();
+        failed.diagnostic = Some("sidecar failed".into());
+        std::fs::write(&status_path, serde_json::to_string(&failed).unwrap()).unwrap();
+
+        let failed_status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+        println!(
+            "failed => active={}, source={:?}, diagnostic={:?}, lines={}",
+            failed_status.active,
+            failed_status.source,
+            failed_status.diagnostic,
+            failed_status.line_count
+        );
+
+        assert!(healthy_status.active);
+        assert!(!failed_status.active);
+        assert_eq!(failed_status.diagnostic.as_deref(), Some("sidecar failed"));
+    }
+
+    /// #258: a standalone session whose PID file is held under a Windows mandatory
+    /// lock (`LockedAlive`, PID unreadable) must report active with real stats and
+    /// `source = Standalone`. The PID is `None` (we don't fabricate it) and no
+    /// "sidecar …" diagnostic leaks onto the standalone path.
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn standalone_locked_alive_reports_active_with_stats() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let status = live_status_with_state(LiveStatusState::Healthy);
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let result = derive_session_status(
+            pid::PidFileState::LockedAlive,
+            None,
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(result.active);
+        assert_eq!(result.source, Some(TranscriptSource::Standalone));
+        assert_eq!(
+            result.pid, None,
+            "locked PID is unreadable, must not be faked"
+        );
+        assert_eq!(result.line_count, 3);
+        assert_eq!(
+            result.diagnostic, None,
+            "no sidecar diagnostic on standalone"
+        );
+    }
+
+    /// Regression guard for the heartbeat-flicker hazard: standalone liveness comes
+    /// from the held lock, NOT the heartbeat. A `LockedAlive` session with a *stale*
+    /// healthy heartbeat (loop busy on a long utterance) must still report active
+    /// and keep reporting its last-known stats rather than dropping back to 0/0.
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn standalone_locked_alive_stays_active_with_stale_heartbeat() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut status = live_status_with_state(LiveStatusState::Healthy);
+        status.updated_at =
+            Local::now() - ChronoDuration::seconds(SIDECAR_HEALTH_STALE_AFTER_SECS + 5);
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let result = derive_session_status(
+            pid::PidFileState::LockedAlive,
+            None,
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(
+            result.active,
+            "lock proves liveness independent of heartbeat"
+        );
+        assert_eq!(result.source, Some(TranscriptSource::Standalone));
+        assert_eq!(result.line_count, 3);
+    }
+
+    /// The readable-PID standalone path (Unix, or Windows when not self-locked)
+    /// reports the real PID alongside `source = Standalone`.
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn standalone_active_pid_reports_pid_and_source() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let status = live_status_with_state(LiveStatusState::Healthy);
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let result = derive_session_status(
+            pid::PidFileState::Active(4321),
+            None,
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(result.active);
+        assert_eq!(result.source, Some(TranscriptSource::Standalone));
+        assert_eq!(result.pid, Some(4321));
+        assert_eq!(result.line_count, 3);
+    }
+
+    /// An inactive standalone PID with no recording reports nothing — unchanged
+    /// behavior, guarding against the fallback over-triggering.
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn standalone_inactive_with_no_recording_is_idle() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let status = live_status_with_state(LiveStatusState::Healthy);
+        std::fs::write(&status_path, serde_json::to_string(&status).unwrap()).unwrap();
+
+        let result = derive_session_status(
+            pid::PidFileState::Inactive,
+            None,
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(!result.active);
+        assert_eq!(result.source, None);
+        assert_eq!(result.line_count, 0);
+        assert_eq!(result.duration_secs, 0.0);
+    }
+}

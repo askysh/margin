@@ -11,7 +11,7 @@ import { APP_NAME, DEVICE, hasSystemAudioPermission, keys, OS_NAME } from "../pl
 
 export function VoicesSection({ voices, setVoices, notify }: SettingsView) {
   const forget = async (slug: string, name: string) => {
-    const sure = await ask(`Margin stops labelling ${name} by voice in new meetings. Meetings that already name ${name} stay as they are.`, {
+    const sure = await ask(`Margin stops labeling ${name} by voice in new meetings. Meetings that already name ${name} stay as they are.`, {
       title: `Forget ${name}'s voice?`,
       kind: "warning",
       okLabel: "Forget",
@@ -28,17 +28,17 @@ export function VoicesSection({ voices, setVoices, notify }: SettingsView) {
   };
   return (
     <>
-      <SectionHead title="Voices" about="People Margin recognises by voice and labels by name in new meetings." />
+      <SectionHead title="Voices" about="People Margin recognizes by voice and labels by name in new meetings." />
       {voices.length === 0 ? (
         <Card>
           <p className="set-empty">
-            <strong>No voices yet.</strong> Rename a speaker in a meeting and keep “Recognise this voice” checked.
+            <strong>No voices yet.</strong> Rename a speaker in a meeting and keep “Recognize this voice” checked.
             Margin then labels that person in later meetings.
           </p>
         </Card>
       ) : (
-        <Card title="Voices Margin recognises">
-          <ul className="set-list" aria-label="Voices Margin recognises">
+        <Card title="Voices Margin recognizes">
+          <ul className="set-list" aria-label="Voices Margin recognizes">
             {voices.map((v) => (
               <li key={v.slug}>
                 <Row title={v.name} help={`${v.samples} sample${v.samples === 1 ? "" : "s"}`}>

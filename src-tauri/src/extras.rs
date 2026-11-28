@@ -30,6 +30,7 @@ pub fn fill(mut s: AppSettings) -> AppSettings {
     s.summary_instructions = Some(summary_instructions());
     s.open_at_login = Some(open_at_login());
     s.rolling_transcription = Some(crate::rolling::pref());
+    s.ollama_fast = Some(!crate::prefs::load().ollama_thinking);
     s
 }
 
@@ -47,6 +48,11 @@ pub fn apply(s: &AppSettings) -> Result<(), String> {
     if let Some(on) = s.rolling_transcription {
         crate::rolling::set_pref(on)?;
     }
+    if let Some(fast) = s.ollama_fast {
+        let mut p = crate::prefs::load();
+        p.ollama_thinking = !fast;
+        crate::prefs::save(&p)?;
+    }
     Ok(())
 }
 
@@ -60,16 +66,29 @@ pub fn use_state_cwd() {
 
 // ---------------------------------------------------------------- vocabulary
 
+/// Core's `vocabulary::default_path()` once `paths::install_env` points `MINUTES_HOME` at the
+/// state directory. Named here so a process that never set it (a unit test, every
+/// `corecfg::load`) reads Margin's list, not the shared `~/.minutes` one.
+fn vocabulary_path() -> PathBuf {
+    paths::state_dir().join("vocabulary.toml")
+}
+
 /// The terms you typed in Settings. Entries that core or the upstream app added for other
 /// reasons (a speaker confirmation, an import) are not shown and are never removed.
 pub fn vocabulary_terms() -> Vec<String> {
-    vocabulary::load()
+    vocabulary::load_at(&vocabulary_path())
         .map(|store| store.entries.into_iter().filter(is_ours).map(|e| e.canonical).collect())
         .unwrap_or_default()
 }
 
+/// Whether core will pass any vocabulary hint to Whisper: every entry counts, not only the
+/// ones typed in Settings, because core's decode hints read the whole store.
+pub fn has_any_vocabulary() -> bool {
+    vocabulary::load_at(&vocabulary_path()).map(|store| !store.entries.is_empty()).unwrap_or(false)
+}
+
 pub fn set_vocabulary(terms: &[String]) -> Result<(), String> {
-    let mut store = vocabulary::load().unwrap_or_else(|error| {
+    let mut store = vocabulary::load_at(&vocabulary_path()).unwrap_or_else(|error| {
         tracing::warn!(%error, "vocabulary unreadable; starting a new one");
         VocabularyStore::empty()
     });
@@ -80,7 +99,7 @@ pub fn set_vocabulary(terms: &[String]) -> Result<(), String> {
         entry.source = VocabularySource::Manual;
         entry
     }));
-    vocabulary::save_at(&vocabulary::default_path(), &store).map_err(|e| format!("Couldn't save the word list: {e}"))
+    vocabulary::save_at(&vocabulary_path(), &store).map_err(|e| format!("Couldn't save the word list: {e}"))
 }
 
 fn is_ours(entry: &VocabularyEntry) -> bool {

@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "id": "capture-mode-parity",
+  "description": "Both capture modes expose the same normalized live assistance trace.",
+  "content_origin": "synthetic",
+  "privacy": {
+    "generation_method": "behavior_first_from_scratch",
+    "source_material": "none",
+    "approved_role_tokens": ["USER", "FACILITATOR"]
+  },
+  "matrix": {
+    "surfaces": ["terminal", "gui"],
+    "capture_modes": ["live", "recording"]
+  },
+  "initial_state": {
+    "user_role": "observer",
+    "posture": "on_demand"
+  },
+  "events": [
+    {
+      "at_ms": 0,
+      "kind": "capture_started",
+      "session_id": "SESSION_A",
+      "payload": {"capture_mode": "live", "capture_session_id": "CAPTURE_A"}
+    },
+    {
+      "at_ms": 40,
+      "kind": "transcript_final",
+      "session_id": "SESSION_A",
+      "payload": {
+        "capture_session_id": "CAPTURE_A",
+        "event_id": "EVENT_A",
+        "speaker": "FACILITATOR",
+        "text": "the agenda is ready for review"
+      }
+    },
+    {
+      "at_ms": 100,
+      "kind": "capture_started",
+      "session_id": "SESSION_B",
+      "payload": {"capture_mode": "recording", "capture_session_id": "CAPTURE_B"}
+    },
+    {
+      "at_ms": 140,
+      "kind": "transcript_final",
+      "session_id": "SESSION_B",
+      "payload": {
+        "capture_session_id": "CAPTURE_B",
+        "event_id": "EVENT_B",
+        "speaker": "FACILITATOR",
+        "text": "the agenda is ready for review"
+      }
+    }
+  ],
+  "expectations": {
+    "ordered_actions": ["attach_live_transcript", "normalize_assistance_trace"],
+    "forbidden_actions": ["treat_recording_as_offline"],
+    "state_equals": {"normalized_live_semantics_equal": true},
+    "required_source_kinds": ["transcript_final"],
+    "required_source_event_ids": ["EVENT_A", "EVENT_B"],
+    "provenance_required": true,
+    "max_unsolicited_messages": 0,
+    "parity_group": "capture-mode-parity"
+  },
+  "execution": {
+    "status": "executable",
+    "target": "core_reducer",
+    "replays": [
+      {
+        "name": "live",
+        "session_id": "SESSION_A",
+        "event_indexes": [0, 1],
+        "expected_reductions": [
+          {"accepted": true, "action_types": ["live_transcript_attached"], "rejection": null},
+          {"accepted": true, "action_types": ["evidence_accepted"], "rejection": null}
+        ],
+        "expected_state": {
+          "scope": "live_capture", "surface": "terminal_sidekick", "phase": "ready",
+          "user_role": {"value": "observer", "revision": 0, "supersedes_revision": null, "source_event_id": null},
+          "posture": "on_demand", "capture_mode": "live", "capture_session_id": "CAPTURE_A",
+          "finalized_meeting_ref": null, "source_policy_generation": 0, "user_generation": 0,
+          "foreground_turn_id": null, "background_run_id": null,
+          "evidence": {"EVENT_A": "transcript_final"}, "speaker_corrections": {}
+        }
+      },
+      {
+        "name": "recording",
+        "session_id": "SESSION_B",
+        "event_indexes": [2, 3],
+        "expected_reductions": [
+          {"accepted": true, "action_types": ["live_transcript_attached"], "rejection": null},
+          {"accepted": true, "action_types": ["evidence_accepted"], "rejection": null}
+        ],
+        "expected_state": {
+          "scope": "live_capture", "surface": "terminal_sidekick", "phase": "ready",
+          "user_role": {"value": "observer", "revision": 0, "supersedes_revision": null, "source_event_id": null},
+          "posture": "on_demand", "capture_mode": "recording", "capture_session_id": "CAPTURE_B",
+          "finalized_meeting_ref": null, "source_policy_generation": 0, "user_generation": 0,
+          "foreground_turn_id": null, "background_run_id": null,
+          "evidence": {"EVENT_B": "transcript_final"}, "speaker_corrections": {}
+        }
+      }
+    ]
+  }
+}

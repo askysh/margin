@@ -1,13 +1,13 @@
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { api, type Settings, type SettingsOptions } from "../api";
+import { api, errorText, type Settings, type SettingsOptions } from "../api";
 import { tildify } from "../util";
 import { DownloadProgress, MODEL_CHOICES } from "./Models";
 import { SummaryChoice } from "./SummaryChoice";
 import { Card, Row, SectionHead, SelectRow, TextRow, ToggleRow, type Choice } from "./SettingsRows";
 import type { SettingsView } from "./Settings";
 import { OneDriveNote } from "./OneDriveNote";
-import { canRecordCalls, DEVICE, GLOBAL_SHORTCUT, hasAppleSpeech, hasGpuSwitch, hasOpenAtLogin, hasRecordingChip, SHOW_IN_FILES, TRAY } from "../platform";
+import { canRecordCalls, DEVICE, GLOBAL_SHORTCUT, hasAppleSpeech, hasGpuSwitch, hasOpenAtLogin, hasRecordingChip, keys, SHOW_IN_FILES, TRAY } from "../platform";
 
 type Save = (patch: Partial<Settings>) => void;
 
@@ -123,9 +123,17 @@ export function RecordingSection({ s, save, options, prefs, changePrefs }: Setti
             onChange={(on) => save({ call_detection: on })}
           />
         )}
+        {canRecordCalls && (
+          <ToggleRow
+            title="Start notes from my calendar"
+            help="When a meeting on your calendar starts, Margin offers Start notes: it opens the call and records it under the meeting's name. Google calendars work once added in System Settings → Internet Accounts."
+            checked={s.calendar_toast ?? false}
+            onChange={(on) => save({ calendar_toast: on })}
+          />
+        )}
         <ToggleRow
           title="Keyboard shortcut in every app"
-          help={<>Start and stop recording from any app with <kbd className="kbd">{GLOBAL_SHORTCUT}</kbd></>}
+          help={<>Start and stop recording from any app with <kbd className="kbd">{GLOBAL_SHORTCUT}</kbd>. Inside Margin, {keys("⌘⇧R and ⌘⇧I work", "Ctrl+Shift+R works")} without this.</>}
           checked={prefs.record_shortcut}
           onChange={(on) => changePrefs({ ...prefs, record_shortcut: on })}
         />
@@ -172,7 +180,7 @@ export function TranscriptionSection({ s, save, options, prefs, changePrefs }: S
               </button>
             ))}
           </div>
-          <DownloadProgress compact key={s.model} />
+          <DownloadProgress compact key={`${s.model}-${s.speaker_model ?? "legacy"}`} />
         </div>
         <RollingToggle s={s} save={save} />
         {hasGpuSwitch && (
@@ -199,10 +207,20 @@ export function TranscriptionSection({ s, save, options, prefs, changePrefs }: S
           checked={s.speaker_separation ?? true}
           onChange={(on) => save({ speaker_separation: on })}
         />
+        {(s.speaker_separation ?? true) && (
+          <SelectRow
+            id="set-speaker-model"
+            label="Speaker model"
+            help="Better tells similar voices apart, about 3 times fewer mix-ups. Slower: 7 min per hour of meeting. 32 MB download."
+            value={s.speaker_model ?? "legacy"}
+            choices={[{ value: "legacy", label: "Standard (faster)" }, { value: "community-1", label: "Better (slower)" }]}
+            onChange={(m) => save({ speaker_model: m })}
+          />
+        )}
         <TextRow
           id="set-vocabulary"
           label="Names and words to spell right"
-          help="One per line: people, products, acronyms. The transcriber gets up to 8 of them as hints."
+          help="One per line: people, products, acronyms. The transcriber gets up to 8 of them as hints. With words here, Margin turns off a setting that otherwise makes transcripts a little more accurate, so add only words it gets wrong."
           placeholder={"Priya Raman\nKubernetes"}
           value={(s.vocabulary ?? []).join("\n")}
           onSave={(text) => save({ vocabulary: text.split("\n") })}
@@ -239,6 +257,14 @@ export function SummariesSection({ s, save, options, backends }: SettingsView) {
 function SummaryOptions({ s, options, save }: { s: Settings; options: SettingsOptions | null; save: Save }) {
   return (
     <Card>
+      {s.summary_engine === "ollama" && (
+        <ToggleRow
+          title="Answer without thinking first"
+          help="Models such as qwen3 think before they answer, and often run past the 2-minute limit for a summary. With this on, they answer at once."
+          checked={s.ollama_fast ?? true}
+          onChange={(on) => save({ ollama_fast: on })}
+        />
+      )}
       <SelectRow
         id="set-summary-language"
         label="Summary language"
@@ -262,4 +288,63 @@ function minutesLabel(m: number): string {
   if (m === 0) return "Never";
   if (m % 60 === 0) return m === 60 ? "After 1 hour" : `After ${m / 60} hours`;
   return `After ${m} minutes`;
+}
+
+const KNOWLEDGE_FORMATS: Choice<"obsidian" | "wiki" | "para">[] = [
+  { value: "obsidian", label: "Obsidian, with [[links]]" },
+  { value: "wiki", label: "Plain Markdown pages" },
+  { value: "para", label: "PARA folders" },
+];
+
+export function KnowledgeSection({ s, save, notify }: SettingsView) {
+  const chooseFolder = async () => {
+    const chosen = await open({ directory: true, multiple: false, title: "Choose a folder for the knowledge wiki", defaultPath: s.knowledge_path || s.output_dir });
+    if (typeof chosen === "string") save({ knowledge_path: chosen });
+  };
+  const useDesk = async () => {
+    try {
+      const found = await api.deskCommand();
+      if (found) save({ post_record: found });
+    } catch (e) {
+      notify(errorText(e), "error");
+    }
+  };
+  return (
+    <>
+      <SectionHead title="Knowledge" about="What Margin keeps from each meeting beyond the meeting itself." />
+      <Card title="Knowledge wiki" note="Facts come from each meeting's people and, when Margin writes a summary, its decisions and action items. No model writes the wiki itself, so it holds nothing that is not in a meeting.">
+        <Row title="Wiki folder" help={s.knowledge_path ? <span className="path">{tildify(s.knowledge_path)}</span> : "Not chosen"}>
+          {s.knowledge_path && <button className="btn btn-quiet" onClick={() => api.reveal(s.knowledge_path!)}>{SHOW_IN_FILES}</button>}
+          <button className="btn btn-quiet" onClick={chooseFolder}>Choose…</button>
+        </Row>
+        <SelectRow
+          id="set-knowledge-format"
+          label="Format"
+          value={s.knowledge_adapter ?? "wiki"}
+          choices={KNOWLEDGE_FORMATS}
+          onChange={(a) => save({ knowledge_adapter: a })}
+        />
+        <ToggleRow
+          title="Update the wiki after each meeting"
+          help={s.knowledge_path ? "Adds a page for each person and a dated log entry for each meeting." : "Choose a wiki folder first."}
+          checked={s.knowledge_enabled ?? false}
+          disabled={!s.knowledge_path}
+          onChange={(on) => save({ knowledge_enabled: on })}
+        />
+      </Card>
+      <Card title="After each meeting">
+        <TextRow
+          id="set-post-record"
+          label="Run this command"
+          help="Margin runs it when a meeting is ready, with the meeting file's path added at the end. Leave it empty to run nothing."
+          placeholder="/path/to/script.sh"
+          value={s.post_record ?? ""}
+          onSave={(text) => save({ post_record: text })}
+        />
+        <Row title="Margin Desk" help="Turns each meeting into tasks, notes pages and a searchable brain on this Mac.">
+          <button className="btn btn-quiet" onClick={useDesk}>Use Margin Desk</button>
+        </Row>
+      </Card>
+    </>
+  );
 }

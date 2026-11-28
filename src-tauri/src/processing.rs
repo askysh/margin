@@ -56,6 +56,14 @@ pub fn run_worker_mode() -> i32 {
     // The meeting opens as soon as the transcript and speakers are done; Margin writes the
     // summary afterwards, in the app (DECISIONS.md D40). A long meeting no longer waits
     // minutes for its summary before you can read it.
+    // The wiki takes decisions and action items from the summary. When Margin writes one
+    // later, it updates the wiki then (summaries.rs), so the worker leaves the wiki alone and
+    // the meeting gets one log entry, not two (D70).
+    // A summary that fails, or a meeting with no speech, still reaches the wiki
+    // (summaries::ingest_without_summary).
+    if crate::summaries::wiki_waits_for_summary(&cfg) {
+        cfg.knowledge.enabled = false;
+    }
     cfg.summarization.engine = "none".into();
     let code = match jobs::process_pending_jobs(&cfg, |job| {
         tracing::info!(id = %job.id, state = ?job.state, "job update");
@@ -348,10 +356,11 @@ pub fn spawn_watcher() {
                     let views = job_views();
                     let mut changed = false;
                     for view in &views {
-                        if last.get(&view.id) != Some(view) {
+                        let previous = last.get(&view.id);
+                        if previous != Some(view) {
                             changed = true;
                             if view.state.is_terminal() {
-                                finish(view, !first);
+                                finish(view, !first && newly_finished(previous.map(|p| p.state), view.state));
                             }
                         }
                     }
@@ -387,8 +396,16 @@ fn change_key(active: &[jobs::ProcessingJob]) -> String {
     )
 }
 
+/// A finished job's view can change again (its title, say), and each change calls
+/// `finish`. Only the change into a terminal state announces, so "Meeting ready" and its
+/// notices come once per run; a retry passes through the active states and announces again.
+fn newly_finished(previous: Option<JobState>, now: JobState) -> bool {
+    now.is_terminal() && !previous.is_some_and(JobState::is_terminal)
+}
+
 /// `announce` is false on the first poll, so old jobs from the archive don't each fire
-/// "meeting-ready". Their leftover drafts are still restored.
+/// "meeting-ready", and false for a job that had already finished (`newly_finished`).
+/// Leftover drafts are still restored.
 fn finish(job: &JobView, announce: bool) {
     if announce && job.state == JobState::Failed {
         events::notify(events::Notice {
@@ -396,6 +413,7 @@ fn finish(job: &JobView, announce: bool) {
             body: "Open Margin to see why and try again.".into(),
             meeting: None,
             call_app: None,
+            calendar: None,
         });
     }
     let Some(output) = job.output_path.as_deref() else {
@@ -413,9 +431,20 @@ fn finish(job: &JobView, announce: bool) {
     restore_notes(job, Path::new(output));
     let _ = std::fs::remove_file(live_draft_path(&job.id));
     let untitled = std::fs::remove_file(untitled_marker(&job.id)).is_ok();
+    // Only a job that just finished: the first poll at launch passes every archived job
+    // here, and the scrub must never rewrite a meeting that was already done.
     if announce {
+        let no_speech = clean_transcript(Path::new(output), untitled);
+        // Before the summary rewrites the file.
+        let fallback_notice = std::fs::read_to_string(output).ok().and_then(|content| model_fallback_notice(output, &content));
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
-        crate::summaries::summarize_in_background(output.to_string(), untitled);
+        if no_speech {
+            tracing::info!("no speech in the meeting; no summary or title is made from nothing");
+            let output = output.to_string();
+            std::thread::spawn(move || crate::summaries::ingest_without_summary(Path::new(&output)));
+        } else {
+            crate::summaries::summarize_in_background(output.to_string(), untitled);
+        }
         // Settings → "Keep audio": a good moment to drop audio that is now too old.
         std::thread::spawn(|| corecfg::audio_cleanup(&corecfg::load()));
         events::notify(events::Notice {
@@ -423,10 +452,58 @@ fn finish(job: &JobView, announce: bool) {
             body: format!("“{}” is transcribed and saved.", job.title.as_deref().unwrap_or("Your meeting")),
             meeting: Some(output.to_string()),
             call_app: None,
+            calendar: None,
         });
+        if let Some(notice) = fallback_notice {
+            events::notify(notice);
+        }
         // A new meeting for the menu bar's recent list.
         events::refresh_tray();
     }
+}
+
+/// Before the summary reads the transcript: remove what Whisper made up (D71, D90), say so
+/// when nothing real is left (D91), and cut a title that core ended with "..." (D92).
+/// Returns true for a meeting with no speech, which gets no summary.
+fn clean_transcript(path: &Path, untitled: bool) -> bool {
+    let removed = library::scrub_prompt_echo(path).unwrap_or_else(|error| {
+        tracing::warn!(%error, "could not check the transcript for lines Whisper made up");
+        0
+    });
+    if removed > 0 {
+        tracing::info!(removed, "removed lines Whisper made up from the transcript");
+    }
+    let no_speech = library::mark_no_speech(path, untitled, removed).unwrap_or_else(|error| {
+        tracing::warn!(%error, "could not check the meeting for speech");
+        false
+    });
+    if let Err(error) = library::tidy_title_in_file(path) {
+        tracing::warn!(%error, "could not cut the title at a word");
+    }
+    no_speech
+}
+
+/// Core transcribed the meeting with a fallback model (its `model_fallback` processing
+/// warning). Margin's size check passes a large file that then fails to load, so only
+/// the meeting file can say which model ran.
+fn model_fallback_notice(output: &str, content: &str) -> Option<events::Notice> {
+    use minutes_core::transcribe::{ModelFallback, ModelUnavailable};
+    let (frontmatter, _) = minutes_core::markdown::split_frontmatter(content);
+    let frontmatter: minutes_core::markdown::Frontmatter = serde_yaml::from_str(frontmatter).ok()?;
+    let fallback = ModelFallback::recorded_in(&frontmatter.processing_warnings)?;
+    let model = if fallback.requested == "hinglish" { "Hindi + English model".to_string() } else { format!("The {} model", fallback.requested) };
+    let what = match fallback.cause {
+        ModelUnavailable::FailedToLoad => "failed to load",
+        ModelUnavailable::Missing => "file was missing",
+        ModelUnavailable::Empty => "file was empty",
+    };
+    Some(events::Notice {
+        title: format!("{model} {what}"),
+        body: format!("This meeting used {}.", fallback.used),
+        meeting: Some(output.to_string()),
+        call_app: None,
+        calendar: None,
+    })
 }
 
 /// Put the notes draft (the exact notes, with edits made during processing) into the
@@ -480,6 +557,29 @@ fn core_wrote_these_notes(written: &str, queued: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_finished_job_is_announced_once_per_run() {
+        use minutes_core::jobs::JobState::{Complete, Failed, NeedsReview, Queued, Transcribing};
+        assert!(super::newly_finished(Some(Transcribing), Complete));
+        assert!(super::newly_finished(None, Complete), "finished between two polls");
+        assert!(!super::newly_finished(Some(Complete), Complete), "a retitle is not a new meeting");
+        assert!(!super::newly_finished(Some(Complete), NeedsReview));
+        assert!(!super::newly_finished(Some(Failed), Failed));
+        assert!(super::newly_finished(Some(Queued), Complete), "a retry announces again");
+        assert!(!super::newly_finished(Some(Complete), Queued));
+    }
+
+    #[test]
+    fn a_fallback_model_is_announced_from_the_meeting_file() {
+        let file = "---\ntitle: Standup\ntype: meeting\ndate: 2026-11-27T10:00:00+05:30\nduration: 5m\nstatus: degraded\nprocessing_warnings:\n  - step: transcribe\n    reason: model_fallback\n    message: used large-v3-turbo because hinglish failed to load\n---\n\n## Transcript\n\nHello.\n";
+        let notice = super::model_fallback_notice("/m/standup.md", file).expect("a notice");
+        assert_eq!(notice.title, "Hindi + English model failed to load");
+        assert_eq!(notice.body, "This meeting used large-v3-turbo.");
+        assert_eq!(notice.meeting.as_deref(), Some("/m/standup.md"));
+        let plain = file.replace("reason: model_fallback", "reason: summarize_failed");
+        assert!(super::model_fallback_notice("/m/standup.md", &plain).is_none());
+    }
+
     #[test]
     fn quit_message_names_the_meeting() {
         let one = super::quit_message(&[Some("Weekly".into())]);
@@ -539,6 +639,30 @@ mod tests {
         assert!(at(&JobTimes::of(&failed).recording_finished_at, "2026-11-10T12:24:03+05:30"));
         let active = job(serde_json::json!({ "state": "transcribing", "started_at": "2026-11-10T12:24:10+05:30" }));
         assert_eq!(JobTimes::of(&active), JobTimes::default());
+    }
+
+    #[test]
+    fn a_launch_poll_leaves_an_old_meeting_file_alone() {
+        let dir = std::env::temp_dir().join(format!("margin-launch-poll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("old.md");
+        // What the scrub would change in a new meeting: a cut title, a silence phrase.
+        let old = "---\ntitle: I Have Kept People in Love, I Am Giving You a Split in Ca...\ntype: meeting\ndate: 2026-11-20T10:00:00+05:30\nduration: 5m\nstatus: complete\n---\n\n## Transcript\n\n[SPEAKER_1 0:00] [SYSTEM] Продолжение следует...\n";
+        std::fs::write(&file, old).unwrap();
+        let view = JobView {
+            id: "launch-poll-old".into(),
+            title: None,
+            state: JobState::Complete,
+            stage: None,
+            output_path: Some(file.display().to_string()),
+            created_at: "2026-11-20T10:05:00+05:30".into(),
+            error: None,
+            draft: None,
+            times: JobTimes::default(),
+        };
+        finish(&view, false);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), old);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

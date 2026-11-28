@@ -2,6 +2,7 @@
 
 mod applespeech;
 mod audio;
+mod calendar_watch;
 mod calldetect;
 mod chat;
 #[cfg(target_os = "macos")]
@@ -26,6 +27,7 @@ mod notepad;
 #[path = "notepad_plain.rs"]
 mod notepad;
 mod notify;
+mod ollama_proxy;
 mod paths;
 mod permissions;
 mod piece_cut;
@@ -127,6 +129,7 @@ fn main() {
             // Windows cannot record a call yet (D61), so it does not suggest one.
             if cfg!(target_os = "macos") {
                 calldetect::spawn();
+                calendar_watch::spawn();
             }
             updater::spawn(&handle);
             Ok(())
@@ -159,6 +162,8 @@ fn main() {
             commands::tauri_cmds::save_app_prefs,
             commands::tauri_cmds::folder_choices,
             commands::tauri_cmds::folder_in_onedrive,
+            commands::tauri_cmds::start_calendar_notes,
+            commands::tauri_cmds::desk_command,
             commands::tauri_cmds::complete_onboarding,
             commands::tauri_cmds::models_status,
             commands::tauri_cmds::download_models,

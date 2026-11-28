@@ -43,6 +43,11 @@ pub mod ops {
         let first_save = !corecfg::exists();
         let mut cfg = corecfg::load();
         let before = corecfg::settings(&cfg);
+        // Ask before anything is saved, so the watcher never runs with access still unknown,
+        // and the prompt follows the click that asked for it (D67).
+        if settings.calendar_toast == Some(true) && before.calendar_toast != Some(true) {
+            crate::calendar_watch::request_access()?;
+        }
         corecfg::apply(&mut cfg, &settings)?;
         // Margin keeps this switch in its own prefs (D54). `save` copies it into the config.
         if let Some(on) = settings.hide_from_screen_share {
@@ -235,10 +240,25 @@ pub mod ops {
     }
 
     pub fn start_recording(kind: Kind, title: Option<String>) -> Res<RecorderView> {
-        if !models::ready_to_record(&corecfg::load()) {
-            return Err("The speech models aren't downloaded yet. Open Settings → Transcription.".into());
+        let cfg = corecfg::load();
+        let mut fallback_notice = None;
+        if let Some(file) = models::missing_local_model(&cfg) {
+            if models::local_model_fallback(&cfg).is_none() {
+                return Err(format!("{} has no download. Copy its file to {}, or choose another model in Settings → Transcription.", file.label, file.dest.display()));
+            }
+            // Core transcribes with a fallback and its own language (corecfg pins
+            // missing_model_fallbacks and missing_model_fallback_language).
+            fallback_notice = Some(models::local_model_fallback_notice(&cfg, &file));
+        }
+        if !models::ready_to_record(&cfg) {
+            let missing: Vec<String> = models::required(&cfg).into_iter().filter(|f| !f.installed && !f.live).map(|f| f.label.to_lowercase()).collect();
+            return Err(format!("Margin is still getting the {} model. Open Settings → Transcription to see the download.", missing.join(" and ")));
         }
         let view = recorder().start(kind, title)?;
+        // Once per recording: a refused or failed start says nothing yet.
+        if let Some(notice) = fallback_notice {
+            crate::events::notify(notice);
+        }
         // However the recording started, the window makes room for the call (D53).
         if prefs::load().recording_chip() {
             crate::events::emit(crate::events::SHRINK_TO_CHIP, ());
@@ -279,6 +299,7 @@ pub mod ops {
                     body: e.clone(),
                     meeting: None,
                     call_app: None,
+                    calendar: None,
                 });
                 Err(e)
             }
@@ -352,7 +373,7 @@ pub mod ops {
         Ok(())
     }
 
-    pub fn search_meetings(query: String) -> Res<Vec<library::SearchHit>> {
+    pub fn search_meetings(query: String) -> Res<library::SearchResults> {
         Ok(library::search(&query))
     }
 
@@ -395,7 +416,33 @@ pub mod ops {
         speakers::rename(&p, &label, &name, remember_voice)
     }
 
+    /// The banner's Start notes for a calendar event (calendar_watch.rs).
+    pub fn start_calendar_notes(offer: crate::calendar_watch::Offer) -> Res<()> {
+        crate::calendar_watch::start_notes(&offer)
+    }
+
+    /// The post-record command for Margin Desk when it is installed in the usual place, so
+    /// Settings → Knowledge can fill it in. Node comes from the login shell's PATH, since an
+    /// app opened from Finder has a short PATH.
+    pub fn desk_command() -> Res<Option<String>> {
+        let desk = paths::home().join("margin-desk").join("bin").join("desk.mjs");
+        if !desk.is_file() {
+            return Err("Margin Desk is not in ~/margin-desk. Put it there (see its README), then click this again.".into());
+        }
+        let node = crate::summaries::find_node(&paths::home()).ok_or("Margin can't find Node.js, which Margin Desk needs. Install it (brew install node), then click this again.")?;
+        Ok(Some(format!("{} {} run", corecfg::shell_word(&node), corecfg::shell_word(&desk))))
+    }
+
     pub fn summarize_meeting(path: String) -> Res<()> {
+        summarize_meeting_with(path, false, None)
+    }
+
+    /// `after_processing`: the automatic first summary of a newly finished meeting. Only it
+    /// updates the knowledge wiki (core appends a log entry on every ingest, so Summarize
+    /// again would add a duplicate line), and only it may replace a machine title (D92): a
+    /// title the user typed can match the opening words, and a Summarize they click must not
+    /// rename it. `fallback_title`: the title Stop left on a meeting that had none (D59).
+    pub fn summarize_meeting_with(path: String, after_processing: bool, fallback_title: Option<String>) -> Res<()> {
         let p = PathBuf::from(path);
         library::ensure_inside_output(&p)?;
         processing::ensure_not_processing(&p)?;
@@ -414,8 +461,10 @@ pub mod ops {
             }
         }
         let Some(_running) = summaries::start(&p.display().to_string()) else {
-            return Err("Margin is already writing this meeting's summary.".into());
+            return Err(summaries::ALREADY_WRITING.into());
         };
+        let mut cfg = cfg;
+        let _forwarder = crate::ollama_proxy::fast_ollama(&mut cfg);
         // Hold the file's lock while core rewrites the file, so a title or speaker edit
         // waits for it. Notes typed meanwhile go into a draft (summaries::save_notes).
         let report = crate::fsutil::with_file_lock(&p, || minutes_core::resummarize::resummarize_meeting(
@@ -424,13 +473,13 @@ pub mod ops {
             &minutes_core::resummarize::ResummarizeOptions {
                 apply: true,
                 template_override: extras::summary_template_slug(),
-                refresh: Default::default(),
+                refresh: minutes_core::derived::RefreshOptions { ingest_knowledge: after_processing && cfg.knowledge.enabled },
             },
         ))
         .map_err(|e| {
             if cfg.summarization.engine == "ollama" {
                 format!(
-                    "Ollama didn't finish the summary. Summaries must finish within 2 minutes, and local models that think before answering (such as qwen3) are often slower than that. Try llama3.2 or gemma3, or Claude. ({e})"
+                    "Ollama didn't finish the summary. Summaries must finish within 2 minutes, and local models that think before answering (such as qwen3) are often slower than that. Turn on \u{201c}Answer without thinking first\u{201d} in Settings \u{2192} Summaries, or try llama3.2 or gemma3, or Claude. ({e})"
                 )
             } else {
                 format!("Summary failed: {e}")
@@ -439,6 +488,7 @@ pub mod ops {
         if !report.applied {
             return Err("The summary engine returned nothing. Check that it's running, then try again.".into());
         }
+        summaries::finish_summary(&p, after_processing, fallback_title.as_deref());
         Ok(())
     }
 
@@ -532,6 +582,9 @@ pub fn dispatch(cmd: &str, args: serde_json::Value) -> Res<serde_json::Value> {
         "install_update" => Err("Updates work only in the app.".into()),
         "folder_choices" => out(ops::folder_choices()),
         "folder_in_onedrive" => out(ops::folder_in_onedrive(arg(a, "path")?)),
+        // The bridge must not open links or start recordings from a calendar.
+        "start_calendar_notes" => Err("Calendar notes work only in the app.".into()),
+        "desk_command" => out(ops::desk_command()),
         "complete_onboarding" => out(ops::complete_onboarding()),
         "models_status" => out(ops::models_status()),
         "download_models" => out(ops::download_models()),
@@ -606,6 +659,8 @@ pub mod tauri_cmds {
     cmd!(save_app_prefs(prefs: prefs::AppPrefs) -> prefs::AppPrefs);
     cmd!(folder_choices() -> ops::FolderChoices);
     cmd!(folder_in_onedrive(path: String) -> bool);
+    cmd!(start_calendar_notes(offer: crate::calendar_watch::Offer) -> ());
+    cmd!(desk_command() -> Option<String>);
     cmd!(complete_onboarding() -> ());
     cmd!(models_status() -> Vec<models::ModelFile>);
     cmd!(download_models() -> ());
@@ -629,7 +684,7 @@ pub mod tauri_cmds {
     cmd!(list_meetings() -> Vec<library::MeetingSummary>);
     cmd!(read_meeting(path: String) -> library::MeetingDetail);
     cmd!(save_notes(path: String, notes: String) -> ());
-    cmd!(search_meetings(query: String) -> Vec<library::SearchHit>);
+    cmd!(search_meetings(query: String) -> library::SearchResults);
     cmd!(set_meeting_title(path: String, title: String) -> ());
     cmd!(trash_meeting(path: String) -> ());
     cmd!(reveal_in_finder(path: String) -> ());

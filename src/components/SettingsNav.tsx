@@ -9,6 +9,7 @@ export const SECTIONS = [
   { id: "recording", label: "Recording", group: 0 },
   { id: "transcription", label: "Transcription", group: 0 },
   { id: "summaries", label: "Summaries", group: 0 },
+  { id: "knowledge", label: "Knowledge", group: 0 },
   { id: "voices", label: "Voices", group: 0 },
   { id: "permissions", label: "Permissions", group: 1 },
   { id: "integrations", label: "Integrations", group: 1 },

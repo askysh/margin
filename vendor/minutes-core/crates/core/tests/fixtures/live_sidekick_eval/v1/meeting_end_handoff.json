@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "id": "meeting-end-handoff",
+  "description": "Meeting end stops monitoring and reports processing without claiming a final artifact.",
+  "content_origin": "synthetic",
+  "privacy": {
+    "generation_method": "behavior_first_from_scratch",
+    "source_material": "none",
+    "approved_role_tokens": ["USER", "FACILITATOR"]
+  },
+  "matrix": {
+    "surfaces": ["terminal", "gui"],
+    "capture_modes": ["live", "recording"]
+  },
+  "initial_state": {
+    "user_role": "participant",
+    "posture": "decision_tracker"
+  },
+  "events": [
+    {
+      "at_ms": 0,
+      "kind": "capture_started",
+      "session_id": "SESSION_A",
+      "payload": {"capture_mode": "recording", "capture_session_id": "CAPTURE_A"}
+    },
+    {
+      "at_ms": 10,
+      "kind": "capture_stopped",
+      "session_id": "SESSION_A",
+      "payload": {"capture_session_id": "CAPTURE_A", "final_live_event_id": "EVENT_A"}
+    },
+    {
+      "at_ms": 20,
+      "kind": "processing_started",
+      "session_id": "SESSION_A",
+      "payload": {"capture_session_id": "CAPTURE_A", "stage": "transcribing"}
+    },
+    {
+      "at_ms": 30,
+      "kind": "user_message",
+      "session_id": "SESSION_A",
+      "payload": {"turn_id": "FOREGROUND_A", "source_event_id": "USER_EVENT_A", "text": "is the final debrief ready"}
+    }
+  ],
+  "expectations": {
+    "ordered_actions": ["stop_live_monitoring", "report_processing_state", "defer_final_debrief"],
+    "forbidden_actions": ["claim_final_artifact_ready", "continue_background_monitoring"],
+    "state_equals": {"phase": "processing", "live_monitoring": false},
+    "required_source_kinds": ["user_statement"],
+    "required_source_event_ids": ["EVENT_A"],
+    "provenance_required": true,
+    "max_unsolicited_messages": 1,
+    "parity_group": "meeting-end-handoff"
+  },
+  "execution": {
+    "status": "executable_projection",
+    "target": "core_reducer",
+    "deferred_assertions": ["defer_final_debrief_until_finalized_artifact"],
+    "replays": [
+      {
+        "name": "lifecycle-to-processing",
+        "session_id": "SESSION_A",
+        "event_indexes": [0, 1, 2],
+        "expected_reductions": [
+          {"accepted": true, "action_types": ["live_transcript_attached"], "rejection": null},
+          {"accepted": true, "action_types": ["meeting_ended"], "rejection": null},
+          {"accepted": true, "action_types": ["final_transcript_processing"], "rejection": null}
+        ],
+        "expected_state": {
+          "scope": "live_capture", "surface": "terminal_sidekick", "phase": "processing",
+          "user_role": {"value": "participant", "revision": 0, "supersedes_revision": null, "source_event_id": null},
+          "posture": "decision_tracker", "capture_mode": "recording", "capture_session_id": "CAPTURE_A",
+          "finalized_meeting_ref": null, "source_policy_generation": 0, "user_generation": 0,
+          "foreground_turn_id": null, "background_run_id": null,
+          "evidence": {}, "speaker_corrections": {}
+        }
+      }
+    ]
+  }
+}

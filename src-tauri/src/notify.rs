@@ -14,15 +14,22 @@ use tauri_plugin_notification::{Action, ActionPerformed, ActionType, Notificatio
 
 const CALL_ACTIONS: &str = "margin-call";
 const RECORD: &str = "record";
+const CALENDAR_ACTIONS: &str = "margin-calendar";
+const START_NOTES: &str = "start-notes";
 
 static NEXT_ID: AtomicI32 = AtomicI32::new(1);
 static SHOWN: Mutex<Option<HashMap<i32, Notice>>> = Mutex::new(None);
 
 pub fn init(app: &AppHandle) {
     let n = app.notification();
-    let _ = n.register_action_types(vec![ActionType::builder(CALL_ACTIONS)
-        .actions(vec![Action::builder(RECORD, "Record call").foreground(true).build()])
-        .build()]);
+    let _ = n.register_action_types(vec![
+        ActionType::builder(CALL_ACTIONS)
+            .actions(vec![Action::builder(RECORD, "Record call").foreground(true).build()])
+            .build(),
+        ActionType::builder(CALENDAR_ACTIONS)
+            .actions(vec![Action::builder(START_NOTES, "Start notes").foreground(true).build()])
+            .build(),
+    ]);
     let handle = app.clone();
     let _ = n.on_action(move |performed| clicked(&handle, performed));
 }
@@ -38,6 +45,8 @@ pub fn show(app: &AppHandle, notice: Notice) {
     let mut builder = app.notification().builder().id(id).title(&notice.title).body(&notice.body);
     if notice.call_app.is_some() {
         builder = builder.action_type_id(CALL_ACTIONS);
+    } else if notice.calendar.is_some() {
+        builder = builder.action_type_id(CALENDAR_ACTIONS);
     }
     SHOWN.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, notice);
     if let Err(error) = builder.show() {
@@ -51,6 +60,21 @@ fn clicked(app: &AppHandle, performed: &ActionPerformed) {
         .and_then(|n| SHOWN.lock().unwrap().as_mut()?.remove(&n.id()));
     match notice {
         Some(Notice { call_app: Some(_), .. }) if performed.action_id() == RECORD => tray::start_outside(app, Kind::Call),
+        // Only Start notes records (D67). A click on the body opens the window, where the
+        // banner still offers it.
+        Some(Notice { calendar: Some(offer), .. }) if performed.action_id() == START_NOTES => {
+            let chip = crate::prefs::load().recording_chip();
+            if !chip {
+                tray::show_main(app);
+            }
+            let app = app.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = crate::calendar_watch::start_notes(&offer) {
+                    tray::show_main(&app);
+                    events::emit("error-toast", error);
+                }
+            });
+        }
         Some(Notice { meeting: Some(path), .. }) => {
             tray::show_main(app);
             events::emit("open-meeting", path);

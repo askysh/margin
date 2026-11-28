@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 /** The title block of a settings section: a name and one line about what it holds. */
 export function SectionHead({ title, about, danger }: { title: string; about?: string; danger?: boolean }) {
@@ -85,17 +85,36 @@ export function SelectRow<T extends string | number>({ id, label, help, value, c
   );
 }
 
-/** A labelled text area under its label, saved when it loses focus. */
+/** A labelled text area under its label, saved when it loses focus. `onSave` may answer with
+ * the reason the text was refused: the text then stays in the box, marked invalid, so it can
+ * be fixed rather than retyped. */
 export function TextRow({ id, label, help, value, placeholder, onSave }: {
   id: string;
   label: string;
   help: string;
   value: string;
   placeholder?: string;
-  onSave: (text: string) => void;
+  onSave: (text: string) => void | Promise<string | null>;
 }) {
   const [draft, setDraft] = useState(value);
-  useEffect(() => setDraft(value), [value]);
+  const [refused, setRefused] = useState<string | null>(null);
+  // A refused save sets the value to the draft and then back; the box must not follow it back.
+  const attempt = useRef<{ text: string; base: string } | null>(null);
+  useEffect(() => {
+    const own = attempt.current;
+    if (own && (value === own.text || value === own.base)) return;
+    attempt.current = null;
+    setDraft(value);
+    setRefused(null);
+  }, [value]);
+
+  const save = async () => {
+    if (draft === value) return;
+    attempt.current = { text: draft, base: value };
+    const reason = (await onSave(draft)) ?? null;
+    if (reason === null) attempt.current = null;
+    setRefused(reason);
+  };
   return (
     <div className="set-row set-row-stacked">
       <span className="set-row-text">
@@ -104,15 +123,17 @@ export function TextRow({ id, label, help, value, placeholder, onSave }: {
       </span>
       <textarea
         id={id}
-        aria-describedby={`${id}-help`}
+        aria-describedby={refused ? `${id}-help ${id}-error` : `${id}-help`}
+        aria-invalid={refused ? true : undefined}
         className="field"
         rows={3}
         value={draft}
         placeholder={placeholder}
         spellCheck={false}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => draft !== value && onSave(draft)}
+        onChange={(e) => { setDraft(e.target.value); setRefused(null); }}
+        onBlur={save}
       />
+      {refused && <span className="set-error" id={`${id}-error`} role="alert">Not saved: {refused}</span>}
     </div>
   );
 }

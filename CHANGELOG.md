@@ -5,6 +5,70 @@ All notable changes to Margin are in this file. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Decision numbers (D1, D2 and so
 on) point to [DECISIONS.md](DECISIONS.md).
 
+## [Unreleased]
+
+### Added
+
+- *Start notes from my calendar* in Settings → Recording. When an event with a call link or
+  two or more people starts, Margin offers Start notes, in a banner and in a notification.
+  It opens the call and records it under the event's title. Margin asks to read the
+  calendar when you turn it on. Meetings then get the event's title and attendees (D67).
+- A warning when the microphone records nothing. Thirty seconds into a recording, Margin
+  checks the microphone track and says so when it is silent, for example with a
+  Bluetooth headset that a call app holds (D68).
+- *Answer without thinking first* in Settings → Summaries, for Ollama. Models such as
+  qwen3 now finish a summary inside the 2-minute limit. On by default (D69).
+- Settings → Knowledge: keep core's knowledge wiki after each meeting, with the meeting's
+  people and, when Margin writes a summary, its decisions and action items. No model
+  writes the wiki. Also a command to run after each meeting, with *Use Margin Desk* (D70).
+- *Speaker model* in Settings → Transcription: *Better* tells similar voices apart. In a
+  test with four people it found all four and gave a third as many wrong speaker labels,
+  and it takes about 7 minutes per hour of meeting instead of 2 (D72).
+
+### Fixed
+- The "microphone is silent" warning now says Margin hasn't heard the microphone *yet*, keeps checking, and disappears as soon as the microphone is heard, so a Bluetooth headset that stays silent until you speak no longer leaves a false alarm.
+- The calendar helper is built from the vendored core, so a build no longer needs cargo's cached git checkout.
+
+- *Use Margin Desk* wrote a command that broke when Node or Margin Desk sat in a folder with
+  a space in its name, such as `C:\Program Files\nodejs`. Both paths are quoted now (D70).
+- With summaries on, a meeting whose summary failed never reached the knowledge wiki. It
+  now goes in without the summary's decisions and action items (D70).
+- *Summarize again* could replace a title you typed when it matched the first words
+  spoken. Only the automatic first summary of a new meeting names it now (D92).
+- Words in Settings → *Names and words to spell right* never reached Whisper: the measured
+  "no text conditioning" setting also drops Whisper's prompt. It now applies only while
+  the word list is empty (D82).
+- Margin rewrote finished meetings at every launch: the silence scrub ran again on each
+  meeting it had already processed. It now runs only on a meeting that just finished (D90).
+- The silence scrub deleted real speech: a line that merely contained "Thank you for
+  listening", several lines in Russian, or a Hindi sentence in an English meeting. A
+  phrase must now be the whole line, Indic scripts are never removed, and at most one short
+  stray line in another script goes. Every removed line is kept in a hidden
+  `.<meeting>.scrubbed.txt` beside the meeting (D90).
+- Notes typed after Settings, or after *Change microphone*, during a recording were lost.
+  The notes now take the keyboard back, and a letter typed with nothing focused goes to them
+  (D73).
+- A refused *Run this command* stays in the box, marked invalid, instead of being cleared
+  (D75).
+- A speaker core could not match shows as *Unknown speaker*, not "UNKNOWN" (D76).
+- Setup now offers *Start notes from my calendar* and points to Margin Desk in Settings →
+  Knowledge. Setup and Settings say that ⌘⇧R works in Margin and ⌃⌥⌘R in any app (D74).
+- Ask says that it always uses Claude Code, whatever the summary engine is (D77).
+- Folders show `~` for the home folder wherever it is (D78).
+- The sidebar says *Showing results for "…"* when search used a corrected spelling (D79).
+- Lines that Whisper made up from its own prompt during room noise, such as "Preserve
+  spelling exactly when heard", no longer appear in the transcript (D71).
+- Lines that Whisper makes up on silence, such as "Продолжение следует..." or "Thanks for
+  watching", are removed from the transcript. A recording with nothing real left is marked
+  *no speech* and named "No speech recorded", instead of getting an invented title and
+  summary (D90, D91).
+- Meeting titles no longer end with "...": they are cut at a word. A meeting named from the
+  first words spoken is renamed from its summary, also after *Summarize again*, unless it
+  came from your calendar or you named it (D92).
+- Search finds "warranty" for "warrnty": when nothing matches, it looks for the closest word
+  in your meetings and says what it searched for (D93).
+- A summary no longer opens with "Based on the transcript provided, here is..." (D94).
+
 ## [0.0.11] - 2026-11-17
 
 ### Added

@@ -3,7 +3,7 @@ import { api, errorText, type AppPrefs, type Backends, type Boot, type Permissio
 import { withoutPatch } from "../util";
 import type { SectionId } from "./SettingsNav";
 import { ResetDialog } from "./ResetDialog";
-import { GeneralSection, RecordingSection, SummariesSection, TranscriptionSection } from "./SettingsSections";
+import { GeneralSection, KnowledgeSection, RecordingSection, SummariesSection, TranscriptionSection } from "./SettingsSections";
 import { AboutSection, IntegrationsSection, PermissionsSection, ResetSection, UpdatesSection, VoicesSection } from "./SettingsMore";
 
 export { SettingsNav } from "./SettingsNav";
@@ -22,11 +22,12 @@ interface Props {
   onReset: () => void;
   onResetBusy: (busy: boolean) => void;
   notify: Notify;
+  dismissToast: (text: string) => void;
 }
 
 /** The Settings page: one section at a time, all sharing one settings state and save queue. */
-export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetBusy, notify }: Props) {
-  const ctx = useSettingsState(boot, onSaved, notify);
+export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetBusy, notify, dismissToast }: Props) {
+  const ctx = useSettingsState(boot, onSaved, notify, dismissToast);
   const [resetOpen, setResetOpen] = useState(false);
   // WebKit doesn't focus a clicked button, so the opener comes from the click itself.
   const resetOpener = useRef<HTMLElement | null>(null);
@@ -56,6 +57,7 @@ export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetB
           {section === "recording" && <RecordingSection {...view} />}
           {section === "transcription" && <TranscriptionSection {...view} />}
           {section === "summaries" && <SummariesSection {...view} />}
+          {section === "knowledge" && <KnowledgeSection {...view} />}
           {section === "voices" && <VoicesSection {...view} />}
           {section === "permissions" && <PermissionsSection {...view} />}
           {section === "integrations" && <IntegrationsSection {...view} />}
@@ -72,7 +74,7 @@ export function SettingsPage({ boot, section, onBack, onSaved, onReset, onResetB
 export type SettingsView = ReturnType<typeof useSettingsState> & { boot: Boot; notify: Notify; openReset: (from: HTMLElement) => void };
 
 /** Everything the sections read and change, loaded once when Settings opens. */
-function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: Notify) {
+function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: Notify, dismissToast: (text: string) => void) {
   const [s, setS] = useState<Settings>(boot.settings);
   const [backends, setBackends] = useState<Backends | null>(null);
   const [perms, setPerms] = useState<Permissions | null>(null);
@@ -100,41 +102,56 @@ function useSettingsState(boot: Boot, onSaved: (s: Settings) => void, notify: No
   const confirmed = useRef<Settings>(boot.settings);
   const queue = useRef<Promise<void>>(Promise.resolve());
   const pendingSaves = useRef(0);
-  const save = (patch: Partial<Settings>) => {
+  // The error toast each setting last raised, so saving that setting again clears it.
+  const refusals = useRef(new Map<string, string>());
+  /** Resolves to the refusal's text, or null once the change is saved. */
+  const save = (patch: Partial<Settings>): Promise<string | null> => {
     latest.current = { ...latest.current, ...patch };
     setS(latest.current);
     pendingSaves.current++;
-    queue.current = queue.current.then(async () => {
-      let saved: Settings;
-      try {
-        const payload: Settings = { ...latest.current };
-        for (const k of EXTRA_KEYS) if (!(k in patch)) delete payload[k];
-        saved = await api.saveSettings(payload);
-      } catch (e) {
-        pendingSaves.current--;
-        // Take the refused change out, or every later save sends it again and fails too.
-        // A later change to the same setting stays.
-        latest.current = withoutPatch(latest.current, patch, confirmed.current);
-        setS(latest.current);
-        notify(errorText(e), "error");
-        return;
-      }
-      pendingSaves.current--;
-      confirmed.current = saved;
-      if (pendingSaves.current === 0) {
-        latest.current = saved;
-        setS(saved);
-        onSaved(saved);
-      }
-      try {
-        if (patch.model) {
-          const files = await api.modelsStatus();
-          if (files.some((f) => !f.installed)) await api.downloadModels();
+    return new Promise((resolve) => {
+      queue.current = queue.current.then(async () => {
+        let saved: Settings;
+        try {
+          const payload: Settings = { ...latest.current };
+          for (const k of EXTRA_KEYS) if (!(k in patch)) delete payload[k];
+          saved = await api.saveSettings(payload);
+        } catch (e) {
+          pendingSaves.current--;
+          // Take the refused change out, or every later save sends it again and fails too.
+          // A later change to the same setting stays.
+          latest.current = withoutPatch(latest.current, patch, confirmed.current);
+          setS(latest.current);
+          notify(errorText(e), "error");
+          for (const key of Object.keys(patch)) refusals.current.set(key, errorText(e));
+          resolve(errorText(e));
+          return;
         }
-        if (patch.output_dir) api.mcpSnippet().then(setMcp);
-      } catch (e) {
-        notify(errorText(e), "error");
-      }
+        pendingSaves.current--;
+        for (const key of Object.keys(patch)) {
+          const refusal = refusals.current.get(key);
+          if (refusal === undefined) continue;
+          dismissToast(refusal);
+          refusals.current.delete(key);
+        }
+        confirmed.current = saved;
+        if (pendingSaves.current === 0) {
+          latest.current = saved;
+          setS(saved);
+          onSaved(saved);
+        }
+        resolve(null);
+        try {
+          // A new speech model or speaker model may need files: fetch them now, not at Record.
+          if (patch.model || patch.speaker_model) {
+            const files = await api.modelsStatus();
+            if (files.some((f) => !f.installed)) await api.downloadModels();
+          }
+          if (patch.output_dir) api.mcpSnippet().then(setMcp);
+        } catch (e) {
+          notify(errorText(e), "error");
+        }
+      });
     });
   };
 

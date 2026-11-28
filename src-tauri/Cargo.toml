@@ -65,6 +65,13 @@ windows-core = "0.62"
 # The microphone question for the Store package (win.rs). Tauri uses the same release.
 windows = { version = "0.62", features = ["Foundation", "Security_Authorization_AppCapabilityAccess"] }
 
+# Margin's patched minutes-core (DECISIONS.md D80). Both minutes-core lines above keep
+# the upstream rev that the vendored copy was taken from; this replaces that source with
+# ../vendor/minutes-core, which is that rev plus the commits listed in UPSTREAM-PATCHES.md.
+# whisper-guard follows: core reaches it by a path inside the vendored workspace.
+[patch."https://github.com/silverstein/minutes"]
+minutes-core = { path = "../vendor/minutes-core/crates/core" }
+
 [features]
 # Whisper on the GPU, on Windows, through Vulkan. Off here, so the macOS build and a
 # plain `cargo build` do not get it. scripts/build-windows.sh turns it on for the Store

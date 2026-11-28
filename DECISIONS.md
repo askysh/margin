@@ -1221,3 +1221,392 @@ The full comparison is in `docs/parity/app.md`.
 - The installer has no code signing certificate. SmartScreen warns at the first install,
   not at an update.
 - Not tested: an update from GitHub over HTTPS, and the Windows jobs on a runner.
+
+## Meeting flow and knowledge (26 Nov 2026)
+
+### D67. Calendar lookup comes back as an opt-in, with a toast that starts notes
+- New fact for D9: the owner asked for it. Google Meet runs in a browser, so the call
+  banner (process names) never sees it, and meetings were titled with the first words
+  spoken. A calendar event has the title, the people and the call link.
+- Options: keep calendar off, turn it on for everyone, or a switch with its own
+  permission step.
+- Pick: **a switch**, *Start notes from my calendar* in Settings → Recording, off by
+  default. Turning it on asks for Calendars access before anything is saved, in the
+  foreground. That answers D9's reason: the prompt follows the click that asked for it.
+  Margin runs core's helper directly for this, with up to 2 minutes for an answer, since
+  core's own calls stop the helper after 3 seconds. Refused, write-only or unanswered
+  access leaves the switch off with a message that says which.
+- Margin now bundles core's `calendar-events` helper (`build.rs` compiles it from the
+  pinned core checkout, `externalBin` signs it). Core looks for it beside the binary
+  first. Without it, only the Mac that built Margin could read the calendar.
+- When the switch is on, `calendar_watch.rs` checks every 30 seconds. An event that starts
+  within a minute, or started up to five minutes ago, and has a call link or two or more
+  attendees, gets one offer: a banner, and a notification with Start notes when the
+  window is not in front. Start notes opens the `https://` call link and records a call
+  under the event's title. Nothing records without that click.
+- The same switch sets core's `calendar.use_event_title_for_meeting_title` and
+  `calendar.require_attendees_or_url`, so the worker titles the meeting from the event and
+  ignores focus blocks.
+- Cost: core reads the calendar from the worker too, as D9 said. With access granted in
+  the foreground first, that read raises no prompt.
+- Not tested: the toast against a real calendar (it needs the permission). Core's helper
+  reads the call link from the event's location. A Google Meet link that sits only in the
+  event's notes or conference data is not seen, so such an event qualifies by its
+  attendees, and Start notes records without opening the call.
+
+### D68. A silent microphone gets a warning thirty seconds in
+- New fact: a 75-minute call on a Bluetooth headset kept only the other side. The
+  microphone stem peaked at 0.002 of full scale for the whole call, and nothing said so.
+- Pick: once per recording, 30 seconds in, Margin reads the last 20 seconds of the
+  microphone track (the voice stem on a call, the meeting file in person). A peak under
+  0.004 shows a warning in the window and a notification. The recording goes on.
+- Why the peak, not the loudness: a quiet room has a low average, but a working
+  microphone passes 0.01 within seconds (typing, breathing). A dead one does not.
+- Cost: a working microphone in a silent room for 20 seconds could warn once. The warning
+  only says to check the microphone.
+
+### D69. Ollama summaries ask the model not to think first, through a local forwarder
+- New fact: core's Ollama request has no `think` field and a fixed 2-minute limit
+  (UPSTREAM-PATCHES #3). qwen3.5:4b with thinking off extracts a 13-minute meeting in
+  42 to 50 seconds. With thinking on, Margin's summaries failed on both test meetings.
+- Options: tell people to pick another model (the old message), an Ollama Modelfile (it
+  cannot set `think`), copy core's summary code (Margin copies no core code), or a
+  forwarder.
+- Pick: **a forwarder** (`ollama_proxy.rs`). For one summary or title call, Margin starts
+  it on a free local port and points an in-memory copy of the config at it. It adds
+  `"think": false` to `/api/generate` and `/api/chat` and passes everything else through.
+  The config file does not change.
+- Settings → Summaries → *Answer without thinking first*, on by default, kept in
+  prefs.json. Remove the forwarder when core sends `think`.
+
+### D70. Settings → Knowledge: the wiki with no model, and a command after each meeting
+- Pick: core's knowledge wiki with `engine = "none"` only. Facts come from the meeting's
+  frontmatter. A model would write facts nobody can check against the transcript.
+- Core takes decisions and action items from the summary, and Margin's worker runs with
+  summaries off (D40). So with a summary engine on, the worker leaves the wiki alone and
+  the first summary after processing updates it, with one log entry per meeting. With
+  summaries off, the worker updates it with the people only. *Summarize again* does not
+  update the wiki, because core appends a log entry on every update.
+- Revised after the final review (28 Nov 2026): when that first summary fails (Ollama not
+  running, a timeout, an empty answer), or the meeting has no speech so no summary runs, the
+  app updates the wiki without a summary, as the worker would with summaries off. Every
+  meeting reaches the wiki once.
+- *After each meeting, run this command* sets core's `hooks.post_record`. *Use Margin Desk*
+  fills it when `~/margin-desk/bin/desk.mjs` and Node are found.
+- Semantic search stays out of Settings. Core's `embed-worker` is not in the app bundle,
+  so the switch would do nothing. Margin Desk has its own search.
+
+### D71. Whisper's prompt echoes are removed from the transcript
+- New fact (benchmark, 26 Nov 2026): on room tone, keyboard noise and hum, Whisper wrote
+  "Silence test. Preserve spelling exactly when hearing." 8 times in 225 seconds. Core
+  gives Whisper the prompt "Names and terms that may appear in this audio: <title, names>.
+  Preserve spelling exactly when heard." and Whisper reads it back on noise. Digital
+  silence gave no text.
+- Pick: when a meeting is ready, before the summary, Margin removes transcript lines that
+  hold the prompt's fixed words, and title-only lines that occur two or more times. One
+  title-only line stays, since it can be real speech. Notes and frontmatter do not change.
+- UPSTREAM-PATCHES asks core to drop segments that reproduce the prompt.
+
+### D72. A choice of speaker model in Settings → Transcription
+- New fact (benchmark, AMI ES2004a, four speakers): the legacy model found 2 speakers and
+  gave the wrong speaker for 37.9% of speech. Raising the threshold split voices into 8.
+  core's `community-1` set found 4 and gave the wrong speaker for 14.0%. It took 118
+  seconds for 17.5 minutes of audio, against 26.
+- Pick: *Speaker model*, Standard (legacy) or Better (community-1). The default stays
+  Standard, so no one gets a 32 MB download or slower processing without asking. Margin
+  downloads the chosen set through the existing model download.
+
+### D73. The notes get the keyboard back after Settings, and a stray key goes to them
+- New fact (UX round, 26 Nov 2026): during a recording, opening Settings (or the microphone
+  banner's *Change microphone*) and coming back left the focus on the page. Typing went
+  nowhere, and the saved notes held only the text from before Settings. Settings hides the
+  live view with `visibility: hidden`, and a hidden field loses its focus.
+- Pick: the live view knows when Settings covers it. When it shows again, the notes take
+  focus (the caret stays where it was), unless a field is already focused. Dismissing the
+  microphone banner does the same. While nothing editable has focus, a printable key without
+  ⌘, Ctrl or Alt moves focus to the notes, and the browser types the key there. Space does
+  so only on a bare page, because on a button it presses the button.
+- Cost: a key pressed on a bare page is no longer ignored. Shortcuts carry ⌘ or Ctrl, so
+  they are untouched.
+
+### D74. Setup mentions the calendar and Margin Desk, and the two shortcuts say where they work
+- New fact: setup never mentioned the calendar banner (D67), Knowledge or Margin Desk, and the
+  calendar switch is off on a new install, so nobody found them. Setup said ⌘⇧R and Settings
+  said ⌃⌥⌘R, with no word on why.
+- Pick: the last setup step has a *Start notes from my calendar* switch, off, with the line
+  that macOS asks to read the calendar when it is switched on, and one line that Margin Desk is
+  in Settings → Knowledge. The switch saves at once through `save_settings`, which asks
+  macOS and refuses without access; the step then shows the refusal and the switch stays off.
+  The shortcut line now says *In Margin*, and that a shortcut for any app is in Settings.
+  Settings says *From any app, ⌃⌥⌘R …* and *Inside Margin, ⌘⇧R and ⌘⇧I work* without it.
+- The switch is not offered on Windows, where calls cannot be recorded (D61).
+
+### D75. A command that Margin refuses stays in the box
+- New fact: a refused *Run this command* was cleared from the box. The toast said why, but
+  the text was gone. The refusal puts the old value back in the settings, and the box followed.
+- Pick: `save` answers with the refusal text (or null when saved). A text box that gets a
+  refusal keeps the text, is marked invalid (`aria-invalid`, a red border, the reason below
+  the box), and does not follow the settings back. Editing the text clears the mark. Nothing
+  is saved until the backend accepts the text. This holds for every text box in Settings.
+
+### D76. UNKNOWN is shown as "Unknown speaker"
+- New fact: a meeting whose speakers core could not match has the label `UNKNOWN`, and the
+  chip showed it in capitals.
+- Pick: `UNKNOWN` is a raw label like `SPEAKER_n`: it shows as *Unknown speaker* with the
+  dashed chip of an unnamed speaker. The other speakers keep their numbers (Speaker 1,
+  Unknown speaker, Speaker 3). The file keeps `UNKNOWN`.
+
+### D77. Ask says that it is Claude only
+- New fact: Ask runs the user's `claude` CLI (D26), read-only. The summary engine in Settings
+  does not matter to it. With Ollama, or summaries off, "Claude isn't signed in" read as if
+  Ask could use something else.
+- Options: Ask through Ollama (it cannot be limited to read-only files the way `claude
+  --tools Read,Grep,Glob` is), or say it plainly.
+- Pick: say it. When Ask is not ready, it adds that Ask always uses Claude Code and ignores the
+  summary engine.
+
+### D78. Paths show `~` for any home folder
+- New fact: `tildify` knew only `/Users/<name>`. A home elsewhere (a sandbox, Linux, Windows)
+  showed the full path on the home page, in setup and in Settings.
+- Pick: it also knows `/home/<name>` and `C:\Users\<name>`. For a home with no such shape,
+  the app learns it at boot from the default meetings folder, which is always
+  `<home>/Documents/Meetings` on macOS (`paths::default_output_dir`). A recognisable shape wins,
+  because Windows can move Documents into OneDrive. A longer folder name that only starts with
+  the home (`/Users/samuel` for `/Users/sam`) is not shortened.
+
+### D79. Search shows the spelling it used
+- New fact: the backend may correct a typo in a meeting search ("warrnty").
+- Pick: `search_meetings` answers with `{ hits: [{ path, excerpt }], corrected: string | null }`.
+  When `corrected` is a string, the sidebar shows *Showing results for "<corrected>"* under the
+  search box. The UI also accepts the bare list of an older backend, and treats null as absent.
+
+
+## Silence, titles, search and summaries (26 Nov 2026, Grug round)
+
+### D80. A vendored minutes-core with patches, again
+- New fact (benchmark plan, docs/benchmark/2026-11-27-improvement-plan.md §1.3): the
+  next transcription and speaker gains need changes inside core: VAD and decoding
+  settings, the vocabulary prompt, the speaker count, short speaker tracks, RTTM output
+  and the speaker pipeline. Core has no settings for any of them.
+- Options: (a) wait for upstream; (b) a fork repository, as in D46; (c) the pristine
+  crates at the pinned commit, vendored into this repository, with a Cargo `[patch]`
+  pointing at them, and one commit per patch.
+- Pick: **(c)**. It needs no second repository, every patch is reviewable in this
+  repository's history, and the pin stays the same.
+  - `margin/vendor/minutes-core/` holds `crates/core` and `crates/whisper-guard` from
+    silverstein/minutes at `209265f`, unchanged in its first commit. It also holds the
+    files that core's build script and tests read from outside those crates: the calendar
+    helper sources, two test fixtures, `assets/demo.wav` and `mcp/src/index.ts`.
+  - Its root `Cargo.toml` is upstream's `[workspace.package]` and
+    `[workspace.dependencies]`, with only the two crates as members. Its `Cargo.lock` is
+    upstream's lock, pruned to those crates, so core's own tests build with upstream's
+    versions.
+  - `src-tauri/Cargo.toml` keeps both `minutes-core` lines on the upstream `rev` and adds
+    `[patch."https://github.com/silverstein/minutes"] minutes-core = { path = ... }`.
+    `Cargo.lock` then lists minutes-core and whisper-guard without a source.
+  - Every patch defaults to upstream's behaviour. Margin turns patches on in
+    `corecfg.rs`. Each patch has an entry in UPSTREAM-PATCHES.md (#25 onward), written
+    to be sent upstream as a pull request.
+- How to rebase onto a new upstream ref (docs/development.md, "Updating minutes-core"):
+  1. List Margin's patch commits: `git log --oneline -- margin/vendor/minutes-core`.
+  2. Run `scripts/bump-upstream.sh --no-build <ref>`. It moves the pin and re-seeds
+     `Cargo.lock`.
+  3. Replace `crates/core`, `crates/whisper-guard` and the extra files with the new
+     ref's copies, and commit that alone ("vendor pristine minutes-core <ref>").
+  4. Cherry-pick each patch commit in order, and fix any conflicts.
+  5. Run `cargo build` and `cargo test`. Cargo drops the source lines for the two
+     patched crates from the lock again.
+  6. A patch that upstream has merged is dropped. When none are left, delete
+     `margin/vendor/` and the `[patch]` table, and Margin is back on plain upstream.
+
+### D81. A Hindi + English model, from a file the user adds
+- New fact (Hinglish trial, 26 Nov 2026): Trelis/whisper-hinglish-preview (Apache-2.0),
+  converted to ggml, loads as a normal large-v3 model in stock whisper.cpp. On FLEURS
+  Hindi (25 clips) its WER was 12.1, against 20.8 for large-v3-turbo with language `hi`.
+  It writes Devanagari only, English words included.
+- Pick: a fourth transcription model, `hinglish`, "Hindi + English (Devanagari)". It is
+  for Hindi-heavy calls and is never the default.
+  - No public URL hosts the converted file. Margin offers no download: the model is ready
+    when `ggml-hinglish.bin` (q5_0, 1.08 GB) is in the models folder. A download attempt
+    says where to put the file (`models::fetch`, `local_only`).
+  - Margin refuses to select it until `ggml-hinglish.bin` is in the models folder and at
+    least 500 MB, so a half-copied file does not count. If the file goes missing, or
+    breaks, later, core transcribes with large-v3-turbo if installed, else small
+    (UPSTREAM-PATCHES #33). The fallback uses the user's language from before Hinglish
+    (auto-detect by default), not Hindi. A started recording says so once, and the
+    finished meeting says which model ran (D83). A missing file never blocks the other
+    downloads.
+  - While it is selected, the transcription language is `hi`. Auto-detect would let it
+    decide per window, and its output is Devanagari anyway. `save` remembers the
+    language from before (`language-before-hinglish` next to config.toml), and gives it
+    back when another model is chosen.
+  - Rolling transcription is off with it (`corecfg::rolling_supported`). Rolling pieces
+    must come from the final pass's model, and this one cannot keep up live.
+  - The live transcript uses Balanced (`small`), as with Best: the model is large-v3
+    sized, much slower than turbo. It runs with the user's language, not `hi` (D83).
+- Core needs no patch: it loads `models_dir/ggml-<model>.bin` for any name
+  (UPSTREAM-PATCHES #32 asks for a model file path and download spec).
+
+### D82. Meeting chunks: speech threshold 2.5, 300 ms padding, no text conditioning
+- New fact (AMI ES2004a and TS3003a, 27 Nov 2026): core's meeting chunker, which decides
+  which audio Whisper sees, dropped 5.9% / 15.8% of the reference speech. Quiet speech
+  stayed under 4 × the noise floor, and word onsets fell outside the chunks. With 2.5 and
+  300 ms of padding it drops 0.2% / 4.3% (a Node port of the chunker, scratchpad
+  chunkprobe). Core got both as settings, defaulting to upstream (UPSTREAM-PATCHES #34).
+- Measured, ES2004a / TS3003a:
+
+  | variant | ES2004a WER | TS3003a WER | line DER strict ES/TS | RTTM strict ES/TS |
+  |---|---|---|---|---|
+  | core defaults | 26.6% | 26.2% | 61.4/60.5 | 32.2/33.3 |
+  | chunk 2.5/300 | 25.1% | 21.8% | 64.3/52.6 | same |
+  | chunk 3/300 | 25.6% | 22.6% | 65.2/56.6 | same |
+  | ctx0 | 23.4% | 25.5% | 52.7/53.7 | same |
+  | chunk 2.5/300 + ctx0 | 21.8% | 20.5% | 52.6/52.7 | same |
+
+  "chunk m/p" is `meeting_chunk_noise_multiplier` m and `meeting_chunk_pad_ms` p; "ctx0"
+  is `n_max_text_ctx = 0`. The ctx0 rows ran on the build before the round-4 fixes, the
+  chunk rows on 1e32585. RTTM DER comes from diarization alone, which these settings
+  don't touch.
+- Pick: **2.5 / 300 ms and `n_max_text_ctx = 0`**, the best row on both meetings. 3/300
+  keeps less quiet speech for no gain. Conditioning off stops one bad window from
+  repeating into the next ones.
+  - `corecfg::pin_measured_transcription_defaults` replaces only core's own defaults, so
+    a value set in config.toml stays.
+  - Revised after the final review (28 Nov 2026): whisper.cpp feeds the initial prompt
+    through the same buffer as the earlier text, so `n_max_text_ctx = 0` also drops the
+    prompt (UPSTREAM-PATCHES #25): the Settings vocabulary and the name and title hints
+    never reached the batch or rolling passes. The AMI gain was measured without user
+    vocabulary. So ctx 0 applies only while the user's own Vocabulary list is empty; with
+    words in it, `n_max_text_ctx` stays unset (upstream) and the words reach Whisper. The
+    check runs on every config load, so adding or clearing words takes effect at the next
+    meeting. Earlier builds saved the 0 into config.toml, so a 0 counts as Margin's value;
+    any other number is the user's and stays. Settings says so under the word list.
+- Rolling pieces (D49) must keep the whole-file chunks. Core pads each piece's chunks
+  inside the piece, so padding never pulls audio from the next piece, and at Stop core
+  reuses a piece whose audio digest and settings match, without comparing chunks. A cut
+  that a padded chunk would cross in the whole file therefore gives a transcript that
+  differs from the non-rolling one near the cut: the text fits the piece's audio, but up
+  to 300 ms of a word onset is missing. So `piece_cut` reads the multiplier and padding
+  from the effective config, and cuts only at a reset point that padding reaches from
+  neither side: at least 1.1 s from one chunk's voiced end to the next chunk, against
+  800 ms before. A 45 s split is never a cut with padding. Where there is no such point,
+  the existing quietest-window fallback applies, which was never exact. The parity tests
+  compile core's chunker and padding from the vendored source and check both 4.0/0 and
+  2.5/300.
+
+### D83. Hinglish: which language each model runs with, and what the notices say
+- New fact (review of D81, 27 Nov 2026): core read `transcription.language` (`hi`) where
+  the Hinglish model never runs: the live transcript, which uses `small`, and the process
+  trace of a meeting that fell back. The notice at Start named the fallback by Margin's
+  rule (the first non-empty file), but core skips a fallback that fails to load. And a
+  broken Hinglish file of 500 MB or more passes Margin's size check, so core fell back
+  with no word to the user.
+- Live transcript with Hinglish selected. Options: (a) `hi`, as the batch pass; (b) the
+  user's language from before Hinglish (auto-detect by default); (c) always auto-detect.
+  Pick **(b)**. `small` forced to `hi` writes poor Devanagari, and Margin's live view is
+  a draft that the batch pass replaces. (c) would detect Hindi windows and do the same.
+  The cost: Hindi speech shows as rough text in the live view until the final
+  transcript is in.
+- Rule in core (UPSTREAM-PATCHES #33): while `missing_model_fallbacks` is set, which
+  Margin does only with Hinglish, `language` belongs to `transcription.model` alone. Every
+  other whisper model, a fallback or the live model, runs with
+  `missing_model_fallback_language`. So the batch pass keeps `hi` with Hinglish, and a
+  fallback, the live transcript, dictation and the process trace get the user's language. With
+  every other model the fallback list is empty and core behaves as upstream.
+- Notices:
+  - At Start, with the file missing or under 500 MB: "Hindi + English model file is
+    missing or unreadable", "This meeting uses another installed model, language
+    <name>." It names no model, since only core knows which one loads.
+  - After processing: core writes `{step: transcribe, reason: model_fallback, message:
+    "used <model> because hinglish missing|empty|failed to load"}` into the meeting file.
+    With "Meeting ready", Margin shows "Hindi + English model failed to load" (or "file
+    was missing", "file was empty") and "This meeting used <model>." That covers a large
+    broken file. Like "Meeting ready", it comes only when the job enters a finished state,
+    not again when a finished job's view changes (a retitle).
+- Summary and title: with summary language "auto" they follow the transcription
+  language, so a Hinglish meeting is summarized in Hindi. After a fallback they follow
+  the language the fallback ran with, read from the meeting's `model_fallback` record
+  (core's pipeline summary and title, core's resummarize, which Margin's summaries use,
+  and Margin's title step in `summaries.rs`).
+
+### D90. Lines Whisper makes up on silence are removed with the prompt echoes
+- New fact (Grug round H2): a 3-second near-silent recording came back as `[SPEAKER_1 0:00]
+  [SYSTEM] Продолжение следует...` ("To be continued") and `...of royal descent in zoos across
+  the world.`. The meeting got an invented title, a project page and a summary.
+- Options: a phrase list only (misses what nobody lists), a model that judges each line (slow,
+  and it would run on speech too), or the scrub that D71 already runs, with a few rules.
+- Pick: the D71 scrub also drops a line that is only markers (`[BLANK_AUDIO]`, `(music)`), holds
+  a known silence phrase (about 50, in 12 languages: "Thanks for watching", the Amara subtitle
+  credit, "Продолжение следует", ...), is a stray line in a script the rest of the transcript
+  does not use, or is a `...` fragment left in a transcript of 12 words or fewer after something
+  else went. "Thank you", "bye" and one-word lines go only when nothing else real is left.
+- The `[SYSTEM]` and `[MICROPHONE]` tags are core's capture-source tags on call lines, so a
+  line is judged by what follows the tag; tagged lines are not removed as a class.
+- Indic scripts (Devanagari, Kannada, Tamil, Telugu, ...) are mixed into English speech by real
+  speakers, so they are never foreign.
+- Revised after the final review (28 Nov 2026): the first rules deleted real speech. A phrase
+  matched anywhere in a line, so "Thank you for listening, any questions?" went, and up to one
+  line in ten in another script went, so five Russian lines in a 50-line meeting, or one Hindi
+  sentence in 20 lines, were lost. Now:
+  - a phrase must be the whole line (after the `[speaker time]` prefix, punctuation, case,
+    numbers and spaces are set aside), so the list holds whole subtitle credits;
+  - a line in another script (not Indic, not Latin) goes only when it is the meeting's single
+    such line, has at most 6 words, and the meeting has at least 10 other lines;
+  - every removed line is appended, under a timestamp, to `.<meeting file>.scrubbed.txt`
+    beside the meeting (0600; Delete takes it too, D10), and a `processing_warnings` entry
+    (`reason: lines_removed`) gives the count. A wrong guess is recoverable.
+  - The scrub runs once, when a job has just finished. It never runs on meetings that were
+    already done, such as the archived jobs that the first poll after launch sees.
+- Cost: a real "Thank you" as the only thing said is dropped (kept in the sidecar). Whisper
+  hallucinations that are plain English sentences in a longer recording (a YouTube-style
+  sentence in a 40-minute call) are not seen, nor are credits that are not on the list.
+
+### D91. A meeting with no speech says so, and gets no title or summary from nothing
+- When the scrub removed lines and no words are left, Margin writes `status: no-speech` (the
+  library already shows that), a `processing_warnings` entry (`step: transcribe`, `reason:
+  no_speech`), and, for a meeting that had no title at Stop, the title "No speech recorded" with
+  its entities cleared. A title that the user chose stays. No summary or title model runs.
+- The scrub's count gates this, so a transcript that was already empty for another reason is
+  not touched here. A meeting core already marked `no-speech` also gets no summary.
+
+### D92. A title is the event's, the user's, or the summary's, and never ends in "..."
+- Verified by reading: Start notes (D67) records under the calendar event's title, so the
+  job has a title at Stop and keeps it. Core titles an untitled meeting with the first words
+  spoken and cuts it at 57 characters plus "..." (`finalize_title`).
+- Renames are not tracked anywhere: `set_title` writes the frontmatter. D59's guard was "the
+  title still equals what Stop left", and it covered only the first summary after processing.
+- Pick: a title is replaced from the summary after the first summary (and, until the
+  revision below, after *Summarize again*), when it is the Stop fallback, core's 60-character cut, or two or more words that are
+  the opening words of the transcript. A calendar meeting is never replaced, and the title is
+  checked again after the model runs. Margin cuts a title that core ended with "..." at a word
+  boundary (also when the summary engine is off), and also when the library shows it.
+- Revised after the final review (28 Nov 2026): only the automatic first summary of a newly
+  finished meeting replaces a title. *Summarize* and *Summarize again* never do, since the
+  user may have typed a title that matches the opening words since.
+- Cost: a user title that was typed as the opening words of the speech before the first
+  summary is taken for the machine's. Prompt change not made: the summary prompt is core's (`build_base_system_prompt`)
+  and core already asks for a TITLE line, which `resummarize` keeps out of the file; the title
+  call (D59) stays the way to get one.
+
+### D93. Search tries the closest library word when nothing matches
+- New fact (Grug round L3): "warrnty" found nothing. Margin's search is its own substring scan,
+  not core's index, so the fallback is Margin's.
+- Pick: with no hits, each query word of 3 letters or more that is not a word in the library is
+  replaced by the closest library word within 2 edits (1 for words of 3 or 4 letters; a swap of
+  two letters is one edit; ties go to the more frequent word). The search runs again with that
+  query. The answer is `{ "hits": [...], "corrected": "warranty" | null }`.
+- This changes `search_meetings` from an array to an object. The window reads `hits`, and shows
+  "Showing results for “corrected”" when `corrected` is set. The extra pass reads every file
+  once more, and runs only on a search with no hits.
+
+### D94. A model's lead-in line is removed from the summary
+- New fact (Grug round L6): a summary began "Based on the transcript provided, here is a
+  structured summary of ...". The model answered in free text, and core stores that as
+  `## Summary`. The prompt is core's, so Margin does not edit it.
+- Pick: after each summary Margin removes the first line of `## Summary` when it reads as an
+  assistant's lead-in ("Based on the transcript...", "Here is...", "Sure..." and names a summary
+  or overview), and a last line that offers more ("Let me know if..."). Nothing else in the
+  summary changes.
+
+
+## minutes-core with Margin's patches (27 Nov 2026)

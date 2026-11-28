@@ -12,7 +12,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0)); req = json.loads(self.rfile.read(n) or b"{}")
-        open(sys.argv[2], "a").write(json.dumps({"path": self.path, "model": req.get("model"), "prompt_chars": len(req.get("prompt", "")), "system": req.get("system", ""), "prompt": req.get("prompt", "")}) + "\n")
+        open(sys.argv[2], "a").write(json.dumps({"path": self.path, "model": req.get("model"), "prompt_chars": len(req.get("prompt", "")), "system": req.get("system", ""), "prompt": req.get("prompt", ""), "think": req.get("think")}) + "\n")
         if os.path.exists(sys.argv[2] + ".slow"): time.sleep(6)
         if os.path.exists(sys.argv[2] + ".fail"):
             self.send_response(500); self.end_headers(); self.wfile.write(b'{"error": "fake failure"}'); return

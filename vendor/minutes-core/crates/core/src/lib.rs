@@ -1,0 +1,360 @@
+#![warn(clippy::disallowed_methods)]
+
+pub mod apple_fm;
+pub mod apple_speech;
+pub mod apple_speech_session;
+pub mod apple_speech_shadow;
+pub mod apple_speech_worker;
+pub(crate) mod audio_budget;
+pub mod audio_decode_worker;
+pub mod autoresearch;
+pub(crate) mod bounded_child;
+mod live_audio_coverage;
+/// Offline, non-authorizing checks of live source observations.
+pub mod live_source_validation;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_graph_xpc;
+pub mod orukeet;
+pub mod semantic;
+pub mod semantic_index;
+pub mod semantic_search;
+mod source_transcript;
+mod summary_semantics;
+
+/// Activate a previously validated MCP process-audio outer process group.
+/// The CLI must also hold the helper's live supervisor capability; the core
+/// repeats the Unix parent/group topology checks before changing child-launch
+/// behavior.
+#[cfg(unix)]
+pub fn install_validated_outer_process_group(process_group: i32) -> std::io::Result<()> {
+    bounded_child::install_validated_outer_process_group(process_group)
+}
+
+/// Exit the process, skipping C++ static destructors on macOS.
+///
+/// whisper.cpp registers process-global Metal state whose teardown runs from
+/// `__cxa_finalize_ranges` on a normal `exit()`. A `WhisperContext` that is
+/// still alive at that moment still has its buffers registered in ggml's
+/// residency-set collection, so `ggml_metal_rsets_free` aborts on
+/// `GGML_ASSERT([rsets->data count] == 0)` (issue #998). The same teardown
+/// aborted a worker subprocess over a partially initialized context in #229.
+///
+/// An interrupt path cannot fix that by dropping the context, because the
+/// decode that owns it is running on another thread. It terminates without the
+/// teardown instead and leaves the rest for the kernel to reclaim.
+///
+/// On every other target this is an ordinary [`std::process::exit`], teardown
+/// included: the aborting destructor is Metal's, and an equivalent exit-time
+/// assertion has not been shown for the CUDA, HIP or Vulkan backends.
+///
+/// This deliberately does not flush `stdout` first. `Stdout::flush` takes the
+/// process-wide stdout lock, so a thread already blocked writing into a stalled
+/// pipe would hold that lock and the interrupt would hang forever instead of
+/// exiting. Rust's own exit cleanup avoids the same trap by using `try_lock`.
+/// A force-quit that cannot quit is worse than the buffered bytes it saves, and
+/// the interrupt handlers report through `stderr`, which is unbuffered.
+pub fn exit_without_cxx_teardown(code: i32) -> ! {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::_exit(code)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    std::process::exit(code)
+}
+
+#[cfg(test)]
+mod exit_teardown_tests {
+    /// Marks the re-executed child role; see the test below.
+    const CHILD_MARKER: &str = "MINUTES_INTERNAL_TEST_EXIT_HELD_STDOUT_CHILD";
+    const CHILD_EXIT_CODE: i32 = 23;
+
+    /// A force-quit must terminate while another thread holds the stdout lock.
+    ///
+    /// This guards the shape of the bug, not its implementation: it asserts the
+    /// process actually dies, so re-adding any blocking flush to
+    /// [`super::exit_without_cxx_teardown`] fails here rather than in a user's
+    /// terminal. Unlike the Metal abort this cannot be reproduced without a GPU
+    /// backend, so it runs on every platform CI builds.
+    #[test]
+    fn exit_without_cxx_teardown_does_not_block_on_a_held_stdout_lock() {
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            std::thread::spawn(|| {
+                let _held = std::io::stdout().lock();
+                std::thread::sleep(std::time::Duration::from_secs(120));
+            });
+            // Let the other thread take the lock before we try to exit under it.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            super::exit_without_cxx_teardown(CHILD_EXIT_CODE);
+        }
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut child = crate::engine_process::command(exe)
+            .args([
+                "--exact",
+                "exit_teardown_tests::exit_without_cxx_teardown_does_not_block_on_a_held_stdout_lock",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MARKER, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("re-exec the test binary in its child role");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait().expect("poll the child") {
+                Some(status) => {
+                    assert_eq!(
+                        status.code(),
+                        Some(CHILD_EXIT_CODE),
+                        "the child should exit cleanly under a held stdout lock"
+                    );
+                    return;
+                }
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "exit_without_cxx_teardown blocked while another thread held the \
+                         stdout lock; an emergency exit path must not wait on that lock"
+                    );
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    }
+}
+#[cfg(any(test, all(feature = "streaming", feature = "whisper")))]
+pub(crate) mod bounded_inference;
+pub mod calendar;
+pub mod capture;
+pub mod config;
+pub mod context_store;
+pub mod copilot;
+pub mod customize;
+pub mod daily_notes;
+pub mod derived;
+pub mod desktop_context;
+pub mod desktop_control;
+pub mod device_monitor;
+pub mod diarize;
+pub mod dictation_cleanup;
+pub mod dictation_commands;
+pub mod dictation_context;
+mod dictation_disfluency;
+pub mod dictation_experience;
+pub mod dictation_memory;
+pub(crate) mod engine_process;
+mod process_reaper;
+pub use process_reaper::spawn_reaped;
+/// Person entity-resolution clustering (issue #385, class 3): suggestion-only
+/// grouping of name-variant fragments. Never merges.
+pub(crate) mod entity_cluster;
+/// Entity-resolution evaluation harness (cluster-level). Test-only; the
+/// measurement contract for the entity-clustering lever (issue #385 / #371).
+#[cfg(test)]
+mod entity_resolution_eval;
+pub mod error;
+pub mod events;
+pub mod evidence;
+pub mod ffmpeg;
+pub mod graph;
+pub mod graph_worker;
+pub mod health;
+pub mod hooks;
+pub mod i18n;
+pub mod interaction;
+pub mod jobs;
+pub mod knowledge;
+pub mod knowledge_extract;
+#[cfg(any(test, all(feature = "streaming", feature = "whisper")))]
+mod live_activity;
+mod live_input_progress;
+pub mod live_partials;
+pub mod live_session;
+pub mod live_sidekick;
+pub mod logging;
+pub mod macos_permissions;
+pub mod markdown;
+/// Post-pass name correction (config-gated, off by default): the big lever of
+/// the name-accuracy epic (bead minutes-25x3.4).
+pub mod name_correction;
+/// Name-accuracy evaluation harness (text-level). Test-only; the measurement
+/// contract for the post-pass name-correction lever (bead minutes-25x3.4).
+#[cfg(test)]
+mod name_eval;
+pub mod notes;
+pub mod ollama;
+pub mod overlays;
+pub mod palette;
+pub mod parakeet;
+pub mod parakeet_sidecar;
+pub mod partial_quality;
+pub(crate) mod person_identity;
+pub mod pid;
+pub mod pipeline;
+#[cfg(all(
+    feature = "pocketstation-capture",
+    any(target_os = "linux", target_os = "windows")
+))]
+mod pocketstation_capture;
+pub mod policy_fs;
+pub mod process_trace;
+pub mod remote_silence;
+pub mod resummarize;
+pub mod retention;
+pub mod retrieval;
+// Shared mono-downmix + decimation resampler (used by capture and streaming)
+pub(crate) mod resample;
+pub mod screen;
+#[cfg(any(target_os = "macos", target_os = "windows", all(test, unix)))]
+pub(crate) mod sealed_audio;
+pub mod search;
+pub mod search_index;
+pub mod sensitive;
+// Always compiled: the path/resolution helpers are pure std/Config so `setup`
+// can install models without the engine. Only `transcribe_samples` is gated.
+pub mod sherpa_engine;
+/// Runtime loader for the isolated sherpa plugin (#685). Gated with the engine
+/// so default builds carry no loader at all.
+#[cfg(feature = "engine-sherpa")]
+pub mod sherpa_plugin;
+pub(crate) mod stem_probe;
+pub mod stem_recovery;
+/// Incremental reader for stems that are still being written (#576).
+pub mod stem_tail;
+#[cfg(feature = "streaming-diarize")]
+pub mod streaming_diarize;
+pub mod summarize;
+pub mod system_audio_backend;
+pub mod template;
+/// Test scaffolding shared by unit and integration tests. Not public API.
+#[doc(hidden)]
+pub mod test_support;
+pub mod tls_roots;
+pub mod transcribe;
+/// Reuse of transcript spans a host produced while recording.
+pub mod transcript_checkpoint;
+pub mod transcription_coordinator;
+pub mod vault;
+pub mod vocabulary;
+pub mod voice;
+#[cfg(feature = "voice-live")]
+pub mod voice_live;
+pub mod watch;
+
+// Streaming audio API (for Prompter and other real-time consumers)
+#[cfg(feature = "streaming")]
+pub mod streaming;
+#[cfg(feature = "streaming")]
+pub mod vad;
+
+// Silero VAD smoothing FSM. Independent of ort so unit tests cover
+// the smoothing logic with synthetic probability streams; the ort
+// session in `silero_vad` (when the `vad-ort` feature is on) feeds
+// real probabilities into the same FSM.
+#[cfg(feature = "streaming")]
+pub mod silero_smoothing;
+
+// Streaming Silero VAD via ort (ONNX Runtime). Only compiled when
+// the user opts into the `vad-ort` feature; default builds keep
+// using whisper-rs's bundled Silero (`SileroSidecarVad` in
+// `live_transcript`).
+#[cfg(feature = "vad-ort")]
+pub mod silero_vad;
+
+// Streaming whisper (progressive transcription) — requires both features.
+// These modules use whisper_rs + whisper_guard::params internally, so they
+// can only compile when the whisper backend is enabled. Downstream consumers
+// that enable `streaming` alone (e.g. Prompter, which does its own whisper
+// via whisper-rs directly) must not pull these in. The `all(...)` gate
+// matches the existing pattern at capture.rs:803.
+#[cfg(all(feature = "streaming", feature = "whisper"))]
+pub mod streaming_whisper;
+
+// Dictation mode (requires streaming + whisper)
+#[cfg(all(feature = "streaming", feature = "whisper"))]
+pub mod dictation;
+
+// Live transcript mode (requires streaming + whisper)
+#[cfg(all(feature = "streaming", feature = "whisper"))]
+pub mod live_transcript;
+#[cfg(any(test, all(feature = "streaming", feature = "whisper")))]
+mod sidecar_timing;
+
+// Native macOS hotkey monitoring via CGEventTap
+#[cfg(target_os = "macos")]
+pub mod hotkey_macos;
+
+// Re-export commonly used types
+pub use config::Config;
+pub use error::{MinutesError, Result};
+pub use markdown::{ContentType, WriteResult};
+pub use pid::CaptureMode;
+pub use pipeline::process;
+pub use template::{Template, TemplateResolver, TemplateSource, DEFAULT_TEMPLATE_SLUG};
+
+#[cfg(feature = "streaming")]
+pub use streaming::{AudioChunk, AudioStream};
+#[cfg(feature = "streaming")]
+pub use vad::{Vad, VadEngine, VadResult};
+
+/// Route whisper.cpp + ggml C-level logs through the Rust `tracing`
+/// subscriber instead of leaking to raw stderr. Without this hook the C
+/// loggers bypass every filter the host process sets up, which is what
+/// made the `whisper_vad_detect_speech: detect speech (X.XXs duration)`
+/// line flood terminals during a recording (issue #163).
+///
+/// **Call exactly once at process startup, before any whisper context is
+/// created.** The underlying `whisper_rs::install_logging_hooks()` wires a
+/// global C-level trampoline that is permanent for the life of the
+/// process and cannot be replaced. Subsequent calls are silently ignored,
+/// so this is safe to call defensively from multiple entry points (CLI
+/// main, Tauri main, MCP server) but each entry point should call it at
+/// most once.
+///
+/// If the host process has no tracing subscriber, the C log events
+/// become events with no recipient and are silently dropped. That is
+/// fine for the bug we are fixing here. If a future change adds a
+/// tracing subscriber to that process, set `whisper_rs=warn` and
+/// `ggml=warn` in the filter so the chatty INFO logs do not flood again.
+///
+/// On builds without the `whisper` feature this is a no-op so callers can
+/// invoke it unconditionally.
+pub fn install_whisper_logging_hooks() {
+    #[cfg(feature = "whisper")]
+    whisper_rs::install_logging_hooks();
+}
+/// Whether a worker-capable binary sits beside the test harness, answered once.
+///
+/// Several tests assert this as a precondition rather than skipping silently, and
+/// each answer copies the ~250 MB debug executable into an immutable snapshot.
+///
+/// WHAT THIS ACTUALLY SAVES, measured rather than assumed, because the first
+/// version of this comment cited a 26% suite regression that does not reproduce:
+/// about 0.4 s across the three call sites, two avoided binds at roughly 0.2 s
+/// each. Run-to-run noise on the same machine is larger than that. It is kept
+/// because it is free and directionally right, not because it rescued anything.
+///
+/// "The answer cannot change during a run" would be too strong: `bind` can fail
+/// transiently under memory pressure or a full temp filesystem, which is the
+/// documented flake behind track-1 item 10. What is true is that a transient
+/// first-call failure caches `false` and then fails all three preconditions
+/// loudly, which is the safe direction.
+#[cfg(test)]
+pub(crate) fn test_worker_binary_is_available() -> bool {
+    use std::sync::OnceLock;
+
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        crate::audio_decode_worker::bounded_decode_fallback_available(
+            &crate::config::Config::default(),
+        )
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::test_support::home_env_lock()
+}

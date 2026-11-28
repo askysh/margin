@@ -1,5 +1,5 @@
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
-import { api, errorText, on, type AppPrefs, type Boot, type Job, type Kind, type LiveLine, type MeetingSummary, type RecorderView } from "./api";
+import { api, errorText, on, type AppPrefs, type Boot, type CalendarOffer, type Job, type Kind, type LiveLine, type MeetingSummary, type RecorderView } from "./api";
 import { Sidebar } from "./components/Sidebar";
 import { LiveView, liveDraft } from "./components/LiveView";
 import { MeetingView } from "./components/MeetingView";
@@ -8,7 +8,7 @@ import { Home } from "./components/Home";
 import { AskPanel, type AskScope } from "./components/AskPanel";
 import { COMPACT_QUERY, OneColumnContext, oneColumnQuery, useMediaQuery } from "./components/Compact";
 import { UpdateBanner } from "./components/Updates";
-import { clock, meetingFileReady } from "./util";
+import { clock, learnHome, meetingFileReady } from "./util";
 import { useCues } from "./cues";
 import { useMenu } from "./menu";
 import { canRecordCalls, hasModKey, hasRecordingChip, isWindows, keys } from "./platform";
@@ -50,6 +50,8 @@ export default function App() {
   const [toast, setToast] = useState<{ text: string; tone: "info" | "error" } | null>(null);
   const [busy, setBusy] = useState(false);
   const [callApp, setCallApp] = useState<string | null>(null);
+  const [calendarOffer, setCalendarOffer] = useState<CalendarOffer | null>(null);
+  const [micSilent, setMicSilent] = useState<string | null>(null);
   const [person, setPerson] = useState<string | null>(null);
   const [askOpen, setAskOpen] = useState(false);
   const [askScope, setAskScope] = useState<AskScope>("meeting");
@@ -68,8 +70,14 @@ export default function App() {
 
   const notify = useCallback((text: string, tone: "info" | "error" = "info") => {
     setToast({ text, tone });
-    window.setTimeout(() => setToast((t) => (t?.text === text ? null : t)), tone === "error" ? 9000 : 4000);
+    window.setTimeout(() => setToast((t) => (t?.text === text ? null : t)), tone === "error" ? 6000 : 4000);
   }, []);
+  const dismissToast = useCallback((text: string) => setToast((t) => (t?.text === text ? null : t)), []);
+  // An error belongs to the screen it came from: moving to another view or Settings section
+  // closes it, so it never shows up next to something unrelated.
+  useEffect(() => {
+    setToast((t) => (t?.tone === "error" ? null : t));
+  }, [selection, settings]);
 
   // Focus, saves and finished jobs all refresh the list. Most refreshes change nothing, and
   // then the sidebar is left alone.
@@ -89,8 +97,11 @@ export default function App() {
   );
 
   const reboot = useCallback(() => {
+    // The home folder is learned first, so no screen shows an absolute path before `~` is known.
     api
-      .boot()
+      .folderChoices()
+      .then((c) => learnHome(c.default_dir), () => {})
+      .then(() => api.boot())
       .then((b) => {
         setBoot(b);
         recorderRef.current = b.recorder;
@@ -110,6 +121,10 @@ export default function App() {
         // A new recording (or one started from the menu bar) takes over the window. Later
         // updates, such as a title change, must not pull you back from another meeting.
         if (v.recording && !recorderRef.current?.recording) {
+          // Whatever started it (banner, notification, menu bar, shortcut), an offer or a
+          // warning from before belongs to the last recording.
+          setCalendarOffer(null);
+          setMicSilent(null);
           setLines(v.lines);
           setSelection({ type: "live" });
           if (!resettingRef.current) {
@@ -141,6 +156,9 @@ export default function App() {
       on<string>("error-toast", (t) => notify(t, "error")),
       on<string>("recording-ended", (t) => notify(t)),
       on<string | null>("call-detected", (a) => setCallApp(a)),
+      on<CalendarOffer>("calendar-upcoming", (o) => setCalendarOffer(o)),
+      on<string>("mic-silent", (m) => setMicSilent(m)),
+      on<null>("mic-heard", () => setMicSilent(null)),
       // The menu bar's recent meetings and a click on a "meeting ready" notification.
       on<string>("open-meeting", (path) => {
         if (resettingRef.current) return;
@@ -150,7 +168,7 @@ export default function App() {
       }),
       // The menu bar's "Settings…": the same as ⌘,.
       // Setup has no Settings yet, so the item waits until it is done.
-      on<null>("open-settings", () => onboardedRef.current && setSettings((now) => now ?? lastSection.current)),
+      on<null>("open-settings", () => onboardedRef.current && setSettings((now) => now ?? sectionToOpen())),
       on<AppPrefs>("app-prefs", (prefs) => setBoot((b) => b && { ...b, prefs })),
       // A click on the recording chip: back to the live notes, with the caret in them.
       on<null>("open-live", () => {
@@ -202,9 +220,12 @@ export default function App() {
   const closeAsk = useCallback(() => setAskOpen(false), []);
   // ⌘, opens the section you were on last, as System Settings does; a deep link (a
   // permission error, say) picks one.
+  // While you record, Settings opens on Recording: the microphone and the call are what you
+  // came to look at, not the section you left last time.
+  const sectionToOpen = (): SectionId => (recorderRef.current?.recording ? "recording" : lastSection.current);
   const openSettings = useCallback((section?: SectionId) => {
     setDrawer(false);
-    setSettings((now) => section ?? now ?? lastSection.current);
+    setSettings((now) => section ?? now ?? sectionToOpen());
   }, []);
   const closeSettings = useCallback(() => {
     if (resettingRef.current) return;
@@ -215,6 +236,8 @@ export default function App() {
   const start = async (kind: Kind) => {
     setBusy(true);
     setCallApp(null);
+    setCalendarOffer(null);
+    setMicSilent(null);
     try {
       const v = await api.startRecording(kind);
       recorderRef.current = v;
@@ -322,6 +345,29 @@ export default function App() {
       <main className="pane">
         <header className="toolbar" data-tauri-drag-region>
           <div className="toolbar-spacer" data-tauri-drag-region />
+          {calendarOffer && !recording && canRecordCalls && (
+            <div className="call-banner" role="status">
+              <span>{calendarOffer.title} is starting.</span>
+              <button
+                className="link-btn"
+                onClick={() => {
+                  const offer = calendarOffer;
+                  setCalendarOffer(null);
+                  api.startCalendarNotes(offer).catch((e) => notify(errorText(e), "error"));
+                }}
+              >
+                Start notes
+              </button>
+              <button className="icon-btn small" aria-label="Dismiss" onClick={() => setCalendarOffer(null)}>×</button>
+            </div>
+          )}
+          {micSilent && recording && (
+            <div className="call-banner mic-banner" role="alert" title={micSilent}>
+              <span><b>Margin hasn't heard your microphone yet.</b> If you have been talking, your voice is not being recorded.</span>
+              <button className="link-btn danger" onClick={() => openSettings("recording")}>Change microphone</button>
+              <button className="icon-btn small" aria-label="Dismiss" onClick={() => { setMicSilent(null); requestAnimationFrame(focusNotesEnd); }}>×</button>
+            </div>
+          )}
           {callApp && !recording && canRecordCalls && (
             <div className="call-banner" role="status">
               <span>{callApp} looks active.</span>
@@ -333,6 +379,7 @@ export default function App() {
           {recording ? (
             <div className="rec-control">
               <span className="rec-dot" aria-hidden />
+              {settings && <span className="rec-label">Recording</span>}
               <span className="rec-time mono">{clock(tick.elapsed_secs)}</span>
               {hasRecordingChip && boot.prefs.recording_chip && !recorder?.stopping && (
                 <button
@@ -367,11 +414,12 @@ export default function App() {
                 onResetBusy={setResetting}
                 onReset={() => { setResetting(false); lastSection.current = "general"; setSettings(null); setAskOpen(false); setSelection({ type: "home" }); lastList.current = ""; setMeetings([]); reboot(); }}
                 notify={notify}
+                dismissToast={dismissToast}
               />
             </Suspense>
           )}
           {selection.type === "live" && recorder?.recording && (
-            <LiveView recorder={recorder} lines={lines} level={tick.level} />
+            <LiveView recorder={recorder} lines={lines} level={tick.level} active={!settings} />
           )}
           {selection.type === "processing" && (
             <ProcessingView

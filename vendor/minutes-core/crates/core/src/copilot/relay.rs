@@ -1,0 +1,2479 @@
+//! Transient, local-only attachment relay for capture consumers.
+//!
+//! The durable transcript/event log remains authoritative. This module only
+//! mirrors live evidence and copilot nudges so another Minutes process can
+//! attach without opening a second microphone.
+
+use super::{CopilotEvidenceMode, CopilotUtterance, Nudge, TranscriptUpdateKind};
+use crate::events::MinutesEvent;
+use crate::live_partials::{LivePartialEvent, LivePartialSubscriber, SupersessionReason};
+use chrono::{DateTime, Utc};
+use interprocess::{
+    local_socket::{
+        prelude::*, ConnectOptions, GenericFilePath, Listener, ListenerNonblockingMode,
+        ListenerOptions, Stream,
+    },
+    ConnectWaitMode,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+const RELAY_PROTOCOL_VERSION: u32 = 1;
+const DISCOVERY_FILE: &str = "capture-relay.json";
+const OWNER_LOCK_FILE: &str = "capture-relay.lock";
+#[cfg(not(windows))]
+const UNIX_SOCKET_FILE: &str = "capture-relay.sock";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
+const ESTABLISHMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+const ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
+const ESTABLISHMENT_RETRY_LIMIT: u8 = 20;
+const FRAME_CAPACITY: usize = 512;
+#[cfg(unix)]
+const CLIENT_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+pub const CURRENT_DRAFT_STALE_AFTER: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayTransport {
+    UnixSocket,
+    WindowsNamedPipe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureRelayDiscovery {
+    pub v: u32,
+    pub session_id: String,
+    pub transport: RelayTransport,
+    pub endpoint: String,
+    pub owner_pid: u32,
+    pub evidence_mode: CopilotEvidenceMode,
+    pub auth_token: String,
+    pub started_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+}
+
+impl CaptureRelayDiscovery {
+    pub fn heartbeat_is_fresh(&self, now: DateTime<Utc>) -> bool {
+        now.signed_duration_since(self.heartbeat_at)
+            <= chrono::Duration::from_std(HEARTBEAT_STALE_AFTER)
+                .expect("relay heartbeat threshold fits chrono")
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub transcript_seq: u64,
+    #[serde(default)]
+    pub nudge_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RelayTranscriptUpdate {
+    Utterance {
+        session_epoch: u64,
+        utterance: CopilotUtterance,
+        /// Capture-to-relay time for a partial. Finals use zero because the
+        /// durable event contract does not expose a monotonic audio timestamp.
+        producer_latency_ms: u64,
+        /// Age of the newest included audio when the relay admitted this
+        /// update. Finals use zero.
+        #[serde(default)]
+        source_audio_age_ms: u64,
+        /// Wall-clock time when the capture owner admitted this update to the
+        /// transient relay. Readers use it to reject stale drafts.
+        observed_at: DateTime<Utc>,
+    },
+    Superseded {
+        session_epoch: u64,
+        through_utterance_sequence: u64,
+        last_revision: u64,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RelayFrame {
+    Attached {
+        v: u32,
+        session_id: String,
+        owner_pid: u32,
+        evidence_mode: CopilotEvidenceMode,
+        transcript_seq: u64,
+        nudge_seq: u64,
+    },
+    Transcript {
+        seq: u64,
+        update: RelayTranscriptUpdate,
+    },
+    Nudge {
+        seq: u64,
+        nudge: Nudge,
+    },
+    Heartbeat {
+        owner_pid: u32,
+        transcript_seq: u64,
+        nudge_seq: u64,
+        sent_at: DateTime<Utc>,
+    },
+    CursorReset {
+        session_id: String,
+        reason: String,
+    },
+    Gap {
+        stream: String,
+        requested_after: u64,
+        available_from: u64,
+    },
+    Published {
+        nudge_seq: u64,
+    },
+    Error {
+        message: String,
+    },
+    Shutdown {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayDraftState {
+    Current,
+    None,
+    Finalizing,
+    Superseded,
+    Stale,
+    Unavailable,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayCurrentDraft {
+    pub provisional: bool,
+    pub session_epoch: u64,
+    pub utterance_sequence: u64,
+    pub revision: u64,
+    pub text: String,
+    pub speaker: Option<String>,
+    pub offset_ms: u64,
+    pub producer_latency_ms: u64,
+    pub source_audio_age_ms: u64,
+    pub observed_at: DateTime<Utc>,
+    pub age_ms: u64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayDraftSnapshot {
+    pub current_draft: Option<RelayCurrentDraft>,
+    pub draft_state: RelayDraftState,
+    #[serde(default)]
+    pub gap: bool,
+}
+
+/// Reduce one bounded relay replay to the single draft a reader may use.
+/// Supersession and gaps fail closed, and old text is never returned merely
+/// because it was the last frame in the buffer.
+pub fn reduce_relay_draft(
+    frames: &[RelayFrame],
+    evidence_mode: CopilotEvidenceMode,
+    now: DateTime<Utc>,
+) -> RelayDraftSnapshot {
+    let mut current: Option<RelayCurrentDraft> = None;
+    let mut state = if evidence_mode == CopilotEvidenceMode::FinalOnly {
+        RelayDraftState::Unsupported
+    } else {
+        RelayDraftState::None
+    };
+    let mut gap = false;
+
+    for frame in frames {
+        match frame {
+            RelayFrame::Transcript {
+                update:
+                    RelayTranscriptUpdate::Utterance {
+                        session_epoch,
+                        utterance,
+                        producer_latency_ms,
+                        source_audio_age_ms,
+                        observed_at,
+                    },
+                ..
+            } if utterance.update_kind == TranscriptUpdateKind::Partial => {
+                let relay_age_ms = now
+                    .signed_duration_since(*observed_at)
+                    .num_milliseconds()
+                    .max(0) as u64;
+                let age_ms = relay_age_ms.saturating_add(*source_audio_age_ms);
+                current = Some(RelayCurrentDraft {
+                    provisional: true,
+                    session_epoch: *session_epoch,
+                    utterance_sequence: utterance.utterance_sequence,
+                    revision: utterance.revision,
+                    text: utterance.text.clone(),
+                    speaker: utterance.speaker.clone(),
+                    offset_ms: utterance.offset_ms,
+                    producer_latency_ms: *producer_latency_ms,
+                    source_audio_age_ms: *source_audio_age_ms,
+                    observed_at: *observed_at,
+                    age_ms,
+                    source: utterance.source.clone(),
+                });
+                state = RelayDraftState::Current;
+            }
+            RelayFrame::Transcript {
+                update:
+                    RelayTranscriptUpdate::Superseded {
+                        session_epoch,
+                        through_utterance_sequence,
+                        reason,
+                        ..
+                    },
+                ..
+            } => {
+                if current.as_ref().is_some_and(|draft| {
+                    draft.session_epoch == *session_epoch
+                        && draft.utterance_sequence <= *through_utterance_sequence
+                }) {
+                    current = None;
+                }
+                state = if reason == "finalizing" {
+                    RelayDraftState::Finalizing
+                } else {
+                    RelayDraftState::Superseded
+                };
+            }
+            RelayFrame::Gap { stream, .. } if stream == "transcript" => {
+                current = None;
+                state = RelayDraftState::Unavailable;
+                gap = true;
+            }
+            RelayFrame::CursorReset { .. } => {
+                current = None;
+                state = RelayDraftState::None;
+            }
+            RelayFrame::Shutdown { .. } | RelayFrame::Error { .. } => {
+                current = None;
+                state = RelayDraftState::Unavailable;
+            }
+            _ => {}
+        }
+    }
+
+    if current
+        .as_ref()
+        .is_some_and(|draft| draft.age_ms > CURRENT_DRAFT_STALE_AFTER.as_millis() as u64)
+    {
+        current = None;
+        state = RelayDraftState::Stale;
+    }
+
+    RelayDraftSnapshot {
+        current_draft: current,
+        draft_state: state,
+        gap,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureAttachPlan {
+    Attach,
+    StartExplicitCapture,
+    WaitForCapture,
+    RefuseDuplicate { message: String },
+}
+
+/// Decide whether a copilot process may open capture.
+///
+/// An existing capture owner always wins. If its relay cannot be reached, the
+/// caller must explain that attachment failed and must not fall through to a
+/// new microphone stream.
+pub fn plan_capture_attachment(
+    capture_active: bool,
+    relay_available: bool,
+    explicit_new_capture: bool,
+) -> CaptureAttachPlan {
+    if capture_active && relay_available {
+        CaptureAttachPlan::Attach
+    } else if capture_active {
+        CaptureAttachPlan::RefuseDuplicate {
+            message: "A recording is already using the microphone, but its secure attachment relay is unavailable. Copilot did not open a second microphone. Update or restart the process that owns the recording, then try again.".into(),
+        }
+    } else if explicit_new_capture {
+        CaptureAttachPlan::StartExplicitCapture
+    } else {
+        CaptureAttachPlan::WaitForCapture
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureRelayError {
+    #[error("no active capture relay was found; start a recording or Live Transcript first. Copilot did not open the microphone")]
+    NotFound,
+    #[error("the capture relay heartbeat is stale; Copilot did not open a second microphone")]
+    Stale,
+    #[error("the capture relay belongs to process {0}, which is no longer running")]
+    OwnerExited(u32),
+    #[error("capture relay protocol {found} is not supported by this build (expected {expected})")]
+    Protocol { found: u32, expected: u32 },
+    #[error("capture relay authentication failed")]
+    Authentication,
+    #[error("capture relay is already owned by process {0}")]
+    AlreadyOwned(u32),
+    #[error("another local process is starting or stopping the capture relay")]
+    OwnershipBusy,
+    #[error("capture relay I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("capture relay data was invalid: {0}")]
+    InvalidData(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ClientHello {
+    v: u32,
+    auth_token: String,
+    action: ClientAction,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClientAction {
+    Observe { cursor: RelayCursor },
+    PublishNudge { nudge: Nudge },
+}
+
+#[derive(Debug)]
+struct RelayState {
+    session_id: String,
+    owner_pid: u32,
+    evidence_mode: CopilotEvidenceMode,
+    transcript_seq: u64,
+    nudge_seq: u64,
+    transcript: VecDeque<(u64, RelayTranscriptUpdate)>,
+    nudges: VecDeque<(u64, Nudge)>,
+    shutdown_reason: Option<String>,
+}
+
+impl RelayState {
+    fn push_transcript(&mut self, update: RelayTranscriptUpdate) -> u64 {
+        self.transcript_seq = self.transcript_seq.saturating_add(1);
+        let seq = self.transcript_seq;
+        self.transcript.push_back((seq, update));
+        trim_to_capacity(&mut self.transcript);
+        seq
+    }
+
+    fn push_nudge(&mut self, nudge: Nudge) -> u64 {
+        self.nudge_seq = self.nudge_seq.saturating_add(1);
+        let seq = self.nudge_seq;
+        self.nudges.push_back((seq, nudge));
+        trim_to_capacity(&mut self.nudges);
+        seq
+    }
+}
+
+fn trim_to_capacity<T>(queue: &mut VecDeque<(u64, T)>) {
+    while queue.len() > FRAME_CAPACITY {
+        queue.pop_front();
+    }
+}
+
+struct SharedRelayState {
+    state: Mutex<RelayState>,
+    changed: Condvar,
+}
+
+pub struct CaptureRelayServer {
+    shared: Arc<SharedRelayState>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    _owner_lock: std::fs::File,
+    discovery_path: PathBuf,
+    discovery: CaptureRelayDiscovery,
+}
+
+impl CaptureRelayServer {
+    /// The session owned by this exact producer process. Persisting this ID
+    /// with durable transcript status survives a transient client failure.
+    #[cfg(all(feature = "streaming", feature = "whisper"))]
+    pub(crate) fn current_process_session_id() -> Option<String> {
+        read_discovery(&capture_relay_discovery_path()).and_then(|discovery| {
+            (discovery.owner_pid == std::process::id() && discovery.heartbeat_is_fresh(Utc::now()))
+                .then_some(discovery.session_id)
+        })
+    }
+
+    pub fn start(
+        evidence_mode: CopilotEvidenceMode,
+        partials: Option<LivePartialSubscriber>,
+    ) -> Result<Self, CaptureRelayError> {
+        Self::start_inner(
+            &crate::config::Config::minutes_dir(),
+            evidence_mode,
+            partials,
+            true,
+        )
+    }
+
+    fn start_inner(
+        dir: &Path,
+        evidence_mode: CopilotEvidenceMode,
+        partials: Option<LivePartialSubscriber>,
+        poll_durable_events: bool,
+    ) -> Result<Self, CaptureRelayError> {
+        std::fs::create_dir_all(dir)?;
+        let discovery_path = capture_relay_discovery_path_in(dir);
+        // Discovery is the platform-independent authority for refusing a live
+        // owner. Check before locking so Windows lock error kinds cannot change
+        // the public result, then re-check after acquiring the lock to close the
+        // check/lock TOCTOU window. The retained lock still serializes claims and
+        // makes a crashed owner's stale discovery reclaimable.
+        if let Some(owner_pid) = live_fresh_owner_pid(&discovery_path) {
+            return Err(CaptureRelayError::AlreadyOwned(owner_pid));
+        }
+        let owner_lock = acquire_owner_lock(dir, &discovery_path)?;
+        if let Some(owner_pid) = live_fresh_owner_pid(&discovery_path) {
+            return Err(CaptureRelayError::AlreadyOwned(owner_pid));
+        }
+
+        let session_id = random_hex(16)?;
+        let auth_token = random_hex(32)?;
+        let endpoint = relay_endpoint(dir, &session_id);
+        #[cfg(unix)]
+        remove_if_present(Path::new(&endpoint))?;
+        let name = endpoint
+            .as_str()
+            .to_fs_name::<GenericFilePath>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let listener: Listener = ListenerOptions::new()
+            .name(name)
+            .nonblocking(ListenerNonblockingMode::Accept)
+            .create_sync()?;
+
+        #[cfg(unix)]
+        set_owner_only_permissions(Path::new(&endpoint))?;
+
+        let now = Utc::now();
+        let discovery = CaptureRelayDiscovery {
+            v: RELAY_PROTOCOL_VERSION,
+            session_id: session_id.clone(),
+            transport: current_transport(),
+            endpoint,
+            owner_pid: std::process::id(),
+            evidence_mode,
+            auth_token,
+            started_at: now,
+            heartbeat_at: now,
+        };
+        write_discovery(&discovery_path, &discovery)?;
+
+        let shared = Arc::new(SharedRelayState {
+            state: Mutex::new(RelayState {
+                session_id,
+                owner_pid: discovery.owner_pid,
+                evidence_mode,
+                transcript_seq: 0,
+                nudge_seq: 0,
+                transcript: VecDeque::new(),
+                nudges: VecDeque::new(),
+                shutdown_reason: None,
+            }),
+            changed: Condvar::new(),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_shared = Arc::clone(&shared);
+        let thread_stop = Arc::clone(&stop);
+        let thread_discovery_path = discovery_path.clone();
+        let thread_discovery = discovery.clone();
+        let thread = thread::Builder::new()
+            .name("capture-attach-relay".into())
+            .spawn(move || {
+                run_server(
+                    listener,
+                    thread_shared,
+                    thread_stop,
+                    thread_discovery_path,
+                    thread_discovery,
+                    partials,
+                    poll_durable_events,
+                );
+            })?;
+
+        Ok(Self {
+            shared,
+            stop,
+            thread: Some(thread),
+            _owner_lock: owner_lock,
+            discovery_path,
+            discovery,
+        })
+    }
+
+    pub fn discovery(&self) -> &CaptureRelayDiscovery {
+        &self.discovery
+    }
+
+    pub fn publish_nudge(&self, nudge: Nudge) -> u64 {
+        let mut state = lock_state(&self.shared);
+        let seq = state.push_nudge(nudge);
+        self.shared.changed.notify_all();
+        seq
+    }
+
+    pub fn shutdown(mut self, reason: impl Into<String>) {
+        self.shutdown_in_place(reason.into());
+    }
+
+    fn shutdown_in_place(&mut self, reason: String) {
+        {
+            let mut state = lock_state(&self.shared);
+            if state.shutdown_reason.is_none() {
+                state.shutdown_reason = Some(reason);
+            }
+            self.shared.changed.notify_all();
+        }
+        self.stop.store(true, Ordering::Release);
+        wake_listener(&self.discovery);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        remove_discovery_if_owned(&self.discovery_path, &self.discovery.session_id);
+    }
+
+    #[cfg(test)]
+    fn start_for_test(dir: &Path) -> Result<Self, CaptureRelayError> {
+        Self::start_inner(dir, CopilotEvidenceMode::InProcessPartials, None, false)
+    }
+
+    #[cfg(test)]
+    fn publish_transcript_for_test(&self, update: RelayTranscriptUpdate) -> u64 {
+        let mut state = lock_state(&self.shared);
+        let seq = state.push_transcript(update);
+        self.shared.changed.notify_all();
+        seq
+    }
+}
+
+impl Drop for CaptureRelayServer {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            self.shutdown_in_place("capture owner stopped".into());
+        }
+    }
+}
+
+pub struct CaptureRelayClient {
+    discovery_path: PathBuf,
+    discovery: CaptureRelayDiscovery,
+    reader: BufReader<Stream>,
+    pending_line: Vec<u8>,
+    cursor: RelayCursor,
+    // The attach acknowledgement is internal. Establishment completes only
+    // after a frame has been delivered to the caller through `try_recv`.
+    established: bool,
+    establishment_retry: EstablishmentRetry,
+}
+
+#[derive(Clone, Copy)]
+struct EstablishmentRetry {
+    deadline: Option<Instant>,
+    attempts_remaining: u8,
+}
+
+impl EstablishmentRetry {
+    fn new() -> Self {
+        Self {
+            deadline: None,
+            attempts_remaining: ESTABLISHMENT_RETRY_LIMIT,
+        }
+    }
+
+    fn started(self) -> bool {
+        self.deadline.is_some()
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn wait_before_retry(&mut self) -> bool {
+        if self.attempts_remaining == 0 {
+            return false;
+        }
+        let deadline = self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + ESTABLISHMENT_RETRY_TIMEOUT);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+
+        thread::sleep(ESTABLISHMENT_RETRY_DELAY.min(remaining));
+        self.attempts_remaining -= 1;
+        Instant::now() < *deadline
+    }
+}
+
+impl CaptureRelayClient {
+    pub fn connect(cursor: RelayCursor) -> Result<Self, CaptureRelayError> {
+        Self::connect_from(&capture_relay_discovery_path(), cursor)
+    }
+
+    fn connect_from(discovery_path: &Path, cursor: RelayCursor) -> Result<Self, CaptureRelayError> {
+        let mut establishment_retry = EstablishmentRetry::new();
+        loop {
+            match Self::connect_once(discovery_path, cursor.clone(), establishment_retry) {
+                Ok(client) => return Ok(client),
+                Err(error)
+                    if is_unexpected_eof(&error)
+                        || is_handshake_teardown_error(&error)
+                        || (establishment_retry.started()
+                            && is_retryable_establishment_error(&error)) =>
+                {
+                    if !establishment_retry.wait_before_retry() {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn connect_once(
+        discovery_path: &Path,
+        cursor: RelayCursor,
+        establishment_retry: EstablishmentRetry,
+    ) -> Result<Self, CaptureRelayError> {
+        let discovery = read_discovery(discovery_path).ok_or(CaptureRelayError::NotFound)?;
+        validate_discovery(&discovery)?;
+        let name = discovery
+            .endpoint
+            .as_str()
+            .to_fs_name::<GenericFilePath>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let mut stream = match establishment_retry.remaining() {
+            Some(timeout) => ConnectOptions::new()
+                .name(name)
+                .wait_mode(ConnectWaitMode::Timeout(timeout))
+                .connect_sync()?,
+            None => Stream::connect(name)?,
+        };
+        write_json_line(
+            &mut stream,
+            &ClientHello {
+                v: RELAY_PROTOCOL_VERSION,
+                auth_token: discovery.auth_token.clone(),
+                action: ClientAction::Observe {
+                    cursor: cursor.clone(),
+                },
+            },
+        )?;
+        let mut reader = BufReader::new(stream);
+        let first = read_frame_blocking(&mut reader)?;
+        match first {
+            RelayFrame::Attached { .. } | RelayFrame::CursorReset { .. } => {}
+            RelayFrame::Error { message } if message.contains("authentication") => {
+                return Err(CaptureRelayError::Authentication);
+            }
+            RelayFrame::Error { message } => return Err(CaptureRelayError::InvalidData(message)),
+            frame => {
+                return Err(CaptureRelayError::InvalidData(format!(
+                    "expected relay attachment acknowledgement, got {frame:?}"
+                )));
+            }
+        }
+        // PIPE_NOWAIT can report an idle Windows byte-mode pipe as a zero-byte
+        // read, which is indistinguishable from EOF through `Read`. Keep the
+        // handle blocking there and use PeekNamedPipe in `try_recv` instead.
+        #[cfg(not(windows))]
+        reader.get_ref().set_nonblocking(true)?;
+        Ok(Self {
+            discovery_path: discovery_path.to_path_buf(),
+            discovery: discovery.clone(),
+            reader,
+            pending_line: Vec::new(),
+            cursor: RelayCursor {
+                session_id: Some(discovery.session_id),
+                ..cursor
+            },
+            established: false,
+            establishment_retry,
+        })
+    }
+
+    pub fn discovery(&self) -> &CaptureRelayDiscovery {
+        &self.discovery
+    }
+
+    pub fn cursor(&self) -> RelayCursor {
+        self.cursor.clone()
+    }
+
+    pub fn try_recv(&mut self) -> Result<Option<RelayFrame>, CaptureRelayError> {
+        loop {
+            #[cfg(windows)]
+            match windows_stream_has_data(self.reader.get_ref()) {
+                Ok(false) => return Ok(None),
+                Ok(true) => {}
+                Err(error) if !self.established => {
+                    self.reconnect_during_establishment(CaptureRelayError::Io(error))?;
+                    continue;
+                }
+                Err(error) => return Err(CaptureRelayError::Io(error)),
+            }
+            // A WouldBlock read may end inside a UTF-8 code point. Keep raw
+            // bytes until the newline; read_line can discard that incomplete
+            // code point and corrupt the next read even when it returns WouldBlock.
+            match self.reader.read_until(b'\n', &mut self.pending_line) {
+                Ok(0) if !self.established => {
+                    self.reconnect_during_establishment(connection_closed_error())?;
+                }
+                Ok(0) => return Err(connection_closed_error()),
+                Ok(_) if !self.pending_line.ends_with(b"\n") => return Ok(None),
+                Ok(_) => {
+                    let line = std::mem::take(&mut self.pending_line);
+                    let frame: RelayFrame = serde_json::from_slice(&line).map_err(|error| {
+                        CaptureRelayError::InvalidData(format!("invalid relay frame: {error}"))
+                    })?;
+                    self.observe_cursor(&frame);
+                    self.established = true;
+                    return Ok(Some(frame));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) if !self.established && error.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.reconnect_during_establishment(CaptureRelayError::Io(error))?;
+                }
+                Err(error) => return Err(CaptureRelayError::Io(error)),
+            }
+        }
+    }
+
+    fn reconnect_during_establishment(
+        &mut self,
+        mut last_error: CaptureRelayError,
+    ) -> Result<(), CaptureRelayError> {
+        let discovery_path = self.discovery_path.clone();
+        let cursor = self.cursor.clone();
+        while self.establishment_retry.wait_before_retry() {
+            match Self::connect_once(&discovery_path, cursor.clone(), self.establishment_retry) {
+                Ok(client) => {
+                    *self = client;
+                    return Ok(());
+                }
+                Err(error) if is_retryable_establishment_error(&error) => {
+                    last_error = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error)
+    }
+
+    pub fn publish_nudge(nudge: Nudge) -> Result<u64, CaptureRelayError> {
+        Self::publish_nudge_via(&capture_relay_discovery_path(), nudge)
+    }
+
+    fn publish_nudge_via(discovery_path: &Path, nudge: Nudge) -> Result<u64, CaptureRelayError> {
+        let discovery = read_discovery(discovery_path).ok_or(CaptureRelayError::NotFound)?;
+        validate_discovery(&discovery)?;
+        let name = discovery
+            .endpoint
+            .as_str()
+            .to_fs_name::<GenericFilePath>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let mut stream = Stream::connect(name)?;
+        write_json_line(
+            &mut stream,
+            &ClientHello {
+                v: RELAY_PROTOCOL_VERSION,
+                auth_token: discovery.auth_token,
+                action: ClientAction::PublishNudge { nudge },
+            },
+        )?;
+        let mut reader = BufReader::new(stream);
+        match read_frame_blocking(&mut reader)? {
+            RelayFrame::Published { nudge_seq } => Ok(nudge_seq),
+            RelayFrame::Error { message } if message.contains("authentication") => {
+                Err(CaptureRelayError::Authentication)
+            }
+            RelayFrame::Error { message } => Err(CaptureRelayError::InvalidData(message)),
+            frame => Err(CaptureRelayError::InvalidData(format!(
+                "unexpected publish response: {frame:?}"
+            ))),
+        }
+    }
+
+    fn observe_cursor(&mut self, frame: &RelayFrame) {
+        match frame {
+            RelayFrame::Transcript { seq, .. } => {
+                self.cursor.transcript_seq = self.cursor.transcript_seq.max(*seq);
+            }
+            RelayFrame::Nudge { seq, .. } => {
+                self.cursor.nudge_seq = self.cursor.nudge_seq.max(*seq);
+            }
+            RelayFrame::CursorReset { session_id, .. } => {
+                self.cursor = RelayCursor {
+                    session_id: Some(session_id.clone()),
+                    ..RelayCursor::default()
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+fn connection_closed_error() -> CaptureRelayError {
+    CaptureRelayError::Io(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "capture relay closed the connection",
+    ))
+}
+
+#[cfg(windows)]
+fn windows_stream_has_data(stream: &Stream) -> io::Result<bool> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_BAD_PIPE, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let raw_handle = match stream {
+        Stream::NamedPipe(named_pipe) => named_pipe.as_handle().as_raw_handle(),
+    };
+    let mut available = 0_u32;
+    let success = unsafe {
+        PeekNamedPipe(
+            raw_handle,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_BROKEN_PIPE as i32
+                    || code == ERROR_BAD_PIPE as i32
+                    || code == ERROR_NO_DATA as i32
+                    || code == ERROR_PIPE_NOT_CONNECTED as i32
+        ) {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "capture relay closed the connection",
+            ))
+        } else {
+            Err(error)
+        }
+    } else {
+        Ok(available > 0)
+    }
+}
+
+fn is_unexpected_eof(error: &CaptureRelayError) -> bool {
+    matches!(error, CaptureRelayError::Io(error) if error.kind() == io::ErrorKind::UnexpectedEof)
+}
+
+/// Transient connection-teardown errors that can surface on a fresh connect's
+/// handshake when a prior client's socket is still tearing down. Observed as
+/// `BrokenPipe` on macOS during rapid reconnects under CPU contention (#529):
+/// the accept/first-write window widens under load, so the client's `ClientHello`
+/// write or first-frame read can race the peer teardown. These are retried from
+/// the first attempt — unlike a general establishment error, the race can hit
+/// before `EstablishmentRetry` has started its clock, so gating on `started()`
+/// would let it fall straight through to the caller.
+fn is_handshake_teardown_error(error: &CaptureRelayError) -> bool {
+    matches!(
+        error,
+        CaptureRelayError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            )
+    )
+}
+
+fn is_retryable_establishment_error(error: &CaptureRelayError) -> bool {
+    matches!(
+        error,
+        CaptureRelayError::Io(error)
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Unsupported
+            )
+    )
+}
+
+pub fn capture_relay_discovery_path() -> PathBuf {
+    capture_relay_discovery_path_in(&crate::config::Config::minutes_dir())
+}
+
+/// PID of the live process that currently owns capture, if any. A stopping
+/// session keeps ownership until it finishes saving, so a caller handing
+/// capture from one session to the next waits for this to clear instead of
+/// racing into `AlreadyOwned` (#1110).
+pub fn current_capture_owner_pid() -> Option<u32> {
+    live_fresh_owner_pid(&capture_relay_discovery_path())
+}
+
+fn capture_relay_discovery_path_in(dir: &Path) -> PathBuf {
+    dir.join(DISCOVERY_FILE)
+}
+
+fn run_server(
+    listener: Listener,
+    shared: Arc<SharedRelayState>,
+    stop: Arc<AtomicBool>,
+    discovery_path: PathBuf,
+    mut discovery: CaptureRelayDiscovery,
+    mut partials: Option<LivePartialSubscriber>,
+    poll_durable_events: bool,
+) {
+    let mut event_tail = if poll_durable_events {
+        crate::events::EventTail::following_now().ok()
+    } else {
+        None
+    };
+    let mut last_event_poll = Instant::now() - Duration::from_millis(100);
+    let mut last_heartbeat = Instant::now() - HEARTBEAT_INTERVAL;
+
+    while !stop.load(Ordering::Acquire) {
+        loop {
+            match listener.accept() {
+                Ok(stream) => {
+                    spawn_client(stream, Arc::clone(&shared), discovery.auth_token.clone())
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    tracing::warn!(error = %error, "capture relay accept failed");
+                    break;
+                }
+            }
+        }
+
+        if let Some(subscriber) = partials.as_mut() {
+            while let Some(event) = subscriber.try_recv() {
+                let update = relay_partial_update(event);
+                let mut state = lock_state(&shared);
+                state.push_transcript(update);
+                shared.changed.notify_all();
+            }
+        }
+
+        if poll_durable_events && last_event_poll.elapsed() >= Duration::from_millis(100) {
+            last_event_poll = Instant::now();
+            if event_tail.is_none() {
+                match crate::events::EventTail::following_now() {
+                    Ok(tail) => event_tail = Some(tail),
+                    Err(error) => tracing::debug!(%error, "capture relay event tail unavailable"),
+                }
+            }
+            let events = event_tail.as_mut().map(|tail| tail.poll()).transpose();
+            let events = match events {
+                Ok(events) => events.unwrap_or_default(),
+                Err(error) => {
+                    tracing::debug!(%error, "capture relay event tail read failed");
+                    Vec::new()
+                }
+            };
+            for envelope in events {
+                let MinutesEvent::LiveUtteranceFinal {
+                    source,
+                    text,
+                    speaker,
+                    offset_ms,
+                    duration_ms,
+                    ..
+                } = envelope.event
+                else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let update = RelayTranscriptUpdate::Utterance {
+                    session_epoch: 0,
+                    utterance: CopilotUtterance {
+                        utterance_sequence: envelope.seq,
+                        revision: envelope.seq,
+                        update_kind: TranscriptUpdateKind::Final,
+                        source,
+                        text,
+                        speaker,
+                        speaker_verified: false,
+                        offset_ms,
+                        duration_ms,
+                    },
+                    producer_latency_ms: 0,
+                    source_audio_age_ms: 0,
+                    observed_at: Utc::now(),
+                };
+                let mut state = lock_state(&shared);
+                state.push_transcript(update);
+                shared.changed.notify_all();
+            }
+        }
+
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            discovery.heartbeat_at = Utc::now();
+            if let Err(error) = write_discovery(&discovery_path, &discovery) {
+                tracing::warn!(error = %error, "capture relay heartbeat write failed");
+            }
+            last_heartbeat = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    {
+        let mut state = lock_state(&shared);
+        if state.shutdown_reason.is_none() {
+            state.shutdown_reason = Some("capture owner stopped".into());
+        }
+        shared.changed.notify_all();
+    }
+    thread::sleep(Duration::from_millis(25));
+    remove_discovery_if_owned(&discovery_path, &discovery.session_id);
+    #[cfg(unix)]
+    remove_if_present(Path::new(&discovery.endpoint)).ok();
+}
+
+fn spawn_client(stream: Stream, shared: Arc<SharedRelayState>, auth_token: String) {
+    if let Err(error) = thread::Builder::new()
+        .name("capture-relay-client".into())
+        .spawn(move || {
+            if let Err(error) = handle_client(stream, &shared, &auth_token) {
+                tracing::debug!(error = %error, "capture relay client disconnected");
+            }
+        })
+    {
+        tracing::warn!(error = %error, "failed to spawn capture relay client");
+    }
+}
+
+fn handle_client(
+    stream: Stream,
+    shared: &Arc<SharedRelayState>,
+    auth_token: &str,
+) -> Result<(), CaptureRelayError> {
+    // BSD/macOS accept inherits O_NONBLOCK from the listener. The pinned IPC
+    // listener only sets the flag when requested; it does not clear inheritance.
+    // This worker owns one peer and uses blocking framed I/O, unlike the accept
+    // loop. Normalize the mode explicitly and bound idle I/O on Unix so a quiet
+    // or backpressured peer cannot leave its worker parked indefinitely.
+    #[cfg(unix)]
+    {
+        stream.set_nonblocking(false)?;
+        stream.set_recv_timeout(Some(CLIENT_IO_IDLE_TIMEOUT))?;
+        stream.set_send_timeout(Some(CLIENT_IO_IDLE_TIMEOUT))?;
+    }
+    // Read the one client request through the original connection, then recover
+    // that connection for replies. The protocol has exactly one client request,
+    // so a second cloned I/O handle is unnecessary.
+    let mut reader = BufReader::new(stream);
+    let hello: ClientHello = read_json_line(&mut reader)?;
+    let mut stream = reader.into_inner();
+    if hello.v != RELAY_PROTOCOL_VERSION {
+        write_frame(
+            &mut stream,
+            &RelayFrame::Error {
+                message: format!(
+                    "unsupported protocol {}; expected {}",
+                    hello.v, RELAY_PROTOCOL_VERSION
+                ),
+            },
+        )?;
+        return Ok(());
+    }
+    if !constant_time_eq(hello.auth_token.as_bytes(), auth_token.as_bytes()) {
+        write_frame(
+            &mut stream,
+            &RelayFrame::Error {
+                message: "capture relay authentication failed".into(),
+            },
+        )?;
+        return Ok(());
+    }
+
+    match hello.action {
+        ClientAction::PublishNudge { nudge } => {
+            let nudge_seq = {
+                let mut state = lock_state(shared);
+                state.push_nudge(nudge)
+            };
+            shared.changed.notify_all();
+            write_frame(&mut stream, &RelayFrame::Published { nudge_seq })?;
+            Ok(())
+        }
+        ClientAction::Observe { cursor } => observe_client(stream, shared, cursor),
+    }
+}
+
+fn observe_client(
+    mut stream: Stream,
+    shared: &Arc<SharedRelayState>,
+    mut cursor: RelayCursor,
+) -> Result<(), CaptureRelayError> {
+    let acknowledgement = {
+        let snapshot = lock_state(shared);
+        if cursor.session_id.as_deref() != Some(snapshot.session_id.as_str()) {
+            cursor = RelayCursor {
+                session_id: Some(snapshot.session_id.clone()),
+                ..RelayCursor::default()
+            };
+            RelayFrame::CursorReset {
+                session_id: snapshot.session_id.clone(),
+                reason: "capture owner session changed; replaying the current relay buffer".into(),
+            }
+        } else {
+            RelayFrame::Attached {
+                v: RELAY_PROTOCOL_VERSION,
+                session_id: snapshot.session_id.clone(),
+                owner_pid: snapshot.owner_pid,
+                evidence_mode: snapshot.evidence_mode,
+                transcript_seq: snapshot.transcript_seq,
+                nudge_seq: snapshot.nudge_seq,
+            }
+        }
+    };
+    // Socket writes must never hold the producer/heartbeat/shutdown state lock.
+    write_frame(&mut stream, &acknowledgement)?;
+
+    let mut last_heartbeat = Instant::now() - HEARTBEAT_INTERVAL;
+    loop {
+        let state = lock_state(shared);
+        if let Some(reason) = state.shutdown_reason.clone() {
+            drop(state);
+            write_frame(&mut stream, &RelayFrame::Shutdown { reason })?;
+            return Ok(());
+        }
+
+        let transcript_gap = gap_frame(
+            "transcript",
+            cursor.transcript_seq,
+            state.transcript.front().map(|(seq, _)| *seq),
+        );
+        let nudge_gap = gap_frame(
+            "nudge",
+            cursor.nudge_seq,
+            state.nudges.front().map(|(seq, _)| *seq),
+        );
+        let transcript = state
+            .transcript
+            .iter()
+            .filter(|(seq, _)| *seq > cursor.transcript_seq)
+            .cloned()
+            .collect::<Vec<_>>();
+        let nudges = state
+            .nudges
+            .iter()
+            .filter(|(seq, _)| *seq > cursor.nudge_seq)
+            .cloned()
+            .collect::<Vec<_>>();
+        let heartbeat = (state.owner_pid, state.transcript_seq, state.nudge_seq);
+        if transcript.is_empty()
+            && nudges.is_empty()
+            && last_heartbeat.elapsed() < HEARTBEAT_INTERVAL
+        {
+            let (next, _) = shared
+                .changed
+                .wait_timeout(state, Duration::from_millis(250))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(next);
+            continue;
+        }
+        drop(state);
+
+        for gap in [transcript_gap, nudge_gap].into_iter().flatten() {
+            write_frame(&mut stream, &gap)?;
+        }
+        for (seq, update) in transcript {
+            write_frame(&mut stream, &RelayFrame::Transcript { seq, update })?;
+            cursor.transcript_seq = seq;
+        }
+        for (seq, nudge) in nudges {
+            write_frame(&mut stream, &RelayFrame::Nudge { seq, nudge })?;
+            cursor.nudge_seq = seq;
+        }
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            write_frame(
+                &mut stream,
+                &RelayFrame::Heartbeat {
+                    owner_pid: heartbeat.0,
+                    transcript_seq: heartbeat.1,
+                    nudge_seq: heartbeat.2,
+                    sent_at: Utc::now(),
+                },
+            )?;
+            last_heartbeat = Instant::now();
+        }
+    }
+}
+
+fn gap_frame(stream_name: &str, cursor: u64, available_from: Option<u64>) -> Option<RelayFrame> {
+    available_from
+        .filter(|available_from| cursor.saturating_add(1) < *available_from)
+        .map(|available_from| RelayFrame::Gap {
+            stream: stream_name.into(),
+            requested_after: cursor,
+            available_from,
+        })
+}
+
+fn relay_partial_update(event: LivePartialEvent) -> RelayTranscriptUpdate {
+    match event {
+        LivePartialEvent::Partial(partial) => RelayTranscriptUpdate::Utterance {
+            session_epoch: partial.session_epoch,
+            producer_latency_ms: partial
+                .partial_published_at
+                .saturating_duration_since(partial.audio_received_at)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            source_audio_age_ms: partial
+                .partial_published_at
+                .saturating_duration_since(partial.audio_snapshot_at)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            observed_at: Utc::now(),
+            utterance: CopilotUtterance {
+                utterance_sequence: partial.utterance_sequence,
+                revision: partial.revision,
+                update_kind: TranscriptUpdateKind::Partial,
+                source: partial.source,
+                text: partial.text,
+                speaker: partial.speaker,
+                speaker_verified: false,
+                offset_ms: partial.offset_ms,
+                duration_ms: 0,
+            },
+        },
+        LivePartialEvent::Superseded(signal) => RelayTranscriptUpdate::Superseded {
+            session_epoch: signal.session_epoch,
+            through_utterance_sequence: signal.through_utterance_sequence,
+            last_revision: signal.last_revision,
+            reason: match signal.reason {
+                SupersessionReason::Finalized => "finalized",
+                SupersessionReason::Finalizing => "finalizing",
+                SupersessionReason::Discarded => "discarded",
+            }
+            .into(),
+        },
+    }
+}
+
+fn validate_discovery(discovery: &CaptureRelayDiscovery) -> Result<(), CaptureRelayError> {
+    if discovery.v != RELAY_PROTOCOL_VERSION {
+        return Err(CaptureRelayError::Protocol {
+            found: discovery.v,
+            expected: RELAY_PROTOCOL_VERSION,
+        });
+    }
+    if !crate::pid::is_process_alive(discovery.owner_pid) {
+        return Err(CaptureRelayError::OwnerExited(discovery.owner_pid));
+    }
+    if !discovery.heartbeat_is_fresh(Utc::now()) {
+        return Err(CaptureRelayError::Stale);
+    }
+    Ok(())
+}
+
+fn current_transport() -> RelayTransport {
+    #[cfg(windows)]
+    {
+        RelayTransport::WindowsNamedPipe
+    }
+    #[cfg(not(windows))]
+    {
+        RelayTransport::UnixSocket
+    }
+}
+
+fn relay_endpoint(dir: &Path, session_id: &str) -> String {
+    #[cfg(windows)]
+    {
+        let _ = (dir, session_id);
+        r"\\.\pipe\minutes-capture-relay".into()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = session_id;
+        dir.join(UNIX_SOCKET_FILE).to_string_lossy().into_owned()
+    }
+}
+
+fn acquire_owner_lock(
+    dir: &Path,
+    discovery_path: &Path,
+) -> Result<std::fs::File, CaptureRelayError> {
+    let path = dir.join(OWNER_LOCK_FILE);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
+    #[cfg(unix)]
+    set_owner_only_permissions(&path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(file),
+        Err(_) => {
+            if let Some(owner_pid) = live_fresh_owner_pid(discovery_path) {
+                Err(CaptureRelayError::AlreadyOwned(owner_pid))
+            } else {
+                Err(CaptureRelayError::OwnershipBusy)
+            }
+        }
+    }
+}
+
+fn live_fresh_owner_pid(discovery_path: &Path) -> Option<u32> {
+    read_discovery(discovery_path).and_then(|discovery| {
+        (crate::pid::is_process_alive(discovery.owner_pid)
+            && discovery.heartbeat_is_fresh(Utc::now()))
+        .then_some(discovery.owner_pid)
+    })
+}
+
+fn random_hex(bytes: usize) -> Result<String, CaptureRelayError> {
+    let mut value = vec![0_u8; bytes];
+    getrandom::fill(&mut value)
+        .map_err(|error| io::Error::other(format!("secure random source failed: {error}")))?;
+    Ok(value.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn write_discovery(path: &Path, discovery: &CaptureRelayDiscovery) -> io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(discovery).map_err(io::Error::other)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    set_owner_only_permissions(&tmp)?;
+    std::fs::rename(tmp, path)?;
+    #[cfg(unix)]
+    set_owner_only_permissions(path)?;
+    Ok(())
+}
+
+fn read_discovery(path: &Path) -> Option<CaptureRelayDiscovery> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn remove_discovery_if_owned(path: &Path, session_id: &str) {
+    if read_discovery(path)
+        .as_ref()
+        .map(|item| item.session_id.as_str())
+        == Some(session_id)
+    {
+        remove_if_present(path).ok();
+    }
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+fn write_json_line(stream: &mut Stream, value: &impl Serialize) -> io::Result<()> {
+    // Serialize to a buffer first, then write. Writing directly with
+    // `serde_json::to_writer` folds a socket write failure into a serde_json
+    // error, and `io::Error::other` then erases its `ErrorKind` to `Other` —
+    // so a `BrokenPipe` during a reconnect handshake became an unclassifiable
+    // error the retry path could not recognize (#529). Serializing to a Vec
+    // isolates genuine serialization faults from the socket write, so the
+    // write's real `ErrorKind` (e.g. `BrokenPipe`) reaches the caller intact.
+    let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes)?;
+    stream.flush()
+}
+
+fn write_frame(stream: &mut Stream, frame: &RelayFrame) -> Result<(), CaptureRelayError> {
+    write_json_line(stream, frame).map_err(CaptureRelayError::Io)
+}
+
+fn read_json_line<T: for<'de> Deserialize<'de>>(
+    reader: &mut impl BufRead,
+) -> Result<T, CaptureRelayError> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(CaptureRelayError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "capture relay peer closed before sending a request",
+        )));
+    }
+    serde_json::from_str(line.trim_end())
+        .map_err(|error| CaptureRelayError::InvalidData(error.to_string()))
+}
+
+fn read_frame_blocking(reader: &mut impl BufRead) -> Result<RelayFrame, CaptureRelayError> {
+    read_json_line(reader)
+}
+
+fn lock_state(shared: &SharedRelayState) -> MutexGuard<'_, RelayState> {
+    shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or_default()
+                ^ right.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
+}
+
+fn wake_listener(discovery: &CaptureRelayDiscovery) {
+    let Ok(name) = discovery.endpoint.as_str().to_fs_name::<GenericFilePath>() else {
+        return;
+    };
+    let _ = Stream::connect(name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::copilot::{NudgeKind, OpportunityKind};
+    use tempfile::TempDir;
+
+    fn utterance(text: &str) -> RelayTranscriptUpdate {
+        RelayTranscriptUpdate::Utterance {
+            session_epoch: 7,
+            utterance: CopilotUtterance {
+                utterance_sequence: 3,
+                revision: 4,
+                update_kind: TranscriptUpdateKind::Partial,
+                source: "test".into(),
+                text: text.into(),
+                speaker: None,
+                speaker_verified: false,
+                offset_ms: 100,
+                duration_ms: 0,
+            },
+            producer_latency_ms: 12,
+            source_audio_age_ms: 0,
+            observed_at: Utc::now(),
+        }
+    }
+
+    fn nudge(id: &str) -> Nudge {
+        Nudge {
+            v: 1,
+            id: id.into(),
+            kind: NudgeKind::Ask,
+            text: "Who owns this?".into(),
+            source_chip: "owner".into(),
+            opportunity: OpportunityKind::NextStep,
+            confidence: 91,
+            session_epoch: 7,
+            evidence_revision: 4,
+            evidence_utterance_sequence: 3,
+            evidence_utterance_revision: 4,
+            grounded_partial_utterance_sequence: Some(3),
+            grounded_partial_utterance_revision: Some(4),
+            update_kind: TranscriptUpdateKind::Partial,
+            created_ts: Utc::now(),
+            ttl_ms: 12_000,
+            supersedes: None,
+        }
+    }
+
+    // Parser fixtures use connected local sockets only. Ownership/authentication
+    // is exercised separately through handle_client and real server fixtures.
+    #[cfg(unix)]
+    fn parser_pair() -> (TempDir, Stream, CaptureRelayClient) {
+        let dir = TempDir::new().unwrap();
+        let endpoint = dir
+            .path()
+            .join("parser.sock")
+            .to_string_lossy()
+            .into_owned();
+        let listener = ListenerOptions::new()
+            .name(endpoint.as_str().to_fs_name::<GenericFilePath>().unwrap())
+            .create_sync()
+            .unwrap();
+        let receiving =
+            Stream::connect(endpoint.as_str().to_fs_name::<GenericFilePath>().unwrap()).unwrap();
+        let sending = listener.accept().unwrap();
+        receiving.set_nonblocking(true).unwrap();
+        let now = Utc::now();
+        let client = CaptureRelayClient {
+            discovery_path: dir.path().join("unused.json"),
+            discovery: CaptureRelayDiscovery {
+                v: RELAY_PROTOCOL_VERSION,
+                session_id: "synthetic".into(),
+                transport: current_transport(),
+                endpoint,
+                owner_pid: std::process::id(),
+                evidence_mode: CopilotEvidenceMode::CaptureRelayPartials,
+                auth_token: String::new(),
+                started_at: now,
+                heartbeat_at: now,
+            },
+            reader: BufReader::new(receiving),
+            pending_line: Vec::new(),
+            cursor: RelayCursor::default(),
+            established: true,
+            establishment_retry: EstablishmentRetry::new(),
+        };
+        (dir, sending, client)
+    }
+
+    #[cfg(unix)]
+    fn synthetic_state() -> Arc<SharedRelayState> {
+        Arc::new(SharedRelayState {
+            state: Mutex::new(RelayState {
+                session_id: "synthetic".into(),
+                owner_pid: std::process::id(),
+                evidence_mode: CopilotEvidenceMode::CaptureRelayPartials,
+                transcript_seq: 0,
+                nudge_seq: 0,
+                transcript: VecDeque::new(),
+                nudges: VecDeque::new(),
+                shutdown_reason: None,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_reader_preserves_every_split_utf8_code_point() {
+        let frame = RelayFrame::Transcript {
+            seq: 1,
+            update: utterance("synthetic café 漢字 😀"),
+        };
+        let mut bytes = serde_json::to_vec(&frame).unwrap();
+        bytes.push(b'\n');
+        for split in 1..bytes.len() {
+            if std::str::from_utf8(&bytes[..split]).is_ok() {
+                continue;
+            }
+            let (_dir, mut peer, mut client) = parser_pair();
+            peer.write_all(&bytes[..split]).unwrap();
+            assert!(matches!(client.try_recv(), Ok(None)), "split {split}");
+            peer.write_all(&bytes[split..]).unwrap();
+            assert_eq!(
+                client.try_recv().unwrap(),
+                Some(frame.clone()),
+                "split {split}"
+            );
+            assert!(matches!(client.try_recv(), Ok(None)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_nonblocking_peer_accepts_delayed_authenticated_request() {
+        let (_dir, peer, client) = parser_pair();
+        peer.set_nonblocking(true).unwrap(); // emulate macOS accept inheritance
+        let mut reader = client.reader;
+        reader.get_ref().set_nonblocking(false).unwrap();
+        // Configure the read before the worker can close its reply socket.
+        // Darwin may reject timeout changes after the peer has disconnected.
+        reader
+            .get_ref()
+            .set_recv_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = synthetic_state();
+        let worker_state = Arc::clone(&shared);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = thread::spawn(move || {
+            tx.send(handle_client(peer, &worker_state, "synthetic-auth"))
+                .unwrap();
+        });
+        // Give the worker a chance to read before any request has been sent.
+        let early = rx.recv_timeout(Duration::from_millis(100));
+        let sent = write_json_line(
+            reader.get_mut(),
+            &ClientHello {
+                v: RELAY_PROTOCOL_VERSION,
+                auth_token: "synthetic-auth".into(),
+                action: ClientAction::PublishNudge {
+                    nudge: nudge("synthetic"),
+                },
+            },
+        );
+        let result = early.unwrap_or_else(|_| rx.recv_timeout(Duration::from_secs(3)).unwrap());
+        join.join().unwrap();
+        sent.unwrap();
+        result.unwrap();
+        assert!(matches!(
+            read_frame_blocking(&mut reader).unwrap(),
+            RelayFrame::Published { nudge_seq: 1 }
+        ));
+        assert_eq!(lock_state(&shared).nudge_seq, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backpressured_inherited_stream_replays_full_buffer_without_holding_state() {
+        let (_dir, peer, mut client) = parser_pair();
+        peer.set_nonblocking(true).unwrap();
+        let shared = synthetic_state();
+        {
+            let mut state = lock_state(&shared);
+            for _ in 0..FRAME_CAPACITY + 5 {
+                state.push_transcript(utterance(&"synthetic café ".repeat(200)));
+            }
+        }
+        write_json_line(
+            client.reader.get_mut(),
+            &ClientHello {
+                v: RELAY_PROTOCOL_VERSION,
+                auth_token: "synthetic-auth".into(),
+                action: ClientAction::Observe {
+                    cursor: RelayCursor::default(),
+                },
+            },
+        )
+        .unwrap();
+        let worker_state = Arc::clone(&shared);
+        let join = thread::spawn(move || handle_client(peer, &worker_state, "synthetic-auth"));
+        // Observe the gap and first transcript so the replay snapshot is in
+        // flight before pausing. More than 1 MiB exceeds the socket buffer.
+        let first_deadline = Instant::now() + Duration::from_secs(3);
+        let mut count = 0;
+        let mut gap = false;
+        while count == 0 && Instant::now() < first_deadline {
+            match client.try_recv().unwrap() {
+                Some(RelayFrame::Transcript { .. }) => count += 1,
+                Some(RelayFrame::Gap { .. }) => gap = true,
+                _ => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(count, 1, "replay must start before the pause");
+        thread::sleep(Duration::from_millis(100));
+        let mut state = shared
+            .state
+            .try_lock()
+            .expect("peer backpressure must not hold shared state");
+        let last = state.transcript_seq;
+        state.shutdown_reason = Some("synthetic stop".into());
+        drop(state);
+        shared.changed.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut shutdown = false;
+        while Instant::now() < deadline {
+            match client.try_recv() {
+                Ok(Some(RelayFrame::Transcript { .. })) => count += 1,
+                Ok(Some(RelayFrame::Gap { .. })) => gap = true,
+                Ok(Some(RelayFrame::Shutdown { .. })) => {
+                    shutdown = true;
+                    break;
+                }
+                Ok(_) => thread::sleep(Duration::from_millis(1)),
+                Err(error) => panic!("synthetic replay failed: {error}"),
+            }
+        }
+        drop(client); // release the writer before join, including deadline failure
+        let result = join.join().unwrap();
+        result.unwrap();
+        assert!(gap && shutdown);
+        assert_eq!(count, FRAME_CAPACITY);
+        assert_eq!(last, (FRAME_CAPACITY + 5) as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresponsive_observer_retires_without_blocking_other_relay_work() {
+        let (_dir, peer, mut client) = parser_pair();
+        peer.set_nonblocking(true).unwrap();
+        let shared = synthetic_state();
+        {
+            let mut state = lock_state(&shared);
+            for _ in 0..FRAME_CAPACITY {
+                state.push_transcript(utterance(&"synthetic payload ".repeat(200)));
+            }
+        }
+        write_json_line(
+            client.reader.get_mut(),
+            &ClientHello {
+                v: RELAY_PROTOCOL_VERSION,
+                auth_token: "synthetic-auth".into(),
+                action: ClientAction::Observe {
+                    cursor: RelayCursor::default(),
+                },
+            },
+        )
+        .unwrap();
+        let worker_state = Arc::clone(&shared);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = tx.send(handle_client(peer, &worker_state, "synthetic-auth"));
+        });
+        wait_for_frame(&mut client, |frame| {
+            matches!(frame, RelayFrame::Transcript { .. })
+        });
+        // Keep the client alive but stop reading its full replay.
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        let published = shared
+            .state
+            .try_lock()
+            .map(|mut state| state.push_nudge(nudge("other-work")));
+        drop(client); // always release the old writer before joining
+        join.join().unwrap();
+        let error = result.expect("idle replay writer must retire").unwrap_err();
+        assert!(
+            matches!(error, CaptureRelayError::Io(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
+        );
+        assert_eq!(published.unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_unauthed_peer_times_out_without_touching_shared_state() {
+        let (_dir, peer, client) = parser_pair();
+        let shared = synthetic_state();
+        let worker_state = Arc::clone(&shared);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = tx.send(handle_client(peer, &worker_state, "synthetic-auth"));
+        });
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        drop(client); // also unblocks an old implementation before joining
+        join.join().unwrap();
+        let error = result
+            .expect("idle request must retire its worker")
+            .unwrap_err();
+        assert!(
+            matches!(error, CaptureRelayError::Io(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
+        );
+        assert_eq!(lock_state(&shared).nudge_seq, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_mode_normalization_preserves_auth_and_protocol_rejection() {
+        for (version, token, expected) in [
+            (RELAY_PROTOCOL_VERSION, "wrong", "authentication"),
+            (
+                RELAY_PROTOCOL_VERSION + 1,
+                "synthetic-auth",
+                "unsupported protocol",
+            ),
+        ] {
+            let (_dir, peer, client) = parser_pair();
+            peer.set_nonblocking(true).unwrap();
+            let shared = synthetic_state();
+            let worker_state = Arc::clone(&shared);
+            let mut reader = client.reader;
+            write_json_line(
+                reader.get_mut(),
+                &ClientHello {
+                    v: version,
+                    auth_token: token.into(),
+                    action: ClientAction::PublishNudge {
+                        nudge: nudge("rejected"),
+                    },
+                },
+            )
+            .unwrap();
+            let join = thread::spawn(move || handle_client(peer, &worker_state, "synthetic-auth"));
+            reader.get_ref().set_nonblocking(false).unwrap();
+            reader
+                .get_ref()
+                .set_recv_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let response = read_frame_blocking(&mut reader).unwrap();
+            join.join().unwrap().unwrap();
+            assert!(
+                matches!(response, RelayFrame::Error { message } if message.contains(expected))
+            );
+            assert_eq!(lock_state(&shared).nudge_seq, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_readers_replay_growing_buffer_through_capacity_and_supersession() {
+        let dir = TempDir::new().unwrap();
+        let server = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+        for cycle in 1..=32 {
+            for _ in 0..20 {
+                server.publish_transcript_for_test(utterance("synthetic café growing replay"));
+            }
+            let expected = cycle * 20;
+            let mut client =
+                CaptureRelayClient::connect_from(&discovery_path, RelayCursor::default()).unwrap();
+            let mut frames = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while client.cursor().transcript_seq < expected && Instant::now() < deadline {
+                match client.try_recv().unwrap() {
+                    Some(frame) => frames.push(frame),
+                    None => thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            assert_eq!(client.cursor().transcript_seq, expected);
+            let snapshot = reduce_relay_draft(
+                &frames,
+                CopilotEvidenceMode::CaptureRelayPartials,
+                Utc::now(),
+            );
+            assert_eq!(snapshot.draft_state, RelayDraftState::Current);
+            assert_eq!(
+                snapshot.current_draft.unwrap().text,
+                "synthetic café growing replay"
+            );
+            assert_eq!(snapshot.gap, expected > FRAME_CAPACITY as u64);
+        }
+        // An explicit invalidation at the end of a full replay must still win.
+        server.publish_transcript_for_test(RelayTranscriptUpdate::Superseded {
+            session_epoch: 7,
+            through_utterance_sequence: 3,
+            last_revision: 4,
+            reason: "finalizing".into(),
+        });
+        let mut client =
+            CaptureRelayClient::connect_from(&discovery_path, RelayCursor::default()).unwrap();
+        let mut frames = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while client.cursor().transcript_seq < 641 && Instant::now() < deadline {
+            match client.try_recv().unwrap() {
+                Some(frame) => frames.push(frame),
+                None => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(client.cursor().transcript_seq, 641);
+        let snapshot = reduce_relay_draft(
+            &frames,
+            CopilotEvidenceMode::CaptureRelayPartials,
+            Utc::now(),
+        );
+        assert_eq!(snapshot.draft_state, RelayDraftState::Finalizing);
+        assert!(snapshot.current_draft.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_invalid_utf8_frame_is_rejected_without_advancing_cursor() {
+        let (_dir, mut peer, mut client) = parser_pair();
+        peer.write_all(b"{\"type\":\"error\",\"message\":\"\xff\"}\n")
+            .unwrap();
+        assert!(matches!(
+            client.try_recv(),
+            Err(CaptureRelayError::InvalidData(_))
+        ));
+        assert_eq!(client.cursor(), RelayCursor::default());
+    }
+
+    #[test]
+    fn client_discovery_validation_preserves_protocol_owner_and_freshness_gates() {
+        let dir = TempDir::new().unwrap();
+        let server = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        let discovery = server.discovery().clone();
+        validate_discovery(&discovery).unwrap();
+        let mut invalid = discovery.clone();
+        invalid.v += 1;
+        assert!(matches!(
+            validate_discovery(&invalid),
+            Err(CaptureRelayError::Protocol { .. })
+        ));
+        invalid = discovery.clone();
+        invalid.owner_pid = i32::MAX as u32;
+        assert!(matches!(
+            validate_discovery(&invalid),
+            Err(CaptureRelayError::OwnerExited(_))
+        ));
+        invalid = discovery;
+        invalid.heartbeat_at = Utc::now() - chrono::Duration::seconds(6);
+        assert!(matches!(
+            validate_discovery(&invalid),
+            Err(CaptureRelayError::Stale)
+        ));
+    }
+
+    #[test]
+    fn older_relay_frames_without_source_audio_age_remain_readable() {
+        let mut legacy = serde_json::to_value(utterance("legacy frame")).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("relay update should serialize as an object")
+            .remove("source_audio_age_ms");
+
+        let decoded: RelayTranscriptUpdate = serde_json::from_value(legacy).unwrap();
+        let RelayTranscriptUpdate::Utterance {
+            source_audio_age_ms,
+            ..
+        } = decoded
+        else {
+            panic!("expected utterance update")
+        };
+        assert_eq!(source_audio_age_ms, 0);
+    }
+
+    #[test]
+    fn bounded_replay_exposes_only_the_latest_fresh_draft() {
+        let now = Utc::now();
+        let mut first = utterance("first draft");
+        let RelayTranscriptUpdate::Utterance { observed_at, .. } = &mut first else {
+            unreachable!()
+        };
+        *observed_at = now - chrono::Duration::milliseconds(800);
+        let mut second = utterance("corrected draft");
+        let RelayTranscriptUpdate::Utterance {
+            utterance,
+            observed_at,
+            ..
+        } = &mut second
+        else {
+            unreachable!()
+        };
+        utterance.revision = 5;
+        *observed_at = now - chrono::Duration::milliseconds(100);
+
+        let snapshot = reduce_relay_draft(
+            &[
+                RelayFrame::Transcript {
+                    seq: 1,
+                    update: first,
+                },
+                RelayFrame::Transcript {
+                    seq: 2,
+                    update: second,
+                },
+            ],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+
+        assert_eq!(snapshot.draft_state, RelayDraftState::Current);
+        let draft = snapshot.current_draft.unwrap();
+        assert_eq!(draft.text, "corrected draft");
+        assert_eq!(draft.revision, 5);
+        assert_eq!(draft.age_ms, 100);
+    }
+
+    #[test]
+    fn supersession_and_age_fail_closed() {
+        let now = Utc::now();
+        let mut stale = utterance("too old");
+        let RelayTranscriptUpdate::Utterance { observed_at, .. } = &mut stale else {
+            unreachable!()
+        };
+        *observed_at = now - chrono::Duration::seconds(4);
+        let stale_snapshot = reduce_relay_draft(
+            &[RelayFrame::Transcript {
+                seq: 1,
+                update: stale,
+            }],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+        assert_eq!(stale_snapshot.draft_state, RelayDraftState::Stale);
+        assert!(stale_snapshot.current_draft.is_none());
+
+        let mut slow_result = utterance("slow recognition");
+        let RelayTranscriptUpdate::Utterance {
+            source_audio_age_ms,
+            observed_at,
+            ..
+        } = &mut slow_result
+        else {
+            unreachable!()
+        };
+        *source_audio_age_ms = 4_000;
+        *observed_at = now;
+        let slow_snapshot = reduce_relay_draft(
+            &[RelayFrame::Transcript {
+                seq: 1,
+                update: slow_result,
+            }],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+        assert_eq!(slow_snapshot.draft_state, RelayDraftState::Stale);
+        assert!(slow_snapshot.current_draft.is_none());
+
+        let finalizing_snapshot = reduce_relay_draft(
+            &[
+                RelayFrame::Transcript {
+                    seq: 1,
+                    update: utterance("about to finalize"),
+                },
+                RelayFrame::Transcript {
+                    seq: 2,
+                    update: RelayTranscriptUpdate::Superseded {
+                        session_epoch: 7,
+                        through_utterance_sequence: 3,
+                        last_revision: 4,
+                        reason: "finalizing".into(),
+                    },
+                },
+            ],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+        assert_eq!(finalizing_snapshot.draft_state, RelayDraftState::Finalizing);
+        assert!(finalizing_snapshot.current_draft.is_none());
+    }
+
+    fn wait_for_frame(
+        client: &mut CaptureRelayClient,
+        predicate: impl Fn(&RelayFrame) -> bool,
+    ) -> RelayFrame {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Some(frame) = client.try_recv().unwrap() {
+                if predicate(&frame) {
+                    return frame;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for relay frame");
+    }
+
+    fn wait_for_error(client: &mut CaptureRelayClient) -> CaptureRelayError {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match client.try_recv() {
+                Ok(_) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => return error,
+            }
+        }
+        panic!("timed out waiting for relay error");
+    }
+
+    #[test]
+    fn recording_style_partial_channel_reaches_relay_and_finalizing_retracts_it() {
+        let dir = TempDir::new().unwrap();
+        let (mut publisher, subscriber) =
+            crate::live_partials::channel_with_source(44, 2, "recording-sidecar");
+        let _server = CaptureRelayServer::start_inner(
+            dir.path(),
+            CopilotEvidenceMode::CaptureRelayPartials,
+            Some(subscriber),
+            false,
+        )
+        .unwrap();
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+        let mut client =
+            CaptureRelayClient::connect_from(&discovery_path, RelayCursor::default()).unwrap();
+
+        publisher.begin_utterance(Instant::now());
+        publisher.try_publish("current speech".into(), 250);
+        let partial = wait_for_frame(&mut client, |frame| {
+            matches!(
+                frame,
+                RelayFrame::Transcript {
+                    update: RelayTranscriptUpdate::Utterance { utterance, .. },
+                    ..
+                } if utterance.update_kind == TranscriptUpdateKind::Partial
+                    && utterance.text == "current speech"
+            )
+        });
+        let (session_epoch, source) = match &partial {
+            RelayFrame::Transcript {
+                update:
+                    RelayTranscriptUpdate::Utterance {
+                        session_epoch,
+                        utterance,
+                        ..
+                    },
+                ..
+            } => (*session_epoch, utterance.source.as_str()),
+            _ => unreachable!(),
+        };
+        assert_eq!(session_epoch, 44);
+        assert_eq!(source, "recording-sidecar");
+
+        publisher.supersede_current(SupersessionReason::Finalizing);
+        let retracted = wait_for_frame(&mut client, |frame| {
+            matches!(
+                frame,
+                RelayFrame::Transcript {
+                    update: RelayTranscriptUpdate::Superseded { reason, .. },
+                    ..
+                } if reason == "finalizing"
+            )
+        });
+        let snapshot = reduce_relay_draft(
+            &[partial, retracted],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            Utc::now(),
+        );
+        assert_eq!(snapshot.draft_state, RelayDraftState::Finalizing);
+        assert!(snapshot.current_draft.is_none());
+    }
+
+    #[test]
+    fn connect_reconnect_replays_only_after_both_cursors() {
+        let dir = TempDir::new().unwrap();
+        let server = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        server.publish_transcript_for_test(utterance("first"));
+        server.publish_nudge(nudge("nudge-1"));
+
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+        let mut first =
+            CaptureRelayClient::connect_from(&discovery_path, RelayCursor::default()).unwrap();
+        wait_for_frame(&mut first, |frame| {
+            matches!(frame, RelayFrame::Transcript { seq: 1, .. })
+        });
+        wait_for_frame(&mut first, |frame| {
+            matches!(frame, RelayFrame::Nudge { seq: 1, .. })
+        });
+        let cursor = first.cursor();
+        drop(first);
+
+        server.publish_transcript_for_test(utterance("second"));
+        server.publish_nudge(nudge("nudge-2"));
+
+        // Reconnect through the retrying helper rather than a bare
+        // connect + wait_for_frame. The server's retirement of the dropped
+        // client is not ordered against accepting the next one, so a freshly
+        // connected client can observe EOF immediately; on Windows named pipes
+        // that happened in 5 of 25 runs (#656).
+        //
+        // An established consumer surfacing that as an error is deliberate
+        // production behavior, established in #529 and relied on by
+        // `repeated_reconnects_replay_each_cursor_advance` directly below, so
+        // the test retries instead of the client swallowing it. Replay is
+        // cursor-based, so a retry resumes from the same cursor and the
+        // invariant under test is unchanged: some (re)connection must deliver
+        // transcript 2 and nudge 2, and only those.
+        let resumed = read_reconnect_cycle_with_retry(&discovery_path, cursor, 2);
+        assert_eq!(resumed.transcript_seq, 2);
+        assert_eq!(resumed.nudge_seq, 2);
+    }
+
+    #[test]
+    fn repeated_reconnects_replay_each_cursor_advance() {
+        const RECONNECT_CYCLES: u64 = 40;
+
+        let dir = TempDir::new().unwrap();
+        let server = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+        let mut cursor = RelayCursor::default();
+
+        for seq in 1..=RECONNECT_CYCLES {
+            server.publish_transcript_for_test(utterance(&format!("transcript-{seq}")));
+            server.publish_nudge(nudge(&format!("nudge-{seq}")));
+
+            // Rapid reconnect churn can transiently close a freshly established
+            // connection mid-delivery (observed on Windows named pipes, #529).
+            // That is a legitimate reconnect scenario, not a replay failure, and
+            // an established consumer surfacing it as an error is correct
+            // production behavior — so the *test* reconnects with the same cursor
+            // and retries the cycle. The replay invariant is unchanged: some
+            // (re)connection must still deliver transcript-seq and nudge-seq.
+            cursor = read_reconnect_cycle_with_retry(&discovery_path, cursor, seq);
+            assert_eq!(cursor.transcript_seq, seq);
+            assert_eq!(cursor.nudge_seq, seq);
+        }
+    }
+
+    /// Retry only the transient reconnect race, and only briefly.
+    ///
+    /// The race being absorbed is documented in #529 and #656: the server's
+    /// retirement of a dropped client is not ordered against accepting the
+    /// next one, so a freshly connected client can see the peer teardown
+    /// immediately. It resolves in milliseconds.
+    ///
+    /// Which errno that teardown surfaces as is platform-dependent, so this
+    /// reuses the same classification the production reconnect path applies
+    /// (see `CaptureRelayClient::read_frame`): a clean `UnexpectedEof`, plus
+    /// the `BrokenPipe`/`ConnectionReset`/`ConnectionAborted` family that
+    /// `is_handshake_teardown_error` documents on macOS under CPU contention.
+    /// Matching only `UnexpectedEof` here would leave the test failing
+    /// immediately on exactly the races production is written to absorb.
+    ///
+    /// A timeout is different in kind. `try_wait_for_frame` waits 3s per frame
+    /// and reports `InvalidData("timed out ...")`, which means replay itself
+    /// did not deliver. Retrying that is never useful and is actively harmful:
+    /// at two frames per attempt it costs 6s a time, and
+    /// `repeated_reconnects_replay_each_cursor_advance` runs 40 cycles, so a
+    /// real break burned tens of minutes against a 4 minute job timeout. The
+    /// failure then surfaced as a CI timeout with no test named, instead of an
+    /// assertion pointing at the broken invariant.
+    ///
+    /// So: retry connection teardown fast, fail everything else immediately.
+    const RECONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+    /// Floor on attempts, so a slow attempt cannot consume the whole wall-clock
+    /// budget and reduce this to a single try.
+    const RECONNECT_MIN_ATTEMPTS: u32 = 3;
+
+    fn is_transient_reconnect_error(error: &CaptureRelayError) -> bool {
+        is_unexpected_eof(error) || is_handshake_teardown_error(error)
+    }
+
+    fn read_reconnect_cycle_with_retry(
+        discovery_path: &Path,
+        cursor: RelayCursor,
+        seq: u64,
+    ) -> RelayCursor {
+        let started = Instant::now();
+        let deadline = started + RECONNECT_RETRY_BUDGET;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match read_reconnect_cycle(discovery_path, cursor.clone(), seq) {
+                Ok(next) => return next,
+                Err(error) if !is_transient_reconnect_error(&error) => panic!(
+                    "reconnect cycle {seq} failed on attempt {attempt} with a non-transient \
+                     error: {error:?}. Only an immediate connection teardown during reconnect \
+                     is retried; anything else means replay is broken."
+                ),
+                // The budget is wall-clock, but an attempt is not instant: a
+                // frame wait can burn 3s before the teardown surfaces, so a
+                // slow first attempt could exhaust the whole budget and leave
+                // this at one try. Honour a floor of RECONNECT_MIN_ATTEMPTS so
+                // the retry cannot silently degrade to no retry at all.
+                Err(error) if attempt < RECONNECT_MIN_ATTEMPTS || Instant::now() < deadline => {
+                    eprintln!("reconnect cycle {seq} attempt {attempt} retrying after {error:?}");
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!(
+                    "reconnect cycle {seq} still hitting the reconnect race after {attempt} \
+                     attempts in {:?}: {error:?}",
+                    started.elapsed()
+                ),
+            }
+        }
+    }
+
+    fn read_reconnect_cycle(
+        discovery_path: &Path,
+        cursor: RelayCursor,
+        seq: u64,
+    ) -> Result<RelayCursor, CaptureRelayError> {
+        let mut client = CaptureRelayClient::connect_from(discovery_path, cursor)?;
+        try_wait_for_frame(
+            &mut client,
+            |frame| matches!(frame, RelayFrame::Transcript { seq: frame_seq, .. } if *frame_seq == seq),
+        )?;
+        try_wait_for_frame(
+            &mut client,
+            |frame| matches!(frame, RelayFrame::Nudge { seq: frame_seq, .. } if *frame_seq == seq),
+        )?;
+        Ok(client.cursor())
+    }
+
+    fn try_wait_for_frame(
+        client: &mut CaptureRelayClient,
+        predicate: impl Fn(&RelayFrame) -> bool,
+    ) -> Result<RelayFrame, CaptureRelayError> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Some(frame) = client.try_recv()? {
+                if predicate(&frame) {
+                    return Ok(frame);
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Err(CaptureRelayError::InvalidData(
+            "timed out waiting for relay frame".into(),
+        ))
+    }
+
+    #[test]
+    fn publishes_nudges_from_an_attached_process() {
+        let dir = TempDir::new().unwrap();
+        let _server = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+        let mut observer =
+            CaptureRelayClient::connect_from(&discovery_path, RelayCursor::default()).unwrap();
+
+        assert_eq!(
+            CaptureRelayClient::publish_nudge_via(&discovery_path, nudge("remote")).unwrap(),
+            1
+        );
+        let frame = wait_for_frame(&mut observer, |frame| {
+            matches!(frame, RelayFrame::Nudge { seq: 1, .. })
+        });
+        assert!(matches!(frame, RelayFrame::Nudge { seq: 1, .. }));
+    }
+
+    #[test]
+    fn heartbeat_and_explicit_shutdown_are_observable() {
+        let dir = TempDir::new().unwrap();
+        let server = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+        let mut client =
+            CaptureRelayClient::connect_from(&discovery_path, RelayCursor::default()).unwrap();
+
+        let heartbeat = wait_for_frame(&mut client, |frame| {
+            matches!(frame, RelayFrame::Heartbeat { .. })
+        });
+        assert!(matches!(heartbeat, RelayFrame::Heartbeat { .. }));
+        assert!(client.established);
+
+        server.shutdown("test owner stopped");
+        let shutdown = wait_for_frame(&mut client, |frame| {
+            matches!(frame, RelayFrame::Shutdown { .. })
+        });
+        assert_eq!(
+            shutdown,
+            RelayFrame::Shutdown {
+                reason: "test owner stopped".into()
+            }
+        );
+        assert!(matches!(
+            wait_for_error(&mut client),
+            CaptureRelayError::Io(error) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn active_capture_without_relay_never_starts_a_second_capture() {
+        let plan = plan_capture_attachment(true, false, true);
+        let CaptureAttachPlan::RefuseDuplicate { message } = plan else {
+            panic!("existing capture without relay must be refused");
+        };
+        assert!(message.contains("did not open a second microphone"));
+    }
+
+    #[test]
+    fn second_relay_owner_is_refused_until_the_first_shuts_down() {
+        let dir = TempDir::new().unwrap();
+        let first = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        let second = CaptureRelayServer::start_for_test(dir.path());
+        assert!(matches!(
+            second,
+            Err(CaptureRelayError::AlreadyOwned(owner_pid))
+                if owner_pid == std::process::id()
+        ));
+
+        first.shutdown("first owner stopped");
+        let replacement = CaptureRelayServer::start_for_test(dir.path());
+        assert!(replacement.is_ok());
+    }
+
+    #[test]
+    fn contended_owner_lock_uses_live_discovery_for_error_classification() {
+        let dir = TempDir::new().unwrap();
+        let _first = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+
+        let second_lock = acquire_owner_lock(dir.path(), &discovery_path);
+        assert!(matches!(
+            second_lock,
+            Err(CaptureRelayError::AlreadyOwned(owner_pid))
+                if owner_pid == std::process::id()
+        ));
+    }
+
+    #[test]
+    fn stale_discovery_is_reclaimed_when_the_owner_lock_is_available() {
+        let dir = TempDir::new().unwrap();
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+        let stale_at = Utc::now() - chrono::Duration::seconds(10);
+        let stale_discovery = CaptureRelayDiscovery {
+            v: RELAY_PROTOCOL_VERSION,
+            session_id: "stale-session".into(),
+            transport: current_transport(),
+            endpoint: relay_endpoint(dir.path(), "stale-session"),
+            owner_pid: std::process::id(),
+            evidence_mode: CopilotEvidenceMode::InProcessPartials,
+            auth_token: "stale-token".into(),
+            started_at: stale_at,
+            heartbeat_at: stale_at,
+        };
+        write_discovery(&discovery_path, &stale_discovery).unwrap();
+
+        let replacement = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        assert_ne!(
+            replacement.discovery().session_id,
+            stale_discovery.session_id
+        );
+        assert_eq!(replacement.discovery().owner_pid, std::process::id());
+    }
+
+    #[test]
+    fn explicit_capture_is_only_allowed_when_no_owner_exists() {
+        assert_eq!(
+            plan_capture_attachment(false, false, true),
+            CaptureAttachPlan::StartExplicitCapture
+        );
+        assert_eq!(
+            plan_capture_attachment(false, false, false),
+            CaptureAttachPlan::WaitForCapture
+        );
+        assert_eq!(
+            plan_capture_attachment(true, true, true),
+            CaptureAttachPlan::Attach
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_and_discovery_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let server = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        let socket_mode = std::fs::metadata(&server.discovery.endpoint)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let discovery_mode = std::fs::metadata(capture_relay_discovery_path_in(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(socket_mode, 0o600);
+        assert_eq!(discovery_mode, 0o600);
+    }
+
+    #[test]
+    fn discovery_uses_platform_transport_contract() {
+        let dir = TempDir::new().unwrap();
+        let server = CaptureRelayServer::start_for_test(dir.path()).unwrap();
+        #[cfg(windows)]
+        {
+            assert_eq!(server.discovery.transport, RelayTransport::WindowsNamedPipe);
+            assert!(server.discovery.endpoint.starts_with(r"\\.\pipe\"));
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(server.discovery.transport, RelayTransport::UnixSocket);
+            assert!(server.discovery.endpoint.ends_with(UNIX_SOCKET_FILE));
+        }
+    }
+}
