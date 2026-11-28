@@ -59,7 +59,9 @@ pub fn run_worker_mode() -> i32 {
     // The wiki takes decisions and action items from the summary. When Margin writes one
     // later, it updates the wiki then (summaries.rs), so the worker leaves the wiki alone and
     // the meeting gets one log entry, not two (D70).
-    if cfg.summarization.engine != "none" {
+    // A summary that fails, or a meeting with no speech, still reaches the wiki
+    // (summaries::ingest_without_summary).
+    if crate::summaries::wiki_waits_for_summary(&cfg) {
         cfg.knowledge.enabled = false;
     }
     cfg.summarization.engine = "none".into();
@@ -438,6 +440,8 @@ fn finish(job: &JobView, announce: bool) {
         events::emit("meeting-ready", serde_json::json!({ "job_id": job.id, "path": output }));
         if no_speech {
             tracing::info!("no speech in the meeting; no summary or title is made from nothing");
+            let output = output.to_string();
+            std::thread::spawn(move || crate::summaries::ingest_without_summary(Path::new(&output)));
         } else {
             crate::summaries::summarize_in_background(output.to_string(), untitled);
         }

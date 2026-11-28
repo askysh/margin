@@ -213,7 +213,10 @@ pub fn summarize_in_background(path: String, untitled: bool) {
         .name("margin-summary".into())
         .spawn(move || {
             let fallback = untitled.then(|| file_title(std::path::Path::new(&path))).flatten();
-            let result = crate::commands::ops::summarize_meeting_with(path.clone(), true, fallback);
+            let result = summarize_or_ingest(
+                || crate::commands::ops::summarize_meeting_with(path.clone(), true, fallback),
+                || ingest_without_summary(std::path::Path::new(&path)),
+            );
             if let Err(error) = &result {
                 tracing::warn!(%error, path, "summary after processing failed");
             }
@@ -224,6 +227,36 @@ pub fn summarize_in_background(path: String, untitled: bool) {
             crate::events::refresh_tray();
         })
         .expect("spawn summary");
+}
+
+/// The first summary of a new meeting also puts it in the knowledge wiki. When it fails, the
+/// meeting goes in without a summary: the worker left the wiki to this step (D70).
+fn summarize_or_ingest(summarize: impl FnOnce() -> Result<(), String>, ingest: impl FnOnce()) -> Result<(), String> {
+    let result = summarize();
+    if result.is_err() {
+        ingest();
+    }
+    result
+}
+
+/// With a summary engine set, the worker leaves the knowledge wiki to the app's summary step,
+/// so a meeting gets one wiki log entry, not two (D70).
+pub fn wiki_waits_for_summary(cfg: &minutes_core::config::Config) -> bool {
+    cfg.summarization.engine != "none"
+}
+
+/// Puts a meeting whose first summary did not happen (it failed, or the meeting has no
+/// speech) in the knowledge wiki without decisions or action items, as the worker does when
+/// summaries are off. Does nothing when the worker already ingested it.
+pub fn ingest_without_summary(path: &std::path::Path) {
+    let cfg = crate::corecfg::load();
+    if !wiki_waits_for_summary(&cfg) || !cfg.knowledge.enabled {
+        return;
+    }
+    let report = minutes_core::derived::refresh_derived_views(path, &cfg, &minutes_core::derived::RefreshOptions { ingest_knowledge: true });
+    for warning in report.warnings {
+        tracing::warn!(%warning, "knowledge wiki update without a summary");
+    }
 }
 
 fn file_title(path: &std::path::Path) -> Option<String> {
@@ -511,6 +544,22 @@ mod tests {
         assert!(!super::wants_new_title(false, &typed, BODY, None), "a title typed as the opening words stays");
         assert!(!super::wants_new_title(false, &fm("Stop Here", false), BODY, Some("Stop Here")));
         assert!(super::wants_new_title(true, &typed, BODY, None), "the first summary after processing names it");
+    }
+
+    #[test]
+    fn a_failed_first_summary_still_reaches_the_wiki() {
+        let ingested = std::cell::Cell::new(0);
+        let failed = super::summarize_or_ingest(|| Err("Ollama isn't running.".into()), || ingested.set(ingested.get() + 1));
+        assert!(failed.is_err());
+        assert_eq!(ingested.get(), 1, "the meeting goes in without a summary");
+        assert!(super::summarize_or_ingest(|| Ok(()), || ingested.set(ingested.get() + 1)).is_ok());
+        assert_eq!(ingested.get(), 1, "a summary that ran did the ingest itself");
+
+        let mut cfg = minutes_core::config::Config::default();
+        cfg.summarization.engine = "ollama".into();
+        assert!(super::wiki_waits_for_summary(&cfg));
+        cfg.summarization.engine = "none".into();
+        assert!(!super::wiki_waits_for_summary(&cfg), "the worker ingests when summaries are off");
     }
 
     #[test]

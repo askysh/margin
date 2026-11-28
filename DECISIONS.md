@@ -1287,6 +1287,10 @@ The full comparison is in `docs/parity/app.md`.
   the first summary after processing updates it, with one log entry per meeting. With
   summaries off, the worker updates it with the people only. *Summarize again* does not
   update the wiki, because core appends a log entry on every update.
+- Revised after the final review (28 Nov 2026): when that first summary fails (Ollama not
+  running, a timeout, an empty answer), or the meeting has no speech so no summary runs, the
+  app updates the wiki without a summary, as the worker would with summaries off. Every
+  meeting reaches the wiki once.
 - *After each meeting, run this command* sets core's `hooks.post_record`. *Use Margin Desk*
   fills it when `~/margin-desk/bin/desk.mjs` and Node are found.
 - Semantic search stays out of Settings. Core's `embed-worker` is not in the app bundle,

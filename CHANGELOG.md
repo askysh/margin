@@ -27,6 +27,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Fixed
 
+- With summaries on, a meeting whose summary failed never reached the knowledge wiki. It
+  now goes in without the summary's decisions and action items (D70).
 - *Summarize again* could replace a title you typed when it matched the first words
   spoken. Only the automatic first summary of a new meeting names it now (D92).
 - Words in Settings → *Names and words to spell right* never reached Whisper: the measured
