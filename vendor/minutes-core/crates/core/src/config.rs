@@ -480,7 +480,7 @@ pub struct DiarizationConfig {
     /// of the short audio. Default false.
     pub attach_unknown: bool,
     /// Write the diarization segments, before they are mapped onto transcript
-    /// lines, as RTTM to `<meeting>.rttm` next to the meeting's Markdown, for
+    /// lines, as RTTM to `<meeting>.diarization.rttm` next to the meeting's Markdown, for
     /// scoring against a reference. Default false.
     pub write_rttm: bool,
     /// community-1 pipeline: "simplified" (default) segments non-overlapping

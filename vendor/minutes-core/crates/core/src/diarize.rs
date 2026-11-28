@@ -3680,7 +3680,9 @@ fn diarize_with_pyannote_rs(
         sample_rate = sample_rate,
         "audio loaded for diarization"
     );
-    if full_speaker_pipeline(&config.diarization.speaker_pipeline) {
+    if full_speaker_pipeline(&config.diarization.speaker_pipeline)
+        && full_pipeline_fits(f32_samples.len(), sample_rate)
+    {
         return diarize_community_full(
             &mut f32_samples,
             sample_rate,
@@ -3897,6 +3899,24 @@ fn diarize_with_pyannote_rs(
         speaker_embedding_segments,
         ..DiarizationResult::default()
     })
+}
+
+/// The full pipeline's step grows with the recording so three local speakers
+/// per window fit clustering's observation budget. Past the 10 s window, audio
+/// between windows would never be segmented, so such a recording (over about
+/// two hours) takes the simplified path instead.
+#[cfg(feature = "diarize")]
+fn full_pipeline_fits(total_samples: usize, sample_rate: u32) -> bool {
+    let window = sample_rate as usize * 10;
+    let step = (3 * total_samples).div_ceil(speaker_tracks::MAX_OBSERVATIONS);
+    let fits = step <= window;
+    if !fits {
+        tracing::warn!(
+            seconds = total_samples / sample_rate.max(1) as usize,
+            "recording too long for speaker_pipeline \"full\"; using \"simplified\""
+        );
+    }
+    fits
 }
 
 /// `diarization.speaker_pipeline = "full"` for community-1: overlapping
@@ -5439,6 +5459,15 @@ mod tests {
 
         assert_eq!(find_speaker(7.0, &segments, false), "UNKNOWN");
         assert_eq!(find_speaker(7.0, &segments, true), "SPEAKER_1");
+    }
+
+    #[test]
+    fn recordings_too_long_for_the_full_pipeline_take_the_simplified_path() {
+        let rate = 16_000u32;
+        let budget_seconds = speaker_tracks::MAX_OBSERVATIONS * 10 / 3;
+        assert!(full_pipeline_fits(rate as usize * 3600, rate));
+        assert!(full_pipeline_fits(rate as usize * budget_seconds, rate));
+        assert!(!full_pipeline_fits(rate as usize * (budget_seconds + 60), rate));
     }
 
     #[test]

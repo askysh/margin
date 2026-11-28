@@ -552,3 +552,13 @@ written to be sent upstream as a pull request, and each defaults to today's beha
   `padded_meeting_chunks_widen_clamp_and_merge`,
   `padded_chunks_never_overlap_and_keep_the_45_second_limit`,
   `a_lower_noise_multiplier_keeps_quieter_speech`.
+
+## 35. The full speaker pipeline falls back on very long recordings
+
+`speaker_pipeline = "full"` lengthens its window step so three local speakers per window fit
+clustering's observation budget. Past about two hours the step would exceed the 10 s window and
+leave audio between windows unsegmented, so such a recording now takes the simplified path, with
+a warning in the log (`diarize.rs` `full_pipeline_fits`). Also in this round: #34's doc now says a
+padded chunk may pass 45 s by up to twice the padding, and its test asserts that bound; the
+`write_rttm` doc names the real file, `<meeting>.diarization.rttm`.
+

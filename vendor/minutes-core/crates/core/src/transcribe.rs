@@ -2685,7 +2685,8 @@ pub(crate) fn detect_meeting_vad_chunks(
 /// Widens each chunk by `pad` on both sides, within `0..len`. Chunks that then
 /// overlap are merged, unless the merge would pass the 45 s chunk limit: then
 /// they meet halfway between the original chunks. No sample is in two chunks,
-/// and chunks stay in order.
+/// and chunks stay in order. Padding can take a chunk past 45 s by up to
+/// `2 * pad`; Whisper splits long input into 30 s windows, so that is harmless.
 fn pad_meeting_chunks(chunks: Vec<(usize, usize)>, pad: usize, len: usize) -> Vec<(usize, usize)> {
     if pad == 0 {
         return chunks;
@@ -5903,6 +5904,11 @@ mod tests {
                 assert!(padded.iter().any(|&(s, e)| s <= start && end <= e), "pad {pad} lost ({start}, {end}): {padded:?}");
             }
             assert!(padded.iter().all(|&(s, e)| s < e && e <= 1_000_000));
+            for &(s, e) in &padded {
+                let longest_inside = chunks.iter().filter(|&&(a, b)| s <= a && b <= e).map(|&(a, b)| b - a).max().unwrap_or(0);
+                let limit = longest_inside.max(45 * second) + 2 * pad;
+                assert!(e - s <= limit, "pad {pad}: ({s}, {e}) is {} samples, over {limit}", e - s);
+            }
         }
     }
 
