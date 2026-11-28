@@ -247,7 +247,7 @@ fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
         Vec::new()
     };
     cfg.diarization.model_path = paths::diarization_models_dir();
-    pin_measured_transcription_defaults(&mut cfg.transcription, !crate::extras::vocabulary_terms().is_empty());
+    pin_measured_transcription_defaults(&mut cfg.transcription, crate::extras::has_any_vocabulary());
     cfg.vault.enabled = false;
     cfg.live_transcript.recording_sidecar = true;
     cfg.live_transcript.model = live_model(&cfg.transcription.model);
@@ -269,7 +269,7 @@ fn pin_with(cfg: &mut Config, prefs: &crate::prefs::Prefs) {
 const MEETING_CHUNK_NOISE_MULTIPLIER: f32 = 2.5;
 const MEETING_CHUNK_PAD_MS: u32 = 300;
 
-/// `has_vocabulary`: the user's Settings word list is not empty. whisper.cpp passes the
+/// `has_vocabulary`: the vocabulary store has any entry (typed in Settings or added by core). whisper.cpp passes the
 /// initial prompt through the conditioning buffer, so `n_max_text_ctx = 0` would drop the
 /// words and the name and title hints (UPSTREAM-PATCHES #25). Then the context stays
 /// upstream's. Earlier builds saved Margin's 0 into config.toml, where it cannot be told from
@@ -445,7 +445,9 @@ fn command_program(command: &str) -> Option<String> {
             (Some(q), c) if c == q => quote = None,
             (Some('"'), '\\') | (None, '\\') if !cfg!(windows) => escaped = true,
             (Some(_), c) => program.push(c),
-            (None, '\'' | '"') => quote = Some(c),
+            // cmd.exe quotes only with ", so O'Brien in a Windows path is a plain letter.
+            (None, '"') => quote = Some(c),
+            (None, '\'') if !cfg!(windows) => quote = Some(c),
             (None, c) if c.is_whitespace() => break,
             (None, c) => program.push(c),
         }

@@ -1203,7 +1203,9 @@ pub fn scrub_prompt_echo(path: &Path) -> Result<usize, String> {
         keep_scrubbed_lines(&sidecar, &removed).map_err(|e| format!("Couldn't keep the removed lines in {}: {e}", sidecar.display()))?;
         crate::fsutil::write_atomic(path, cleaned.as_bytes(), None).map_err(|e| e.to_string())?;
         let sidecar_name = sidecar.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        minutes_core::markdown::update_frontmatter(path, |fm| {
+        // The lines are already gone from the meeting and kept in the sidecar: a failed note
+        // must not hide that, or the caller would not mark an empty meeting as no speech.
+        if let Err(error) = minutes_core::markdown::update_frontmatter(path, |fm| {
             fm.processing_warnings.push(minutes_core::markdown::ProcessingWarning {
                 step: "transcribe".into(),
                 reason: "lines_removed".into(),
@@ -1213,8 +1215,9 @@ pub fn scrub_prompt_echo(path: &Path) -> Result<usize, String> {
                     removed.len()
                 )),
             });
-        })
-        .map_err(|e| e.to_string())?;
+        }) {
+            tracing::warn!(%error, "could not note the removed lines in the meeting");
+        }
         Ok(removed.len())
     })
 }
@@ -1228,10 +1231,19 @@ pub fn scrubbed_path(meeting: &Path) -> PathBuf {
 /// Appends `lines` under a timestamp. 0600, as core writes meetings: it is meeting text.
 fn keep_scrubbed_lines(sidecar: &Path, lines: &[String]) -> std::io::Result<()> {
     use std::io::Write;
+    // Only Margin's own regular file: never through a symlink, never into something else.
+    if let Ok(meta) = std::fs::symlink_metadata(sidecar) {
+        if !meta.file_type().is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "not a regular file"));
+        }
+    }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
     let mut file = options.open(sidecar)?;
     let mut text = format!("# {} removed by Margin\n", chrono::Local::now().to_rfc3339());
     for line in lines {
@@ -1246,6 +1258,25 @@ fn keep_scrubbed_lines(sidecar: &Path, lines: &[String]) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_scrubbed_lines_sidecar_never_writes_through_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("margin-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("someone-elses.txt");
+        std::fs::write(&target, "theirs\n").unwrap();
+        let sidecar = dir.join(".m.md.scrubbed.txt");
+        std::os::unix::fs::symlink(&target, &sidecar).unwrap();
+        assert!(keep_scrubbed_lines(&sidecar, &["x".into()]).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "theirs\n");
+        std::fs::remove_file(&sidecar).unwrap();
+        keep_scrubbed_lines(&sidecar, &["[A 0:01] Thanks for watching".into()]).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::read_to_string(&sidecar).unwrap().contains("Thanks for watching"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The cleaned content and how many lines went.
     fn scrub(content: &str, title: &str) -> (String, usize) {

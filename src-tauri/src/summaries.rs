@@ -215,6 +215,7 @@ pub fn summarize_in_background(path: String, untitled: bool) {
             let fallback = untitled.then(|| file_title(std::path::Path::new(&path))).flatten();
             let result = summarize_or_ingest(
                 || crate::commands::ops::summarize_meeting_with(path.clone(), true, fallback),
+                || is_running(&path),
                 || ingest_without_summary(std::path::Path::new(&path)),
             );
             if let Err(error) = &result {
@@ -229,14 +230,33 @@ pub fn summarize_in_background(path: String, untitled: bool) {
         .expect("spawn summary");
 }
 
+pub const ALREADY_WRITING: &str = "Margin is already writing this meeting's summary.";
+
 /// The first summary of a new meeting also puts it in the knowledge wiki. When it fails, the
-/// meeting goes in without a summary: the worker left the wiki to this step (D70).
-fn summarize_or_ingest(summarize: impl FnOnce() -> Result<(), String>, ingest: impl FnOnce()) -> Result<(), String> {
+/// meeting goes in without a summary: the worker left the wiki to this step (D70). When a
+/// Summarize click got there first, that run does not touch the wiki, so this waits for it
+/// and then ingests the meeting with whatever summary it wrote.
+fn summarize_or_ingest(
+    summarize: impl FnOnce() -> Result<(), String>,
+    still_writing: impl Fn() -> bool,
+    ingest: impl FnOnce(),
+) -> Result<(), String> {
     let result = summarize();
-    if result.is_err() {
-        ingest();
+    match &result {
+        Err(error) if error == ALREADY_WRITING => {
+            let waited_until = std::time::Instant::now() + std::time::Duration::from_secs(30 * 60);
+            while still_writing() && std::time::Instant::now() < waited_until {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            ingest();
+            Ok(())
+        }
+        Err(_) => {
+            ingest();
+            result
+        }
+        Ok(()) => result,
     }
-    result
 }
 
 /// With a summary engine set, the worker leaves the knowledge wiki to the app's summary step,
@@ -245,9 +265,10 @@ pub fn wiki_waits_for_summary(cfg: &minutes_core::config::Config) -> bool {
     cfg.summarization.engine != "none"
 }
 
-/// Puts a meeting whose first summary did not happen (it failed, or the meeting has no
-/// speech) in the knowledge wiki without decisions or action items, as the worker does when
-/// summaries are off. Does nothing when the worker already ingested it.
+/// Puts a meeting whose first summary was not written by this step (it failed, a Summarize
+/// click wrote it, or the meeting has no speech) in the knowledge wiki from the file as it is
+/// now, with or without a summary, as the worker does when summaries are off. Does nothing
+/// when the worker already ingested it.
 pub fn ingest_without_summary(path: &std::path::Path) {
     let cfg = crate::corecfg::load();
     if !wiki_waits_for_summary(&cfg) || !cfg.knowledge.enabled {
@@ -549,11 +570,20 @@ mod tests {
     #[test]
     fn a_failed_first_summary_still_reaches_the_wiki() {
         let ingested = std::cell::Cell::new(0);
-        let failed = super::summarize_or_ingest(|| Err("Ollama isn't running.".into()), || ingested.set(ingested.get() + 1));
+        let failed = super::summarize_or_ingest(|| Err("Ollama isn't running.".into()), || false, || ingested.set(ingested.get() + 1));
         assert!(failed.is_err());
         assert_eq!(ingested.get(), 1, "the meeting goes in without a summary");
-        assert!(super::summarize_or_ingest(|| Ok(()), || ingested.set(ingested.get() + 1)).is_ok());
+        assert!(super::summarize_or_ingest(|| Ok(()), || false, || ingested.set(ingested.get() + 1)).is_ok());
         assert_eq!(ingested.get(), 1, "a summary that ran did the ingest itself");
+        let polls = std::cell::Cell::new(0);
+        let busy = super::summarize_or_ingest(
+            || Err(super::ALREADY_WRITING.into()),
+            || { polls.set(polls.get() + 1); polls.get() < 3 },
+            || ingested.set(ingested.get() + 1),
+        );
+        assert!(busy.is_ok(), "a Summarize click in progress is not a failure");
+        assert_eq!(polls.get(), 3, "waits for the click's summary to finish");
+        assert_eq!(ingested.get(), 2, "then ingests once, with that summary");
 
         let mut cfg = minutes_core::config::Config::default();
         cfg.summarization.engine = "ollama".into();

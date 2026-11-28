@@ -584,6 +584,7 @@ fn spawn_ticker(session: u64) {
             let r = recorder();
             let mut since = 0usize;
             let mut mic = MicWatch::Unchecked;
+            let mut ticks: u64 = 0;
             loop {
                 std::thread::sleep(Duration::from_millis(500));
                 let (kind, wav, ended) = {
@@ -618,7 +619,10 @@ fn spawn_ticker(session: u64) {
                     let guard = r.active.lock().unwrap();
                     guard.as_ref().map(|a| (Local::now() - a.started_at).num_seconds().max(0)).unwrap_or(0)
                 };
-                if mic != MicWatch::Done && elapsed >= MIC_CHECK_AFTER_SECS {
+                ticks += 1;
+                // After a warning the 20 s tail is read again every few seconds, not every tick.
+                let due = mic == MicWatch::Unchecked || ticks % MIC_RECHECK_EVERY_TICKS == 0;
+                if mic != MicWatch::Done && due && elapsed >= MIC_CHECK_AFTER_SECS {
                     // A track that is not readable yet is tried again on the next tick.
                     let (next, say) = mic.next(mic_silence(&mic_track(kind, &wav)));
                     mic = next;
@@ -714,6 +718,8 @@ impl MicWatch {
 /// The first microphone check runs this many seconds into a recording, over the last
 /// `MIC_CHECK_WINDOW_MS` of the microphone track.
 const MIC_CHECK_AFTER_SECS: i64 = 30;
+/// Ticks between checks once a warning is up (the ticker runs about twice a second).
+const MIC_RECHECK_EVERY_TICKS: u64 = 10;
 const MIC_CHECK_WINDOW_MS: u64 = 20_000;
 /// A peak under this, as a fraction of full scale, means the microphone sent nothing. A
 /// silent Bluetooth headset stem peaked at 0.002 for a whole call; a working microphone in

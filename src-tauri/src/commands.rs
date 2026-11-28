@@ -461,7 +461,7 @@ pub mod ops {
             }
         }
         let Some(_running) = summaries::start(&p.display().to_string()) else {
-            return Err("Margin is already writing this meeting's summary.".into());
+            return Err(summaries::ALREADY_WRITING.into());
         };
         let mut cfg = cfg;
         let _forwarder = crate::ollama_proxy::fast_ollama(&mut cfg);

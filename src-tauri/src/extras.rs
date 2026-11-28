@@ -81,6 +81,12 @@ pub fn vocabulary_terms() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether core will pass any vocabulary hint to Whisper: every entry counts, not only the
+/// ones typed in Settings, because core's decode hints read the whole store.
+pub fn has_any_vocabulary() -> bool {
+    vocabulary::load_at(&vocabulary_path()).map(|store| !store.entries.is_empty()).unwrap_or(false)
+}
+
 pub fn set_vocabulary(terms: &[String]) -> Result<(), String> {
     let mut store = vocabulary::load_at(&vocabulary_path()).unwrap_or_else(|error| {
         tracing::warn!(%error, "vocabulary unreadable; starting a new one");
