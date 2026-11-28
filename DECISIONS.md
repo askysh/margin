@@ -1530,12 +1530,23 @@ The full comparison is in `docs/parity/app.md`.
 - The `[SYSTEM]` and `[MICROPHONE]` tags are core's capture-source tags on call lines, so a
   line is judged by what follows the tag; tagged lines are not removed as a class.
 - Indic scripts (Devanagari, Kannada, Tamil, Telugu, ...) are mixed into English speech by real
-  speakers. A script that more than a tenth of the lines use stays. A single Indic line goes
-  only in a transcript of 20 lines or more. Other scripts need 3 lines or more, and one stray
-  line per ten.
-- Cost: a real "Thank you" as the only thing said is dropped, and a real 3-line meeting with one
-  Cyrillic line loses it. Whisper hallucinations that are plain English sentences in a longer
-  recording (a YouTube-style sentence in a 40-minute call) are not seen.
+  speakers, so they are never foreign.
+- Revised after the final review (28 Nov 2026): the first rules deleted real speech. A phrase
+  matched anywhere in a line, so "Thank you for listening, any questions?" went, and up to one
+  line in ten in another script went, so five Russian lines in a 50-line meeting, or one Hindi
+  sentence in 20 lines, were lost. Now:
+  - a phrase must be the whole line (after the `[speaker time]` prefix, punctuation, case,
+    numbers and spaces are set aside), so the list holds whole subtitle credits;
+  - a line in another script (not Indic, not Latin) goes only when it is the meeting's single
+    such line, has at most 6 words, and the meeting has at least 10 other lines;
+  - every removed line is appended, under a timestamp, to `.<meeting file>.scrubbed.txt`
+    beside the meeting (0600; Delete takes it too, D10), and a `processing_warnings` entry
+    (`reason: lines_removed`) gives the count. A wrong guess is recoverable.
+  - The scrub runs once, when a job has just finished. It never runs on meetings that were
+    already done, such as the archived jobs that the first poll after launch sees.
+- Cost: a real "Thank you" as the only thing said is dropped (kept in the sidecar). Whisper
+  hallucinations that are plain English sentences in a longer recording (a YouTube-style
+  sentence in a 40-minute call) are not seen, nor are credits that are not on the list.
 
 ### D91. A meeting with no speech says so, and gets no title or summary from nothing
 - When the scrub removed lines and no words are left, Margin writes `status: no-speech` (the

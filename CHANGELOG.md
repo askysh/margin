@@ -27,6 +27,13 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Fixed
 
+- Margin rewrote finished meetings at every launch: the silence scrub ran again on each
+  meeting it had already processed. It now runs only on a meeting that just finished (D90).
+- The silence scrub deleted real speech: a line that merely contained "Thank you for
+  listening", several lines in Russian, or a Hindi sentence in an English meeting. A
+  phrase must now be the whole line, Indic scripts are never removed, and at most one short
+  stray line in another script goes. Every removed line is kept in a hidden
+  `.<meeting>.scrubbed.txt` beside the meeting (D90).
 - Notes typed after Settings, or after *Change microphone*, during a recording were lost.
   The notes now take the keyboard back, and a letter typed with nothing focused goes to them
   (D73).

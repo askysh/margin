@@ -768,11 +768,12 @@ pub fn trash(path: &Path) -> Result<(), String> {
 
 /// A meeting file and every file beside it that belongs to it and exists: the audio, the
 /// stems, the voice embeddings, and the hidden backups that core's "summarize again" keeps
-/// (`.<name>.md.pre-resummarize.<time>.bak`). Each backup is a full copy of the meeting,
-/// so a delete must take them too (D10).
+/// (`.<name>.md.pre-resummarize.<time>.bak`), and the lines the scrub removed
+/// (`scrubbed_path`). Each holds meeting text, so a delete must take them too (D10).
 pub fn meeting_files(path: &Path) -> Vec<PathBuf> {
     let mut items = vec![path.to_path_buf()];
     items.extend(minutes_core::capture::meeting_audio_artifact_paths(path).into_iter().filter(|p| p.exists()));
+    items.extend(Some(scrubbed_path(path)).filter(|p| p.exists()));
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let prefix = format!(".{name}.pre-resummarize.");
     if let (Some(dir), false) = (path.parent(), name.is_empty()) {
@@ -804,14 +805,15 @@ pub fn meeting_files(path: &Path) -> Vec<PathBuf> {
 /// - a line that is only the meeting title, when it occurs at least twice. One title-only
 ///   line can be real speech.
 /// - silence hallucinations (D90), see `drop_silence_hallucinations`.
-/// Every other byte stays. Returns the cleaned content and the number of lines removed.
-pub fn scrub_prompt_echo_text(content: &str, title: &str) -> (String, usize) {
-    let (without_echoes, echoes) = drop_prompt_echoes(content, title);
+/// Every other byte stays. Returns the cleaned content and the lines removed.
+pub fn scrub_prompt_echo_text(content: &str, title: &str) -> (String, Vec<String>) {
+    let (without_echoes, mut removed) = drop_prompt_echoes(content, title);
     let (clean, hallucinations) = drop_silence_hallucinations(&without_echoes);
-    (clean, echoes + hallucinations)
+    removed.extend(hallucinations);
+    (clean, removed)
 }
 
-fn drop_prompt_echoes(content: &str, title: &str) -> (String, usize) {
+fn drop_prompt_echoes(content: &str, title: &str) -> (String, Vec<String>) {
     let norm = |s: &str| s.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
     let spoken = |line: &str| -> Option<String> {
         let rest = line.strip_prefix('[')?;
@@ -819,10 +821,10 @@ fn drop_prompt_echoes(content: &str, title: &str) -> (String, usize) {
         Some(rest[close + 1..].trim().to_string())
     };
     let title_n = norm(title);
-    let Some(start) = content.find("\n## Transcript") else { return (content.to_string(), 0) };
+    let Some(start) = content.find("\n## Transcript") else { return (content.to_string(), vec![]) };
     let (head, tail) = content.split_at(start);
     let title_lines = tail.lines().filter(|l| spoken(l).is_some_and(|t| !title_n.is_empty() && norm(&t) == title_n)).count();
-    let mut removed = 0;
+    let mut removed = Vec::new();
     let mut last_was_echo = false;
     let kept: Vec<&str> = tail
         .split_inclusive('\n')
@@ -830,14 +832,14 @@ fn drop_prompt_echoes(content: &str, title: &str) -> (String, usize) {
             // Core writes "[...] [repeated audio removed - N identical segments collapsed]"
             // after a line it repeated. When that line was an echo, the marker goes with it.
             if l.trim_start().starts_with("[...] [repeated audio removed") {
-                if last_was_echo { removed += 1; return false; }
+                if last_was_echo { removed.push(l.trim_end().to_string()); return false; }
                 return true;
             }
             let Some(text) = spoken(l.trim_end()) else { last_was_echo = false; return true };
             let t = norm(&text);
             let echo = t.contains("preserve spelling exactly") || t.contains("names and terms that may appear")
                 || (title_lines >= 2 && !title_n.is_empty() && t == title_n);
-            if echo { removed += 1; }
+            if echo { removed.push(l.trim_end().to_string()); }
             last_was_echo = echo;
             !echo
         })
@@ -845,23 +847,29 @@ fn drop_prompt_echoes(content: &str, title: &str) -> (String, usize) {
     (format!("{head}{}", kept.concat()), removed)
 }
 
-/// Lines Whisper writes on silence, hum and noise because its training data held them as
-/// subtitles. Compared after `normalise`. A line that contains one of these is never speech
-/// in a meeting. Multilingual on purpose: the Russian "to be continued" came from a quiet
-/// microphone in an English meeting (26 Nov 2026).
+/// Whole lines Whisper writes on silence, hum and noise because its training data held them
+/// as subtitles. A transcript line goes only when its whole text is one of these (compared
+/// with `phrase_key`), never when it merely contains one: "Thank you for listening, any
+/// questions?" is speech. Multilingual on purpose: the Russian "to be continued" came from
+/// a quiet microphone in an English meeting (26 Nov 2026).
 const SILENCE_PHRASES: &[&str] = &[
-    "thanks for watching", "thank you for watching", "thanks for listening", "thank you for listening",
-    "please subscribe", "like and subscribe", "don t forget to subscribe", "subscribe to my channel",
-    "see you in the next video", "amara org",
-    "продолжение следует", "спасибо за просмотр", "подписывайтесь на канал", "субтитры сделал", "субтитры создавал",
-    "редактор субтитров",
-    "untertitel der amara org", "untertitel im auftrag des zdf", "vielen dank fürs zuschauen",
-    "sous titres", "sous titrage", "merci d avoir regardé", "merci d avoir regarde",
-    "subtítulos realizados por la comunidad", "subtitulos realizados por la comunidad", "gracias por ver el video", "suscríbete", "suscribete",
-    "legendas pela comunidade", "obrigado por assistir",
-    "sottotitoli creati dalla comunità", "sottotitoli creati dalla comunita", "grazie per la visione",
-    "ondertitels ingediend door de amara", "bedankt voor het kijken",
-    "ご視聴ありがとうございました", "チャンネル登録", "字幕由", "请不要忘记订阅", "谢谢观看", "感谢观看", "謝謝觀看", "시청해 주셔서 감사합니다",
+    "thanks for watching", "thank you for watching", "thank you so much for watching", "thanks for listening",
+    "thank you for listening", "please subscribe", "like and subscribe", "please like and subscribe",
+    "don't forget to subscribe", "subscribe to my channel", "see you in the next video", "amara.org",
+    "subtitles by the amara.org community",
+    "продолжение следует", "спасибо за просмотр", "подписывайтесь на канал", "субтитры сделал dimatorzok",
+    "субтитры создавал dimatorzok", "редактор субтитров а.синецкая корректор а.егорова",
+    "untertitel der amara.org-community", "untertitel im auftrag des zdf", "untertitel im auftrag des zdf für funk",
+    "vielen dank fürs zuschauen",
+    "sous-titres réalisés par la communauté d'amara.org", "sous-titrage st' 501", "sous-titrage société radio-canada",
+    "merci d'avoir regardé", "merci d'avoir regarde",
+    "subtítulos realizados por la comunidad de amara.org", "subtitulos realizados por la comunidad de amara.org",
+    "gracias por ver el video", "suscríbete", "suscribete", "suscríbete al canal",
+    "legendas pela comunidade amara.org", "obrigado por assistir",
+    "sottotitoli creati dalla comunità amara.org", "sottotitoli creati dalla comunita amara.org", "grazie per la visione",
+    "ondertitels ingediend door de amara.org gemeenschap", "bedankt voor het kijken",
+    "ご視聴ありがとうございました", "チャンネル登録", "チャンネル登録をお願いします", "字幕由amara.org社区提供", "请不要忘记订阅",
+    "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", "谢谢观看", "感谢观看", "謝謝觀看", "시청해 주셔서 감사합니다",
     "اشتركوا في القناة", "ترجمة نانسي قنقر",
 ];
 
@@ -904,9 +912,15 @@ fn is_marker_only(text: &str) -> bool {
     true
 }
 
+/// `normalise`d, without numbers (a subtitle credit's year) and without spaces (a Chinese
+/// credit comes with and without spaces around "Amara.org").
+fn phrase_key(text: &str) -> String {
+    normalise(text).split(' ').filter(|w| !w.chars().all(char::is_numeric)).collect()
+}
+
 fn is_silence_phrase(text: &str) -> bool {
-    let n = normalise(text);
-    !n.is_empty() && SILENCE_PHRASES.iter().any(|p| n.contains(&normalise(p)))
+    let key = phrase_key(text);
+    !key.is_empty() && SILENCE_PHRASES.iter().any(|p| phrase_key(p) == key)
 }
 
 fn is_weak_phrase(text: &str) -> bool {
@@ -961,39 +975,35 @@ fn line_script(text: &str) -> Option<Script> {
     (n * 10 >= total * 6).then_some(script)
 }
 
-/// Indexes of lines in a script that the rest of the transcript does not use. A hallucination
-/// is one stray line (a lone Cyrillic or Chinese line in an English meeting). People do mix
-/// Indic scripts (Devanagari, Kannada, Tamil, Telugu, ...) into English speech, so a line in
-/// one goes only when it is the single stray line of a transcript of 20 lines or more. A
-/// script that more than a tenth of the lines use is a real share and stays. Latin is never
-/// foreign: English words are everywhere in speech in other languages.
-fn foreign_script_lines(texts: &[(usize, String)]) -> Vec<usize> {
+/// A stray line in another script goes only when the meeting has at least this many other
+/// lines, so there is a clear language to stray from.
+const STRAY_MIN_OTHER_LINES: usize = 10;
+/// Whisper's stray lines are short credits and phrases; a longer line is someone talking.
+const STRAY_MAX_WORDS: usize = 6;
+
+/// The index of the one line Whisper wrote in a script the meeting does not use: a lone
+/// Cyrillic or Chinese line in an English meeting. It goes only when it is the meeting's
+/// single line in any foreign script, has at most `STRAY_MAX_WORDS` words, and the meeting
+/// has `STRAY_MIN_OTHER_LINES` other lines. Two or more such lines are someone speaking
+/// that language. Indic scripts are never foreign, since people mix Hindi, Kannada, Tamil
+/// and the rest into English speech; nor is Latin, since English words are everywhere in
+/// speech in other languages.
+fn stray_script_line(texts: &[(usize, String)]) -> Option<usize> {
     let mut letters: HashMap<Script, usize> = HashMap::new();
     for (_, text) in texts {
         for (script, n) in script_letters(text) {
             *letters.entry(script).or_default() += n;
         }
     }
-    let Some((&dominant, _)) = letters.iter().max_by_key(|&(script, n)| (*n, *script == Script::Latin)) else { return vec![] };
-    let mut by_script: HashMap<Script, Vec<usize>> = HashMap::new();
-    for (i, text) in texts {
-        if let Some(script) = line_script(text).filter(|s| *s != dominant && *s != Script::Latin) {
-            by_script.entry(script).or_default().push(*i);
-        }
+    let (&dominant, _) = letters.iter().max_by_key(|&(script, n)| (*n, *script == Script::Latin))?;
+    let foreign: Vec<&(usize, String)> = texts
+        .iter()
+        .filter(|(_, text)| line_script(text).is_some_and(|s| s != dominant && !matches!(s, Script::Latin | Script::Indic)))
+        .collect();
+    match foreign.as_slice() {
+        [(i, text)] if texts.len() > STRAY_MIN_OTHER_LINES && word_count(text) <= STRAY_MAX_WORDS => Some(*i),
+        _ => None,
     }
-    let n = texts.len();
-    by_script
-        .into_iter()
-        .filter(|(script, lines)| {
-            let allowed = match (*script == Script::Indic, n) {
-                (true, n) => usize::from(n >= 20),
-                (false, n) if n >= 3 => n.div_ceil(10),
-                _ => 0,
-            };
-            lines.len() <= allowed
-        })
-        .flat_map(|(_, lines)| lines)
-        .collect()
 }
 
 fn word_count(text: &str) -> usize {
@@ -1007,18 +1017,18 @@ const CORE_TRAILING_NOISE_MARKER: &str = "[Recording ended - ";
 /// Whisper writes lines nobody said when the microphone hears silence or noise. This removes
 /// them from `## Transcript` (D90). A transcript line goes when:
 /// - it is only markers (`[BLANK_AUDIO]`, `(music)`, a bare `[SYSTEM]`);
-/// - it holds a known silence phrase ("Thanks for watching", "Продолжение следует", the
-///   Amara subtitle credit, in many languages);
-/// - it is a stray line in a script the rest of the transcript does not use;
+/// - its whole text is a known silence phrase ("Thanks for watching", "Продолжение
+///   следует", the Amara subtitle credit, in many languages);
+/// - it is the one short stray line in a script the rest of the transcript does not use;
 /// - it is a dangling fragment that starts with "..." in a transcript of at most 12 words
 ///   in which something else was just removed (a silent recording yields a subtitle credit
 ///   and a half sentence together);
 /// - it is core's trailing-noise marker and no speech is left;
 /// - it is a "thank you" or one-word line, and nothing real is left (silence often becomes
 ///   a lone "Thank you").
-/// Every other byte stays. Returns the cleaned content and the number of lines removed.
-fn drop_silence_hallucinations(content: &str) -> (String, usize) {
-    let Some(start) = content.find("\n## Transcript") else { return (content.to_string(), 0) };
+/// Every other byte stays. Returns the cleaned content and the lines removed.
+fn drop_silence_hallucinations(content: &str) -> (String, Vec<String>) {
+    let Some(start) = content.find("\n## Transcript") else { return (content.to_string(), vec![]) };
     let (head, tail) = content.split_at(start);
     let lines: Vec<&str> = tail.split_inclusive('\n').collect();
     let spoken: Vec<Option<String>> = lines
@@ -1029,7 +1039,7 @@ fn drop_silence_hallucinations(content: &str) -> (String, usize) {
     let live = |dropped: &[bool]| -> Vec<(usize, String)> {
         spoken.iter().enumerate().filter(|(i, _)| !dropped[*i]).filter_map(|(i, t)| t.clone().map(|t| (i, t))).collect()
     };
-    for i in foreign_script_lines(&live(&dropped)) {
+    if let Some(i) = stray_script_line(&live(&dropped)) {
         dropped[i] = true;
     }
     let remaining = live(&dropped);
@@ -1047,14 +1057,14 @@ fn drop_silence_hallucinations(content: &str) -> (String, usize) {
         }
     }
     let nothing_spoken = live(&dropped).is_empty();
-    let mut removed = 0;
+    let mut removed = Vec::new();
     let mut last_dropped = false;
     let kept: Vec<&str> = lines
         .iter()
         .enumerate()
         .filter(|(i, l)| {
             if nothing_spoken && l.trim_start().starts_with(CORE_TRAILING_NOISE_MARKER) {
-                removed += 1;
+                removed.push(l.trim_end().to_string());
                 return false;
             }
             let marker = l.trim_start().starts_with("[...] [repeated audio removed");
@@ -1062,7 +1072,9 @@ fn drop_silence_hallucinations(content: &str) -> (String, usize) {
             if marker || spoken[*i].is_some() {
                 last_dropped = drop;
             }
-            removed += usize::from(drop);
+            if drop {
+                removed.push(l.trim_end().to_string());
+            }
             !drop
         })
         .map(|(_, l)| *l)
@@ -1175,38 +1187,87 @@ pub fn tidy_title_in_file(path: &Path) -> Result<bool, String> {
 }
 
 /// `scrub_prompt_echo_text` on a meeting file, under its lock. Writes only when a line goes.
+/// The removed lines are first appended to the scrub sidecar (`scrubbed_path`), so no line
+/// is ever lost to a wrong guess, and a `processing_warnings` entry gives their count.
+/// Returns the number of lines removed.
 pub fn scrub_prompt_echo(path: &Path) -> Result<usize, String> {
     crate::fsutil::with_file_lock(path, || {
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let (fm, _) = split_frontmatter(&content);
         let title = serde_yaml::from_str::<minutes_core::markdown::Frontmatter>(fm).map(|f| f.title).unwrap_or_default();
         let (cleaned, removed) = scrub_prompt_echo_text(&content, &title);
-        if removed > 0 {
-            crate::fsutil::write_atomic(path, cleaned.as_bytes(), None).map_err(|e| e.to_string())?;
+        if removed.is_empty() {
+            return Ok(0);
         }
-        Ok(removed)
+        let sidecar = scrubbed_path(path);
+        keep_scrubbed_lines(&sidecar, &removed).map_err(|e| format!("Couldn't keep the removed lines in {}: {e}", sidecar.display()))?;
+        crate::fsutil::write_atomic(path, cleaned.as_bytes(), None).map_err(|e| e.to_string())?;
+        let sidecar_name = sidecar.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        minutes_core::markdown::update_frontmatter(path, |fm| {
+            fm.processing_warnings.push(minutes_core::markdown::ProcessingWarning {
+                step: "transcribe".into(),
+                reason: "lines_removed".into(),
+                timeout_secs: None,
+                message: Some(format!(
+                    "Margin removed {} transcript line(s) that Whisper makes up on silence. They are kept in {sidecar_name}.",
+                    removed.len()
+                )),
+            });
+        })
+        .map_err(|e| e.to_string())?;
+        Ok(removed.len())
     })
+}
+
+/// `.<meeting file name>.scrubbed.txt` beside the meeting: every line the scrub removed.
+pub fn scrubbed_path(meeting: &Path) -> PathBuf {
+    let name = meeting.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    meeting.with_file_name(format!(".{name}.scrubbed.txt"))
+}
+
+/// Appends `lines` under a timestamp. 0600, as core writes meetings: it is meeting text.
+fn keep_scrubbed_lines(sidecar: &Path, lines: &[String]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(sidecar)?;
+    let mut text = format!("# {} removed by Margin\n", chrono::Local::now().to_rfc3339());
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    text.push('\n');
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The cleaned content and how many lines went.
+    fn scrub(content: &str, title: &str) -> (String, usize) {
+        let (clean, removed) = scrub_prompt_echo_text(content, title);
+        (clean, removed.len())
+    }
+
     #[test]
     fn prompt_echoes_leave_the_transcript_and_real_speech_stays() {
         let md = "---\ntitle: Silence test\n---\n\n## Notes\n\nPreserve spelling exactly when heard is in my notes.\n\n## Transcript\n\n[SPEAKER_1 0:00] Hello everyone.\n[UNKNOWN 1:15] Silence test. Preserve spelling exactly when hearing.\n[UNKNOWN 1:20] Names and terms that may appear in this audio: Mohan.\n[UNKNOWN 4:45] Silence test.\n[SPEAKER_1 5:00] Thanks, bye.\n";
-        let (out, n) = scrub_prompt_echo_text(md, "Silence test");
+        let (out, n) = scrub(md, "Silence test");
         assert_eq!(n, 2);
         assert!(out.contains("[SPEAKER_1 0:00] Hello everyone.") && out.contains("[SPEAKER_1 5:00] Thanks, bye."));
         assert!(out.contains("[UNKNOWN 4:45] Silence test."), "one title-only line may be real speech");
         assert!(out.contains("Preserve spelling exactly when heard is in my notes."), "notes are never touched");
         let twice = "---\ntitle: Standup\n---\n## Transcript\n[A 0:01] Standup.\n[A 0:30] Standup.\n[B 0:40] Real words.\n";
-        let (out, n) = scrub_prompt_echo_text(twice, "Standup");
+        let (out, n) = scrub(twice, "Standup");
         assert_eq!(n, 2);
         assert!(out.ends_with("[B 0:40] Real words.\n"));
-        assert_eq!(scrub_prompt_echo_text("no transcript", "x"), ("no transcript".to_string(), 0));
+        assert_eq!(scrub("no transcript", "x"), ("no transcript".to_string(), 0));
         let collapsed = "---\ntitle: T\n---\n## Transcript\n[U 1:15] T. Preserve spelling exactly when hearing.\n[...] [repeated audio removed - 7 identical segments collapsed]\n[A 2:00] Real.\n[...] [repeated audio removed - 2 identical segments collapsed]\n";
-        let (out, n) = scrub_prompt_echo_text(collapsed, "T");
+        let (out, n) = scrub(collapsed, "T");
         assert_eq!(n, 2, "the echo and its marker");
         assert!(out.contains("[A 2:00] Real.\n[...] [repeated audio removed - 2"), "a marker after real speech stays");
     }
@@ -1371,7 +1432,7 @@ mod tests {
 
     #[test]
     fn the_silence_hallucination_meeting_loses_both_lines() {
-        let (out, n) = scrub_prompt_echo_text(HALLUCINATION_MEETING, "Royal Descents Global Zoos Update");
+        let (out, n) = scrub(HALLUCINATION_MEETING, "Royal Descents Global Zoos Update");
         assert_eq!(n, 2);
         assert!(spoken_lines(&out).is_empty());
         assert!(out.contains("## Notes\n\nmy note"));
@@ -1387,10 +1448,36 @@ mod tests {
         let fm: minutes_core::markdown::Frontmatter = serde_yaml::from_str(split_frontmatter(&content).0).unwrap();
         assert_eq!(fm.title, "No speech recorded");
         assert_eq!(fm.status, Some(minutes_core::markdown::OutputStatus::NoSpeech));
-        assert_eq!(fm.processing_warnings.len(), 1);
-        assert_eq!(fm.processing_warnings[0].reason, "no_speech");
+        let reasons: Vec<&str> = fm.processing_warnings.iter().map(|w| w.reason.as_str()).collect();
+        assert_eq!(reasons, ["lines_removed", "no_speech"]);
+        assert!(fm.processing_warnings[0].message.as_deref().unwrap().contains("removed 2 transcript line(s)"));
         assert!(fm.entities.is_empty());
         assert!(content.contains("## Notes\n\nmy note"));
+        let kept = std::fs::read_to_string(scrubbed_path(&file)).unwrap();
+        assert!(kept.contains("[MICROPHONE 0:00] ...of royal descent in zoos across the world.\n"), "{kept}");
+        assert!(kept.contains("[SPEAKER_1 0:00] [SYSTEM] Продолжение следует...\n"), "{kept}");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn removed_lines_are_appended_to_a_private_sidecar() {
+        let md = "---\ntitle: Planning\ntype: meeting\ndate: 2026-11-26\nduration: 10m\n---\n\n## Transcript\n\n[A 0:00] We ship on Friday.\n[A 0:05] Thanks for watching!\n";
+        let file = temp_meeting("sidecar", md);
+        assert_eq!(scrub_prompt_echo(&file).unwrap(), 1);
+        let sidecar = scrubbed_path(&file);
+        assert_eq!(sidecar.file_name().unwrap(), ".m.md.scrubbed.txt");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let again = std::fs::read_to_string(&file).unwrap() + "[A 0:09] Продолжение следует...\n";
+        std::fs::write(&file, again).unwrap();
+        assert_eq!(scrub_prompt_echo(&file).unwrap(), 1);
+        let kept = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(kept.matches(" removed by Margin\n").count(), 2, "{kept}");
+        assert!(kept.contains("[A 0:05] Thanks for watching!\n") && kept.contains("[A 0:09] Продолжение следует...\n"), "{kept}");
+        assert!(meeting_files(&file).contains(&sidecar), "Delete takes the sidecar too");
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
@@ -1403,7 +1490,7 @@ mod tests {
         assert!(write_no_speech(&file, false, removed).unwrap());
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
         let real = "---\ntitle: T\n---\n\n## Transcript\n\n[A 0:00] We ship on Friday.\n[Recording ended - 2 lines of trailing noise removed]\n";
-        assert_eq!(scrub_prompt_echo_text(real, "T"), (real.to_string(), 0));
+        assert_eq!(scrub(real, "T"), (real.to_string(), 0));
     }
 
     #[test]
@@ -1440,17 +1527,17 @@ mod tests {
     #[test]
     fn a_lone_thank_you_is_silence_but_a_thank_you_in_a_real_meeting_stays() {
         let silent = "---\ntitle: T\n---\n\n## Transcript\n\n[SPEAKER_1 0:00] Thank you.\n";
-        let (out, n) = scrub_prompt_echo_text(silent, "T");
+        let (out, n) = scrub(silent, "T");
         assert_eq!((n, spoken_lines(&out).len()), (1, 0));
         let real = "---\ntitle: T\n---\n\n## Transcript\n\n[SPEAKER_1 0:00] We are done with the budget.\n[SPEAKER_2 0:09] Thank you.\n";
-        let (out, n) = scrub_prompt_echo_text(real, "T");
+        let (out, n) = scrub(real, "T");
         assert_eq!((n, spoken_lines(&out).len()), (0, 2));
     }
 
     #[test]
     fn known_phrases_and_markers_go_in_any_language() {
         let md = "---\ntitle: T\n---\n\n## Transcript\n\n[A 0:00] Let us start with the roadmap.\n[A 0:10] Thanks for watching!\n[A 0:12] Субтитры сделал DimaTorzok\n[A 0:14] [BLANK_AUDIO]\n[A 0:16] (music)\n[A 0:18] 字幕由 Amara.org 社区提供\n[A 0:20] [SYSTEM] [BLANK_AUDIO]\n[A 0:22] Then we agree on Friday.\n";
-        let (out, n) = scrub_prompt_echo_text(md, "T");
+        let (out, n) = scrub(md, "T");
         assert_eq!(n, 6);
         assert_eq!(spoken_lines(&out), ["Let us start with the roadmap.", "Then we agree on Friday."]);
     }
@@ -1458,25 +1545,50 @@ mod tests {
     #[test]
     fn a_source_tag_is_not_a_hallucination() {
         let md = "---\ntitle: T\n---\n\n## Transcript\n\n[SPEAKER_0 0:00] [MICROPHONE] Can you hear me?\n[SPEAKER_1 0:03] [SYSTEM] Yes, loud and clear.\n";
-        assert_eq!(scrub_prompt_echo_text(md, "T").1, 0);
+        assert_eq!(scrub(md, "T").1, 0);
     }
 
     #[test]
     fn a_stray_line_in_a_foreign_script_goes_and_a_real_share_stays() {
-        let english: String = (0..9).map(|i| format!("[A 0:{i:02}] This is a sentence number {i} about the launch.\n")).collect();
+        let english: String = (0..10).map(|i| format!("[A 0:{i:02}] This is a sentence number {i} about the launch.\n")).collect();
         let stray = format!("---\ntitle: T\n---\n\n## Transcript\n\n{english}[A 0:30] Это совсем другой язык.\n");
-        let (out, n) = scrub_prompt_echo_text(&stray, "T");
-        assert_eq!((n, spoken_lines(&out).len()), (1, 9));
+        let (out, n) = scrub(&stray, "T");
+        assert_eq!((n, spoken_lines(&out).len()), (1, 10));
+        let few = stray.replace("[A 0:09] This is a sentence number 9 about the launch.\n", "");
+        assert_eq!(scrub(&few, "T").1, 0, "nine other lines are too few to call a line stray");
+        let long = stray.replace("Это совсем другой язык.", "Это совсем другой язык, и я говорю на нём долго.");
+        assert_eq!(scrub(&long, "T").1, 0, "a line of more than six words is someone talking");
 
         let mixed = format!("---\ntitle: T\n---\n\n## Transcript\n\n{english}[A 0:30] यह पूरी बात ठीक है।\n[A 0:31] ಇದು ಸರಿಯಾಗಿದೆ.\n[A 0:32] இது சரி.\n");
-        assert_eq!(scrub_prompt_echo_text(&mixed, "T").1, 0);
+        assert_eq!(scrub(&mixed, "T").1, 0);
 
         let one_hindi_line = format!("---\ntitle: T\n---\n\n## Transcript\n\n{english}[A 0:30] धन्यवाद सब लोग।\n");
-        assert_eq!(scrub_prompt_echo_text(&one_hindi_line, "T").1, 0, "ten lines is too few to call one Devanagari line stray");
+        assert_eq!(scrub(&one_hindi_line, "T").1, 0);
 
         let mostly_telugu: String = (0..6).map(|i| format!("[A 1:{i:02}] ఇది సమావేశం భాగం {i}.\n")).collect();
         let md = format!("---\ntitle: T\n---\n\n## Transcript\n\n{mostly_telugu}[A 2:00] Okay.\n");
-        assert_eq!(scrub_prompt_echo_text(&md, "T").1, 0);
+        assert_eq!(scrub(&md, "T").1, 0);
+    }
+
+    #[test]
+    fn speech_in_another_language_is_never_scrubbed() {
+        let english = |n: usize| -> String { (0..n).map(|i| format!("[A {i}:00] We went over item {i} of the launch plan.\n")).collect() };
+        let hindi = format!("---\ntitle: T\n---\n\n## Transcript\n\n{}[B 30:00] मुझे लगता है हमें यह काम शुक्रवार तक खत्म करना चाहिए।\n{}", english(12), english(12));
+        assert_eq!(scrub(&hindi, "T").1, 0, "a Hindi sentence in an English meeting is speech");
+        let russian: String = (0..5).map(|i| format!("[C 40:{i:02}] Да, это правда.\n")).collect();
+        let md = format!("---\ntitle: T\n---\n\n## Transcript\n\n{}{russian}{}", english(25), english(20));
+        let (out, n) = scrub(&md, "T");
+        assert_eq!(n, 0, "five Russian lines are someone speaking Russian");
+        assert_eq!(spoken_lines(&out).iter().filter(|t| t.as_str() == "Да, это правда.").count(), 5);
+    }
+
+    #[test]
+    fn a_silence_phrase_must_be_the_whole_line() {
+        let md = "---\ntitle: T\n---\n\n## Transcript\n\n[A 40:00] That is the whole roadmap.\n[A 41:00] Thank you for listening, any questions?\n[A 41:05] Thank you for listening.\n";
+        let (out, removed) = scrub_prompt_echo_text(md, "T");
+        assert_eq!(removed, ["[A 41:05] Thank you for listening."]);
+        assert!(out.contains("[A 41:00] Thank you for listening, any questions?\n"));
+        assert_eq!(scrub("---\ntitle: T\n---\n\n## Transcript\n\n[A 0:00] Untertitel im Auftrag des ZDF, 2021\n[A 0:05] Real words here.\n", "T").1, 1, "a credit's year is not part of it");
     }
 
     #[test]
