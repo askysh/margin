@@ -430,7 +430,7 @@ pub mod ops {
             return Err("Margin Desk is not in ~/margin-desk. Put it there (see its README), then click this again.".into());
         }
         let node = crate::summaries::find_node(&paths::home()).ok_or("Margin can't find Node.js, which Margin Desk needs. Install it (brew install node), then click this again.")?;
-        Ok(Some(format!("{} {} run", node.display(), desk.display())))
+        Ok(Some(format!("{} {} run", corecfg::shell_word(&node), corecfg::shell_word(&desk))))
     }
 
     pub fn summarize_meeting(path: String) -> Res<()> {

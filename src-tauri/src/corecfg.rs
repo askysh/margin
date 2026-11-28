@@ -408,7 +408,7 @@ pub fn apply(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
     if let Some(command) = &s.post_record {
         let command = command.trim();
         if !command.is_empty() && !command_runs(command) {
-            let program = command.split_whitespace().next().unwrap_or(command);
+            let program = command_program(command).unwrap_or_else(|| command.to_string());
             return Err(format!("Margin can't find the program “{program}”. Use its full path, or click Use Margin Desk."));
         }
         cfg.hooks.post_record = (!command.is_empty()).then(|| command.to_string());
@@ -421,13 +421,50 @@ pub fn apply(cfg: &mut Config, s: &AppSettings) -> Result<(), String> {
 /// name that only an interactive shell knows (an alias, a profile PATH) would fail there,
 /// silently, after every meeting.
 fn command_runs(command: &str) -> bool {
-    let Some(program) = command.split_whitespace().next() else { return false };
-    let program = program.trim_matches(|c| c == '"' || c == '\'');
-    if program.contains('/') {
-        let path = std::path::Path::new(program);
+    let Some(program) = command_program(command) else { return false };
+    if program.contains(['/', '\\']) {
+        let path = std::path::Path::new(&program);
         return path.is_file() && crate::summaries::is_executable(path);
     }
-    which::which(program).is_ok()
+    which::which(&program).is_ok()
+}
+
+/// The first word of a command line as the hook's shell reads it, quotes removed: `sh -c`
+/// (a backslash escapes the next character outside single quotes) or, on Windows, `cmd.exe`
+/// (a backslash is a path separator). None for an unclosed quote.
+fn command_program(command: &str) -> Option<String> {
+    let mut program = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in command.trim_start().chars() {
+        match (quote, c) {
+            _ if escaped => {
+                program.push(c);
+                escaped = false;
+            }
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') | (None, '\\') if !cfg!(windows) => escaped = true,
+            (Some(_), c) => program.push(c),
+            (None, '\'' | '"') => quote = Some(c),
+            (None, c) if c.is_whitespace() => break,
+            (None, c) => program.push(c),
+        }
+    }
+    (!program.is_empty() && quote.is_none()).then_some(program)
+}
+
+/// `path` as one word of a hook command line, which core runs with `sh -c`, or with
+/// `cmd.exe` on Windows, where "C:\Program Files\nodejs\node.exe" would split at the space.
+pub fn shell_word(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        // A Windows path cannot hold a double quote, so nothing inside needs escaping.
+        return format!("\"{text}\"");
+    }
+    if !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+@:,=".contains(c)) {
+        return text;
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// The calendar toast and core's event match share one switch. The match gives a meeting
@@ -811,6 +848,33 @@ mod tests {
             pin_measured_transcription_defaults(&mut chosen, has_vocabulary);
             assert_eq!((chosen.meeting_chunk_noise_multiplier, chosen.meeting_chunk_pad_ms, chosen.n_max_text_ctx), (3.0, 150, Some(64)));
         }
+    }
+
+    #[test]
+    fn a_hook_command_with_spaces_in_its_paths_runs() {
+        let dir = std::env::temp_dir().join(format!("margin-hook-{}", std::process::id())).join("Program Files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = dir.join("node js");
+        std::fs::write(&node, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let desk = dir.join("Akash's desk.mjs");
+        let command = format!("{} {} run", shell_word(&node), shell_word(&desk));
+        assert_eq!(command_program(&command).as_deref(), Some(node.to_str().unwrap()));
+        assert!(command_runs(&command), "{command}");
+        assert!(!command_runs(&format!("{} run", node.display())), "unquoted, the space splits the program");
+        assert_eq!(shell_word(std::path::Path::new("/opt/homebrew/bin/node")), "/opt/homebrew/bin/node");
+        assert_eq!(command_program("'/a b/c"), None, "an unclosed quote");
+        #[cfg(unix)]
+        {
+            // The words that sh itself reads.
+            let words = std::process::Command::new("sh").arg("-c").arg(format!("printf '%s|' {command}")).output().unwrap();
+            assert_eq!(String::from_utf8(words.stdout).unwrap(), format!("{}|{}|run|", node.display(), desk.display()));
+        }
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]

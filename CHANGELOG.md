@@ -27,6 +27,8 @@ on) point to [DECISIONS.md](DECISIONS.md).
 
 ### Fixed
 
+- *Use Margin Desk* wrote a command that broke when Node or Margin Desk sat in a folder with
+  a space in its name, such as `C:\Program Files\nodejs`. Both paths are quoted now (D70).
 - With summaries on, a meeting whose summary failed never reached the knowledge wiki. It
   now goes in without the summary's decisions and action items (D70).
 - *Summarize again* could replace a title you typed when it matched the first words
